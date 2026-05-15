@@ -1,0 +1,13 @@
+services:
+  lightchat:
+    build: .
+    container_name: lightchat
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8899:8899"
+    volumes:
+      - ./data:/app/data
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Shanghai
