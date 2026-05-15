@@ -1,0 +1,34 @@
+{
+  "description": "Scheduler test scenarios",
+  "scenarios": [
+    {
+      "name": "sleep_hours",
+      "hour": 3,
+      "expected": false,
+      "reason_contains": "sleep"
+    },
+    {
+      "name": "normal_hour",
+      "hour": 14,
+      "last_chat_seconds_ago": 14400,
+      "messages_today": 1,
+      "consecutive_ignored": 0,
+      "expected": true
+    },
+    {
+      "name": "too_recent_chat",
+      "hour": 14,
+      "last_chat_seconds_ago": 600,
+      "expected": false,
+      "reason_contains": "recent"
+    },
+    {
+      "name": "ignored_streak",
+      "hour": 14,
+      "last_chat_seconds_ago": 14400,
+      "consecutive_ignored": 3,
+      "expected": false,
+      "reason_contains": "ignored"
+    }
+  ]
+}

@@ -1,0 +1,1302 @@
+"""Goal Chat Agent — main entry point.
+
+A lightweight, privacy-preserving chat agent with:
+  - Multi-message output (JSON format, DeepSeek-compatible)
+  - Simple tool calling (weather, time)
+  - Long-term memory (SQLite + CJK bigram retrieval)
+  - Proactive messaging (hard rules + LLM scheduler)
+  - WeChat integration (emoRebot iLink bridge)
+
+All 10 production safeguards built in from day one.
+Single process, single SQLite file, zero cloud dependencies.
+"""
+
+import asyncio
+import io
+import secrets
+import zipfile
+import json
+import logging
+import os
+import re
+import sys
+import time
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+import yaml
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from openai import AsyncOpenAI
+
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).parent))
+
+from agent.chat_agent import ChatAgent
+from agent.context_builder import compact_history
+from agent.memory_worker import MemoryWorker
+from agent.scheduler import SchedulerAgent
+from agent.tools import configure_tools
+from bridge.wechat_poller import WeChatBridge, login_qr
+from memory.store import MemoryStore
+
+# ================================================================
+# Config loading
+# ================================================================
+
+load_dotenv()
+
+def _env_replace(value: str) -> str:
+    """Replace ${VAR:-default} patterns with env values."""
+    import re
+    def replacer(match):
+        var_expr = match.group(1)
+        if ":-" in var_expr:
+            var, default = var_expr.split(":-", 1)
+            return os.getenv(var.strip(), default.strip())
+        return os.getenv(var_expr.strip(), "")
+    return re.sub(r"\$\{([^}]+)\}", replacer, value)
+
+
+def load_config(path: str = "config.yaml") -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        raw = f.read()
+    raw = _env_replace(raw)
+    return yaml.safe_load(raw)
+
+
+cfg = load_config()
+RUNTIME_SETTINGS_PATH = Path("./data/runtime_settings.json")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
+ADMIN_SESSIONS: set[str] = set()
+ADMIN_COOKIE = "goal_admin_session"
+
+
+def _deep_update(base: dict, updates: dict) -> dict:
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_update(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def load_runtime_settings() -> dict:
+    if not RUNTIME_SETTINGS_PATH.exists():
+        return {}
+    try:
+        with open(RUNTIME_SETTINGS_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        logging.getLogger("goal").warning(
+            "Failed to load runtime settings", exc_info=True
+        )
+        return {}
+
+
+def save_runtime_settings(settings: dict):
+    RUNTIME_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(RUNTIME_SETTINGS_PATH, "w", encoding="utf-8") as f:
+        json.dump(settings, f, ensure_ascii=False, indent=2)
+
+
+def read_persona_file() -> str:
+    path = Path(cfg.get("agent", {}).get("persona_file", "./prompts/persona.md"))
+    if path.exists():
+        return path.read_text(encoding="utf-8")
+    return cfg["agent"].get("personality", "")
+
+
+def require_admin(request: Request):
+    token = request.cookies.get(ADMIN_COOKIE, "")
+    if not token or token not in ADMIN_SESSIONS:
+        raise HTTPException(status_code=401, detail="请先登录")
+
+
+runtime_settings = load_runtime_settings()
+_deep_update(cfg, runtime_settings)
+
+# ================================================================
+# Logging
+# ================================================================
+
+# Ensure data directory exists before logging touches it
+Path("./data").mkdir(parents=True, exist_ok=True)
+
+logging.basicConfig(
+    level=getattr(logging, cfg.get("logging", {}).get("level", "INFO")),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(
+            cfg.get("logging", {}).get("file", "./data/agent.log"),
+            encoding="utf-8",
+        ),
+    ],
+)
+logger = logging.getLogger("goal")
+logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
+configure_tools(cfg)
+
+# ================================================================
+# Clients and services
+# ================================================================
+
+llm_client = AsyncOpenAI(
+    api_key=cfg["model"]["api_key"],
+    base_url=cfg["model"]["base_url"],
+)
+
+model_name = cfg["model"]["name"]
+temperature = cfg["model"].get("temperature", 0.7)
+
+memory_store = MemoryStore(
+    db_path=cfg["memory"].get("db_path", "./data/memory.db"),
+)
+
+chat_agent = ChatAgent(
+    client=llm_client,
+    model=model_name,
+    persona=cfg["agent"]["persona"],
+    personality=read_persona_file(),
+    temperature=temperature,
+)
+
+memory_worker = MemoryWorker(
+    store=memory_store,
+    client=llm_client,
+    model=model_name,
+    min_importance=cfg["memory"].get("min_importance_save", 0.4),
+)
+
+scheduler_agent = SchedulerAgent(
+    store=memory_store,
+    client=llm_client,
+    model=model_name,
+    config=cfg.get("scheduler"),
+)
+
+scheduler = AsyncIOScheduler()
+
+# WeChat iLink bridge (lazy start if config.enabled)
+_bridge: WeChatBridge | None = None
+if cfg.get("wechat", {}).get("enabled"):
+    wcfg = cfg["wechat"]
+    _bridge = WeChatBridge(
+        token=wcfg.get("token", ""),
+        base_url=wcfg.get("base_url", ""),
+        goal_url=wcfg.get("goal_url", "http://127.0.0.1:8899"),
+        poll_timeout_ms=wcfg.get("poll_timeout_ms", 35_000),
+        message_delay=wcfg.get("message_delay", 1.2),
+    )
+
+# ================================================================
+# Conversation history (in-memory, per session)
+# ================================================================
+
+# Simple in-memory history store. For multi-user/production,
+# replace with a per-user history table in SQLite.
+conversation_histories: dict[str, list[dict]] = {}
+MAX_HISTORY_TURNS = cfg["conversation"].get("max_history_turns", 20)
+COMPACT_AT_TURNS = cfg["conversation"].get("compact_at_turns", 40)
+
+
+def get_history(user_id: str) -> list[dict]:
+    if user_id not in conversation_histories:
+        conversation_histories[user_id] = []
+    return conversation_histories[user_id]
+
+
+def append_history(user_id: str, role: str, content: str):
+    history = get_history(user_id)
+    history.append({"role": role, "content": content})
+
+    # Safeguard #9: compact if too long
+    if len(history) > COMPACT_AT_TURNS * 2:
+        compacted, _ = compact_history(history, MAX_HISTORY_TURNS, COMPACT_AT_TURNS)
+        conversation_histories[user_id] = compacted
+
+
+def public_settings() -> dict:
+    """Settings safe to show/edit in the local admin UI."""
+    email_cfg = cfg.get("email", {})
+    return {
+        "scheduler": {
+            "enabled": cfg.get("scheduler", {}).get("enabled", True),
+            "interval_minutes": cfg.get("scheduler", {}).get("interval_minutes", 30),
+            "scheduled_check_seconds": cfg.get("scheduler", {}).get("scheduled_check_seconds", 10),
+            "sleep_start": cfg.get("scheduler", {}).get("sleep_start", 0),
+            "sleep_end": cfg.get("scheduler", {}).get("sleep_end", 7),
+            "min_chat_gap_hours": cfg.get("scheduler", {}).get("min_chat_gap_hours", 2),
+            "max_daily_proactive": cfg.get("scheduler", {}).get("max_daily_proactive", 5),
+            "min_proactive_interval": cfg.get("scheduler", {}).get("min_proactive_interval", 90),
+        },
+        "wechat": {
+            "message_delay": cfg.get("wechat", {}).get("message_delay", 1.2),
+        },
+        "weather": {
+            "timeout_seconds": cfg.get("weather", {}).get("timeout_seconds", 4),
+            "cache_ttl_seconds": cfg.get("weather", {}).get("cache_ttl_seconds", 600),
+        },
+        "email": {
+            "enabled": email_cfg.get("enabled", False),
+            "smtp_host": email_cfg.get("smtp_host", ""),
+            "smtp_port": email_cfg.get("smtp_port", 465),
+            "from_addr": email_cfg.get("from_addr", ""),
+            "default_to": email_cfg.get("default_to", ""),
+            "username": email_cfg.get("username", ""),
+            "use_ssl": email_cfg.get("use_ssl", True),
+            "use_starttls": email_cfg.get("use_starttls", False),
+        },
+    }
+
+
+def apply_runtime_settings(updates: dict):
+    """Persist and apply runtime-editable settings."""
+    _deep_update(runtime_settings, updates)
+    save_runtime_settings(runtime_settings)
+    _deep_update(cfg, updates)
+    configure_tools(cfg)
+
+    scfg = cfg.get("scheduler", {})
+    scheduler_agent.sleep_start = scfg.get("sleep_start", 0)
+    scheduler_agent.sleep_end = scfg.get("sleep_end", 7)
+    scheduler_agent.min_chat_gap_hours = scfg.get("min_chat_gap_hours", 2)
+    scheduler_agent.max_ignored_streak = scfg.get("max_ignored_streak", 3)
+    scheduler_agent.max_daily = scfg.get("max_daily_proactive", 5)
+    scheduler_agent.min_interval = scfg.get("min_proactive_interval", 90)
+
+    if _bridge is not None:
+        _bridge.message_delay = float(
+            cfg.get("wechat", {}).get("message_delay", 1.2)
+        )
+
+    if scheduler.running:
+        check_job = scheduler.get_job("deliver_scheduled_messages")
+        if check_job:
+            check_job.reschedule(
+                trigger="interval",
+                seconds=scfg.get("scheduled_check_seconds", 10),
+            )
+
+        proactive_job = scheduler.get_job("scheduler_tick")
+        if proactive_job:
+            if scfg.get("enabled", True):
+                proactive_job.resume()
+                proactive_job.reschedule(
+                    trigger="interval",
+                    minutes=scfg.get("interval_minutes", 30),
+                )
+            else:
+                proactive_job.pause()
+        elif scfg.get("enabled", True):
+            scheduler.add_job(
+                scheduler_tick,
+                "interval",
+                minutes=scfg.get("interval_minutes", 30),
+                id="scheduler_tick",
+                replace_existing=True,
+            )
+
+
+async def start_internal_wechat_bridge():
+    """Start or restart the built-in iLink bridge from current config."""
+    global _bridge
+    wcfg = cfg.get("wechat", {})
+    token = wcfg.get("token", "")
+    if not token:
+        raise HTTPException(400, "No wechat token configured. Run QR deployment first.")
+
+    if _bridge is not None:
+        await _bridge.stop()
+
+    _bridge = WeChatBridge(
+        token=token,
+        base_url=wcfg.get("base_url", ""),
+        goal_url=wcfg.get("goal_url", "http://127.0.0.1:8899"),
+        poll_timeout_ms=wcfg.get("poll_timeout_ms", 35_000),
+        message_delay=wcfg.get("message_delay", 1.2),
+    )
+    await _bridge.start()
+    return _bridge
+
+
+def persist_wechat_deployment(token: str, base_url: str = ""):
+    """Persist iLink credentials so restart can reuse the deployment."""
+    updates = {
+        "wechat": {
+            "enabled": True,
+            "token": token,
+            "base_url": base_url or cfg.get("wechat", {}).get("base_url", ""),
+        }
+    }
+    apply_runtime_settings(updates)
+
+
+def normalize_qr_payload(raw: dict) -> dict:
+    """Normalize the iLink QR response for the admin frontend."""
+    qrcode = (
+        raw.get("qrcode")
+        or raw.get("qr_code")
+        or raw.get("code")
+        or ""
+    )
+    image = (
+        raw.get("qrcode_img_content")
+        or raw.get("qrcode_img")
+        or raw.get("qrcode_url")
+        or raw.get("qr_code_url")
+        or raw.get("url")
+        or ""
+    )
+    qr_url = image or qrcode
+    svg = make_qr_svg(qr_url)
+    return {
+        "qrcode": qrcode,
+        "qrcode_img": image,
+        "qrcode_url": qr_url,
+        "qrcode_svg": svg,
+        "can_render_qr": bool(svg),
+        "status": raw.get("status", "wait"),
+        "raw_keys": sorted(raw.keys()),
+    }
+
+
+def make_qr_svg(content: str) -> str:
+    """Render a QR code SVG for the deployment URL.
+
+    iLink returns a WeChat liteapp URL, not an image. The browser needs an
+    actual QR image to scan, matching emoRebot's Next implementation.
+    """
+    if not content:
+        return ""
+    try:
+        import qrcode
+        from qrcode.image.svg import SvgPathImage
+    except Exception:
+        return ""
+
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=10,
+        border=2,
+    )
+    qr.add_data(content)
+    qr.make(fit=True)
+    img = qr.make_image(image_factory=SvgPathImage)
+    return img.to_string(encoding="unicode")
+
+
+def parse_memory_upload(filename: str, data: bytes) -> list[dict]:
+    """Parse zip/json/md/txt memory exports into normalized entries."""
+    suffix = Path(filename or "").suffix.lower()
+    if suffix == ".zip" or zipfile.is_zipfile(io.BytesIO(data)):
+        return parse_memory_zip(data)
+
+    text = decode_text(data)
+    if suffix == ".json":
+        return parse_memory_json(text)
+    return parse_memory_text(filename or "memory.txt", text)
+
+
+def parse_memory_zip(data: bytes) -> list[dict]:
+    entries: list[dict] = []
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            name = info.filename.replace("\\", "/")
+            lower = name.lower()
+            if not lower.endswith((".md", ".txt", ".json")):
+                continue
+            if lower.endswith("/memory.md") or lower == "memory/memory.md":
+                # MEMORY.md is usually an index pointing to the real memories.
+                continue
+            raw = zf.read(info)
+            text = decode_text(raw)
+            if lower.endswith(".json"):
+                entries.extend(parse_memory_json(text, source=name))
+            else:
+                entries.extend(parse_memory_text(name, text))
+    return entries
+
+
+def decode_text(data: bytes) -> str:
+    for enc in ["utf-8-sig", "utf-8", "gb18030"]:
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def parse_memory_json(text: str, source: str = "memory.json") -> list[dict]:
+    payload = json.loads(text)
+    if isinstance(payload, dict):
+        items = payload.get("memories", payload.get("items", []))
+    else:
+        items = payload
+    if not isinstance(items, list):
+        return []
+
+    entries = []
+    for item in items:
+        if isinstance(item, str):
+            entries.extend(parse_memory_text(source, item))
+        elif isinstance(item, dict):
+            content = str(item.get("content", item.get("text", ""))).strip()
+            if content:
+                entries.append({
+                    "content": content,
+                    "category": item.get("category", "imported"),
+                    "importance": item.get("importance", 0.72),
+                    "keywords": item.get("keywords", ""),
+                    "source_turn_id": item.get("source_turn_id", source),
+                })
+    return entries
+
+
+def parse_memory_text(source: str, text: str) -> list[dict]:
+    meta, body = split_front_matter(text)
+    body = body.strip()
+    if not body:
+        return []
+
+    title = str(meta.get("name") or Path(source).stem)
+    desc = str(meta.get("description") or "")
+    category = str(meta.get("type") or infer_memory_category(source))
+    session_id = str(meta.get("originSessionId") or meta.get("origin_session_id") or source)
+
+    header = f"{title}\n{desc}".strip()
+    base = f"{header}\n\n{body}" if header else body
+    chunks = chunk_memory_text(base)
+    return [
+        {
+            "content": chunk,
+            "category": category,
+            "importance": 0.78 if category in {"feedback", "user"} else 0.70,
+            "keywords": title,
+            "source_turn_id": session_id,
+        }
+        for chunk in chunks
+    ]
+
+
+def split_front_matter(text: str) -> tuple[dict, str]:
+    if not text.startswith("---"):
+        return {}, text
+    match = re.match(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", text, re.S)
+    if not match:
+        return {}, text
+    raw_meta, body = match.groups()
+    try:
+        meta = yaml.safe_load(raw_meta) or {}
+        if not isinstance(meta, dict):
+            meta = {}
+    except Exception:
+        meta = {}
+    return meta, body
+
+
+def infer_memory_category(source: str) -> str:
+    lower = source.lower()
+    if "feedback" in lower or "style" in lower or "persona" in lower:
+        return "preference"
+    if "summary" in lower or "chat" in lower:
+        return "summary"
+    return "imported"
+
+
+def chunk_memory_text(text: str, max_chars: int = 1800) -> list[str]:
+    text = text.strip()
+    if len(text) <= max_chars:
+        return [text]
+
+    parts = re.split(r"\n(?=##? |\d+\. |- )", text)
+    chunks: list[str] = []
+    current = ""
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if current and len(current) + len(part) + 2 > max_chars:
+            chunks.append(current)
+            current = part
+        else:
+            current = f"{current}\n\n{part}".strip() if current else part
+    if current:
+        chunks.append(current)
+
+    if not chunks:
+        chunks = [text[i:i + max_chars] for i in range(0, len(text), max_chars)]
+    return chunks
+
+
+def build_memory_export_zip(memories: list[dict]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        payload = {
+            "exported_at": time.time(),
+            "format": "goal-memory-v1",
+            "memories": memories,
+        }
+        zf.writestr(
+            "memory/memories.json",
+            json.dumps(payload, ensure_ascii=False, indent=2),
+        )
+        lines = ["# Goal Memory Export", ""]
+        for m in memories:
+            lines.append(f"## {m.get('id', '')}")
+            lines.append(f"- category: {m.get('category', '')}")
+            lines.append(f"- importance: {m.get('importance', '')}")
+            lines.append("")
+            lines.append(str(m.get("content", "")))
+            lines.append("")
+        zf.writestr("memory/memories.md", "\n".join(lines))
+    return buf.getvalue()
+
+
+# ================================================================
+# FastAPI app
+# ================================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup and shutdown."""
+    logger.info(f"Starting Goal Chat Agent (model={model_name})")
+
+    # Start background jobs. One-shot reminders are always checked because they
+    # are user-requested tasks; proactive messaging is separately configurable.
+    scfg = cfg.get("scheduler", {})
+    scheduler.add_job(
+        deliver_scheduled_messages,
+        "interval",
+        seconds=scfg.get("scheduled_check_seconds", 10),
+        id="deliver_scheduled_messages",
+        replace_existing=True,
+        max_instances=1,
+    )
+
+    if scfg.get("enabled", True):
+        interval = scfg.get("interval_minutes", 30)
+        scheduler.add_job(
+            scheduler_tick,
+            "interval",
+            minutes=interval,
+            id="scheduler_tick",
+            replace_existing=True,
+        )
+        # Daily counter reset at midnight CST
+        scheduler.add_job(
+            daily_reset,
+            "cron",
+            hour=0,
+            minute=1,
+            timezone="Asia/Shanghai",
+            id="daily_reset",
+            replace_existing=True,
+        )
+        # Memory decay at 3am daily
+        scheduler.add_job(
+            memory_decay,
+            "cron",
+            hour=3,
+            minute=0,
+            timezone="Asia/Shanghai",
+            id="memory_decay",
+            replace_existing=True,
+        )
+
+    scheduler.start()
+    logger.info("Background scheduler started")
+
+    # Start WeChat bridge if configured
+    if _bridge is not None and _bridge.token:
+        await _bridge.start()
+
+    yield
+
+    # Shutdown
+    logger.info("Shutting down...")
+    if _bridge is not None:
+        await _bridge.stop()
+    if scheduler.running:
+        scheduler.shutdown(wait=False)
+    await memory_store.close()
+    logger.info("Shutdown complete")
+
+
+app = FastAPI(
+    title="Goal Chat Agent",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+STATIC_DIR = Path("./static")
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+# ================================================================
+# API Routes
+# ================================================================
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "model": model_name}
+
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_page():
+    """Mobile-first local admin UI."""
+    html_path = STATIC_DIR / "admin.html"
+    if not html_path.exists():
+        raise HTTPException(status_code=404, detail="admin UI not found")
+    return HTMLResponse(html_path.read_text(encoding="utf-8"))
+
+
+@app.get("/admin/auth/status")
+async def admin_auth_status(request: Request):
+    token = request.cookies.get(ADMIN_COOKIE, "")
+    return {
+        "authenticated": bool(token and token in ADMIN_SESSIONS),
+        "default_password": ADMIN_PASSWORD == "admin",
+    }
+
+
+@app.post("/admin/auth/login")
+async def admin_auth_login(request: Request):
+    body = await request.json()
+    password = str(body.get("password", ""))
+    if not secrets.compare_digest(password, ADMIN_PASSWORD):
+        raise HTTPException(status_code=401, detail="密码不对")
+
+    token = secrets.token_urlsafe(32)
+    ADMIN_SESSIONS.add(token)
+    response = JSONResponse({"status": "ok"})
+    response.set_cookie(
+        ADMIN_COOKIE,
+        token,
+        httponly=True,
+        samesite="lax",
+        max_age=60 * 60 * 24 * 7,
+    )
+    return response
+
+
+@app.post("/admin/auth/logout")
+async def admin_auth_logout(request: Request):
+    token = request.cookies.get(ADMIN_COOKIE, "")
+    if token:
+        ADMIN_SESSIONS.discard(token)
+    response = JSONResponse({"status": "ok"})
+    response.delete_cookie(ADMIN_COOKIE)
+    return response
+
+
+@app.get("/admin/config")
+async def admin_config(request: Request):
+    require_admin(request)
+    contact = await memory_store.get_contact_state()
+    outbound_available = _bridge is not None and bool(_bridge.token)
+    token = str(cfg.get("wechat", {}).get("token", ""))
+    return {
+        "persona": read_persona_file(),
+        "settings": public_settings(),
+        "wechat": {
+            "running": _bridge is not None and _bridge.running,
+            "configured": bool(cfg.get("wechat", {}).get("token", "")),
+            "outbound_available": outbound_available,
+            "inbound_seen": bool(contact.get("user_id")),
+            "mode": "internal_bridge" if outbound_available else "external_or_chat_only",
+            "token_masked": f"...{token[-6:]}" if token else "",
+            "base_url": cfg.get("wechat", {}).get("base_url", ""),
+        },
+        "contact": contact,
+        "send_ready": bool(
+            outbound_available
+            and contact.get("user_id")
+            and contact.get("context_token")
+        ),
+    }
+
+
+@app.post("/admin/persona")
+async def admin_save_persona(request: Request):
+    require_admin(request)
+    body = await request.json()
+    content = str(body.get("content", "")).strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="content required")
+
+    path = Path(cfg.get("agent", {}).get("persona_file", "./prompts/persona.md"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content + "\n", encoding="utf-8")
+    chat_agent.personality = content
+    return {"status": "saved", "path": str(path)}
+
+
+@app.post("/admin/settings")
+async def admin_save_settings(request: Request):
+    require_admin(request)
+    body = await request.json()
+    allowed = {}
+    for section in ["scheduler", "wechat", "weather", "email"]:
+        if isinstance(body.get(section), dict):
+            allowed[section] = body[section]
+    if not allowed:
+        raise HTTPException(status_code=400, detail="no settings provided")
+    apply_runtime_settings(allowed)
+    return {"status": "saved", "settings": public_settings()}
+
+
+@app.post("/admin/send")
+async def admin_send_message(request: Request):
+    """Manually send a message to the latest known single-user contact."""
+    require_admin(request)
+    body = await request.json()
+    text = str(body.get("text", "")).strip()
+    raw_messages = body.get("messages")
+    messages = []
+
+    if isinstance(raw_messages, list):
+        for item in raw_messages:
+            if isinstance(item, dict):
+                item_text = str(item.get("text", "")).strip()
+                delay = item.get("delay", 0)
+            else:
+                item_text = str(item).strip()
+                delay = 0
+            if item_text:
+                messages.append({"text": item_text, "delay": delay})
+    elif text:
+        messages.append({"text": text, "delay": 0})
+
+    if not messages:
+        raise HTTPException(status_code=400, detail="message text required")
+
+    contact = await memory_store.get_contact_state()
+    if not contact.get("user_id"):
+        raise HTTPException(status_code=400, detail="还没有记录到微信联系人。先从手机给她发一条消息。")
+    if not contact.get("context_token"):
+        raise HTTPException(
+            status_code=400,
+            detail="还没有真实 iLink 会话。请部署后从手机给这个内置 bot 发一条消息。",
+        )
+    if _bridge is None or not _bridge.token:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "内置微信发送通道未启动。当前只看到 /chat 收到了消息，"
+                "但后台没有可用于主动发送的 iLink token。"
+            ),
+        )
+
+    await _send_message_batch(
+        user_id=contact["user_id"],
+        context_token=contact.get("context_token", ""),
+        messages=messages,
+    )
+    return {"status": "sent", "count": len(messages)}
+
+
+@app.post("/chat")
+async def chat(request: Request):
+    """Main chat endpoint.
+
+    Compatible with emoRebot bridge:
+      POST /chat {"messages": ["你好", "今天天气怎么样"], "user_id": "wxid_xxx"}
+
+    Returns:
+      {"messages": [{"text": "...", "delay": 1.0}, ...], "done": true}
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    # Parse input (compatible with emoRebot format: messages array or single message)
+    raw_messages = body.get("messages")
+    if raw_messages is None:
+        raw_messages = [body.get("message", "")]
+    if isinstance(raw_messages, str):
+        raw_messages = [raw_messages]
+    if not isinstance(raw_messages, list) or not raw_messages:
+        raise HTTPException(status_code=400, detail="messages required")
+
+    user_message = "\n".join(str(m) for m in raw_messages[:8])  # Max 8 input messages
+    user_id = str(body.get("user_id", "default"))
+    context_token = str(body.get("context_token", ""))
+
+    logger.info(f"[{user_id}] Received {len(str(user_message))} chars")
+
+    # Retrieve memories
+    memories = await memory_store.search(user_message, top_k=5)
+
+    # Get relationship state
+    relationship = await memory_store.get_relationship()
+
+    # Get conversation history
+    history = get_history(user_id)
+
+    # Run Chat Agent
+    result = await chat_agent.chat(
+        user_message=user_message,
+        memories=memories,
+        history=history,
+        relationship=relationship,
+    )
+
+    # Remember the latest reachable contact. Only iLink-origin requests carry
+    # context_token; external /chat relays often use their own user_id and are
+    # not valid targets for proactive/scheduled sends.
+    if user_id and user_id != "default" and context_token:
+        await memory_store.update_contact_state(user_id, context_token)
+
+    scheduled_task_ids = []
+    contact = await memory_store.get_contact_state()
+    for task in result.get("scheduled_messages", []):
+        due_at = time.time() + float(task["delay_minutes"]) * 60
+        target_user_id = user_id
+        target_context_token = context_token
+        if not target_context_token and contact.get("user_id") and contact.get("context_token"):
+            target_user_id = contact["user_id"]
+            target_context_token = contact["context_token"]
+        task_id = await memory_store.create_scheduled_message(
+            user_id=target_user_id,
+            context_token=target_context_token,
+            messages=task["messages"],
+            due_at=due_at,
+        )
+        scheduled_task_ids.append(task_id)
+
+    # Save assistant history as the same JSON action shape we expect from the
+    # model. This prevents later turns from learning that merged prose is an
+    # acceptable assistant output.
+    append_history(user_id, "user", user_message)
+    assistant_text = "\n".join(
+        m["text"] for m in result["messages"] if m.get("text")
+    )
+    if result["messages"] or result.get("scheduled_messages"):
+        append_history(user_id, "assistant", _assistant_history_json(result))
+
+    # Fire-and-forget memory extraction — skip for trivial messages
+    # "嗯", "好", "哈哈" etc. don't contain extractable information.
+    # Aggressive extraction on noise creates junk memories that bloat the prompt.
+    if len(user_message.strip()) >= 10 and assistant_text.strip():
+        asyncio.create_task(
+            memory_worker.extract(user_message, assistant_text, memories)
+        )
+
+    # Update scheduler state
+    await scheduler_agent.record_chat_activity()
+
+    logger.info(
+        f"[{user_id}] Reply: {len(result['messages'])} messages, "
+        f"{len(result.get('tool_calls', []))} tool calls, "
+        f"{result['iterations']} iterations, "
+        f"{result['elapsed_ms']}ms"
+    )
+
+    return {
+        "messages": [
+            {"text": m["text"], "delay": m.get("delay", 0)}
+            for m in result["messages"]
+        ],
+        "tool_calls": result.get("tool_calls", []),
+        "scheduled_task_ids": scheduled_task_ids,
+        "iterations": result["iterations"],
+        "elapsed_ms": result["elapsed_ms"],
+    }
+
+
+@app.post("/scheduler/trigger")
+async def scheduler_trigger(request: Request):
+    """Manual trigger for scheduler check. Called by internal timer or admin."""
+    require_admin(request)
+    result = await scheduler_tick()
+    return {"status": "ok", "result": result}
+
+
+@app.get("/scheduler/state")
+async def scheduler_state(request: Request):
+    """Get current scheduler state."""
+    require_admin(request)
+    state = await memory_store.get_scheduler_state()
+    return state
+
+
+@app.get("/scheduler/messages")
+async def scheduled_messages(request: Request, status: str = "", limit: int = 50):
+    """Inspect scheduled one-shot message tasks."""
+    require_admin(request)
+    tasks = await memory_store.list_scheduled_messages(
+        status=status or None,
+        limit=limit,
+    )
+    return {"tasks": tasks}
+
+
+@app.get("/memories")
+async def list_memories(request: Request, category: str = "", limit: int = 20):
+    """List memories, optionally filtered by category."""
+    require_admin(request)
+    memories = await memory_store.list_all()
+    if category:
+        memories = [m for m in memories if m.get("category") == category]
+    return {"memories": memories[:limit]}
+
+
+@app.get("/memories/export")
+async def export_memories(request: Request):
+    """Export current memories as a portable zip."""
+    require_admin(request)
+    memories = await memory_store.list_all()
+    data = build_memory_export_zip(memories)
+    filename = f"goal-memory-{time.strftime('%Y%m%d-%H%M%S')}.zip"
+    return StreamingResponse(
+        io.BytesIO(data),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/memories/import")
+async def import_memories(request: Request, clear_existing: bool = False):
+    """Import memories from zip/json/md/txt uploaded by the admin UI."""
+    require_admin(request)
+    data = await request.body()
+    if not data:
+        raise HTTPException(status_code=400, detail="上传文件为空")
+    filename = request.headers.get("X-Filename", "memory.zip")
+    try:
+        entries = parse_memory_upload(filename, data)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"解析失败：{e}")
+    if not entries:
+        raise HTTPException(status_code=400, detail="没有解析到可导入的记忆")
+    result = await memory_store.import_memories(
+        entries,
+        clear_existing=clear_existing,
+    )
+    return {"status": "ok", **result, "parsed": len(entries)}
+
+
+@app.delete("/memories/{mem_id}")
+async def delete_memory(mem_id: str, request: Request):
+    """Delete a single memory entry."""
+    require_admin(request)
+    deleted = await memory_store.delete_memory(mem_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Memory not found")
+    return {"status": "deleted", "id": mem_id}
+
+
+@app.get("/relationship")
+async def get_relationship(request: Request):
+    """Get current relationship state."""
+    require_admin(request)
+    return await memory_store.get_relationship()
+
+
+@app.post("/relationship")
+async def update_relationship(request: Request):
+    """Update relationship state fields."""
+    require_admin(request)
+    body = await request.json()
+    await memory_store.update_relationship(body)
+    return {"status": "updated"}
+
+
+@app.get("/history/{user_id}")
+async def get_history_route(user_id: str, request: Request):
+    """Get conversation history for a user."""
+    require_admin(request)
+    history = get_history(user_id)
+    return {"history": history[-20:]}  # Last 20 messages
+
+
+@app.delete("/history/{user_id}")
+async def clear_history(user_id: str, request: Request):
+    """Clear conversation history for a user."""
+    require_admin(request)
+    conversation_histories[user_id] = []
+    return {"status": "cleared"}
+
+
+# ================================================================
+# WeChat iLink Bridge routes
+# ================================================================
+
+
+@app.get("/wechat/qr")
+async def wechat_qr_login(request: Request):
+    """Get a QR code for WeChat iLink login. Poll /wechat/qr/status next."""
+    require_admin(request)
+    from bridge.ilink_client import get_qr_code
+    wcfg = cfg.get("wechat", {})
+    base_url = wcfg.get("base_url", "")
+    qr = await get_qr_code(base_url)
+    return normalize_qr_payload(qr)
+
+
+@app.get("/wechat/qr/status")
+async def wechat_qr_status(request: Request, qrcode: str):
+    """Poll QR code scan status. Returns bot credentials on confirmed."""
+    require_admin(request)
+    from bridge.ilink_client import poll_qr_status
+    wcfg = cfg.get("wechat", {})
+    base_url = wcfg.get("base_url", "")
+    status = await poll_qr_status(qrcode, base_url)
+    return status
+
+
+@app.post("/wechat/deploy/start")
+async def wechat_deploy_start(request: Request):
+    """Start QR deployment flow for the built-in iLink bridge."""
+    require_admin(request)
+    from bridge.ilink_client import get_qr_code
+
+    wcfg = cfg.get("wechat", {})
+    qr = await get_qr_code(wcfg.get("base_url", ""))
+    return normalize_qr_payload(qr)
+
+
+@app.get("/wechat/deploy/status")
+async def wechat_deploy_status(request: Request, qrcode: str):
+    """Poll QR deployment status; persist credentials when confirmed."""
+    require_admin(request)
+    from bridge.ilink_client import poll_qr_status
+
+    wcfg = cfg.get("wechat", {})
+    status = await poll_qr_status(qrcode, wcfg.get("base_url", ""))
+    st = status.get("status", "wait")
+
+    if st == "confirmed":
+        token = status.get("bot_token") or status.get("token") or ""
+        base_url = (
+            status.get("baseurl")
+            or status.get("base_url")
+            or wcfg.get("base_url", "")
+        )
+        if not token:
+            raise HTTPException(502, "QR confirmed but no bot token returned")
+        persist_wechat_deployment(token=token, base_url=base_url)
+        await start_internal_wechat_bridge()
+        return {
+            "status": "confirmed",
+            "running": True,
+            "configured": True,
+            "token_masked": f"...{token[-6:]}",
+        }
+
+    return {
+        "status": st,
+        "running": _bridge is not None and _bridge.running,
+        "configured": bool(cfg.get("wechat", {}).get("token", "")),
+    }
+
+
+@app.post("/wechat/start")
+async def wechat_start(request: Request):
+    """Start or restart the WeChat bridge."""
+    require_admin(request)
+    await start_internal_wechat_bridge()
+    return {"status": "started"}
+
+
+@app.post("/wechat/stop")
+async def wechat_stop(request: Request):
+    """Stop the WeChat bridge."""
+    require_admin(request)
+    global _bridge
+    if _bridge is not None:
+        await _bridge.stop()
+    return {"status": "stopped"}
+
+
+@app.get("/wechat/status")
+async def wechat_status(request: Request):
+    """Get WeChat bridge status."""
+    require_admin(request)
+    return {
+        "running": _bridge is not None and _bridge.running,
+        "configured": bool(cfg.get("wechat", {}).get("token", "")),
+        "base_url": cfg.get("wechat", {}).get("base_url", ""),
+    }
+
+
+# ================================================================
+# Background tasks
+# ================================================================
+
+
+async def scheduler_tick() -> dict:
+    """Periodic scheduler check. Called by APScheduler or manual trigger."""
+    try:
+        memories = await memory_store.search("", top_k=5)
+        decision = await scheduler_agent.should_proactive_message(memories)
+
+        if decision.get("should_message"):
+            msg = decision.get("message", "")
+            emotion = decision.get("emotion", "neutral")
+            reason = decision.get("reason", "")
+            contact = await memory_store.get_contact_state()
+            if not contact.get("user_id"):
+                logger.info("Scheduler: skip — no contact target yet")
+                return {"sent": False, "reason": "no contact target yet"}
+            if _bridge is None or not _bridge.token:
+                logger.info("Scheduler: skip — WeChat bridge unavailable")
+                return {"sent": False, "reason": "WeChat bridge unavailable"}
+
+            await _send_message_batch(
+                user_id=contact["user_id"],
+                context_token=contact.get("context_token", ""),
+                messages=[{"text": msg, "delay": 0}],
+            )
+            await scheduler_agent.record_sent()
+            logger.info(f"Scheduler: SENT — {reason}")
+
+            return {
+                "sent": True,
+                "message": msg,
+                "emotion": emotion,
+                "reason": reason,
+            }
+        else:
+            reason = decision.get("reason", "unknown")
+            logger.info(f"Scheduler: skip — {reason}")
+            return {
+                "sent": False,
+                "reason": reason,
+            }
+    except Exception as e:
+        logger.error(f"Scheduler tick failed: {e}", exc_info=True)
+        return {"sent": False, "reason": f"error: {e}"}
+
+
+async def deliver_scheduled_messages() -> dict:
+    """Send due one-shot scheduled messages from SQLite."""
+    if _bridge is None or not _bridge.token:
+        return {"sent": 0, "reason": "WeChat bridge unavailable"}
+
+    tasks = await memory_store.get_due_scheduled_messages(limit=20)
+    sent = 0
+    failed = 0
+
+    for task in tasks:
+        task_id = task["id"]
+        try:
+            user_id = task["user_id"]
+            context_token = task.get("context_token", "")
+            if not context_token:
+                contact = await memory_store.get_contact_state()
+                if contact.get("user_id") and contact.get("context_token"):
+                    user_id = contact["user_id"]
+                    context_token = contact["context_token"]
+                else:
+                    raise RuntimeError(
+                        "no iLink contact context_token; send a message to the built-in bot first"
+                    )
+            await _send_message_batch(
+                user_id=user_id,
+                context_token=context_token,
+                messages=task.get("messages", []),
+            )
+            await memory_store.mark_scheduled_message_status(task_id, "sent")
+            sent += 1
+            logger.info(f"Scheduled message sent: {task_id}")
+        except Exception as e:
+            failed += 1
+            await memory_store.mark_scheduled_message_status(
+                task_id, "failed", str(e)
+            )
+            logger.exception(f"Scheduled message failed: {task_id}")
+
+    return {"sent": sent, "failed": failed}
+
+
+async def _send_message_batch(
+    user_id: str,
+    context_token: str,
+    messages: list[dict],
+):
+    """Send a normalized message list through the active WeChat bridge."""
+    if _bridge is None:
+        raise RuntimeError("WeChat bridge is not configured")
+    if not context_token:
+        raise RuntimeError("missing iLink context_token")
+
+    min_gap = float(cfg.get("wechat", {}).get("message_delay", 1.2) or 1.2)
+    for i, m in enumerate(messages):
+        text = str(m.get("text", "")).strip()
+        if not text:
+            continue
+        delay = float(m.get("delay", 0) or 0)
+        if i == 0:
+            await asyncio.sleep(max(delay, 0))
+        else:
+            await asyncio.sleep(max(delay, min_gap))
+        await _bridge.send_text(user_id, text, context_token)
+
+
+def _assistant_history_json(result: dict) -> str:
+    """Represent assistant output in history using the required action format."""
+    actions = []
+    for m in result.get("messages", []):
+        text = str(m.get("text", "")).strip()
+        if text:
+            actions.append({
+                "type": "tool",
+                "name": "wechat_reply",
+                "args": {
+                    "text": text,
+                    "delay": m.get("delay", 0),
+                },
+            })
+
+    for task in result.get("scheduled_messages", []):
+        actions.append({
+            "type": "tool",
+            "name": "schedule_wechat_message",
+            "args": {
+                "delay_minutes": task.get("delay_minutes", 0),
+                "messages": task.get("messages", []),
+            },
+        })
+
+    return json.dumps(
+        {"actions": actions[:cfg["conversation"].get("max_actions_per_turn", 8)], "done": True},
+        ensure_ascii=False,
+    )
+
+
+async def daily_reset():
+    """Reset daily counters at midnight."""
+    await scheduler_agent.reset_daily_counter()
+    logger.info("Daily scheduler counter reset")
+
+
+async def memory_decay():
+    """Apply time-based importance decay to memories."""
+    await memory_store.apply_decay()
+    logger.info("Memory decay applied")
+
+
+# ================================================================
+# Entry point
+# ================================================================
+
+if __name__ == "__main__":
+    import uvicorn
+
+    host = cfg.get("server", {}).get("host", "0.0.0.0")
+    port = int(cfg.get("server", {}).get("port", 8899))
+
+    logger.info(f"Starting server on {host}:{port}")
+    uvicorn.run(app, host=host, port=port)

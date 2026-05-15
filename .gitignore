@@ -1,0 +1,13 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+
+# Local private state
+data/
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

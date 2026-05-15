@@ -1,0 +1,13 @@
+{
+  "description": "Memory dedup test data",
+  "threshold": 0.5,
+  "existing": [
+    {"content": "用户喜欢喝冰美式咖啡，不加糖", "category": "preference"},
+    {"content": "用户在杭州西湖区工作", "category": "identity"},
+    {"content": "用户养了一只猫叫毛球，是橘猫", "category": "identity"}
+  ],
+  "new_similar": "用户喜欢喝咖啡，冰美式不加糖",
+  "new_different": "用户最近开始学弹吉他",
+  "expected_duplicate": true,
+  "expected_different": false
+}

@@ -1,0 +1,12 @@
+{
+  "description": "User asking about weather",
+  "input": {
+    "messages": ["今天天气怎么样？"],
+    "user_id": "test_user_001"
+  },
+  "expected": {
+    "has_messages": true,
+    "messages_not_empty": true,
+    "done": true
+  }
+}
