@@ -38,14 +38,15 @@ def build_system_prompt(
 
     tool_list = ", ".join(tool_names) if tool_names else "无"
 
-    # Memories section
-    memories_text = "（暂无相关记忆）"
+    # Memory section: do not inject full facts by default. The model can search
+    # when the current turn actually needs past context.
+    memories_text = "长期记忆不会默认展开。需要过去事实、偏好或项目进展时，先调用 search_memory；没有工具结果不要说“我记得”。"
     if memories:
-        lines = []
+        lines = ["可搜索记忆线索："]
         for i, m in enumerate(memories, 1):
             cat = m.get("category", "other")
             content = m.get("content", "")
-            lines.append(f"{i}. [{cat}] {content}")
+            lines.append(f"{i}. [{cat}] {content[:80]}")
         memories_text = "\n".join(lines)
 
     # Relationship section
@@ -86,6 +87,9 @@ wechat_reply 是聊天工具，没有理由跳过它。
 - schedule_wechat_message(delay_minutes, messages) — 安排未来发送微信消息。messages 是数组，每项包含 text 和 delay。比如 10 分钟后发两条：{{"delay_minutes":10,"messages":[{{"text":"第一条","delay":0}},{{"text":"第二条","delay":1}}]}}
 - get_weather(city) — 查天气
 - get_time(timezone) — 查时间
+- search_memory(query, top_k) — 按需搜索长期记忆。需要过去事实时先查，没查到就说不确定
+- read_persona_file() — 读取当前人设文件。只能读取这一个配置允许的文件
+- propose_persona_change(content, reason) — 提出人设文件修改草案，等待辣椒微信确认后由系统写入
 - send_email(to, subject, body) — 发送邮件。用户没有指定收件人时可以留空 to，系统会使用默认收件人
 
 ## 输出格式
@@ -97,7 +101,9 @@ wechat_reply 是聊天工具，没有理由跳过它。
 1. 想现在发几条，就输出几个 wechat_reply action。不要把多条消息塞进同一个 text。
 2. 用户要求“过一会儿/几分钟后/几点提醒我/之后发消息”时，必须调用 schedule_wechat_message，由代码定时发送。
 3. 用户要求发邮件时，先用 send_email 执行，再用 wechat_reply 简短说明结果。
-4. 不要用空格、换行、分隔符来假装多条消息。消息条数只由 actions 数组决定。"""
+4. 不要用空格、换行、分隔符来假装多条消息。消息条数只由 actions 数组决定。
+5. 不准编造你拥有的能力。你不能直接读项目目录、代码、屏幕或任意文件；只能使用本轮消息、系统上下文和真实工具结果。
+6. 要修改人设时，只能调用 propose_persona_change 提草案，并用 wechat_reply 问辣椒是否确认。"""
     return prompt
 
 

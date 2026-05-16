@@ -111,6 +111,21 @@ class MemoryStore:
                 updated_at REAL NOT NULL DEFAULT 0
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS pending_persona_change (
+                id INTEGER PRIMARY KEY DEFAULT 1,
+                content TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL DEFAULT 0
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS history_summaries (
+                user_id TEXT PRIMARY KEY,
+                summary TEXT NOT NULL DEFAULT '',
+                updated_at REAL NOT NULL DEFAULT 0
+            )
+        """)
         await db.commit()
 
     async def close(self):
@@ -577,3 +592,68 @@ class MemoryStore:
         if row:
             return dict(row[0])
         return {"user_id": "", "context_token": "", "updated_at": 0}
+
+    # ================================================================
+    # Persona change confirmation
+    # ================================================================
+
+    async def set_pending_persona_change(self, content: str, reason: str = ""):
+        now = time.time()
+        async with self._lock:
+            db = await self._get_db()
+            await db.execute(
+                """INSERT INTO pending_persona_change
+                   (id, content, reason, created_at)
+                   VALUES (1, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                       content = excluded.content,
+                       reason = excluded.reason,
+                       created_at = excluded.created_at""",
+                (content, reason, now),
+            )
+            await db.commit()
+
+    async def get_pending_persona_change(self) -> dict[str, Any] | None:
+        db = await self._get_db()
+        row = await db.execute_fetchall(
+            "SELECT * FROM pending_persona_change WHERE id = 1"
+        )
+        if row and row[0]["content"]:
+            return dict(row[0])
+        return None
+
+    async def clear_pending_persona_change(self):
+        async with self._lock:
+            db = await self._get_db()
+            await db.execute(
+                "UPDATE pending_persona_change SET content = '', reason = '', created_at = 0 WHERE id = 1"
+            )
+            await db.commit()
+
+    # ================================================================
+    # Compacted conversation summaries
+    # ================================================================
+
+    async def get_history_summary(self, user_id: str) -> str:
+        db = await self._get_db()
+        row = await db.execute_fetchall(
+            "SELECT summary FROM history_summaries WHERE user_id = ?",
+            (user_id,),
+        )
+        if row:
+            return str(row[0]["summary"] or "")
+        return ""
+
+    async def save_history_summary(self, user_id: str, summary: str):
+        now = time.time()
+        async with self._lock:
+            db = await self._get_db()
+            await db.execute(
+                """INSERT INTO history_summaries(user_id, summary, updated_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(user_id) DO UPDATE SET
+                       summary = excluded.summary,
+                       updated_at = excluded.updated_at""",
+                (user_id, summary, now),
+            )
+            await db.commit()

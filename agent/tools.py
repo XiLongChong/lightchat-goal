@@ -9,6 +9,7 @@ import smtplib
 import time
 from datetime import datetime
 from email.message import EmailMessage
+from pathlib import Path
 from urllib.parse import quote
 from typing import Any
 
@@ -37,6 +38,18 @@ TOOL_DEFINITIONS: dict[str, dict[str, Any]] = {
         "description": "查询城市的实时天气",
         "args": ["city"],
     },
+    "search_memory": {
+        "description": "按需搜索长期记忆。只有需要过去事实、偏好、项目进展时调用；没有结果就不要编造",
+        "args": ["query", "top_k"],
+    },
+    "read_persona_file": {
+        "description": "读取当前人设文件原文。只能读配置允许的人设文件，不能读任意项目文件",
+        "args": [],
+    },
+    "propose_persona_change": {
+        "description": "提出人设文件修改草案。不会直接写入，系统会发微信让用户确认后再改",
+        "args": ["content", "reason"],
+    },
     "send_email": {
         "description": "发送邮件。需要系统已配置 SMTP。args: to, subject, body",
         "args": ["to", "subject", "body"],
@@ -52,6 +65,11 @@ def configure_tools(config: dict[str, Any]):
     """Inject runtime config for tools without coupling tools to FastAPI."""
     global TOOL_RUNTIME_CONFIG
     TOOL_RUNTIME_CONFIG = config or {}
+
+
+def configure_runtime(memory_store: Any = None):
+    """Inject runtime objects that tools may use without importing main.py."""
+    TOOL_RUNTIME_CONFIG["_memory_store"] = memory_store
 
 
 def _as_bool(value: Any) -> bool:
@@ -202,6 +220,43 @@ async def execute_tool(name: str, args: dict[str, Any] | None) -> str:
         city = str(args.get("city", ""))[:50]
         return await _get_weather(city)
 
+    if name == "search_memory":
+        store = TOOL_RUNTIME_CONFIG.get("_memory_store")
+        if store is None:
+            return "记忆系统未连接"
+        query = str(args.get("query", "")).strip()[:500]
+        top_k = int(args.get("top_k", 5) or 5)
+        top_k = max(1, min(8, top_k))
+        if not query:
+            return "请提供要搜索的记忆关键词"
+        memories = await store.search(query, top_k=top_k)
+        if not memories:
+            return "没有找到相关记忆"
+        lines = []
+        for i, memory in enumerate(memories, 1):
+            lines.append(f"{i}. [{memory.get('category', 'other')}] {memory.get('content', '')}")
+        return "\n".join(lines)[:2000]
+
+    if name == "read_persona_file":
+        path = _persona_path()
+        try:
+            return path.read_text(encoding="utf-8")[:4000]
+        except FileNotFoundError:
+            return "人设文件不存在"
+        except Exception as e:
+            return f"读取人设文件失败：{e}"
+
+    if name == "propose_persona_change":
+        store = TOOL_RUNTIME_CONFIG.get("_memory_store")
+        if store is None:
+            return "确认系统未连接，无法提交修改草案"
+        content = str(args.get("content", "")).strip()
+        reason = str(args.get("reason", "")).strip()[:300]
+        if not content:
+            return "修改草案为空，未提交"
+        await store.set_pending_persona_change(content=content, reason=reason)
+        return "已提交人设修改草案，等待用户在微信回复“确认/保存/可以”后写入"
+
     if name == "send_email":
         return await _send_email(
             to=str(args.get("to", "")),
@@ -210,3 +265,13 @@ async def execute_tool(name: str, args: dict[str, Any] | None) -> str:
         )
 
     return f"[未知工具: {name}]"
+
+
+def _persona_path() -> Path:
+    agent_cfg = TOOL_RUNTIME_CONFIG.get("agent", {})
+    configured = Path(agent_cfg.get("persona_file", "./prompts/persona.md"))
+    root = Path.cwd().resolve()
+    path = (root / configured).resolve() if not configured.is_absolute() else configured.resolve()
+    if root not in path.parents and path != root:
+        raise ValueError("persona_file must stay inside project root")
+    return path

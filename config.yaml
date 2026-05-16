@@ -392,6 +392,8 @@ wechat:
   goal_url: "http://127.0.0.1:8899"
   poll_timeout_ms: 35000
   message_delay: 1.2
+  buffer_debounce_seconds: 5.0
+  buffer_max_wait_seconds: 12.0
 
 # ---- Scheduler ----
 scheduler:
@@ -404,6 +406,18 @@ scheduler:
   max_ignored_streak: 3         # 连续被忽略次数上限
   max_daily_proactive: 5        # 每天最多主动发几条
   min_proactive_interval: 90    # 两次主动消息间隔（分钟）
+
+# ---- Fixed proactive messages ----
+fixed_messages:
+  morning:
+    enabled: true
+    hour: 8
+    minute: 0
+    city: "成都"
+  night_recap:
+    enabled: true
+    hour: 23
+    minute: 0
 
 # ---- Weather ----
 weather:

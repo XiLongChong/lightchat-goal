@@ -26,15 +26,22 @@ class WeChatBridge:
         goal_url: str = "http://127.0.0.1:8899",
         poll_timeout_ms: int = 35_000,
         message_delay: float = 1.2,
+        buffer_debounce_seconds: float = 5.0,
+        buffer_max_wait_seconds: float = 12.0,
     ):
         self.token = token
         self.base_url = base_url
         self.goal_url = goal_url.rstrip("/")
         self.poll_timeout_ms = poll_timeout_ms
         self.message_delay = message_delay
+        self.buffer_debounce_seconds = buffer_debounce_seconds
+        self.buffer_max_wait_seconds = buffer_max_wait_seconds
         self.buf = ""
         self.running = False
         self._task: asyncio.Task | None = None
+        self._buffers: dict[str, list[dict[str, Any]]] = {}
+        self._buffer_started: dict[str, float] = {}
+        self._buffer_tasks: dict[str, asyncio.Task] = {}
 
     async def start(self):
         """Begin polling in the background."""
@@ -53,6 +60,10 @@ class WeChatBridge:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        for task in list(self._buffer_tasks.values()):
+            task.cancel()
+        if self._buffer_tasks:
+            await asyncio.gather(*self._buffer_tasks.values(), return_exceptions=True)
         logger.info("Bridge stopped")
 
     async def _poll_loop(self):
@@ -95,7 +106,56 @@ class WeChatBridge:
         if not text or not from_user:
             return
 
-        logger.info(f"WeChat [{from_user}]: {text[:60]}")
+        logger.info(f"WeChat [{from_user}]: {text[:60]} (buffered)")
+        await self._push_buffer(from_user, text, context_token)
+
+    async def _push_buffer(self, from_user: str, text: str, context_token: str):
+        now = asyncio.get_running_loop().time()
+        if from_user not in self._buffers:
+            self._buffers[from_user] = []
+            self._buffer_started[from_user] = now
+        self._buffers[from_user].append({
+            "text": text,
+            "context_token": context_token,
+        })
+
+        existing = self._buffer_tasks.get(from_user)
+        if existing and not existing.done():
+            existing.cancel()
+
+        elapsed = now - self._buffer_started.get(from_user, now)
+        remaining = self.buffer_max_wait_seconds - elapsed
+        delay = 0 if remaining <= 0 else min(self.buffer_debounce_seconds, remaining)
+        self._buffer_tasks[from_user] = asyncio.create_task(
+            self._flush_later(from_user, delay)
+        )
+
+    async def _flush_later(self, from_user: str, delay: float):
+        try:
+            if delay > 0:
+                await asyncio.sleep(delay)
+            await self._flush_buffer(from_user)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("Buffered WeChat flush failed")
+
+    async def _flush_buffer(self, from_user: str):
+        batch = self._buffers.pop(from_user, [])
+        self._buffer_started.pop(from_user, None)
+        self._buffer_tasks.pop(from_user, None)
+        if not batch:
+            return
+
+        messages = [item["text"] for item in batch if item.get("text")]
+        context_token = next(
+            (item.get("context_token", "") for item in reversed(batch) if item.get("context_token")),
+            "",
+        )
+        if not messages:
+            return
+
+        logger.info(f"WeChat [{from_user}]: flushing {len(messages)} message(s)")
 
         # Forward to Goal Chat Agent
         try:
@@ -103,7 +163,7 @@ class WeChatBridge:
                 resp = await client.post(
                     f"{self.goal_url}/chat",
                     json={
-                        "messages": [text],
+                        "messages": messages,
                         "user_id": from_user,
                         "context_token": context_token,
                     },

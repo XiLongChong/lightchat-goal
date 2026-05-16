@@ -39,7 +39,7 @@ from agent.chat_agent import ChatAgent
 from agent.context_builder import compact_history
 from agent.memory_worker import MemoryWorker
 from agent.scheduler import SchedulerAgent
-from agent.tools import configure_tools
+from agent.tools import configure_runtime, configure_tools
 from bridge.wechat_poller import WeChatBridge, login_qr
 from memory.store import MemoryStore
 
@@ -110,6 +110,70 @@ def read_persona_file() -> str:
     return cfg["agent"].get("personality", "")
 
 
+CONFIRM_WORDS = {"确认", "可以", "保存", "写入", "改吧", "同意", "好", "行", "yes", "ok", "okay"}
+CANCEL_WORDS = {"取消", "不要", "不用", "别改", "先别", "不保存", "no", "cancel"}
+
+
+def _has_any_word(text: str, words: set[str]) -> bool:
+    lowered = text.lower()
+    return any(word in lowered for word in words)
+
+
+async def handle_pending_persona_confirmation(user_message: str) -> dict | None:
+    pending = await memory_store.get_pending_persona_change()
+    if not pending:
+        return None
+
+    if _has_any_word(user_message, CANCEL_WORDS):
+        await memory_store.clear_pending_persona_change()
+        return {
+            "messages": [{"text": "好 我先不改", "delay": 0}],
+            "tool_calls": [{"name": "pending_persona_change", "result": "cancelled"}],
+            "scheduled_task_ids": [],
+            "iterations": 0,
+            "elapsed_ms": 0,
+        }
+
+    if not _has_any_word(user_message, CONFIRM_WORDS):
+        return None
+
+    content = str(pending.get("content", "")).strip()
+    if not content:
+        await memory_store.clear_pending_persona_change()
+        return {
+            "messages": [{"text": "草案是空的 我丢掉了", "delay": 0}],
+            "tool_calls": [{"name": "pending_persona_change", "result": "empty"}],
+            "scheduled_task_ids": [],
+            "iterations": 0,
+            "elapsed_ms": 0,
+        }
+
+    path = Path(cfg.get("agent", {}).get("persona_file", "./prompts/persona.md"))
+    root = Path.cwd().resolve()
+    path = (root / path).resolve() if not path.is_absolute() else path.resolve()
+    if root not in path.parents and path != root:
+        await memory_store.clear_pending_persona_change()
+        return {
+            "messages": [{"text": "这个路径不安全 我没改", "delay": 0}],
+            "tool_calls": [{"name": "pending_persona_change", "result": "unsafe_path"}],
+            "scheduled_task_ids": [],
+            "iterations": 0,
+            "elapsed_ms": 0,
+        }
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content + "\n", encoding="utf-8")
+    chat_agent.personality = content
+    await memory_store.clear_pending_persona_change()
+    return {
+        "messages": [{"text": "好 已经写进人设了", "delay": 0}],
+        "tool_calls": [{"name": "pending_persona_change", "result": "committed"}],
+        "scheduled_task_ids": [],
+        "iterations": 0,
+        "elapsed_ms": 0,
+    }
+
+
 def require_admin(request: Request):
     token = request.cookies.get(ADMIN_COOKIE, "")
     if not token or token not in ADMIN_SESSIONS:
@@ -156,6 +220,7 @@ temperature = cfg["model"].get("temperature", 0.7)
 memory_store = MemoryStore(
     db_path=cfg["memory"].get("db_path", "./data/memory.db"),
 )
+configure_runtime(memory_store=memory_store)
 
 chat_agent = ChatAgent(
     client=llm_client,
@@ -191,6 +256,8 @@ if cfg.get("wechat", {}).get("enabled"):
         goal_url=wcfg.get("goal_url", "http://127.0.0.1:8899"),
         poll_timeout_ms=wcfg.get("poll_timeout_ms", 35_000),
         message_delay=wcfg.get("message_delay", 1.2),
+        buffer_debounce_seconds=wcfg.get("buffer_debounce_seconds", 5.0),
+        buffer_max_wait_seconds=wcfg.get("buffer_max_wait_seconds", 12.0),
     )
 
 # ================================================================
@@ -217,6 +284,19 @@ def append_history(user_id: str, role: str, content: str):
     # Safeguard #9: compact if too long
     if len(history) > COMPACT_AT_TURNS * 2:
         compacted, _ = compact_history(history, MAX_HISTORY_TURNS, COMPACT_AT_TURNS)
+        conversation_histories[user_id] = compacted
+
+
+async def append_history_async(user_id: str, role: str, content: str):
+    history = get_history(user_id)
+    history.append({"role": role, "content": content})
+
+    if len(history) > COMPACT_AT_TURNS * 2:
+        compacted, summary = compact_history(history, MAX_HISTORY_TURNS, COMPACT_AT_TURNS)
+        previous = await memory_store.get_history_summary(user_id)
+        merged = "\n".join(part for part in [previous, summary] if part).strip()
+        if merged:
+            await memory_store.save_history_summary(user_id, merged[-4000:])
         conversation_histories[user_id] = compacted
 
 
@@ -260,6 +340,7 @@ def apply_runtime_settings(updates: dict):
     save_runtime_settings(runtime_settings)
     _deep_update(cfg, updates)
     configure_tools(cfg)
+    configure_runtime(memory_store=memory_store)
 
     scfg = cfg.get("scheduler", {})
     scheduler_agent.sleep_start = scfg.get("sleep_start", 0)
@@ -319,6 +400,8 @@ async def start_internal_wechat_bridge():
         goal_url=wcfg.get("goal_url", "http://127.0.0.1:8899"),
         poll_timeout_ms=wcfg.get("poll_timeout_ms", 35_000),
         message_delay=wcfg.get("message_delay", 1.2),
+        buffer_debounce_seconds=wcfg.get("buffer_debounce_seconds", 5.0),
+        buffer_max_wait_seconds=wcfg.get("buffer_max_wait_seconds", 12.0),
     )
     await _bridge.start()
     return _bridge
@@ -611,6 +694,30 @@ async def lifespan(app: FastAPI):
             replace_existing=True,
         )
 
+        fixed_cfg = cfg.get("fixed_messages", {})
+        morning = fixed_cfg.get("morning", {})
+        if morning.get("enabled", True):
+            scheduler.add_job(
+                fixed_morning_message,
+                "cron",
+                hour=int(morning.get("hour", 8)),
+                minute=int(morning.get("minute", 0)),
+                timezone="Asia/Shanghai",
+                id="fixed_morning_message",
+                replace_existing=True,
+            )
+        night = fixed_cfg.get("night_recap", {})
+        if night.get("enabled", True):
+            scheduler.add_job(
+                fixed_night_recap,
+                "cron",
+                hour=int(night.get("hour", 23)),
+                minute=int(night.get("minute", 0)),
+                timezone="Asia/Shanghai",
+                id="fixed_night_recap",
+                replace_existing=True,
+            )
+
     scheduler.start()
     logger.info("Background scheduler started")
 
@@ -835,6 +942,16 @@ async def chat(request: Request):
 
     logger.info(f"[{user_id}] Received {len(str(user_message))} chars")
 
+    confirmation_result = await handle_pending_persona_confirmation(user_message)
+    if confirmation_result:
+        await append_history_async(user_id, "user", user_message)
+        await append_history_async(
+            user_id,
+            "assistant",
+            _assistant_history_json(confirmation_result),
+        )
+        return confirmation_result
+
     # Retrieve memories
     memories = await memory_store.search(user_message, top_k=5)
 
@@ -843,6 +960,7 @@ async def chat(request: Request):
 
     # Get conversation history
     history = get_history(user_id)
+    history_summary = await memory_store.get_history_summary(user_id)
 
     # Run Chat Agent
     result = await chat_agent.chat(
@@ -850,6 +968,7 @@ async def chat(request: Request):
         memories=memories,
         history=history,
         relationship=relationship,
+        history_summary=history_summary,
     )
 
     # Remember the latest reachable contact. Only iLink-origin requests carry
@@ -878,12 +997,12 @@ async def chat(request: Request):
     # Save assistant history as the same JSON action shape we expect from the
     # model. This prevents later turns from learning that merged prose is an
     # acceptable assistant output.
-    append_history(user_id, "user", user_message)
+    await append_history_async(user_id, "user", user_message)
     assistant_text = "\n".join(
         m["text"] for m in result["messages"] if m.get("text")
     )
     if result["messages"] or result.get("scheduled_messages"):
-        append_history(user_id, "assistant", _assistant_history_json(result))
+        await append_history_async(user_id, "assistant", _assistant_history_json(result))
 
     # Fire-and-forget memory extraction — skip for trivial messages
     # "嗯", "好", "哈哈" etc. don't contain extractable information.
@@ -1178,6 +1297,78 @@ async def scheduler_tick() -> dict:
     except Exception as e:
         logger.error(f"Scheduler tick failed: {e}", exc_info=True)
         return {"sent": False, "reason": f"error: {e}"}
+
+
+async def fixed_morning_message() -> dict:
+    fixed_cfg = cfg.get("fixed_messages", {}).get("morning", {})
+    city = fixed_cfg.get("city", "成都")
+    prompt = (
+        f"现在是早上8点。主动给辣椒发早安消息。"
+        f"先调用 get_weather 查询{city}天气，不要编造工具没有返回的天气细节。"
+        "然后用几条短微信说早安、天气、今天可以做的一两件小事。"
+    )
+    return await _run_fixed_message_prompt(prompt, save_diary=False)
+
+
+async def fixed_night_recap() -> dict:
+    prompt = (
+        "现在是晚上11点。请从AI的角度写一小段今天的陪伴日记并发给辣椒。"
+        "基于今天真实聊过的内容，说我今天和你聊到了什么、我看见了什么状态、"
+        "我想轻轻替你记住什么。不要冒充用户本人，不要编造没聊过的现实事实。"
+        "200字以内，像随手写日记。"
+    )
+    return await _run_fixed_message_prompt(prompt, save_diary=True)
+
+
+async def _run_fixed_message_prompt(prompt: str, save_diary: bool) -> dict:
+    contact = await memory_store.get_contact_state()
+    if not contact.get("user_id"):
+        logger.info("Fixed message skipped — no contact target yet")
+        return {"sent": False, "reason": "no contact target yet"}
+    if _bridge is None or not _bridge.token:
+        logger.info("Fixed message skipped — WeChat bridge unavailable")
+        return {"sent": False, "reason": "WeChat bridge unavailable"}
+
+    user_id = contact["user_id"]
+    memories = await memory_store.search(prompt, top_k=5)
+    relationship = await memory_store.get_relationship()
+    history = get_history(user_id)
+    history_summary = await memory_store.get_history_summary(user_id)
+
+    result = await chat_agent.chat(
+        user_message=prompt,
+        memories=memories,
+        history=history,
+        relationship=relationship,
+        history_summary=history_summary,
+    )
+    messages = [
+        {"text": m["text"], "delay": m.get("delay", 0)}
+        for m in result.get("messages", [])
+        if m.get("text")
+    ]
+    if not messages:
+        messages = [{"text": "我在 但这轮没组织好", "delay": 0}]
+
+    await _send_message_batch(
+        user_id=user_id,
+        context_token=contact.get("context_token", ""),
+        messages=messages,
+    )
+
+    await append_history_async(user_id, "user", prompt)
+    await append_history_async(user_id, "assistant", _assistant_history_json(result))
+
+    text = "\n".join(m["text"] for m in messages)
+    if save_diary and text.strip():
+        await memory_store.save_memory(
+            content=f"AI视角陪伴日记：{text}",
+            category="journal",
+            keywords="晚间复盘,陪伴日记",
+            min_importance=0.0,
+        )
+
+    return {"sent": True, "count": len(messages)}
 
 
 async def deliver_scheduled_messages() -> dict:

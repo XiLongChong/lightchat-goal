@@ -61,6 +61,7 @@ class ChatAgent:
         memories: list[dict[str, Any]],
         history: list[dict[str, Any]],
         relationship: dict[str, Any],
+        history_summary: str = "",
     ) -> dict[str, Any]:
         """Process a user message.
 
@@ -88,6 +89,11 @@ class ChatAgent:
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
         ]
+        if history_summary.strip():
+            messages.append({
+                "role": "system",
+                "content": "更早对话摘要：\n" + history_summary.strip()[-3000:],
+            })
 
         # Add recent history — limited to last 8 turns to prevent
         # the formatting rules from being diluted by long context.

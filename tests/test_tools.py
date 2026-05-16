@@ -50,6 +50,31 @@ def test_tool_definitions_are_valid():
         assert "args" in TOOL_DEFINITIONS[name]
 
 
+def test_persona_change_tool_creates_pending_state(tmp_path, monkeypatch):
+    from agent.tools import configure_runtime, configure_tools, execute_tool
+    from memory.store import MemoryStore
+
+    async def run():
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "prompts").mkdir()
+        (tmp_path / "prompts" / "persona.md").write_text("旧人设", encoding="utf-8")
+        store = MemoryStore(str(tmp_path / "memory.db"))
+        configure_tools({"agent": {"persona_file": "./prompts/persona.md"}})
+        configure_runtime(memory_store=store)
+
+        result = await execute_tool(
+            "propose_persona_change",
+            {"content": "新人设", "reason": "测试"},
+        )
+        pending = await store.get_pending_persona_change()
+        await store.close()
+        return result, pending
+
+    result, pending = asyncio.run(run())
+    assert "等待用户" in result
+    assert pending["content"] == "新人设"
+
+
 if __name__ == "__main__":
     test_whitelist_blocks_unknown_tool()
     test_get_time_returns_valid_format()
