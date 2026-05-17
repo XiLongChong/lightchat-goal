@@ -415,7 +415,7 @@ fixed_messages:
     minute: 0
     city: "成都"
   night_recap:
-    enabled: true
+    enabled: false
     hour: 23
     minute: 0
 

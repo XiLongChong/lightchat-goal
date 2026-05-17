@@ -277,9 +277,14 @@ def get_history(user_id: str) -> list[dict]:
     return conversation_histories[user_id]
 
 
-def append_history(user_id: str, role: str, content: str):
+def append_history(user_id: str, role: str, content: str, source: str = "user"):
     history = get_history(user_id)
-    history.append({"role": role, "content": content})
+    history.append({
+        "role": role,
+        "content": content,
+        "ts": time.time(),
+        "source": source,
+    })
 
     # Safeguard #9: compact if too long
     if len(history) > COMPACT_AT_TURNS * 2:
@@ -287,9 +292,14 @@ def append_history(user_id: str, role: str, content: str):
         conversation_histories[user_id] = compacted
 
 
-async def append_history_async(user_id: str, role: str, content: str):
+async def append_history_async(user_id: str, role: str, content: str, source: str = "user"):
     history = get_history(user_id)
-    history.append({"role": role, "content": content})
+    history.append({
+        "role": role,
+        "content": content,
+        "ts": time.time(),
+        "source": source,
+    })
 
     if len(history) > COMPACT_AT_TURNS * 2:
         compacted, summary = compact_history(history, MAX_HISTORY_TURNS, COMPACT_AT_TURNS)
@@ -944,11 +954,12 @@ async def chat(request: Request):
 
     confirmation_result = await handle_pending_persona_confirmation(user_message)
     if confirmation_result:
-        await append_history_async(user_id, "user", user_message)
+        await append_history_async(user_id, "user", user_message, source="wechat")
         await append_history_async(
             user_id,
             "assistant",
             _assistant_history_json(confirmation_result),
+            source="assistant",
         )
         return confirmation_result
 
@@ -969,6 +980,7 @@ async def chat(request: Request):
         history=history,
         relationship=relationship,
         history_summary=history_summary,
+        trigger="user",
     )
 
     # Remember the latest reachable contact. Only iLink-origin requests carry
@@ -997,12 +1009,17 @@ async def chat(request: Request):
     # Save assistant history as the same JSON action shape we expect from the
     # model. This prevents later turns from learning that merged prose is an
     # acceptable assistant output.
-    await append_history_async(user_id, "user", user_message)
+    await append_history_async(user_id, "user", user_message, source="wechat")
     assistant_text = "\n".join(
         m["text"] for m in result["messages"] if m.get("text")
     )
     if result["messages"] or result.get("scheduled_messages"):
-        await append_history_async(user_id, "assistant", _assistant_history_json(result))
+        await append_history_async(
+            user_id,
+            "assistant",
+            _assistant_history_json(result),
+            source="assistant",
+        )
 
     # Fire-and-forget memory extraction — skip for trivial messages
     # "嗯", "好", "哈哈" etc. don't contain extractable information.
@@ -1278,6 +1295,18 @@ async def scheduler_tick() -> dict:
                 context_token=contact.get("context_token", ""),
                 messages=[{"text": msg, "delay": 0}],
             )
+            await append_history_async(
+                contact["user_id"],
+                "system",
+                f"[主动消息判断] {reason}",
+                source="proactive",
+            )
+            await append_history_async(
+                contact["user_id"],
+                "assistant",
+                _assistant_history_json({"messages": [{"text": msg, "delay": 0}]}),
+                source="proactive",
+            )
             await scheduler_agent.record_sent()
             logger.info(f"Scheduler: SENT — {reason}")
 
@@ -1341,6 +1370,7 @@ async def _run_fixed_message_prompt(prompt: str, save_diary: bool) -> dict:
         history=history,
         relationship=relationship,
         history_summary=history_summary,
+        trigger="proactive",
     )
     messages = [
         {"text": m["text"], "delay": m.get("delay", 0)}
@@ -1356,8 +1386,18 @@ async def _run_fixed_message_prompt(prompt: str, save_diary: bool) -> dict:
         messages=messages,
     )
 
-    await append_history_async(user_id, "user", prompt)
-    await append_history_async(user_id, "assistant", _assistant_history_json(result))
+    await append_history_async(
+        user_id,
+        "system",
+        f"[固定主动消息] {prompt}",
+        source="proactive",
+    )
+    await append_history_async(
+        user_id,
+        "assistant",
+        _assistant_history_json(result),
+        source="proactive",
+    )
 
     text = "\n".join(m["text"] for m in messages)
     if save_diary and text.strip():
@@ -1425,7 +1465,7 @@ async def _send_message_batch(
 
     min_gap = float(cfg.get("wechat", {}).get("message_delay", 1.2) or 1.2)
     for i, m in enumerate(messages):
-        text = str(m.get("text", "")).strip()
+        text = _sanitize_wechat_text(m.get("text", ""))
         if not text:
             continue
         delay = float(m.get("delay", 0) or 0)
@@ -1434,6 +1474,20 @@ async def _send_message_batch(
         else:
             await asyncio.sleep(max(delay, min_gap))
         await _bridge.send_text(user_id, text, context_token)
+
+
+def _sanitize_wechat_text(text: object) -> str:
+    """Final outbound guard before anything reaches WeChat."""
+    value = str(text).strip()
+    if not value:
+        return ""
+    lowered = value.lower()
+    has_actions = '"actions"' in lowered or "'actions'" in lowered
+    has_protocol = "wechat_reply" in lowered or '"done"' in lowered or "'done'" in lowered
+    if value.startswith("{") and has_actions and has_protocol:
+        logger.warning("Blocked protocol-shaped text at WeChat send boundary")
+        return "我刚刚卡了一下 重新说"
+    return value
 
 
 def _assistant_history_json(result: dict) -> str:

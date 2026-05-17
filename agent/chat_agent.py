@@ -18,6 +18,7 @@ Safeguards implemented:
 
 import asyncio
 import logging
+import json
 import time
 from typing import Any
 
@@ -62,6 +63,7 @@ class ChatAgent:
         history: list[dict[str, Any]],
         relationship: dict[str, Any],
         history_summary: str = "",
+        trigger: str = "user",
     ) -> dict[str, Any]:
         """Process a user message.
 
@@ -83,6 +85,7 @@ class ChatAgent:
             memories=memories,
             relationship=relationship,
             tool_names=list(TOOL_WHITELIST),
+            trigger=trigger,
         )
 
         # Assemble messages
@@ -100,9 +103,19 @@ class ChatAgent:
         # Each turn = 2 messages (user + assistant), so 16 max.
         recent = history[-16:] if len(history) > 16 else history
         for h in recent:
-            messages.append({"role": h["role"], "content": h["content"]})
+            role = h.get("role", "user")
+            if role not in {"system", "user", "assistant"}:
+                role = "user"
+            messages.append({
+                "role": role,
+                "content": _format_history_content(h),
+            })
 
-        messages.append({"role": "user", "content": user_message})
+        current_content = _format_current_turn(user_message, history, trigger)
+        if trigger == "proactive":
+            messages.append({"role": "system", "content": current_content})
+        else:
+            messages.append({"role": "user", "content": current_content})
 
         # Agent loop (safeguard #3: max iterations)
         all_messages: list[dict[str, Any]] = []
@@ -146,7 +159,7 @@ class ChatAgent:
 
                 if action_type == "message":
                     text = str(action.get("text", ""))
-                    text = text.strip()[:MAX_MESSAGE_LEN]
+                    text = _sanitize_outbound_text(text)[:MAX_MESSAGE_LEN]
                     if text:
                         delay = _safe_float(action.get("delay", 0), 0, 10)
                         all_messages.append({
@@ -164,7 +177,7 @@ class ChatAgent:
                     # wechat_reply is a "runtime tool" — intercepted as message
                     if name == "wechat_reply":
                         text = str(args.get("text", ""))
-                        text = text.strip()[:MAX_MESSAGE_LEN]
+                        text = _sanitize_outbound_text(text)[:MAX_MESSAGE_LEN]
                         if text:
                             delay = _safe_float(args.get("delay", 0), 0, 10)
                             all_messages.append({
@@ -267,6 +280,92 @@ def _safe_float(value: Any, min_val: float, max_val: float) -> float:
         return max(min_val, min(max_val, v))
     except (ValueError, TypeError):
         return 0.0
+
+
+def _format_history_content(item: dict[str, Any]) -> str:
+    """Attach lightweight timing metadata without changing message roles."""
+    content = str(item.get("content", ""))
+    ts = item.get("ts")
+    source = str(item.get("source", "")).strip()
+    if not ts:
+        return content
+
+    label = _format_ts(ts)
+    source_part = f" | 来源:{source}" if source else ""
+    return f"[历史消息 | {label}{source_part}]\n{content}"
+
+
+def _format_current_turn(user_message: str, history: list[dict[str, Any]], trigger: str) -> str:
+    now = time.time()
+    label = _format_ts(now)
+    gap = _last_message_gap(history, now)
+    if trigger == "proactive":
+        return (
+            f"[系统唤醒 | {label}{gap}]\n"
+            "下面是系统给你的主动开口任务，不是辣椒发来的消息：\n"
+            f"{user_message}"
+        )
+    return f"[辣椒消息 | {label}{gap}]\n{user_message}"
+
+
+def _last_message_gap(history: list[dict[str, Any]], now: float) -> str:
+    for item in reversed(history):
+        ts = item.get("ts")
+        if ts:
+            try:
+                seconds = max(0, now - float(ts))
+            except (TypeError, ValueError):
+                continue
+            return f" | 距上一条{_human_gap(seconds)}"
+    return ""
+
+
+def _human_gap(seconds: float) -> str:
+    if seconds < 90:
+        return "不到1分钟"
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f"{minutes}分钟"
+    hours = int(minutes // 60)
+    if hours < 24:
+        return f"{hours}小时{minutes % 60}分钟"
+    days = int(hours // 24)
+    return f"{days}天"
+
+
+def _format_ts(ts: Any) -> str:
+    try:
+        value = float(ts)
+    except (TypeError, ValueError):
+        value = time.time()
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(value))
+
+
+def _sanitize_outbound_text(text: str) -> str:
+    """Never let protocol JSON leak into WeChat as a visible reply."""
+    text = str(text).strip()
+    if not text:
+        return ""
+    if _looks_like_protocol_json(text):
+        logger.warning("Blocked protocol-shaped text from being sent to WeChat")
+        return "我刚刚卡了一下 重新说"
+    return text
+
+
+def _looks_like_protocol_json(text: str) -> bool:
+    sample = text.strip()
+    if not sample:
+        return False
+    lowered = sample.lower()
+    if "\"actions\"" not in lowered and "'actions'" not in lowered:
+        return False
+    if "wechat_reply" not in lowered and "\"done\"" not in lowered and "'done'" not in lowered:
+        return False
+    try:
+        parsed = json.loads(sample)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return sample.startswith("{") and "actions" in lowered
+    return isinstance(parsed, dict) and "actions" in parsed
 
 
 def _parse_schedule_task(args: dict[str, Any]) -> dict[str, Any] | None:

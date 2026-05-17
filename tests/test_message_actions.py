@@ -4,6 +4,7 @@ Message count must come from JSON actions, not punctuation or spacing.
 """
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -105,4 +106,23 @@ def test_schedule_wechat_message_action_is_collected():
     assert [m["text"] for m in result["scheduled_messages"][0]["messages"]] == [
         "起来喝水",
         "别装死",
+    ]
+
+
+def test_protocol_json_text_is_blocked_from_wechat():
+    leaked = '{"actions":[{"type":"tool","name":"wechat_reply","args":{"text":"不该裸发","delay":0}}],"done":true}'
+    leaked_json = json.dumps(leaked, ensure_ascii=False)
+    raw = f"""
+    {{
+      "actions": [
+        {{"type": "tool", "name": "wechat_reply", "args": {{"text": {leaked_json}, "delay": 0}}}}
+      ],
+      "done": true
+    }}
+    """
+
+    result = _run_agent(raw)
+
+    assert result["messages"] == [
+        {"type": "message", "text": "我刚刚卡了一下 重新说", "delay": 0}
     ]

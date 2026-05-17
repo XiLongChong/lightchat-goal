@@ -23,6 +23,7 @@ def build_system_prompt(
     memories: list[dict[str, Any]],
     relationship: dict[str, Any],
     tool_names: list[str],
+    trigger: str = "user",
 ) -> str:
     """Build the system prompt from components.
 
@@ -57,6 +58,16 @@ def build_system_prompt(
     if boundary:
         rel_text += f"\n边界: {boundary}"
 
+    if trigger == "proactive":
+        trigger_text = """本轮是系统唤醒，不是辣椒发来的消息。
+你是在主动开口，不能把唤醒指令当成辣椒说过的话。
+不要说“你刚才说/你问我/你不是要”等把系统任务误认成用户消息的话。
+主动消息要像微信里自然冒出来的一句，短，少解释。"""
+    else:
+        trigger_text = """本轮是辣椒发来的微信消息。
+历史消息里如果带有时间间隔，要先判断上一句话是不是已经过去一段时间。
+隔了十几分钟以上时，不要默认上一句话还在同一个瞬间里。"""
+
     prompt = f"""## 身份
 {persona}
 
@@ -72,6 +83,16 @@ wechat_reply 是聊天工具，没有理由跳过它。
 每一条微信消息都可以调用一次 wechat_reply。
 你可以连续调用多次 wechat_reply，达到真人一句一句发的感觉。
 除非辣椒明确说不用回复，否则必须回。
+
+## 本轮来源
+{trigger_text}
+
+## 对话节奏
+普通闲聊默认只发 1 条微信。
+情绪或复杂话题最多先发 2 条，除非辣椒明确要你展开。
+不要为了显得懂而连续分析、解释、下判断。
+不要主动分析动机、投射、戒断、心理机制，除非辣椒明确问“为什么会这样”。
+问句如果很简单，先按简单问题答，不要升维。
 
 ## 当前时间
 {now}
