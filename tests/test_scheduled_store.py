@@ -49,3 +49,34 @@ def test_contact_state_round_trip(tmp_path):
         await store.close()
 
     asyncio.run(run())
+
+
+def test_conversation_history_round_trip(tmp_path):
+    async def run():
+        store = MemoryStore(str(tmp_path / "memory.db"))
+        await store.append_conversation_history(
+            user_id="wxid_me",
+            role="user",
+            content="今天天气怎么样",
+            source="wechat",
+            ts=100.0,
+        )
+        await store.append_conversation_history(
+            user_id="wxid_me",
+            role="assistant",
+            content="成都今天有点闷",
+            source="assistant",
+            ts=101.0,
+        )
+
+        history = await store.get_recent_conversation_history("wxid_me", limit=20)
+        assert [item["role"] for item in history] == ["user", "assistant"]
+        assert history[0]["content"] == "今天天气怎么样"
+
+        deleted = await store.clear_conversation_history("wxid_me")
+        assert deleted == 2
+        assert await store.get_recent_conversation_history("wxid_me", limit=20) == []
+
+        await store.close()
+
+    asyncio.run(run())

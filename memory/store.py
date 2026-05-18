@@ -126,6 +126,20 @@ class MemoryStore:
                 updated_at REAL NOT NULL DEFAULT 0
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS conversation_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT '',
+                ts REAL NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_conversation_history_user_ts
+            ON conversation_history(user_id, ts DESC)
+        """)
         await db.commit()
 
     async def close(self):
@@ -657,3 +671,54 @@ class MemoryStore:
                 (user_id, summary, now),
             )
             await db.commit()
+
+    async def append_conversation_history(
+        self,
+        user_id: str,
+        role: str,
+        content: str,
+        source: str = "",
+        ts: float | None = None,
+    ):
+        """Persist one raw conversation message for restart recovery."""
+        if not user_id or not content:
+            return
+        now = time.time() if ts is None else float(ts)
+        async with self._lock:
+            db = await self._get_db()
+            await db.execute(
+                """INSERT INTO conversation_history(user_id, role, content, source, ts)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (user_id, role, content, source, now),
+            )
+            await db.commit()
+
+    async def get_recent_conversation_history(
+        self,
+        user_id: str,
+        limit: int = 40,
+    ) -> list[dict[str, Any]]:
+        """Load recent raw messages in chronological order."""
+        if not user_id:
+            return []
+        db = await self._get_db()
+        rows = await db.execute_fetchall(
+            """SELECT role, content, source, ts
+               FROM conversation_history
+               WHERE user_id = ?
+               ORDER BY ts DESC
+               LIMIT ?""",
+            (user_id, max(1, int(limit))),
+        )
+        return [dict(r) for r in reversed(rows)]
+
+    async def clear_conversation_history(self, user_id: str) -> int:
+        """Delete persisted raw conversation history for one user."""
+        async with self._lock:
+            db = await self._get_db()
+            cursor = await db.execute(
+                "DELETE FROM conversation_history WHERE user_id = ?",
+                (user_id,),
+            )
+            await db.commit()
+            return cursor.rowcount

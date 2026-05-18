@@ -39,7 +39,7 @@ from agent.chat_agent import ChatAgent
 from agent.context_builder import compact_history
 from agent.memory_worker import MemoryWorker
 from agent.scheduler import SchedulerAgent
-from agent.tools import configure_runtime, configure_tools
+from agent.tools import configure_runtime, configure_tools, execute_tool
 from bridge.wechat_poller import WeChatBridge, login_qr
 from memory.store import MemoryStore
 
@@ -228,6 +228,12 @@ chat_agent = ChatAgent(
     persona=cfg["agent"]["persona"],
     personality=read_persona_file(),
     temperature=temperature,
+    defaults={
+        "default_city": cfg.get("weather", {}).get(
+            "default_city",
+            cfg.get("fixed_messages", {}).get("morning", {}).get("city", ""),
+        )
+    },
 )
 
 memory_worker = MemoryWorker(
@@ -277,6 +283,20 @@ def get_history(user_id: str) -> list[dict]:
     return conversation_histories[user_id]
 
 
+async def get_history_async(user_id: str) -> list[dict]:
+    """Return in-memory history, restoring recent raw history after restart."""
+    history = get_history(user_id)
+    if history:
+        return history
+    restored = await memory_store.get_recent_conversation_history(
+        user_id,
+        limit=MAX_HISTORY_TURNS * 2,
+    )
+    if restored:
+        conversation_histories[user_id] = restored
+    return conversation_histories[user_id]
+
+
 def append_history(user_id: str, role: str, content: str, source: str = "user"):
     history = get_history(user_id)
     history.append({
@@ -293,13 +313,21 @@ def append_history(user_id: str, role: str, content: str, source: str = "user"):
 
 
 async def append_history_async(user_id: str, role: str, content: str, source: str = "user"):
+    ts = time.time()
     history = get_history(user_id)
     history.append({
         "role": role,
         "content": content,
-        "ts": time.time(),
+        "ts": ts,
         "source": source,
     })
+    await memory_store.append_conversation_history(
+        user_id=user_id,
+        role=role,
+        content=content,
+        source=source,
+        ts=ts,
+    )
 
     if len(history) > COMPACT_AT_TURNS * 2:
         compacted, summary = compact_history(history, MAX_HISTORY_TURNS, COMPACT_AT_TURNS)
@@ -328,6 +356,7 @@ def public_settings() -> dict:
             "message_delay": cfg.get("wechat", {}).get("message_delay", 1.2),
         },
         "weather": {
+            "default_city": cfg.get("weather", {}).get("default_city", ""),
             "timeout_seconds": cfg.get("weather", {}).get("timeout_seconds", 4),
             "cache_ttl_seconds": cfg.get("weather", {}).get("cache_ttl_seconds", 600),
         },
@@ -359,6 +388,12 @@ def apply_runtime_settings(updates: dict):
     scheduler_agent.max_ignored_streak = scfg.get("max_ignored_streak", 3)
     scheduler_agent.max_daily = scfg.get("max_daily_proactive", 5)
     scheduler_agent.min_interval = scfg.get("min_proactive_interval", 90)
+    chat_agent.defaults = {
+        "default_city": cfg.get("weather", {}).get(
+            "default_city",
+            cfg.get("fixed_messages", {}).get("morning", {}).get("city", ""),
+        )
+    }
 
     if _bridge is not None:
         _bridge.message_delay = float(
@@ -970,7 +1005,7 @@ async def chat(request: Request):
     relationship = await memory_store.get_relationship()
 
     # Get conversation history
-    history = get_history(user_id)
+    history = await get_history_async(user_id)
     history_summary = await memory_store.get_history_summary(user_id)
 
     # Run Chat Agent
@@ -1153,7 +1188,7 @@ async def update_relationship(request: Request):
 async def get_history_route(user_id: str, request: Request):
     """Get conversation history for a user."""
     require_admin(request)
-    history = get_history(user_id)
+    history = await get_history_async(user_id)
     return {"history": history[-20:]}  # Last 20 messages
 
 
@@ -1162,7 +1197,8 @@ async def clear_history(user_id: str, request: Request):
     """Clear conversation history for a user."""
     require_admin(request)
     conversation_histories[user_id] = []
-    return {"status": "cleared"}
+    deleted = await memory_store.clear_conversation_history(user_id)
+    return {"status": "cleared", "deleted": deleted}
 
 
 # ================================================================
@@ -1330,13 +1366,23 @@ async def scheduler_tick() -> dict:
 
 async def fixed_morning_message() -> dict:
     fixed_cfg = cfg.get("fixed_messages", {}).get("morning", {})
-    city = fixed_cfg.get("city", "成都")
+    city = (
+        cfg.get("weather", {}).get("default_city")
+        or fixed_cfg.get("city")
+        or "成都"
+    )
+    weather_result = await execute_tool("get_weather", {"city": city})
     prompt = (
         f"现在是早上8点。主动给辣椒发早安消息。"
-        f"先调用 get_weather 查询{city}天气，不要编造工具没有返回的天气细节。"
-        "然后用几条短微信说早安、天气、今天可以做的一两件小事。"
+        f"天气工具结果：{weather_result}。"
+        "基于这个真实结果，用几条短微信说早安、天气、今天可以做的一两件小事。"
+        "不要再调用 get_weather，不要编造工具没有返回的天气细节。"
     )
-    return await _run_fixed_message_prompt(prompt, save_diary=False)
+    return await _run_fixed_message_prompt(
+        prompt,
+        save_diary=False,
+        fallback_messages=_morning_fallback_messages(city, weather_result),
+    )
 
 
 async def fixed_night_recap() -> dict:
@@ -1346,10 +1392,18 @@ async def fixed_night_recap() -> dict:
         "我想轻轻替你记住什么。不要冒充用户本人，不要编造没聊过的现实事实。"
         "200字以内，像随手写日记。"
     )
-    return await _run_fixed_message_prompt(prompt, save_diary=True)
+    return await _run_fixed_message_prompt(
+        prompt,
+        save_diary=True,
+        fallback_messages=[{"text": "今天先收住 明天再慢慢来", "delay": 0}],
+    )
 
 
-async def _run_fixed_message_prompt(prompt: str, save_diary: bool) -> dict:
+async def _run_fixed_message_prompt(
+    prompt: str,
+    save_diary: bool,
+    fallback_messages: list[dict] | None = None,
+) -> dict:
     contact = await memory_store.get_contact_state()
     if not contact.get("user_id"):
         logger.info("Fixed message skipped — no contact target yet")
@@ -1361,7 +1415,7 @@ async def _run_fixed_message_prompt(prompt: str, save_diary: bool) -> dict:
     user_id = contact["user_id"]
     memories = await memory_store.search(prompt, top_k=5)
     relationship = await memory_store.get_relationship()
-    history = get_history(user_id)
+    history = await get_history_async(user_id)
     history_summary = await memory_store.get_history_summary(user_id)
 
     result = await chat_agent.chat(
@@ -1378,7 +1432,7 @@ async def _run_fixed_message_prompt(prompt: str, save_diary: bool) -> dict:
         if m.get("text")
     ]
     if not messages:
-        messages = [{"text": "我在 但这轮没组织好", "delay": 0}]
+        messages = fallback_messages or [{"text": "我刚刚卡了一下 重新说", "delay": 0}]
 
     await _send_message_batch(
         user_id=user_id,
@@ -1409,6 +1463,20 @@ async def _run_fixed_message_prompt(prompt: str, save_diary: bool) -> dict:
         )
 
     return {"sent": True, "count": len(messages)}
+
+
+def _morning_fallback_messages(city: str, weather_result: str) -> list[dict]:
+    """Task-specific fallback for the fixed 8am greeting."""
+    weather_text = str(weather_result or "").strip()
+    if not weather_text or "失败" in weather_text or "出错" in weather_text:
+        middle = f"{city}天气我这边没查稳 出门前看一眼"
+    else:
+        middle = weather_text[:80]
+    return [
+        {"text": "早", "delay": 0},
+        {"text": middle, "delay": 1},
+        {"text": "今天先慢慢开机", "delay": 1},
+    ]
 
 
 async def deliver_scheduled_messages() -> dict:

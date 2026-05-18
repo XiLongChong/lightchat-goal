@@ -111,6 +111,8 @@ async def _get_weather(city: str = "") -> str:
     """Get weather from wttr.in (free, no API key)."""
     city = str(city).strip()[:50]
     if not city:
+        city = _default_weather_city()
+    if not city:
         return "请指定城市"
 
     weather_cfg = TOOL_RUNTIME_CONFIG.get("weather", {})
@@ -275,3 +277,14 @@ def _persona_path() -> Path:
     if root not in path.parents and path != root:
         raise ValueError("persona_file must stay inside project root")
     return path
+
+
+def _default_weather_city() -> str:
+    weather_cfg = TOOL_RUNTIME_CONFIG.get("weather", {})
+    city = str(weather_cfg.get("default_city", "") or "").strip()
+    if city:
+        return city[:50]
+
+    morning_cfg = TOOL_RUNTIME_CONFIG.get("fixed_messages", {}).get("morning", {})
+    city = str(morning_cfg.get("city", "") or "").strip()
+    return city[:50]

@@ -421,6 +421,7 @@ fixed_messages:
 
 # ---- Weather ----
 weather:
+  default_city: "成都"
   timeout_seconds: 4
   cache_ttl_seconds: 600
 

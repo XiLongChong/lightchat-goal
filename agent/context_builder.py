@@ -24,6 +24,7 @@ def build_system_prompt(
     relationship: dict[str, Any],
     tool_names: list[str],
     trigger: str = "user",
+    defaults: dict[str, Any] | None = None,
 ) -> str:
     """Build the system prompt from components.
 
@@ -38,6 +39,11 @@ def build_system_prompt(
     now = datetime.now().strftime("%Y年%m月%d日 %H:%M 周%u")
 
     tool_list = ", ".join(tool_names) if tool_names else "无"
+    defaults = defaults or {}
+    default_city = str(defaults.get("default_city", "") or "").strip()
+    defaults_text = "无"
+    if default_city:
+        defaults_text = f"用户默认天气城市：{default_city}。用户只问“天气怎么样/今天天气怎么样”时，直接按这个城市查天气，不要先反问城市。"
 
     # Memory section: do not inject full facts by default. The model can search
     # when the current turn actually needs past context.
@@ -96,6 +102,9 @@ wechat_reply 是聊天工具，没有理由跳过它。
 
 ## 当前时间
 {now}
+
+## 默认事实
+{defaults_text}
 
 ## 关系状态
 {rel_text}

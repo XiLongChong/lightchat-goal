@@ -48,12 +48,14 @@ class ChatAgent:
         persona: str,
         personality: str,
         temperature: float = 0.7,
+        defaults: dict[str, Any] | None = None,
     ):
         self.client = client
         self.model = model
         self.persona = persona
         self.personality = personality
         self.temperature = temperature
+        self.defaults = defaults or {}
         self._last_call_time = 0.0
 
     async def chat(
@@ -86,6 +88,7 @@ class ChatAgent:
             relationship=relationship,
             tool_names=list(TOOL_WHITELIST),
             trigger=trigger,
+            defaults=self.defaults,
         )
 
         # Assemble messages

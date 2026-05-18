@@ -40,6 +40,46 @@ def test_get_weather_without_city():
     assert "指定城市" in result
 
 
+def test_get_weather_uses_default_city(monkeypatch):
+    """Weather without explicit city can use configured default city."""
+    from agent import tools
+    from agent.tools import configure_tools, execute_tool
+
+    class FakeResponse:
+        status_code = 200
+        text = "多云 +22°C 80% 6km/h"
+
+    class FakeAsyncClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url):
+            assert "%E6%88%90%E9%83%BD" in url
+            return FakeResponse()
+
+    tools._WEATHER_CACHE.clear()
+    monkeypatch.setattr(tools.httpx, "AsyncClient", FakeAsyncClient)
+    configure_tools({
+        "weather": {
+            "default_city": "成都",
+            "timeout_seconds": 4,
+            "cache_ttl_seconds": 600,
+        }
+    })
+
+    result = asyncio.run(execute_tool("get_weather", {}))
+
+    assert result.startswith("成都天气：")
+    assert "多云" in result
+    configure_tools({})
+
+
 def test_tool_definitions_are_valid():
     """All whitelisted tools have descriptions and args."""
     from agent.tools import TOOL_DEFINITIONS, TOOL_WHITELIST
