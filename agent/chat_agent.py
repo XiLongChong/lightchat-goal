@@ -163,10 +163,13 @@ class ChatAgent:
             })
 
         current_content = _format_current_turn(user_message, history, trigger)
-        if trigger == "proactive":
-            messages.append({"role": "system", "content": current_content})
-        else:
+        # V2.1: only real user messages go in user role.
+        # System-triggered tasks (proactive, fixed_morning, fixed_night,
+        # scheduled, admin) use system role.
+        if trigger == "user":
             messages.append({"role": "user", "content": current_content})
+        else:
+            messages.append({"role": "system", "content": current_content})
 
         # Agent loop (safeguard #3: max iterations)
         all_messages: list[dict[str, Any]] = []
@@ -245,6 +248,17 @@ class ChatAgent:
                     args = action.get("args", {})
                     if not isinstance(args, dict):
                         args = {}
+
+                    # V2.1: Reject tools not enabled for this bot
+                    if name not in effective_tools:
+                        tool_results_this_round.append(
+                            f"[{name}] 此工具未对当前bot启用"
+                        )
+                        all_tool_results.append({
+                            "name": name,
+                            "result": "工具未启用",
+                        })
+                        continue
 
                     # wechat_reply is a "runtime tool" — intercepted as message
                     if name == "wechat_reply":
@@ -457,13 +471,24 @@ def _format_current_turn(user_message: str, history: list[dict[str, Any]], trigg
     now = time.time()
     label = _format_ts(now)
     gap = _last_message_gap(history, now)
-    if trigger == "proactive":
-        return (
-            f"[系统唤醒 | {label}{gap}]\n"
-            "下面是系统给你的主动开口任务，不是辣椒发来的消息：\n"
-            f"{user_message}"
-        )
-    return f"[辣椒消息 | {label}{gap}]\n{user_message}"
+    if trigger == "user":
+        return f"[辣椒消息 | {label}{gap}]\n{user_message}"
+
+    # All system-triggered messages: label clearly so the model knows
+    # this is NOT a user message
+    trigger_labels = {
+        "proactive": "系统唤醒 — 主动开口任务",
+        "fixed_morning": "系统定时 — 早安消息",
+        "fixed_night": "系统定时 — 晚间陪伴日记",
+        "scheduled": "系统定时 — 用户预约提醒",
+        "admin": "系统 — 管理员手动触发",
+    }
+    trigger_label = trigger_labels.get(trigger, f"系统任务 ({trigger})")
+    return (
+        f"[{trigger_label} | {label}{gap}]\n"
+        "下面是系统任务，不是辣椒发来的消息：\n"
+        f"{user_message}"
+    )
 
 
 def _last_message_gap(history: list[dict[str, Any]], now: float) -> str:

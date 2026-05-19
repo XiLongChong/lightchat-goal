@@ -348,35 +348,42 @@ def _select_context_policy(route: str, memories_count: int) -> str:
 # Conversation history (in-memory, per session)
 # ================================================================
 
-# Simple in-memory history store. For multi-user/production,
-# replace with a per-user history table in SQLite.
+# Simple in-memory history store. Keyed by "user_id:bot_id".
 conversation_histories: dict[str, list[dict]] = {}
 MAX_HISTORY_TURNS = cfg["conversation"].get("max_history_turns", 20)
 COMPACT_AT_TURNS = cfg["conversation"].get("compact_at_turns", 40)
 
 
-def get_history(user_id: str) -> list[dict]:
-    if user_id not in conversation_histories:
-        conversation_histories[user_id] = []
-    return conversation_histories[user_id]
+def _history_key(user_id: str, bot_id: str) -> str:
+    return f"{user_id}:{bot_id}"
 
 
-async def get_history_async(user_id: str) -> list[dict]:
+def get_history(user_id: str, bot_id: str = "") -> list[dict]:
+    key = _history_key(user_id, bot_id)
+    if key not in conversation_histories:
+        conversation_histories[key] = []
+    return conversation_histories[key]
+
+
+async def get_history_async(user_id: str, bot_id: str = "") -> list[dict]:
     """Return in-memory history, restoring recent raw history after restart."""
-    history = get_history(user_id)
+    key = _history_key(user_id, bot_id)
+    history = get_history(user_id, bot_id)
     if history:
         return history
     restored = await memory_store.get_recent_conversation_history(
         user_id,
         limit=MAX_HISTORY_TURNS * 2,
+        bot_id=bot_id,
     )
     if restored:
-        conversation_histories[user_id] = restored
-    return conversation_histories[user_id]
+        conversation_histories[key] = restored
+    return conversation_histories[key]
 
 
-def append_history(user_id: str, role: str, content: str, source: str = "user"):
-    history = get_history(user_id)
+def append_history(user_id: str, role: str, content: str, source: str = "user", bot_id: str = ""):
+    key = _history_key(user_id, bot_id)
+    history = get_history(user_id, bot_id)
     history.append({
         "role": role,
         "content": content,
@@ -384,15 +391,15 @@ def append_history(user_id: str, role: str, content: str, source: str = "user"):
         "source": source,
     })
 
-    # Safeguard #9: compact if too long
     if len(history) > COMPACT_AT_TURNS * 2:
         compacted, _ = compact_history(history, MAX_HISTORY_TURNS, COMPACT_AT_TURNS)
-        conversation_histories[user_id] = compacted
+        conversation_histories[key] = compacted
 
 
-async def append_history_async(user_id: str, role: str, content: str, source: str = "user"):
+async def append_history_async(user_id: str, role: str, content: str, source: str = "user", bot_id: str = ""):
     ts = time.time()
-    history = get_history(user_id)
+    key = _history_key(user_id, bot_id)
+    history = get_history(user_id, bot_id)
     history.append({
         "role": role,
         "content": content,
@@ -405,6 +412,7 @@ async def append_history_async(user_id: str, role: str, content: str, source: st
         content=content,
         source=source,
         ts=ts,
+        bot_id=bot_id,
     )
 
     if len(history) > COMPACT_AT_TURNS * 2:
@@ -413,7 +421,7 @@ async def append_history_async(user_id: str, role: str, content: str, source: st
         merged = "\n".join(part for part in [previous, summary] if part).strip()
         if merged:
             await memory_store.save_history_summary(user_id, merged[-4000:])
-        conversation_histories[user_id] = compacted
+        conversation_histories[key] = compacted
 
 
 def result_token_count(result: dict) -> int:
@@ -1121,14 +1129,18 @@ async def chat(request: Request):
     memory_enqueued = 0
 
     async with lock:
+        # V2.1: Resolve current bot once for the entire turn
+        current_bot_id = bot_manager.current_bot_id
+
         confirmation_result = await handle_pending_persona_confirmation(user_message)
         if confirmation_result:
-            await append_history_async(user_id, "user", user_message, source="wechat")
+            await append_history_async(user_id, "user", user_message, source="wechat", bot_id=current_bot_id)
             await append_history_async(
                 user_id,
                 "assistant",
                 _assistant_history_json(confirmation_result),
                 source="assistant",
+                bot_id=current_bot_id,
             )
             await memory_store.record_usage_event(
                 event_type="chat_turn",
@@ -1143,9 +1155,6 @@ async def chat(request: Request):
         # V2: Select route and context policy (Phase 5 + 6)
         route = _select_route(user_message, trigger="user")
 
-        # V2.1: Resolve current bot before loading bot-scoped data
-        current_bot_id = bot_manager.current_bot_id
-
         # Retrieve memories scoped to current bot (or shared)
         memories = await memory_store.search_bot(user_message, bot_id=current_bot_id, top_k=5)
 
@@ -1154,8 +1163,8 @@ async def chat(request: Request):
         # Get relationship state scoped to current bot
         relationship = await memory_store.get_relationship_bot(current_bot_id)
 
-        # Get conversation history
-        history = await get_history_async(user_id)
+        # Get conversation history scoped to current bot
+        history = await get_history_async(user_id, bot_id=current_bot_id)
         history_summary = await memory_store.get_history_summary(user_id)
 
         # V2.1: Get recap for current bot
@@ -1200,18 +1209,17 @@ async def chat(request: Request):
                 send_status=send_status or "generated",
             )
         )
-        # V2.1: Record outbound messages with full semantics
+        # V2.1: Record outbound messages with full semantics.
+        # Must await so that mark_outbound_batch_status below doesn't race.
         if result.get("messages"):
-            asyncio.create_task(
-                memory_store.record_outbound_messages(
-                    turn_id=turn_id,
-                    messages=result["messages"],
-                    user_id=user_id,
-                    bot_id=current_bot_id,
-                    source=result.get("source", "user_reply"),
-                    author=result.get("author", "assistant"),
-                    trigger=result.get("trigger", "user_message"),
-                )
+            await memory_store.record_outbound_messages(
+                turn_id=turn_id,
+                messages=result["messages"],
+                user_id=user_id,
+                bot_id=current_bot_id,
+                source=result.get("source", "user_reply"),
+                author=result.get("author", "assistant"),
+                trigger=result.get("trigger", "user_message"),
             )
 
         # V2.1: Trigger recap check in background
@@ -1261,7 +1269,7 @@ async def chat(request: Request):
             scheduled_task_ids.append(task_id)
 
         # Save assistant history
-        await append_history_async(user_id, "user", user_message, source="wechat")
+        await append_history_async(user_id, "user", user_message, source="wechat", bot_id=current_bot_id)
         assistant_text = "\n".join(
             m["text"] for m in result["messages"] if m.get("text")
         )
@@ -1271,6 +1279,7 @@ async def chat(request: Request):
                 "assistant",
                 _assistant_history_json(result),
                 source="assistant",
+                bot_id=current_bot_id,
             )
 
         # Fire-and-forget memory extraction
@@ -1484,17 +1493,18 @@ async def update_relationship(request: Request):
 
 @app.get("/history/{user_id}")
 async def get_history_route(user_id: str, request: Request):
-    """Get conversation history for a user."""
+    """Get conversation history for a user and current bot."""
     require_admin(request)
-    history = await get_history_async(user_id)
+    history = await get_history_async(user_id, bot_id=bot_manager.current_bot_id)
     return {"history": history[-20:]}  # Last 20 messages
 
 
 @app.delete("/history/{user_id}")
 async def clear_history(user_id: str, request: Request):
-    """Clear conversation history for a user."""
+    """Clear conversation history for a user and current bot."""
     require_admin(request)
-    conversation_histories[user_id] = []
+    key = _history_key(user_id, bot_manager.current_bot_id)
+    conversation_histories[key] = []
     deleted = await memory_store.clear_conversation_history(user_id)
     return {"status": "cleared", "deleted": deleted}
 
@@ -1719,12 +1729,14 @@ async def scheduler_tick() -> dict:
                 "system",
                 f"[主动消息判断] {reason}",
                 source="proactive",
+                bot_id=bot_id,
             )
             await append_history_async(
                 user_id,
                 "assistant",
                 _assistant_history_json({"messages": [{"text": msg, "delay": 0}]}),
                 source="proactive",
+                bot_id=bot_id,
             )
             # V2.1: Mark candidate as sent
             if candidate_id:
@@ -1815,7 +1827,7 @@ async def _run_fixed_message_prompt(
         current_bot_id = bot_manager.current_bot_id
         memories = await memory_store.search_bot(prompt, bot_id=current_bot_id, top_k=5)
         relationship = await memory_store.get_relationship_bot(current_bot_id)
-        history = await get_history_async(user_id)
+        history = await get_history_async(user_id, bot_id=current_bot_id)
         history_summary = await memory_store.get_history_summary(user_id)
         latest_recap = await memory_store.get_latest_recap(user_id, current_bot_id)
         recap_text = latest_recap["recap_text"] if latest_recap else ""
@@ -1914,12 +1926,14 @@ async def _run_fixed_message_prompt(
         "system",
         f"[固定主动消息] {prompt}",
         source="proactive",
+        bot_id=current_bot_id,
     )
     await append_history_async(
         user_id,
         "assistant",
         _assistant_history_json(result),
         source="proactive",
+        bot_id=current_bot_id,
     )
 
     text = "\n".join(m["text"] for m in messages)

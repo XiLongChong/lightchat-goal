@@ -299,7 +299,8 @@ class MemoryStore:
         # Use ALTER TABLE IF NOT EXISTS pattern — SQLite doesn't support
         # conditional column add, so we catch the "duplicate column" error
         for col in [("memories", "bot_id", "TEXT NOT NULL DEFAULT ''"),
-                     ("relationship_state", "bot_id", "TEXT NOT NULL DEFAULT ''")]:
+                     ("relationship_state", "bot_id", "TEXT NOT NULL DEFAULT ''"),
+                     ("conversation_history", "bot_id", "TEXT NOT NULL DEFAULT ''")]:
             try:
                 await db.execute(
                     f"ALTER TABLE {col[0]} ADD COLUMN {col[1]} {col[2]}"
@@ -900,6 +901,7 @@ class MemoryStore:
         content: str,
         source: str = "",
         ts: float | None = None,
+        bot_id: str = "",
     ):
         """Persist one raw conversation message for restart recovery."""
         if not user_id or not content:
@@ -908,9 +910,9 @@ class MemoryStore:
         async with self._lock:
             db = await self._get_db()
             await db.execute(
-                """INSERT INTO conversation_history(user_id, role, content, source, ts)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (user_id, role, content, source, now),
+                """INSERT INTO conversation_history(user_id, role, content, source, ts, bot_id)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (user_id, role, content, source, now, bot_id),
             )
             await db.commit()
 
@@ -918,18 +920,19 @@ class MemoryStore:
         self,
         user_id: str,
         limit: int = 40,
+        bot_id: str = "",
     ) -> list[dict[str, Any]]:
-        """Load recent raw messages in chronological order."""
+        """Load recent raw messages in chronological order, scoped by bot."""
         if not user_id:
             return []
         db = await self._get_db()
         rows = await db.execute_fetchall(
             """SELECT role, content, source, ts
                FROM conversation_history
-               WHERE user_id = ?
+               WHERE user_id = ? AND bot_id = ?
                ORDER BY ts DESC
                LIMIT ?""",
-            (user_id, max(1, int(limit))),
+            (user_id, bot_id, max(1, int(limit))),
         )
         return [dict(r) for r in reversed(rows)]
 

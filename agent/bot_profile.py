@@ -441,10 +441,17 @@ class BotProfileManager:
 
     @staticmethod
     def _resolve_tools(pack: dict[str, str], tool_list: str) -> str:
-        """Build tool section from tool_policy + available tools."""
+        """Build tool section from tool_policy + actual available tools.
+
+        The static tool_policy.md is used as a base, but the tool listing
+        at the end is replaced with the actual effective tool list so that
+        disabled tools don't appear in the prompt.
+        """
         policy = pack.get("tool_policy", "")
         if policy:
-            return policy
+            # Append effective tool list, overriding any static listing
+            effective_part = f"\n\n## 当前可用工具清单\n{tool_list}"
+            return policy + effective_part
         return f"可用工具：{tool_list}"
 
 
