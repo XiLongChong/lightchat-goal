@@ -18,20 +18,38 @@ from memory.dedup import is_duplicate, compute_importance, jaccard_similarity
 async def _migrate_history_summaries(db: aiosqlite.Connection):
     """Ensure history_summaries has PRIMARY KEY (user_id, bot_id).
 
-    Old DBs may have user_id alone as PK. Rebuild the table safely:
-    rename → create new → copy data → drop old.
+    Handles three cases:
+    - Table missing (fresh DB): create new table, return.
+    - Table exists with correct schema: return.
+    - Old schema (user_id alone as PK): rebuild via rename → create → copy → drop.
     """
-    # Check if the old schema is in place (user_id column exists but bot_id missing)
+    # Case 1: Table doesn't exist yet (fresh DB)
+    cur = await db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='history_summaries'"
+    )
+    if not await cur.fetchone():
+        await db.execute("""
+            CREATE TABLE history_summaries (
+                user_id TEXT NOT NULL DEFAULT '',
+                bot_id TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                updated_at REAL NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, bot_id)
+            )
+        """)
+        await db.commit()
+        return
+
+    # Check schema: if bot_id column exists, already migrated
     cur = await db.execute("PRAGMA table_info('history_summaries')")
     columns = {row[1] for row in await cur.fetchall()}
     if "bot_id" in columns:
-        return  # Already migrated
+        return  # Case 2: already correct
 
-    # Save existing data
+    # Case 3: Old schema — rebuild
     cur = await db.execute("SELECT user_id, summary, updated_at FROM history_summaries")
     old_rows = await cur.fetchall()
 
-    # Rebuild
     await db.execute("DROP TABLE IF EXISTS history_summaries")
     await db.execute("""
         CREATE TABLE history_summaries (
