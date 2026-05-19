@@ -121,9 +121,11 @@ class MemoryStore:
         """)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS history_summaries (
-                user_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL DEFAULT '',
+                bot_id TEXT NOT NULL DEFAULT '',
                 summary TEXT NOT NULL DEFAULT '',
-                updated_at REAL NOT NULL DEFAULT 0
+                updated_at REAL NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, bot_id)
             )
         """)
         await db.execute("""
@@ -300,7 +302,8 @@ class MemoryStore:
         # conditional column add, so we catch the "duplicate column" error
         for col in [("memories", "bot_id", "TEXT NOT NULL DEFAULT ''"),
                      ("relationship_state", "bot_id", "TEXT NOT NULL DEFAULT ''"),
-                     ("conversation_history", "bot_id", "TEXT NOT NULL DEFAULT ''")]:
+                     ("conversation_history", "bot_id", "TEXT NOT NULL DEFAULT ''"),
+                     ("history_summaries", "bot_id", "TEXT NOT NULL DEFAULT ''")]:
             try:
                 await db.execute(
                     f"ALTER TABLE {col[0]} ADD COLUMN {col[1]} {col[2]}"
@@ -870,27 +873,27 @@ class MemoryStore:
     # Compacted conversation summaries
     # ================================================================
 
-    async def get_history_summary(self, user_id: str) -> str:
+    async def get_history_summary(self, user_id: str, bot_id: str = "") -> str:
         db = await self._get_db()
         row = await db.execute_fetchall(
-            "SELECT summary FROM history_summaries WHERE user_id = ?",
-            (user_id,),
+            "SELECT summary FROM history_summaries WHERE user_id = ? AND bot_id = ?",
+            (user_id, bot_id),
         )
         if row:
             return str(row[0]["summary"] or "")
         return ""
 
-    async def save_history_summary(self, user_id: str, summary: str):
+    async def save_history_summary(self, user_id: str, summary: str, bot_id: str = ""):
         now = time.time()
         async with self._lock:
             db = await self._get_db()
             await db.execute(
-                """INSERT INTO history_summaries(user_id, summary, updated_at)
-                   VALUES (?, ?, ?)
-                   ON CONFLICT(user_id) DO UPDATE SET
+                """INSERT INTO history_summaries(user_id, bot_id, summary, updated_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(user_id, bot_id) DO UPDATE SET
                        summary = excluded.summary,
                        updated_at = excluded.updated_at""",
-                (user_id, summary, now),
+                (user_id, bot_id, summary, now),
             )
             await db.commit()
 
@@ -936,13 +939,13 @@ class MemoryStore:
         )
         return [dict(r) for r in reversed(rows)]
 
-    async def clear_conversation_history(self, user_id: str) -> int:
-        """Delete persisted raw conversation history for one user."""
+    async def clear_conversation_history(self, user_id: str, bot_id: str = "") -> int:
+        """Delete persisted raw conversation history for one user+bot."""
         async with self._lock:
             db = await self._get_db()
             cursor = await db.execute(
-                "DELETE FROM conversation_history WHERE user_id = ?",
-                (user_id,),
+                "DELETE FROM conversation_history WHERE user_id = ? AND bot_id = ?",
+                (user_id, bot_id),
             )
             await db.commit()
             return cursor.rowcount

@@ -417,10 +417,10 @@ async def append_history_async(user_id: str, role: str, content: str, source: st
 
     if len(history) > COMPACT_AT_TURNS * 2:
         compacted, summary = compact_history(history, MAX_HISTORY_TURNS, COMPACT_AT_TURNS)
-        previous = await memory_store.get_history_summary(user_id)
+        previous = await memory_store.get_history_summary(user_id, bot_id=bot_id)
         merged = "\n".join(part for part in [previous, summary] if part).strip()
         if merged:
-            await memory_store.save_history_summary(user_id, merged[-4000:])
+            await memory_store.save_history_summary(user_id, merged[-4000:], bot_id=bot_id)
         conversation_histories[key] = compacted
 
 
@@ -1165,7 +1165,7 @@ async def chat(request: Request):
 
         # Get conversation history scoped to current bot
         history = await get_history_async(user_id, bot_id=current_bot_id)
-        history_summary = await memory_store.get_history_summary(user_id)
+        history_summary = await memory_store.get_history_summary(user_id, bot_id=current_bot_id)
 
         # V2.1: Get recap for current bot
         latest_recap = await memory_store.get_latest_recap(
@@ -1505,7 +1505,7 @@ async def clear_history(user_id: str, request: Request):
     require_admin(request)
     key = _history_key(user_id, bot_manager.current_bot_id)
     conversation_histories[key] = []
-    deleted = await memory_store.clear_conversation_history(user_id)
+    deleted = await memory_store.clear_conversation_history(user_id, bot_id=bot_manager.current_bot_id)
     return {"status": "cleared", "deleted": deleted}
 
 
@@ -1828,7 +1828,7 @@ async def _run_fixed_message_prompt(
         memories = await memory_store.search_bot(prompt, bot_id=current_bot_id, top_k=5)
         relationship = await memory_store.get_relationship_bot(current_bot_id)
         history = await get_history_async(user_id, bot_id=current_bot_id)
-        history_summary = await memory_store.get_history_summary(user_id)
+        history_summary = await memory_store.get_history_summary(user_id, bot_id=current_bot_id)
         latest_recap = await memory_store.get_latest_recap(user_id, current_bot_id)
         recap_text = latest_recap["recap_text"] if latest_recap else ""
 
