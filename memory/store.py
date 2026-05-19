@@ -310,6 +310,18 @@ class MemoryStore:
                 )
             except Exception:
                 pass  # Column already exists
+        # V2.1: Deduplicate old history_summaries rows (old schema had only
+        # user_id, new schema is user_id+b bot_id). Keep latest per key.
+        try:
+            await db.execute("""
+                DELETE FROM history_summaries
+                WHERE rowid NOT IN (
+                    SELECT MIN(rowid) FROM history_summaries
+                    GROUP BY user_id, bot_id
+                )
+            """)
+        except Exception:
+            pass
         await db.commit()
 
     async def close(self):
@@ -887,12 +899,15 @@ class MemoryStore:
         now = time.time()
         async with self._lock:
             db = await self._get_db()
+            # Delete-then-insert avoids ON CONFLICT schema compatibility issues
+            # with databases created before the (user_id, bot_id) PK migration.
+            await db.execute(
+                "DELETE FROM history_summaries WHERE user_id = ? AND bot_id = ?",
+                (user_id, bot_id),
+            )
             await db.execute(
                 """INSERT INTO history_summaries(user_id, bot_id, summary, updated_at)
-                   VALUES (?, ?, ?, ?)
-                   ON CONFLICT(user_id, bot_id) DO UPDATE SET
-                       summary = excluded.summary,
-                       updated_at = excluded.updated_at""",
+                   VALUES (?, ?, ?, ?)""",
                 (user_id, bot_id, summary, now),
             )
             await db.commit()
@@ -940,11 +955,15 @@ class MemoryStore:
         return [dict(r) for r in reversed(rows)]
 
     async def clear_conversation_history(self, user_id: str, bot_id: str = "") -> int:
-        """Delete persisted raw conversation history for one user+bot."""
+        """Delete persisted raw conversation history and summary for one user+bot."""
         async with self._lock:
             db = await self._get_db()
             cursor = await db.execute(
                 "DELETE FROM conversation_history WHERE user_id = ? AND bot_id = ?",
+                (user_id, bot_id),
+            )
+            await db.execute(
+                "DELETE FROM history_summaries WHERE user_id = ? AND bot_id = ?",
                 (user_id, bot_id),
             )
             await db.commit()
