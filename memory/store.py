@@ -140,6 +140,70 @@ class MemoryStore:
             CREATE INDEX IF NOT EXISTS idx_conversation_history_user_ts
             ON conversation_history(user_id, ts DESC)
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS usage_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                user_id TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT '',
+                message_count INTEGER NOT NULL DEFAULT 0,
+                token_count INTEGER NOT NULL DEFAULT 0,
+                elapsed_ms INTEGER NOT NULL DEFAULT 0,
+                fallback_type TEXT NOT NULL DEFAULT '',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                ts REAL NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_usage_events_ts
+            ON usage_events(ts DESC)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_usage_events_type_ts
+            ON usage_events(event_type, ts DESC)
+        """)
+        # V2 tables
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS turn_drafts (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT '',
+                route TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'generated',
+                messages_json TEXT NOT NULL,
+                send_error TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_turn_drafts_user_status
+            ON turn_drafts(user_id, status)
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS turn_diagnostics (
+                turn_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT '',
+                route TEXT NOT NULL DEFAULT '',
+                context_policy TEXT NOT NULL DEFAULT '',
+                llm_status TEXT NOT NULL DEFAULT '',
+                token_count INTEGER NOT NULL DEFAULT 0,
+                elapsed_ms INTEGER NOT NULL DEFAULT 0,
+                fallback_type TEXT NOT NULL DEFAULT '',
+                send_status TEXT NOT NULL DEFAULT '',
+                memory_enqueued INTEGER NOT NULL DEFAULT 0,
+                input_chars INTEGER NOT NULL DEFAULT 0,
+                output_messages INTEGER NOT NULL DEFAULT 0,
+                tool_calls INTEGER NOT NULL DEFAULT 0,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                ts REAL NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_turn_diagnostics_user_ts
+            ON turn_diagnostics(user_id, ts DESC)
+        """)
         await db.commit()
 
     async def close(self):
@@ -722,3 +786,287 @@ class MemoryStore:
             )
             await db.commit()
             return cursor.rowcount
+
+    # ================================================================
+    # Usage telemetry
+    # ================================================================
+
+    async def record_usage_event(
+        self,
+        event_type: str,
+        user_id: str = "",
+        source: str = "",
+        message_count: int = 0,
+        token_count: int = 0,
+        elapsed_ms: int = 0,
+        fallback_type: str = "",
+        metadata: dict[str, Any] | None = None,
+        ts: float | None = None,
+    ):
+        """Persist lightweight local usage telemetry for the admin dashboard."""
+        now = time.time() if ts is None else float(ts)
+        payload = json.dumps(metadata or {}, ensure_ascii=False)
+        async with self._lock:
+            db = await self._get_db()
+            await db.execute(
+                """INSERT INTO usage_events
+                   (event_type, user_id, source, message_count, token_count,
+                    elapsed_ms, fallback_type, metadata_json, ts)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    str(event_type)[:80],
+                    str(user_id)[:200],
+                    str(source)[:80],
+                    max(0, int(message_count or 0)),
+                    max(0, int(token_count or 0)),
+                    max(0, int(elapsed_ms or 0)),
+                    str(fallback_type)[:120],
+                    payload,
+                    now,
+                ),
+            )
+            await db.commit()
+
+    async def get_usage_summary(self, today_start_ts: float) -> dict[str, Any]:
+        """Return today and all-time usage totals for the admin dashboard."""
+        db = await self._get_db()
+        today = await self._usage_totals(db, today_start_ts)
+        total = await self._usage_totals(db, None)
+        recent_fallbacks = await db.execute_fetchall(
+            """SELECT event_type, user_id, source, fallback_type,
+                      elapsed_ms, metadata_json, ts
+               FROM usage_events
+               WHERE fallback_type != ''
+               ORDER BY ts DESC
+               LIMIT 5"""
+        )
+        return {
+            "today": today,
+            "total": total,
+            "recent_fallbacks": [
+                self._usage_fallback_row(row) for row in recent_fallbacks
+            ],
+        }
+
+    async def _usage_totals(
+        self,
+        db: aiosqlite.Connection,
+        since_ts: float | None,
+    ) -> dict[str, int]:
+        where = "WHERE ts >= ?" if since_ts is not None else ""
+        params = (since_ts,) if since_ts is not None else ()
+        rows = await db.execute_fetchall(
+            f"""SELECT
+                    COALESCE(SUM(message_count), 0) AS messages,
+                    COALESCE(SUM(token_count), 0) AS tokens,
+                    COALESCE(SUM(elapsed_ms), 0) AS elapsed_ms,
+                    COALESCE(SUM(CASE WHEN fallback_type != '' THEN 1 ELSE 0 END), 0) AS fallbacks,
+                    COUNT(*) AS events
+                FROM usage_events
+                {where}""",
+            params,
+        )
+        row = rows[0]
+        return {
+            "messages": int(row["messages"] or 0),
+            "tokens": int(row["tokens"] or 0),
+            "elapsed_ms": int(row["elapsed_ms"] or 0),
+            "fallbacks": int(row["fallbacks"] or 0),
+            "events": int(row["events"] or 0),
+        }
+
+    def _usage_fallback_row(self, row: aiosqlite.Row) -> dict[str, Any]:
+        try:
+            metadata = json.loads(row["metadata_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+        return {
+            "event_type": row["event_type"],
+            "user_id": row["user_id"],
+            "source": row["source"],
+            "fallback_type": row["fallback_type"],
+            "elapsed_ms": int(row["elapsed_ms"] or 0),
+            "ts": float(row["ts"] or 0),
+            "detail": str(metadata.get("detail", ""))[:200],
+        }
+
+    # ================================================================
+    # V2: Turn drafts (Phase 3 — Draft And Delivery State)
+    # ================================================================
+
+    async def create_turn_draft(
+        self,
+        turn_id: str,
+        user_id: str,
+        messages: list[dict[str, Any]],
+        source: str = "",
+        route: str = "",
+    ) -> str:
+        """Persist a turn draft before sending. Status: 'generated'."""
+        now = time.time()
+        payload = json.dumps(messages, ensure_ascii=False)
+        async with self._lock:
+            db = await self._get_db()
+            await db.execute(
+                """INSERT OR REPLACE INTO turn_drafts
+                   (id, user_id, source, route, status, messages_json, send_error, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, 'generated', ?, '', ?, ?)""",
+                (turn_id, user_id, source, route, payload, now, now),
+            )
+            await db.commit()
+        return turn_id
+
+    async def mark_turn_draft_status(
+        self,
+        turn_id: str,
+        status: str,
+        send_error: str = "",
+    ) -> bool:
+        """Mark a turn draft as sending/delivered/failed/retry_pending."""
+        valid = {"generated", "sending", "delivered", "failed", "retry_pending"}
+        if status not in valid:
+            raise ValueError(f"invalid turn draft status: {status}")
+        now = time.time()
+        async with self._lock:
+            db = await self._get_db()
+            cursor = await db.execute(
+                """UPDATE turn_drafts
+                   SET status = ?, send_error = ?, updated_at = ?
+                   WHERE id = ?""",
+                (status, send_error[:500], now, turn_id),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def get_turn_draft(self, turn_id: str) -> dict[str, Any] | None:
+        """Get a turn draft by id. Used for outbound idempotency check."""
+        db = await self._get_db()
+        rows = await db.execute_fetchall(
+            "SELECT * FROM turn_drafts WHERE id = ?", (turn_id,)
+        )
+        if rows:
+            item = dict(rows[0])
+            try:
+                item["messages"] = json.loads(item.pop("messages_json"))
+            except (json.JSONDecodeError, TypeError):
+                item["messages"] = []
+            return item
+        return None
+
+    async def list_turn_drafts(
+        self,
+        user_id: str = "",
+        status: str = "",
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """List turn drafts for inspection."""
+        db = await self._get_db()
+        conditions = []
+        params: list[Any] = []
+        if user_id:
+            conditions.append("user_id = ?")
+            params.append(user_id)
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        params.append(limit)
+        rows = await db.execute_fetchall(
+            f"SELECT * FROM turn_drafts {where} ORDER BY created_at DESC LIMIT ?",
+            tuple(params),
+        )
+        result = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["messages"] = json.loads(item.pop("messages_json"))
+            except (json.JSONDecodeError, TypeError):
+                item["messages"] = []
+            result.append(item)
+        return result
+
+    # ================================================================
+    # V2: Turn diagnostics (Phase 2 — Turn Observability)
+    # ================================================================
+
+    async def record_turn_diagnostics(
+        self,
+        turn_id: str,
+        user_id: str,
+        source: str = "",
+        route: str = "",
+        context_policy: str = "",
+        llm_status: str = "",
+        token_count: int = 0,
+        elapsed_ms: int = 0,
+        fallback_type: str = "",
+        send_status: str = "",
+        memory_enqueued: int = 0,
+        input_chars: int = 0,
+        output_messages: int = 0,
+        tool_calls: int = 0,
+        metadata: dict[str, Any] | None = None,
+    ):
+        """Record structured turn diagnostics for every turn."""
+        now = time.time()
+        payload = json.dumps(metadata or {}, ensure_ascii=False)
+        async with self._lock:
+            db = await self._get_db()
+            await db.execute(
+                """INSERT OR REPLACE INTO turn_diagnostics
+                   (turn_id, user_id, source, route, context_policy,
+                    llm_status, token_count, elapsed_ms, fallback_type,
+                    send_status, memory_enqueued, input_chars, output_messages,
+                    tool_calls, metadata_json, ts)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    turn_id,
+                    user_id,
+                    source,
+                    route,
+                    context_policy,
+                    llm_status,
+                    token_count,
+                    elapsed_ms,
+                    fallback_type,
+                    send_status,
+                    memory_enqueued,
+                    input_chars,
+                    output_messages,
+                    tool_calls,
+                    payload,
+                    now,
+                ),
+            )
+            await db.commit()
+
+    async def get_recent_turn_diagnostics(
+        self,
+        limit: int = 20,
+        user_id: str = "",
+        fallback_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        """List recent turn diagnostics for the admin panel."""
+        db = await self._get_db()
+        conditions = []
+        params: list[Any] = []
+        if user_id:
+            conditions.append("user_id = ?")
+            params.append(user_id)
+        if fallback_only:
+            conditions.append("fallback_type != ''")
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        params.append(limit)
+        rows = await db.execute_fetchall(
+            f"SELECT * FROM turn_diagnostics {where} ORDER BY ts DESC LIMIT ?",
+            tuple(params),
+        )
+        result = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["metadata"] = json.loads(item.pop("metadata_json", "{}"))
+            except (json.JSONDecodeError, TypeError):
+                item["metadata"] = {}
+            result.append(item)
+        return result

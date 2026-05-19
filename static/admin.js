@@ -146,6 +146,71 @@ function describeDeploy(data) {
   };
 }
 
+function formatNumber(value) {
+  const num = Number(value || 0);
+  if (!Number.isFinite(num)) return "0";
+  return new Intl.NumberFormat("zh-CN").format(num);
+}
+
+function formatDuration(seconds) {
+  let remaining = Math.max(0, Math.floor(Number(seconds || 0)));
+  const days = Math.floor(remaining / 86400);
+  remaining %= 86400;
+  const hours = Math.floor(remaining / 3600);
+  remaining %= 3600;
+  const minutes = Math.floor(remaining / 60);
+  if (days > 0) return `${days}天 ${hours}小时`;
+  if (hours > 0) return `${hours}小时 ${minutes}分钟`;
+  return `${minutes}分钟`;
+}
+
+function formatTime(ts) {
+  const value = Number(ts || 0);
+  if (!value) return "";
+  return new Date(value * 1000).toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function renderUsage(usage = {}) {
+  const today = usage.today || {};
+  const total = usage.total || {};
+  const runtime = usage.runtime || {};
+
+  $("usageUptime").textContent = formatDuration(runtime.uptime_seconds);
+  $("usageTodayMessages").textContent = formatNumber(today.messages);
+  $("usageTodayTokens").textContent = formatNumber(today.tokens);
+  $("usageTodayFallbacks").textContent = formatNumber(today.fallbacks);
+  $("usageTotalMessages").textContent = formatNumber(total.messages);
+  $("usageTotalTokens").textContent = formatNumber(total.tokens);
+
+  $("usageBridgeBadge").textContent = runtime.bridge_running ? "桥接运行中" : "桥接未运行";
+  $("usageBridgeBadge").classList.toggle("ok", Boolean(runtime.bridge_running));
+
+  const list = $("fallbackList");
+  list.innerHTML = "";
+  const items = usage.recent_fallbacks || [];
+  if (!items.length) {
+    const empty = document.createElement("p");
+    empty.className = "hint";
+    empty.textContent = "暂无兜底记录";
+    list.appendChild(empty);
+    return;
+  }
+  for (const item of items) {
+    const row = document.createElement("div");
+    row.className = "fallback-item";
+    const time = formatTime(item.ts);
+    const type = item.fallback_type || "fallback";
+    const detail = item.detail ? ` · ${item.detail}` : "";
+    row.textContent = `${time} · ${type}${detail}`;
+    list.appendChild(row);
+  }
+}
+
 function qrImageSrc(value) {
   if (!value) return "";
   if (value.startsWith("data:")) return value;
@@ -207,6 +272,7 @@ async function loadConfig() {
   $("deployDetail").textContent = deploy.detail;
   $("deployBadge").textContent = current.wechat?.configured ? "已部署" : "未部署";
   $("deployBadge").classList.toggle("ok", Boolean(current.wechat?.configured));
+  renderUsage(current.usage);
 
   const canSend = Boolean(current.send_ready);
   $("manualSendBtn").disabled = !canSend;
@@ -407,12 +473,72 @@ function exportMemory() {
   window.location.href = "/memories/export";
 }
 
+async function loadDiagnostics() {
+  try {
+    const data = await api("/admin/diagnostics?limit=15&fallback_only=false");
+    const list = $("diagList");
+    list.innerHTML = "";
+    const items = data.diagnostics || [];
+    if (!items.length) {
+      const empty = document.createElement("p");
+      empty.className = "hint";
+      empty.textContent = "暂无诊断记录";
+      list.appendChild(empty);
+      return;
+    }
+    for (const item of items) {
+      const row = document.createElement("div");
+      row.className = "fallback-item";
+      const time = formatTime(item.ts);
+      const fb = item.fallback_type ? ` · 兜底:${item.fallback_type}` : "";
+      const send = item.send_status ? ` · 发送:${item.send_status}` : "";
+      const route = item.route ? ` · ${item.route}` : "";
+      const policy = item.context_policy ? ` · ${item.context_policy}` : "";
+      row.textContent = `${time}${route}${policy}${fb}${send} · ${item.elapsed_ms}ms · ${item.token_count}tok`;
+      list.appendChild(row);
+    }
+  } catch (err) {
+    $("diagList").innerHTML = `<p class="hint">加载失败：${err.message}</p>`;
+  }
+}
+
+async function loadDrafts() {
+  try {
+    const data = await api("/admin/drafts?limit=15");
+    const list = $("draftList");
+    list.innerHTML = "";
+    const items = data.drafts || [];
+    if (!items.length) {
+      const empty = document.createElement("p");
+      empty.className = "hint";
+      empty.textContent = "暂无发送草稿";
+      list.appendChild(empty);
+      return;
+    }
+    for (const item of items) {
+      const row = document.createElement("div");
+      row.className = "fallback-item";
+      const time = formatTime(item.created_at);
+      const firstMsg = item.messages?.[0]?.text || "";
+      const preview = firstMsg.length > 40 ? firstMsg.slice(0, 40) + "…" : firstMsg;
+      row.textContent = `${time} · ${item.status} · ${item.route} · ${preview}`;
+      list.appendChild(row);
+    }
+  } catch (err) {
+    $("draftList").innerHTML = `<p class="hint">加载失败：${err.message}</p>`;
+  }
+}
+
 document.querySelectorAll(".nav-item").forEach((btn) => {
   btn.addEventListener("click", () => {
     document.querySelectorAll(".nav-item").forEach((b) => b.classList.remove("active"));
     document.querySelectorAll(".panel").forEach((p) => p.classList.remove("active"));
     btn.classList.add("active");
     $(btn.dataset.tab).classList.add("active");
+    if (btn.dataset.tab === "diagnostics") {
+      loadDiagnostics();
+      loadDrafts();
+    }
   });
 });
 

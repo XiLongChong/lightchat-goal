@@ -43,7 +43,7 @@ def _run_agent(raw: str):
         personality="test personality",
     )
     return asyncio.run(agent.chat(
-        user_message="测试",
+        user_message="test",
         memories=[],
         history=[],
         relationship={},
@@ -54,8 +54,8 @@ def test_multiple_wechat_reply_actions_stay_multiple():
     raw = """
     {
       "actions": [
-        {"type": "tool", "name": "wechat_reply", "args": {"text": "第一条", "delay": 0}},
-        {"type": "tool", "name": "wechat_reply", "args": {"text": "第二条", "delay": 1}}
+        {"type": "tool", "name": "wechat_reply", "args": {"text": "first", "delay": 0}},
+        {"type": "tool", "name": "wechat_reply", "args": {"text": "second", "delay": 1}}
       ],
       "done": true
     }
@@ -63,14 +63,14 @@ def test_multiple_wechat_reply_actions_stay_multiple():
 
     result = _run_agent(raw)
 
-    assert [m["text"] for m in result["messages"]] == ["第一条", "第二条"]
+    assert [m["text"] for m in result["messages"]] == ["first", "second"]
 
 
 def test_single_message_with_spaces_is_not_split():
     raw = """
     {
       "actions": [
-        {"type": "tool", "name": "wechat_reply", "args": {"text": "还行 不算热 就是有点闷", "delay": 0}}
+        {"type": "tool", "name": "wechat_reply", "args": {"text": "one message with spaces", "delay": 0}}
       ],
       "done": true
     }
@@ -79,7 +79,7 @@ def test_single_message_with_spaces_is_not_split():
     result = _run_agent(raw)
 
     assert len(result["messages"]) == 1
-    assert result["messages"][0]["text"] == "还行 不算热 就是有点闷"
+    assert result["messages"][0]["text"] == "one message with spaces"
 
 
 def test_schedule_wechat_message_action_is_collected():
@@ -89,8 +89,8 @@ def test_schedule_wechat_message_action_is_collected():
         {"type": "tool", "name": "schedule_wechat_message", "args": {
           "delay_minutes": 10,
           "messages": [
-            {"text": "起来喝水", "delay": 0},
-            {"text": "别装死", "delay": 1}
+            {"text": "drink water", "delay": 0},
+            {"text": "stand up", "delay": 1}
           ]
         }}
       ],
@@ -104,13 +104,21 @@ def test_schedule_wechat_message_action_is_collected():
     assert len(result["scheduled_messages"]) == 1
     assert result["scheduled_messages"][0]["delay_minutes"] == 10
     assert [m["text"] for m in result["scheduled_messages"][0]["messages"]] == [
-        "起来喝水",
-        "别装死",
+        "drink water",
+        "stand up",
     ]
 
 
-def test_protocol_json_text_is_blocked_from_wechat():
-    leaked = '{"actions":[{"type":"tool","name":"wechat_reply","args":{"text":"不该裸发","delay":0}}],"done":true}'
+def test_invalid_json_records_fallback_and_token_usage():
+    result = _run_agent("plain text fallback")
+
+    assert result["fallback_events"][0]["type"] == "invalid_json"
+    assert result["token_usage"]["total_tokens"] > 0
+    assert result["token_usage"]["estimated"] is True
+
+
+def test_protocol_json_text_is_unwrapped_before_wechat():
+    leaked = '{"actions":[{"type":"tool","name":"wechat_reply","args":{"text":"nested ok","delay":0}}],"done":true}'
     leaked_json = json.dumps(leaked, ensure_ascii=False)
     raw = f"""
     {{
@@ -123,6 +131,9 @@ def test_protocol_json_text_is_blocked_from_wechat():
 
     result = _run_agent(raw)
 
+    # V2: messages no longer carry "type" key; output_guard unwraps protocol JSON
     assert result["messages"] == [
-        {"type": "message", "text": "我刚刚卡了一下 重新说", "delay": 0}
+        {"text": "nested ok", "delay": 0}
     ]
+    # V2: protocol unwrap is recorded as "protocol_text_unwrapped" by the guard
+    assert any(e["type"] == "protocol_text_unwrapped" for e in result.get("fallback_events", []))

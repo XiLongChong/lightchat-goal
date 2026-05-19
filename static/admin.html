@@ -55,6 +55,43 @@
         </div>
       </div>
 
+      <div class="usage-panel" aria-label="用量统计">
+        <div class="usage-head">
+          <div>
+            <h3>用量统计</h3>
+            <p>运行时长、消息数量、token 消耗和兜底情况</p>
+          </div>
+          <span id="usageBridgeBadge" class="status-badge">读取中</span>
+        </div>
+        <div class="usage-grid">
+          <div class="usage-card">
+            <span>运行时长</span>
+            <strong id="usageUptime">--</strong>
+          </div>
+          <div class="usage-card">
+            <span>今日消息</span>
+            <strong id="usageTodayMessages">--</strong>
+          </div>
+          <div class="usage-card">
+            <span>今日 token</span>
+            <strong id="usageTodayTokens">--</strong>
+          </div>
+          <div class="usage-card">
+            <span>今日兜底</span>
+            <strong id="usageTodayFallbacks">--</strong>
+          </div>
+          <div class="usage-card">
+            <span>总消息</span>
+            <strong id="usageTotalMessages">--</strong>
+          </div>
+          <div class="usage-card">
+            <span>总 token</span>
+            <strong id="usageTotalTokens">--</strong>
+          </div>
+        </div>
+        <div id="fallbackList" class="fallback-list"></div>
+      </div>
+
       <div class="actions">
         <button id="startDeployBtn" class="primary">开始部署</button>
         <button id="startBridgeBtn">启动已保存部署</button>
@@ -210,10 +247,32 @@
       </details>
     </section>
 
+    <section id="diagnostics" class="panel">
+      <div class="section-title">
+        <h2>诊断</h2>
+        <p>V2 每轮对话的诊断记录：路由、兜底、发送状态。</p>
+      </div>
+
+      <div class="usage-panel" aria-label="诊断概况">
+        <div class="usage-head">
+          <h3>最近诊断</h3>
+          <span id="diagBridgeBadge" class="status-badge">读取中</span>
+        </div>
+        <div id="diagList" class="fallback-list"></div>
+      </div>
+
+      <div class="section-title" style="margin-top: 1.5rem;">
+        <h3>发送草稿</h3>
+        <p>每条生成的消息在发送前都会记录草稿。可查看送达或失败状态。</p>
+      </div>
+      <div id="draftList" class="fallback-list"></div>
+    </section>
+
     <nav class="bottom-nav" aria-label="主导航">
       <button class="nav-item active" data-tab="home">首页</button>
       <button class="nav-item" data-tab="persona">人设</button>
       <button class="nav-item" data-tab="settings">设置</button>
+      <button class="nav-item" data-tab="diagnostics">诊断</button>
     </nav>
   </main>
 

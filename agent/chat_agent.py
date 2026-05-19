@@ -1,7 +1,13 @@
-"""Chat Agent — core conversation handler with all 10 safeguards.
+"""Chat Agent — core conversation handler with all 10 safeguards + V2 features.
 
 Design: JSON output format (emoRebot style), not function calling.
 This is more reliable with DeepSeek than OpenAI-style function calling.
+
+V2 additions:
+  - UnifiedOutputGuard for all user-visible text
+  - Turn ID tracking and diagnostics
+  - Route selection (SystemFastPath / ChatLite / ChatFull)
+  - Context policy (hot_only / hot+cheap / hot+full)
 
 Safeguards implemented:
   #1 JSON parse fallback → plain text message
@@ -18,11 +24,12 @@ Safeguards implemented:
 
 import asyncio
 import logging
-import json
 import time
+import uuid
 from typing import Any
 
 from agent.context_builder import build_system_prompt
+from agent.output_guard import guard_single_message, guard_messages
 from agent.tools import execute_tool, TOOL_WHITELIST
 from utils.json_parser import parse_agent_output
 
@@ -36,6 +43,20 @@ MAX_MESSAGE_LEN = 500     # Single message max chars
 MAX_TOTAL_CHARS = 2000    # Total output max chars
 MAX_TOOL_LOOP = 5         # Safeguard #3
 MAX_SCHEDULE_DELAY_MINUTES = 60 * 24 * 30
+
+# ================================================================
+# V2 Route constants
+# ================================================================
+ROUTE_SYSTEM_FAST = "SystemFastPath"
+ROUTE_CHAT_LITE = "ChatLite"
+ROUTE_CHAT_FULL = "ChatFull"
+
+# ================================================================
+# V2 Context policy constants
+# ================================================================
+CTX_HOT_ONLY = "hot_only"
+CTX_HOT_CHEAP = "hot+cheap_memory"
+CTX_HOT_FULL = "hot+full_memory"
 
 
 class ChatAgent:
@@ -66,19 +87,33 @@ class ChatAgent:
         relationship: dict[str, Any],
         history_summary: str = "",
         trigger: str = "user",
+        route: str = "",
+        context_policy: str = "",
     ) -> dict[str, Any]:
         """Process a user message.
+
+        V2: accepts route and context_policy for turn diagnostics.
+        All user-visible text passes through UnifiedOutputGuard.
 
         Returns:
             {
                 "messages": [{"text": "...", "delay": 1.0}, ...],
                 "tool_calls": [{"name": "...", "result": "..."}],
+                "scheduled_messages": [...],
                 "done": True,
-                "raw_output": "...",
                 "iterations": 2,
+                "elapsed_ms": 123,
+                "token_usage": {...},
+                "fallback_events": [...],
+                "turn_id": "turn_xxx",
+                "route": "ChatLite",
+                "context_policy": "hot+cheap_memory",
+                "llm_status": "ok",
             }
         """
+        turn_id = f"turn_{uuid.uuid4().hex[:12]}"
         start_time = time.time()
+        llm_status = "ok"
 
         # Build system prompt
         system_prompt = build_system_prompt(
@@ -124,8 +159,15 @@ class ChatAgent:
         all_messages: list[dict[str, Any]] = []
         scheduled_messages: list[dict[str, Any]] = []
         all_tool_results: list[dict[str, str]] = []
+        fallback_events: list[dict[str, str]] = []
         raw_output = ""
         iterations = 0
+        token_usage = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "estimated": False,
+        }
 
         for iteration in range(MAX_TOOL_LOOP):
             iterations = iteration + 1
@@ -138,8 +180,17 @@ class ChatAgent:
                     max_tokens=2048,
                 )
                 raw_output = response.choices[0].message.content or ""
+                _merge_token_usage(
+                    token_usage,
+                    _extract_token_usage(response, messages, raw_output),
+                )
             except Exception as e:
                 logger.error(f"LLM call failed: {e}")
+                llm_status = "error"
+                fallback_events.append({
+                    "type": "llm_error",
+                    "detail": str(e)[:200],
+                })
                 all_messages.append({
                     "type": "message",
                     "text": "（信号不太好，稍等我一下）",
@@ -149,6 +200,11 @@ class ChatAgent:
 
             # Safeguard #1: parse with fallback
             parsed = parse_agent_output(raw_output)
+            if parsed.get("_fallback_reason"):
+                fallback_events.append({
+                    "type": str(parsed["_fallback_reason"]),
+                    "detail": raw_output[:200],
+                })
 
             actions = parsed.get("actions", [])
 
@@ -162,7 +218,7 @@ class ChatAgent:
 
                 if action_type == "message":
                     text = str(action.get("text", ""))
-                    text = _sanitize_outbound_text(text)[:MAX_MESSAGE_LEN]
+                    text = guard_single_message(text, issues=_fallback_issue_list(fallback_events))
                     if text:
                         delay = _safe_float(action.get("delay", 0), 0, 10)
                         all_messages.append({
@@ -180,7 +236,7 @@ class ChatAgent:
                     # wechat_reply is a "runtime tool" — intercepted as message
                     if name == "wechat_reply":
                         text = str(args.get("text", ""))
-                        text = _sanitize_outbound_text(text)[:MAX_MESSAGE_LEN]
+                        text = guard_single_message(text, issues=_fallback_issue_list(fallback_events))
                         if text:
                             delay = _safe_float(args.get("delay", 0), 0, 10)
                             all_messages.append({
@@ -264,7 +320,12 @@ class ChatAgent:
 
         self._last_call_time = start_time
 
-        final_messages = [m for m in all_messages if m["type"] == "message"]
+        # Apply UnifiedOutputGuard to all messages (V2: final pass)
+        raw_messages = [m for m in all_messages if m["type"] == "message"]
+        final_messages = [
+            {"text": m["text"], "delay": m.get("delay", 0)}
+            for m in guard_messages(raw_messages)
+        ]
 
         return {
             "messages": final_messages,
@@ -273,7 +334,28 @@ class ChatAgent:
             "done": True,
             "iterations": iterations,
             "elapsed_ms": int((time.time() - start_time) * 1000),
+            "token_usage": token_usage,
+            "fallback_events": fallback_events,
+            "turn_id": turn_id,
+            "route": route or ROUTE_CHAT_FULL,
+            "context_policy": context_policy or CTX_HOT_ONLY,
+            "llm_status": llm_status,
         }
+
+
+class _FallbackIssueBridge:
+    """Adapter that converts output_guard issues into fallback_events entries."""
+
+    def __init__(self, fallback_events: list[dict[str, str]]):
+        self._events = fallback_events
+
+    def append(self, issue: str):
+        self._events.append({"type": issue, "detail": ""})
+
+
+def _fallback_issue_list(fallback_events: list[dict[str, str]]) -> list:
+    """Return an object whose append() adds fallback event entries."""
+    return _FallbackIssueBridge(fallback_events)  # type: ignore[return-value]
 
 
 def _safe_float(value: Any, min_val: float, max_val: float) -> float:
@@ -283,6 +365,59 @@ def _safe_float(value: Any, min_val: float, max_val: float) -> float:
         return max(min_val, min(max_val, v))
     except (ValueError, TypeError):
         return 0.0
+
+
+def _extract_token_usage(
+    response: Any,
+    messages: list[dict[str, Any]],
+    raw_output: str,
+) -> dict[str, int | bool]:
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        prompt_tokens = _usage_value(usage, "prompt_tokens")
+        completion_tokens = _usage_value(usage, "completion_tokens")
+        total_tokens = _usage_value(usage, "total_tokens")
+        if total_tokens or prompt_tokens or completion_tokens:
+            return {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens or prompt_tokens + completion_tokens,
+                "estimated": False,
+            }
+
+    prompt_text = "\n".join(str(m.get("content", "")) for m in messages)
+    prompt_tokens = _estimate_tokens(prompt_text)
+    completion_tokens = _estimate_tokens(raw_output)
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+        "estimated": True,
+    }
+
+
+def _usage_value(usage: Any, key: str) -> int:
+    if isinstance(usage, dict):
+        value = usage.get(key, 0)
+    else:
+        value = getattr(usage, key, 0)
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _merge_token_usage(total: dict[str, Any], item: dict[str, Any]):
+    total["prompt_tokens"] += int(item.get("prompt_tokens", 0) or 0)
+    total["completion_tokens"] += int(item.get("completion_tokens", 0) or 0)
+    total["total_tokens"] += int(item.get("total_tokens", 0) or 0)
+    total["estimated"] = bool(total.get("estimated") or item.get("estimated"))
+
+
+def _estimate_tokens(text: str) -> int:
+    if not text:
+        return 0
+    return max(1, int(len(text) / 1.8))
 
 
 def _format_history_content(item: dict[str, Any]) -> str:
@@ -342,33 +477,6 @@ def _format_ts(ts: Any) -> str:
     except (TypeError, ValueError):
         value = time.time()
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(value))
-
-
-def _sanitize_outbound_text(text: str) -> str:
-    """Never let protocol JSON leak into WeChat as a visible reply."""
-    text = str(text).strip()
-    if not text:
-        return ""
-    if _looks_like_protocol_json(text):
-        logger.warning("Blocked protocol-shaped text from being sent to WeChat")
-        return "我刚刚卡了一下 重新说"
-    return text
-
-
-def _looks_like_protocol_json(text: str) -> bool:
-    sample = text.strip()
-    if not sample:
-        return False
-    lowered = sample.lower()
-    if "\"actions\"" not in lowered and "'actions'" not in lowered:
-        return False
-    if "wechat_reply" not in lowered and "\"done\"" not in lowered and "'done'" not in lowered:
-        return False
-    try:
-        parsed = json.loads(sample)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return sample.startswith("{") and "actions" in lowered
-    return isinstance(parsed, dict) and "actions" in parsed
 
 
 def _parse_schedule_task(args: dict[str, Any]) -> dict[str, Any] | None:
