@@ -1143,23 +1143,22 @@ async def chat(request: Request):
         # V2: Select route and context policy (Phase 5 + 6)
         route = _select_route(user_message, trigger="user")
 
-        # Retrieve memories
-        # TODO: context_policy is currently diagnostic only — same memories
-        # are always loaded regardless of hot_only / hot+cheap / hot+full.
-        # Implement real layered loading once stability work is complete.
-        memories = await memory_store.search(user_message, top_k=5)
+        # V2.1: Resolve current bot before loading bot-scoped data
+        current_bot_id = bot_manager.current_bot_id
+
+        # Retrieve memories scoped to current bot (or shared)
+        memories = await memory_store.search_bot(user_message, bot_id=current_bot_id, top_k=5)
 
         context_policy = _select_context_policy(route, len(memories))
 
-        # Get relationship state
-        relationship = await memory_store.get_relationship()
+        # Get relationship state scoped to current bot
+        relationship = await memory_store.get_relationship_bot(current_bot_id)
 
         # Get conversation history
         history = await get_history_async(user_id)
         history_summary = await memory_store.get_history_summary(user_id)
 
-        # V2.1: Get current bot_id and recap
-        current_bot_id = bot_manager.current_bot_id
+        # V2.1: Get recap for current bot
         latest_recap = await memory_store.get_latest_recap(
             user_id, current_bot_id
         )
@@ -1277,7 +1276,7 @@ async def chat(request: Request):
         # Fire-and-forget memory extraction
         if len(user_message.strip()) >= 10 and assistant_text.strip():
             asyncio.create_task(
-                memory_worker.extract(user_message, assistant_text, memories)
+                memory_worker.extract(user_message, assistant_text, memories, bot_id=current_bot_id)
             )
             memory_enqueued = 1
 
@@ -1338,6 +1337,7 @@ async def chat(request: Request):
         send_error = ""
         if _bridge is not None and _bridge.token and context_token:
             await memory_store.mark_turn_draft_status(turn_id, "sending")
+            await memory_store.mark_outbound_batch_status(turn_id, "sending")
             try:
                 await _send_message_batch(
                     user_id=user_id,
@@ -1347,11 +1347,13 @@ async def chat(request: Request):
                 send_status = "delivered"
                 bridge_sent = True
                 await memory_store.mark_turn_draft_status(turn_id, "delivered")
+                await memory_store.mark_outbound_batch_status(turn_id, "delivered")
             except Exception as e:
                 logger.error(f"[{user_id}] Send failed for turn {turn_id}: {e}")
                 send_status = "failed"
                 send_error = str(e)[:500]
                 await memory_store.mark_turn_draft_status(turn_id, "failed", send_error)
+                await memory_store.mark_outbound_batch_status(turn_id, "failed", send_error)
                 # On failure, return empty messages — the poller must not
                 # re-send a partially-delivered batch, which would duplicate
                 # messages that already went out before the failure.
@@ -1360,6 +1362,7 @@ async def chat(request: Request):
             # No bridge — messages will be picked up by poller's reply path
             send_status = "delivered"
             await memory_store.mark_turn_draft_status(turn_id, "delivered")
+            await memory_store.mark_outbound_batch_status(turn_id, "delivered")
 
         # V2: Update turn diagnostics send status (preserves prior fields, merges error)
         await memory_store.update_turn_send_status(turn_id, send_status, error=send_error)
@@ -1637,16 +1640,29 @@ async def scheduler_tick() -> dict:
     when available; falls back to legacy should_proactive_message.
     """
     try:
-        memories = await memory_store.search("", top_k=5)
         bot_id = bot_manager.current_bot_id
-        latest_recap = await memory_store.get_latest_recap("", bot_id)
+        contact = await memory_store.get_contact_state()
+        user_id = contact.get("user_id", "")
+
+        # V2.1: Build deployment prerequisites before pipeline call
+        current_bot = bot_manager.current_bot
+        prereqs = {
+            "bot_active": bot_id == bot_manager.current_bot_id,
+            "proactive_enabled": current_bot.proactive_enabled,
+            "bridge_available": _bridge is not None and bool(_bridge.token),
+            "valid_contact": bool(user_id),
+        }
+
+        memories = await memory_store.search_bot("", bot_id=bot_id, top_k=5)
+        latest_recap = await memory_store.get_latest_recap(user_id, bot_id)
         recap_text = latest_recap["recap_text"] if latest_recap else ""
 
-        # V2.1: Try 3-stage pipeline first
+        # V2.1: Try 3-stage pipeline first (prerequisites checked internally)
         decision = await scheduler_agent.run_proactive_pipeline(
             recent_memories=memories,
             recap_text=recap_text,
             bot_id=bot_id,
+            prerequisites=prereqs,
         )
 
         if decision.get("sent"):
@@ -1654,14 +1670,6 @@ async def scheduler_tick() -> dict:
             emotion = decision.get("emotion", "neutral")
             reason = decision.get("reason", "")
             candidate_id = decision.get("candidate_id", "")
-            contact = await memory_store.get_contact_state()
-            user_id = contact.get("user_id", "")
-            if not user_id:
-                logger.info("Scheduler: skip — no contact target yet")
-                return {"sent": False, "reason": "no contact target yet"}
-            if _bridge is None or not _bridge.token:
-                logger.info("Scheduler: skip — WeChat bridge unavailable")
-                return {"sent": False, "reason": "WeChat bridge unavailable"}
 
             # V2: Acquire per-user lock
             lock = _get_user_lock(user_id)
@@ -1763,6 +1771,7 @@ async def fixed_morning_message() -> dict:
         prompt,
         save_diary=False,
         fallback_messages=_morning_fallback_messages(city, weather_result),
+        trigger="fixed_morning",
     )
 
 
@@ -1777,6 +1786,7 @@ async def fixed_night_recap() -> dict:
         prompt,
         save_diary=True,
         fallback_messages=[{"text": "今天先收住 明天再慢慢来", "delay": 0}],
+        trigger="fixed_night",
     )
 
 
@@ -1784,6 +1794,7 @@ async def _run_fixed_message_prompt(
     prompt: str,
     save_diary: bool,
     fallback_messages: list[dict] | None = None,
+    trigger: str = "proactive",
 ) -> dict:
     contact = await memory_store.get_contact_state()
     if not contact.get("user_id"):
@@ -1800,13 +1811,12 @@ async def _run_fixed_message_prompt(
     send_status = "delivered"
 
     async with lock:
-        memories = await memory_store.search(prompt, top_k=5)
-        relationship = await memory_store.get_relationship()
+        # V2.1: Resolve current bot before loading bot-scoped data
+        current_bot_id = bot_manager.current_bot_id
+        memories = await memory_store.search_bot(prompt, bot_id=current_bot_id, top_k=5)
+        relationship = await memory_store.get_relationship_bot(current_bot_id)
         history = await get_history_async(user_id)
         history_summary = await memory_store.get_history_summary(user_id)
-
-        # V2.1: Get bot_id and recap
-        current_bot_id = bot_manager.current_bot_id
         latest_recap = await memory_store.get_latest_recap(user_id, current_bot_id)
         recap_text = latest_recap["recap_text"] if latest_recap else ""
 
@@ -1820,7 +1830,7 @@ async def _run_fixed_message_prompt(
             history=history,
             relationship=relationship,
             history_summary=history_summary,
-            trigger="proactive",
+            trigger=trigger,
             route=route,
             context_policy=context_policy,
             bot_id=current_bot_id,
@@ -2071,9 +2081,18 @@ async def _generate_recap(
         if not turns or len(turns) < 2:
             return None
 
+        # Find the turn number of the last summarized turn
+        since_number = 0
+        if since_turn_id:
+            for t in turns:
+                if t.get("id") == since_turn_id:
+                    since_number = t.get("turn_number", 0)
+                    break
+
+        # Only include turns after the last recap
         new_turns = [
             t for t in turns
-            if not since_turn_id or t.get("turn_number", 0) > 0
+            if t.get("turn_number", 0) > since_number
         ]
         if len(new_turns) < 3:
             return None
@@ -2197,10 +2216,12 @@ async def admin_switch_bot(request: Request):
 
 @app.get("/admin/recaps")
 async def admin_list_recaps(request: Request, limit: int = 10):
-    """List recent recaps."""
+    """List recent recaps for the current bot and known contact."""
     require_admin(request)
+    contact = await memory_store.get_contact_state()
+    user_id = contact.get("user_id", "")
     recaps = await memory_store.get_recaps(
-        "", bot_manager.current_bot_id, limit=limit
+        user_id, bot_manager.current_bot_id, limit=limit
     )
     return {"recaps": recaps}
 

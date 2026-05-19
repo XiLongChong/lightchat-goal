@@ -280,12 +280,19 @@ class SchedulerAgent:
         recent_memories: list[dict[str, Any]] | None = None,
         recap_text: str = "",
         bot_id: str = "",
+        prerequisites: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """V2.1 3-stage proactive pipeline.
 
         Stage 1: Candidate reason generation
         Stage 2: Decision gate
         Stage 3: Message generation (only if gate passes)
+
+        prerequisites dict keys (all checked before any LLM call):
+            bot_active: bool
+            proactive_enabled: bool
+            bridge_available: bool
+            valid_contact: bool
 
         Returns:
             {"sent": bool, "message": str, "reason_type": str,
@@ -295,6 +302,25 @@ class SchedulerAgent:
 
         now_cst = datetime.now(CST)
         now_ts = time_module()
+
+        # ---- Deployment pre-check (before any LLM call) ----
+        prereq = prerequisites or {}
+        if not prereq.get("bot_active", True):
+            return self._pipeline_result(
+                False, "bot is not the active/deployed bot", stage="pre_check"
+            )
+        if not prereq.get("proactive_enabled", True):
+            return self._pipeline_result(
+                False, "proactive messaging disabled for this bot", stage="pre_check"
+            )
+        if not prereq.get("bridge_available", True):
+            return self._pipeline_result(
+                False, "WeChat bridge unavailable", stage="pre_check"
+            )
+        if not prereq.get("valid_contact", True):
+            return self._pipeline_result(
+                False, "no valid contact target", stage="pre_check"
+            )
 
         # ---- Hard pre-check (before any LLM call) ----
         hour = now_cst.hour

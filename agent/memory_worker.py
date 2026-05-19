@@ -70,14 +70,17 @@ class MemoryWorker:
         user_message: str,
         assistant_reply: str,
         existing_memories: list[dict[str, Any]] | None = None,
+        bot_id: str = "",
     ):
         """Extract and save memories from a conversation turn.
 
         Fire-and-forget: caller should use asyncio.create_task().
         All errors are caught and logged — never raises to caller.
+
+        V2.1: bot_id scopes memories to a specific bot.
         """
         try:
-            await self._do_extract(user_message, assistant_reply, existing_memories)
+            await self._do_extract(user_message, assistant_reply, existing_memories, bot_id)
         except Exception as e:
             logger.error(f"MemoryWorker extraction failed: {e}", exc_info=True)
 
@@ -86,6 +89,7 @@ class MemoryWorker:
         user_message: str,
         assistant_reply: str,
         existing_memories: list[dict[str, Any]] | None,
+        bot_id: str = "",
     ):
         # Build the extraction prompt
         conversation = f"用户：{user_message}\n助手：{assistant_reply}"
@@ -165,8 +169,9 @@ class MemoryWorker:
             if is_duplicate(content, existing_contents):
                 continue
 
-            mem_id = await self.store.save_memory(
+            mem_id = await self.store.save_memory_bot(
                 content=content,
+                bot_id=bot_id,
                 category=category,
                 keywords=keywords,
                 min_importance=self.min_importance,

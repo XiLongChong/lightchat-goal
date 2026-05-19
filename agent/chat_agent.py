@@ -104,6 +104,16 @@ class ChatAgent:
         start_time = time.time()
         llm_status = "ok"
 
+        # V2.1: Compute effective tool list for this bot
+        effective_tools = list(TOOL_WHITELIST)
+        if self.bot_manager and bot_id:
+            bot = self.bot_manager.get_bot(bot_id)
+            if bot and bot.enabled_tools:
+                effective_tools = [
+                    t for t in bot.enabled_tools
+                    if t in TOOL_WHITELIST
+                ]
+
         # Build system prompt — V2.1 prompt pack or legacy
         if self.bot_manager and bot_id:
             system_prompt = build_system_prompt_v21(
@@ -111,7 +121,7 @@ class ChatAgent:
                 bot_id=bot_id,
                 relationship=relationship,
                 memories=memories,
-                tool_names=list(TOOL_WHITELIST),
+                tool_names=effective_tools,
                 trigger=trigger,
                 trigger_content=user_message,
                 defaults=self.defaults,
@@ -124,7 +134,7 @@ class ChatAgent:
                 personality=self.personality,
                 memories=memories,
                 relationship=relationship,
-                tool_names=list(TOOL_WHITELIST),
+                tool_names=effective_tools,
                 trigger=trigger,
                 defaults=self.defaults,
             )
@@ -556,7 +566,7 @@ def _resolve_outbound_semantics(trigger: str) -> tuple[str, str, str]:
     elif trigger == "fixed_morning":
         return ("fixed_morning", "system", "fixed_time")
     elif trigger == "fixed_night":
-        return ("fixed_morning", "system", "fixed_time")
+        return ("fixed_night", "system", "fixed_time")
     elif trigger == "scheduled":
         return ("scheduled_reminder", "system", "user_scheduled")
     elif trigger == "admin":
