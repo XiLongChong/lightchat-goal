@@ -15,6 +15,42 @@ import aiosqlite
 from memory.dedup import is_duplicate, compute_importance, jaccard_similarity
 
 
+async def _migrate_history_summaries(db: aiosqlite.Connection):
+    """Ensure history_summaries has PRIMARY KEY (user_id, bot_id).
+
+    Old DBs may have user_id alone as PK. Rebuild the table safely:
+    rename → create new → copy data → drop old.
+    """
+    # Check if the old schema is in place (user_id column exists but bot_id missing)
+    cur = await db.execute("PRAGMA table_info('history_summaries')")
+    columns = {row[1] for row in await cur.fetchall()}
+    if "bot_id" in columns:
+        return  # Already migrated
+
+    # Save existing data
+    cur = await db.execute("SELECT user_id, summary, updated_at FROM history_summaries")
+    old_rows = await cur.fetchall()
+
+    # Rebuild
+    await db.execute("DROP TABLE IF EXISTS history_summaries")
+    await db.execute("""
+        CREATE TABLE history_summaries (
+            user_id TEXT NOT NULL DEFAULT '',
+            bot_id TEXT NOT NULL DEFAULT '',
+            summary TEXT NOT NULL DEFAULT '',
+            updated_at REAL NOT NULL DEFAULT 0,
+            PRIMARY KEY (user_id, bot_id)
+        )
+    """)
+    for row in old_rows:
+        await db.execute(
+            """INSERT INTO history_summaries(user_id, bot_id, summary, updated_at)
+               VALUES (?, ?, ?, ?)""",
+            (row[0], "", row[1], row[2]),
+        )
+    await db.commit()
+
+
 class MemoryStore:
     """Persistent memory storage with keyword-based retrieval.
 
@@ -119,15 +155,9 @@ class MemoryStore:
                 created_at REAL NOT NULL DEFAULT 0
             )
         """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS history_summaries (
-                user_id TEXT NOT NULL DEFAULT '',
-                bot_id TEXT NOT NULL DEFAULT '',
-                summary TEXT NOT NULL DEFAULT '',
-                updated_at REAL NOT NULL DEFAULT 0,
-                PRIMARY KEY (user_id, bot_id)
-            )
-        """)
+        # history_summaries may have old schema (user_id alone as PK)
+        # on upgraded DBs. Rebuild if needed.
+        await _migrate_history_summaries(db)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS conversation_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -302,26 +332,13 @@ class MemoryStore:
         # conditional column add, so we catch the "duplicate column" error
         for col in [("memories", "bot_id", "TEXT NOT NULL DEFAULT ''"),
                      ("relationship_state", "bot_id", "TEXT NOT NULL DEFAULT ''"),
-                     ("conversation_history", "bot_id", "TEXT NOT NULL DEFAULT ''"),
-                     ("history_summaries", "bot_id", "TEXT NOT NULL DEFAULT ''")]:
+                     ("conversation_history", "bot_id", "TEXT NOT NULL DEFAULT ''")]:
             try:
                 await db.execute(
                     f"ALTER TABLE {col[0]} ADD COLUMN {col[1]} {col[2]}"
                 )
             except Exception:
                 pass  # Column already exists
-        # V2.1: Deduplicate old history_summaries rows (old schema had only
-        # user_id, new schema is user_id+b bot_id). Keep latest per key.
-        try:
-            await db.execute("""
-                DELETE FROM history_summaries
-                WHERE rowid NOT IN (
-                    SELECT MIN(rowid) FROM history_summaries
-                    GROUP BY user_id, bot_id
-                )
-            """)
-        except Exception:
-            pass
         await db.commit()
 
     async def close(self):
