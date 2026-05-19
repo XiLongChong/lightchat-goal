@@ -38,6 +38,7 @@ from openai import AsyncOpenAI
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
 
+from agent.bot_profile import BotProfileManager, DEFAULT_BOT_ID
 from agent.chat_agent import ChatAgent, ROUTE_SYSTEM_FAST, ROUTE_CHAT_LITE, ROUTE_CHAT_FULL
 from agent.chat_agent import CTX_HOT_ONLY, CTX_HOT_CHEAP, CTX_HOT_FULL
 from agent.context_builder import compact_history
@@ -228,6 +229,13 @@ memory_store = MemoryStore(
 )
 configure_runtime(memory_store=memory_store)
 
+# V2.1: Bot profile manager
+bot_manager = BotProfileManager(
+    config=cfg,
+    prompts_dir=cfg.get("prompt_pack", {}).get("directory", "./prompts"),
+    persona_file=cfg.get("agent", {}).get("persona_file", "./prompts/persona.md"),
+)
+
 chat_agent = ChatAgent(
     client=llm_client,
     model=model_name,
@@ -240,6 +248,7 @@ chat_agent = ChatAgent(
             cfg.get("fixed_messages", {}).get("morning", {}).get("city", ""),
         )
     },
+    bot_manager=bot_manager,
 )
 
 memory_worker = MemoryWorker(
@@ -274,6 +283,7 @@ if cfg.get("wechat", {}).get("enabled"):
 
 # ================================================================
 # V2: Per-user turn lock (Phase 4)
+# TODO: single-process only; multi-process / multi-replica needs a distributed lock
 # ================================================================
 
 _user_turn_locks: dict[str, asyncio.Lock] = {}
@@ -307,11 +317,9 @@ def _select_route(user_message: str, trigger: str, tool_likely: bool = False) ->
     if not stripped:
         return ROUTE_SYSTEM_FAST
 
-    # SystemFastPath: explicit continuation confirmations
-    if stripped in {"继续", "嗯", "好", "哦", "行", "可以", "对", "是的", "ok", "OK", "嗯嗯", "哈哈"}:
-        return ROUTE_SYSTEM_FAST
-
     # ChatLite: short message, no obvious tool/complexity signal
+    # (includes continuation confirmations like "继续", "嗯", "好" —
+    #  these depend on context so they must not be routed to SystemFastPath)
     if len(stripped) <= 30 and not tool_likely:
         return ROUTE_CHAT_LITE
 
@@ -1136,6 +1144,9 @@ async def chat(request: Request):
         route = _select_route(user_message, trigger="user")
 
         # Retrieve memories
+        # TODO: context_policy is currently diagnostic only — same memories
+        # are always loaded regardless of hot_only / hot+cheap / hot+full.
+        # Implement real layered loading once stability work is complete.
         memories = await memory_store.search(user_message, top_k=5)
 
         context_policy = _select_context_policy(route, len(memories))
@@ -1147,7 +1158,14 @@ async def chat(request: Request):
         history = await get_history_async(user_id)
         history_summary = await memory_store.get_history_summary(user_id)
 
-        # Run Chat Agent (V2: with route and context_policy)
+        # V2.1: Get current bot_id and recap
+        current_bot_id = bot_manager.current_bot_id
+        latest_recap = await memory_store.get_latest_recap(
+            user_id, current_bot_id
+        )
+        recap_text = latest_recap["recap_text"] if latest_recap else ""
+
+        # Run Chat Agent (V2.1: with bot_id and recap)
         result = await chat_agent.chat(
             user_message=user_message,
             memories=memories,
@@ -1157,15 +1175,67 @@ async def chat(request: Request):
             trigger="user",
             route=route,
             context_policy=context_policy,
+            bot_id=current_bot_id,
+            recap=recap_text,
         )
 
         turn_id = result["turn_id"]
+
+        # V2.1: Record turn (L2) and outbound messages
+        asyncio.create_task(
+            memory_store.create_turn(
+                turn_id=turn_id,
+                user_id=user_id,
+                bot_id=current_bot_id,
+                user_messages=user_message,
+                assistant_actions=json.dumps(
+                    result.get("messages", []),
+                    ensure_ascii=False,
+                ),
+                tool_calls=json.dumps(
+                    result.get("tool_calls", []),
+                    ensure_ascii=False,
+                ),
+                source=result.get("source", "user_reply"),
+                trigger=result.get("trigger", "user_message"),
+                send_status=send_status or "generated",
+            )
+        )
+        # V2.1: Record outbound messages with full semantics
+        if result.get("messages"):
+            asyncio.create_task(
+                memory_store.record_outbound_messages(
+                    turn_id=turn_id,
+                    messages=result["messages"],
+                    user_id=user_id,
+                    bot_id=current_bot_id,
+                    source=result.get("source", "user_reply"),
+                    author=result.get("author", "assistant"),
+                    trigger=result.get("trigger", "user_message"),
+                )
+            )
+
+        # V2.1: Trigger recap check in background
+        recap_cfg = cfg.get("recap", {})
+        if recap_cfg.get("enabled", True):
+            unsummarized = await memory_store.count_unsummarized_turns(
+                user_id, current_bot_id
+            )
+            every_n = int(recap_cfg.get("trigger", {}).get("every_n_turns", 8))
+            if unsummarized >= every_n:
+                asyncio.create_task(
+                    _generate_recap(user_id, current_bot_id, recap_cfg)
+                )
 
         # Remember the latest reachable contact
         if user_id and user_id != "default" and context_token:
             await memory_store.update_contact_state(user_id, context_token)
 
         # V2: Persist turn draft BEFORE sending (Phase 3)
+        # TODO: turn_drafts currently track send status only, not full
+        # outbound idempotency. /chat does not check existing draft status
+        # before sending — a crash-and-retry or bridge timeout replay could
+        # still produce duplicates across process boundaries.
         await memory_store.create_turn_draft(
             turn_id=turn_id,
             user_id=user_id,
@@ -1261,35 +1331,44 @@ async def chat(request: Request):
             f"route={route}, policy={context_policy}"
         )
 
-    # Lock released — now send messages and mark draft status
-    send_status = "delivered"
-    if _bridge is not None and _bridge.token and context_token:
-        try:
-            await _send_message_batch(
-                user_id=user_id,
-                context_token=context_token,
-                messages=result["messages"],
-            )
-        except Exception as e:
-            logger.error(f"[{user_id}] Send failed for turn {turn_id}: {e}")
-            send_status = "failed"
-            await memory_store.mark_turn_draft_status(turn_id, "failed", str(e)[:500])
-    else:
-        # No bridge — messages will be picked up by poller's reply path
-        send_status = "delivered"
+        # V2: Send via built-in bridge inside the lock (Phase 4)
+        # Sending under the lock prevents scheduler/proactive sends from
+        # interleaving before the user reply finishes.
+        bridge_sent = False
+        send_error = ""
+        if _bridge is not None and _bridge.token and context_token:
+            await memory_store.mark_turn_draft_status(turn_id, "sending")
+            try:
+                await _send_message_batch(
+                    user_id=user_id,
+                    context_token=context_token,
+                    messages=result["messages"],
+                )
+                send_status = "delivered"
+                bridge_sent = True
+                await memory_store.mark_turn_draft_status(turn_id, "delivered")
+            except Exception as e:
+                logger.error(f"[{user_id}] Send failed for turn {turn_id}: {e}")
+                send_status = "failed"
+                send_error = str(e)[:500]
+                await memory_store.mark_turn_draft_status(turn_id, "failed", send_error)
+                # On failure, return empty messages — the poller must not
+                # re-send a partially-delivered batch, which would duplicate
+                # messages that already went out before the failure.
+                bridge_sent = True
+        else:
+            # No bridge — messages will be picked up by poller's reply path
+            send_status = "delivered"
+            await memory_store.mark_turn_draft_status(turn_id, "delivered")
 
-    if send_status == "delivered":
-        await memory_store.mark_turn_draft_status(turn_id, "delivered")
+        # V2: Update turn diagnostics send status (preserves prior fields, merges error)
+        await memory_store.update_turn_send_status(turn_id, send_status, error=send_error)
 
-    # Update turn diagnostics with final send status
-    await memory_store.record_turn_diagnostics(
-        turn_id=turn_id,
-        user_id=user_id,
-        send_status=send_status,
-    )
-
+    # Lock released — return response.
+    # When the built-in bridge already sent (or failed trying), return empty
+    # messages so the bridge poller's reply loop doesn't double-send.
     return {
-        "messages": [
+        "messages": [] if bridge_sent else [
             {"text": m["text"], "delay": m.get("delay", 0)}
             for m in result["messages"]
         ],
@@ -1554,16 +1633,27 @@ async def admin_drafts(request: Request, status: str = "", limit: int = 20):
 async def scheduler_tick() -> dict:
     """Periodic scheduler check. Called by APScheduler or manual trigger.
 
-    V2: acquires per-user lock before sending proactive messages.
+    V2.1: uses 3-stage proactive pipeline (candidate → gate → generation)
+    when available; falls back to legacy should_proactive_message.
     """
     try:
         memories = await memory_store.search("", top_k=5)
-        decision = await scheduler_agent.should_proactive_message(memories)
+        bot_id = bot_manager.current_bot_id
+        latest_recap = await memory_store.get_latest_recap("", bot_id)
+        recap_text = latest_recap["recap_text"] if latest_recap else ""
 
-        if decision.get("should_message"):
+        # V2.1: Try 3-stage pipeline first
+        decision = await scheduler_agent.run_proactive_pipeline(
+            recent_memories=memories,
+            recap_text=recap_text,
+            bot_id=bot_id,
+        )
+
+        if decision.get("sent"):
             msg = decision.get("message", "")
             emotion = decision.get("emotion", "neutral")
             reason = decision.get("reason", "")
+            candidate_id = decision.get("candidate_id", "")
             contact = await memory_store.get_contact_state()
             user_id = contact.get("user_id", "")
             if not user_id:
@@ -1605,6 +1695,10 @@ async def scheduler_tick() -> dict:
                     output_messages=1,
                 )
 
+            if send_status != "delivered":
+                logger.error(f"Scheduler: send failed, skipping post-send bookkeeping")
+                return {"sent": False, "reason": "send failed"}
+
             await memory_store.record_usage_event(
                 event_type="proactive_send",
                 user_id=user_id,
@@ -1624,21 +1718,27 @@ async def scheduler_tick() -> dict:
                 _assistant_history_json({"messages": [{"text": msg, "delay": 0}]}),
                 source="proactive",
             )
-            await scheduler_agent.record_sent()
-            logger.info(f"Scheduler: SENT — {reason}")
+            # V2.1: Mark candidate as sent
+            if candidate_id:
+                await scheduler_agent.record_proactive_sent(candidate_id)
+            else:
+                await scheduler_agent.record_sent()
+            logger.info(f"Scheduler: SENT — {reason} (stage={decision.get('stage', '')})")
 
             return {
                 "sent": True,
                 "message": msg,
                 "emotion": emotion,
                 "reason": reason,
+                "stage": decision.get("stage", ""),
             }
         else:
             reason = decision.get("reason", "unknown")
-            logger.info(f"Scheduler: skip — {reason}")
+            logger.info(f"Scheduler: skip — {reason} (stage={decision.get('stage', '')})")
             return {
                 "sent": False,
                 "reason": reason,
+                "stage": decision.get("stage", ""),
             }
     except Exception as e:
         logger.error(f"Scheduler tick failed: {e}", exc_info=True)
@@ -1705,6 +1805,11 @@ async def _run_fixed_message_prompt(
         history = await get_history_async(user_id)
         history_summary = await memory_store.get_history_summary(user_id)
 
+        # V2.1: Get bot_id and recap
+        current_bot_id = bot_manager.current_bot_id
+        latest_recap = await memory_store.get_latest_recap(user_id, current_bot_id)
+        recap_text = latest_recap["recap_text"] if latest_recap else ""
+
         # V2: Route and context policy for fixed messages
         route = ROUTE_CHAT_FULL
         context_policy = CTX_HOT_FULL
@@ -1718,6 +1823,8 @@ async def _run_fixed_message_prompt(
             trigger="proactive",
             route=route,
             context_policy=context_policy,
+            bot_id=current_bot_id,
+            recap=recap_text,
         )
         turn_id = result["turn_id"]
 
@@ -1771,6 +1878,10 @@ async def _run_fixed_message_prompt(
             output_messages=len(messages),
             tool_calls=len(result.get("tool_calls", [])),
         )
+
+    if send_status == "failed":
+        logger.error(f"Fixed message send failed, skipping post-send bookkeeping")
+        return {"sent": False, "reason": "send failed"}
 
     await memory_store.record_usage_event(
         event_type="fixed_message",
@@ -1832,7 +1943,9 @@ async def deliver_scheduled_messages() -> dict:
     if _bridge is None or not _bridge.token:
         return {"sent": 0, "reason": "WeChat bridge unavailable"}
 
-    tasks = await memory_store.get_due_scheduled_messages(limit=20)
+    # V2: Atomically claim pending tasks as 'sending' to prevent duplicate
+    # delivery when multiple workers or concurrent triggers read the same tasks.
+    tasks = await memory_store.claim_due_scheduled_messages(limit=20)
     sent = 0
     failed = 0
 
@@ -1850,13 +1963,17 @@ async def deliver_scheduled_messages() -> dict:
                     raise RuntimeError(
                         "no iLink contact context_token; send a message to the built-in bot first"
                     )
-            await _send_message_batch(
-                user_id=user_id,
-                context_token=context_token,
-                messages=task.get("messages", []),
-            )
-            await memory_store.mark_scheduled_message_status(task_id, "sent")
-            sent += 1
+            # V2: Acquire per-user lock so scheduled delivery doesn't
+            # interleave with an active chat turn for the same user.
+            lock = _get_user_lock(user_id)
+            async with lock:
+                await _send_message_batch(
+                    user_id=user_id,
+                    context_token=context_token,
+                    messages=task.get("messages", []),
+                )
+                await memory_store.mark_scheduled_message_status(task_id, "sent")
+                sent += 1
             await memory_store.record_usage_event(
                 event_type="scheduled_send",
                 user_id=user_id,
@@ -1936,6 +2053,84 @@ def _assistant_history_json(result: dict) -> str:
     )
 
 
+async def _generate_recap(
+    user_id: str,
+    bot_id: str,
+    recap_cfg: dict,
+) -> str | None:
+    """V2.1: Background recap generation from recent turns.
+
+    Uses LLM to summarize conversation stage between the last recap
+    and the current turn.
+    """
+    try:
+        latest = await memory_store.get_latest_recap(user_id, bot_id)
+        since_turn_id = latest.get("end_turn_id", "") if latest else ""
+
+        turns = await memory_store.get_recent_turns(user_id, bot_id, limit=50)
+        if not turns or len(turns) < 2:
+            return None
+
+        new_turns = [
+            t for t in turns
+            if not since_turn_id or t.get("turn_number", 0) > 0
+        ]
+        if len(new_turns) < 3:
+            return None
+
+        start_id = new_turns[0]["id"] if new_turns else ""
+        end_id = new_turns[-1]["id"] if new_turns else ""
+
+        # Build summary text from turns
+        turn_texts = []
+        for t in new_turns:
+            user_msg = str(t.get("user_messages", ""))[:200]
+            assistant_action = str(t.get("assistant_actions", ""))[:200]
+            turn_texts.append(f"User: {user_msg}\nBot: {assistant_action}")
+
+        turns_summary = "\n---\n".join(turn_texts[-20:])  # last 20 turns
+
+        prompt = (
+            "你是一个对话摘要助手。基于以下对话回合，生成一个会话阶段摘要(recap)。"
+            "recap应该包括：对话刚才到了哪里、未完成的话题、当前的语气/氛围、"
+            "这个阶段用户表达的关切或偏好、最自然的下一步继续方向。"
+            "不要包含：永久用户事实、推测性心理标签、原始历史细节。"
+            "200字以内。只输出摘要文本，不要JSON。\n\n"
+            f"对话记录：\n{turns_summary}"
+        )
+
+        response = await llm_client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": "你是一个简洁的对话摘要助手。"},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=float(recap_cfg.get("generation", {}).get("temperature", 0.5)),
+            max_tokens=int(recap_cfg.get("generation", {}).get("max_chars", 500)),
+        )
+
+        recap_text = (response.choices[0].message.content or "").strip()
+        if not recap_text:
+            return None
+
+        recap_id = await memory_store.save_recap(
+            user_id=user_id,
+            bot_id=bot_id,
+            recap_text=recap_text,
+            start_turn_id=start_id,
+            end_turn_id=end_id,
+            turn_count=len(new_turns),
+        )
+        logger.info(
+            f"Recap generated: {recap_id} "
+            f"({len(new_turns)} turns, bot={bot_id})"
+        )
+        return recap_id
+    except Exception as e:
+        logger.error(f"Recap generation failed: {e}", exc_info=True)
+        return None
+
+
 async def daily_reset():
     """Reset daily counters at midnight."""
     await scheduler_agent.reset_daily_counter()
@@ -1946,6 +2141,130 @@ async def memory_decay():
     """Apply time-based importance decay to memories."""
     await memory_store.apply_decay()
     logger.info("Memory decay applied")
+
+
+# ================================================================
+# V2.1: Bot management routes
+# ================================================================
+
+
+@app.get("/admin/bots")
+async def admin_list_bots(request: Request):
+    """List all configured bots and active bot."""
+    require_admin(request)
+    bots_info = {}
+    for bot_id, bot in bot_manager.bots.items():
+        state = bot_manager.get_state(bot_id)
+        bots_info[bot_id] = {
+            "display_name": bot.display_name,
+            "identity_file": bot.identity_file,
+            "enabled_tools": bot.enabled_tools,
+            "proactive_enabled": bot.proactive_enabled,
+            "is_current": bot_id == bot_manager.current_bot_id,
+            "recap": state.current_recap[:200] if state.current_recap else "",
+        }
+    return {
+        "current_bot_id": bot_manager.current_bot_id,
+        "bots": bots_info,
+    }
+
+
+@app.post("/admin/bots/switch")
+async def admin_switch_bot(request: Request):
+    """Switch the active bot."""
+    require_admin(request)
+    body = await request.json()
+    bot_id = str(body.get("bot_id", "")).strip()
+    if not bot_id:
+        raise HTTPException(status_code=400, detail="bot_id required")
+    if bot_id not in bot_manager.bots:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown bot: {bot_id}. Available: {bot_manager.list_bot_ids()}",
+        )
+    bot_manager.set_current_bot(bot_id)
+    # Update runtime settings to persist choice
+    apply_runtime_settings({"bots": {"_current_bot_id": bot_id}})
+    return {
+        "status": "switched",
+        "current_bot_id": bot_id,
+        "bot": {
+            "display_name": bot_manager.current_bot.display_name,
+            "proactive_enabled": bot_manager.current_bot.proactive_enabled,
+        },
+    }
+
+
+@app.get("/admin/recaps")
+async def admin_list_recaps(request: Request, limit: int = 10):
+    """List recent recaps."""
+    require_admin(request)
+    recaps = await memory_store.get_recaps(
+        "", bot_manager.current_bot_id, limit=limit
+    )
+    return {"recaps": recaps}
+
+
+@app.post("/admin/recaps/generate")
+async def admin_trigger_recap(request: Request):
+    """Manually trigger recap generation."""
+    require_admin(request)
+    contact = await memory_store.get_contact_state()
+    user_id = contact.get("user_id", "")
+    if not user_id:
+        raise HTTPException(status_code=400, detail="没有联系人")
+    recap_cfg = cfg.get("recap", {})
+    recap_id = await _generate_recap(
+        user_id, bot_manager.current_bot_id, recap_cfg
+    )
+    if recap_id:
+        return {"status": "generated", "recap_id": recap_id}
+    return {"status": "skipped", "reason": "not enough turns or error"}
+
+
+@app.get("/admin/outbound")
+async def admin_list_outbound(
+    request: Request,
+    turn_id: str = "",
+    status: str = "",
+    limit: int = 50,
+):
+    """List outbound messages with V2.1 semantics."""
+    require_admin(request)
+    messages = await memory_store.get_outbound_messages(
+        turn_id=turn_id,
+        send_status=status or "",
+        limit=limit,
+    )
+    return {"outbound_messages": messages}
+
+
+@app.get("/admin/turns")
+async def admin_list_turns(request: Request, limit: int = 20):
+    """List recent turns (L2) for the current bot."""
+    require_admin(request)
+    contact = await memory_store.get_contact_state()
+    user_id = contact.get("user_id", "")
+    turns = await memory_store.get_recent_turns(
+        user_id, bot_manager.current_bot_id, limit=limit
+    )
+    return {"turns": turns}
+
+
+@app.get("/admin/proactive/candidates")
+async def admin_list_proactive_candidates(request: Request, limit: int = 20):
+    """List recent proactive candidates (V2.1 3-stage pipeline)."""
+    require_admin(request)
+    candidates = await memory_store.get_recent_proactive_candidates(limit=limit)
+    return {"candidates": candidates}
+
+
+@app.get("/admin/shared-facts")
+async def admin_list_shared_facts(request: Request, limit: int = 20):
+    """List shared user facts."""
+    require_admin(request)
+    facts = await memory_store.get_shared_facts(limit=limit)
+    return {"shared_facts": facts}
 
 
 # ================================================================

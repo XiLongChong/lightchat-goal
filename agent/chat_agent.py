@@ -1,37 +1,18 @@
-"""Chat Agent — core conversation handler with all 10 safeguards + V2 features.
-
-Design: JSON output format (emoRebot style), not function calling.
-This is more reliable with DeepSeek than OpenAI-style function calling.
-
-V2 additions:
-  - UnifiedOutputGuard for all user-visible text
-  - Turn ID tracking and diagnostics
-  - Route selection (SystemFastPath / ChatLite / ChatFull)
-  - Context policy (hot_only / hot+cheap / hot+full)
-
-Safeguards implemented:
-  #1 JSON parse fallback → plain text message
-  #2 Max actions per turn (8) + max chars per message (500) + max total chars (2000)
-  #3 Max tool loop iterations (5)
-  #4 Tool whitelist (enforced in tools.py)
-  #5 Low importance memories filtered (enforced in memory_worker.py)
-  #6 Scheduler hard rules before LLM decision (enforced in scheduler.py)
-  #7 Memory Worker is async fire-and-forget (enforced in memory_worker.py)
-  #8 SQLite WAL + write lock (enforced in memory/store.py)
-  #9 Context compaction (enforced in context_builder.py)
-  #10 Test suite (enforced in tests/)
-"""
+from __future__ import annotations
 
 import asyncio
 import logging
 import time
 import uuid
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
-from agent.context_builder import build_system_prompt
+from agent.context_builder import build_system_prompt, build_system_prompt_v21
 from agent.output_guard import guard_single_message, guard_messages
 from agent.tools import execute_tool, TOOL_WHITELIST
 from utils.json_parser import parse_agent_output
+
+if TYPE_CHECKING:
+    from agent.bot_profile import BotProfileManager
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +51,7 @@ class ChatAgent:
         personality: str,
         temperature: float = 0.7,
         defaults: dict[str, Any] | None = None,
+        bot_manager: "BotProfileManager | None" = None,
     ):
         self.client = client
         self.model = model
@@ -77,6 +59,7 @@ class ChatAgent:
         self.personality = personality
         self.temperature = temperature
         self.defaults = defaults or {}
+        self.bot_manager = bot_manager
         self._last_call_time = 0.0
 
     async def chat(
@@ -89,16 +72,18 @@ class ChatAgent:
         trigger: str = "user",
         route: str = "",
         context_policy: str = "",
+        bot_id: str = "",
+        recap: str = "",
     ) -> dict[str, Any]:
         """Process a user message.
 
-        V2: accepts route and context_policy for turn diagnostics.
-        All user-visible text passes through UnifiedOutputGuard.
+        V2.1: accepts bot_id for bot-scoped prompt assembly.
+        When bot_manager is set, uses prompt pack components.
 
         Returns:
             {
-                "messages": [{"text": "...", "delay": 1.0}, ...],
-                "tool_calls": [{"name": "...", "result": "..."}],
+                "messages": [...],
+                "tool_calls": [...],
                 "scheduled_messages": [...],
                 "done": True,
                 "iterations": 2,
@@ -109,22 +94,40 @@ class ChatAgent:
                 "route": "ChatLite",
                 "context_policy": "hot+cheap_memory",
                 "llm_status": "ok",
+                # V2.1
+                "source": "user_reply",
+                "author": "assistant",
+                "trigger": "user_message",
             }
         """
         turn_id = f"turn_{uuid.uuid4().hex[:12]}"
         start_time = time.time()
         llm_status = "ok"
 
-        # Build system prompt
-        system_prompt = build_system_prompt(
-            persona=self.persona,
-            personality=self.personality,
-            memories=memories,
-            relationship=relationship,
-            tool_names=list(TOOL_WHITELIST),
-            trigger=trigger,
-            defaults=self.defaults,
-        )
+        # Build system prompt — V2.1 prompt pack or legacy
+        if self.bot_manager and bot_id:
+            system_prompt = build_system_prompt_v21(
+                bot_manager=self.bot_manager,
+                bot_id=bot_id,
+                relationship=relationship,
+                memories=memories,
+                tool_names=list(TOOL_WHITELIST),
+                trigger=trigger,
+                trigger_content=user_message,
+                defaults=self.defaults,
+                history_summary=history_summary,
+                recap=recap,
+            )
+        else:
+            system_prompt = build_system_prompt(
+                persona=self.persona,
+                personality=self.personality,
+                memories=memories,
+                relationship=relationship,
+                tool_names=list(TOOL_WHITELIST),
+                trigger=trigger,
+                defaults=self.defaults,
+            )
 
         # Assemble messages
         messages: list[dict[str, Any]] = [
@@ -327,6 +330,9 @@ class ChatAgent:
             for m in guard_messages(raw_messages)
         ]
 
+        # V2.1: resolve outbound semantics from trigger
+        source, author, trigger_type = _resolve_outbound_semantics(trigger)
+
         return {
             "messages": final_messages,
             "scheduled_messages": scheduled_messages,
@@ -340,6 +346,10 @@ class ChatAgent:
             "route": route or ROUTE_CHAT_FULL,
             "context_policy": context_policy or CTX_HOT_ONLY,
             "llm_status": llm_status,
+            # V2.1 outbound semantics
+            "source": source,
+            "author": author,
+            "trigger": trigger_type,
         }
 
 
@@ -525,3 +535,30 @@ def _parse_schedule_task(args: dict[str, Any]) -> dict[str, Any] | None:
         "delay_minutes": delay_minutes,
         "messages": messages,
     }
+
+
+# ================================================================
+# V2.1: Outbound message semantics
+# ================================================================
+
+def _resolve_outbound_semantics(trigger: str) -> tuple[str, str, str]:
+    """Resolve source, author, trigger_type from trigger string.
+
+    Per V2.1 design:
+      source: user_reply | fixed_morning | scheduled_reminder | proactive | admin
+      author: assistant   | system
+      trigger: user_message | fixed_time | user_scheduled | proactive_reason | manual_admin
+    """
+    if trigger == "user":
+        return ("user_reply", "assistant", "user_message")
+    elif trigger == "proactive":
+        return ("proactive", "assistant", "proactive_reason")
+    elif trigger == "fixed_morning":
+        return ("fixed_morning", "system", "fixed_time")
+    elif trigger == "fixed_night":
+        return ("fixed_morning", "system", "fixed_time")
+    elif trigger == "scheduled":
+        return ("scheduled_reminder", "system", "user_scheduled")
+    elif trigger == "admin":
+        return ("admin", "system", "manual_admin")
+    return ("user_reply", "assistant", "user_message")

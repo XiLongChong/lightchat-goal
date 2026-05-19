@@ -1,12 +1,16 @@
 """Context assembly with token-aware compaction — Safeguard #9.
 
-Assembles system prompt from persona + memories + relationship + history.
+V2.1: Supports prompt-pack assembly via BotProfileManager.
+Legacy path kept for backward compatibility.
 Triggers compaction when history exceeds configured limits.
 """
 
 import time
 from datetime import datetime
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from agent.bot_profile import BotProfileManager
 
 
 def estimate_tokens(text: str) -> int:
@@ -135,6 +139,37 @@ wechat_reply 是聊天工具，没有理由跳过它。
 5. 不准编造你拥有的能力。你不能直接读项目目录、代码、屏幕或任意文件；只能使用本轮消息、系统上下文和真实工具结果。
 6. 要修改人设时，只能调用 propose_persona_change 提草案，并用 wechat_reply 问辣椒是否确认。"""
     return prompt
+
+
+def build_system_prompt_v21(
+    bot_manager: "BotProfileManager",
+    bot_id: str,
+    relationship: dict[str, Any],
+    memories: list[dict[str, Any]],
+    tool_names: list[str],
+    trigger: str = "user",
+    trigger_content: str = "",
+    defaults: dict[str, Any] | None = None,
+    history_summary: str = "",
+    recap: str = "",
+) -> str:
+    """Build system prompt from bot's prompt pack components.
+
+    V2.1: delegates to BotProfileManager.build_system_prompt,
+    which assembles from base_protocol, bot_identity, relationship_context,
+    memory_policy, tool_policy, and trigger_context components.
+    """
+    return bot_manager.build_system_prompt(
+        bot_id=bot_id,
+        relationship=relationship,
+        memories=memories,
+        tool_names=tool_names,
+        trigger=trigger,
+        trigger_content=trigger_content,
+        defaults=defaults,
+        history_summary=history_summary,
+        recap=recap,
+    )
 
 
 def compact_history(
