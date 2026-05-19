@@ -424,6 +424,83 @@ html[data-theme="dark"] .status-hero {
   background: rgba(255, 255, 255, 0.05);
 }
 
+.usage-panel {
+  display: grid;
+  gap: 14px;
+  margin-top: 16px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.34);
+  padding: 16px;
+}
+
+html[data-theme="dark"] .usage-panel {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.usage-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.usage-head h3 {
+  margin: 0 0 4px;
+  font-size: 18px;
+  line-height: 1.2;
+}
+
+.usage-head p {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.usage-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.usage-card {
+  display: grid;
+  gap: 4px;
+  min-height: 78px;
+  border: 1px solid var(--line);
+  border-radius: var(--small-radius);
+  background: rgba(255, 255, 255, 0.36);
+  padding: 12px;
+}
+
+html[data-theme="dark"] .usage-card {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.usage-card span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.usage-card strong {
+  font-size: 22px;
+  line-height: 1.15;
+}
+
+.fallback-list {
+  display: grid;
+  gap: 8px;
+}
+
+.fallback-item {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.4;
+  padding: 10px 12px;
+}
+
 .status-hero h3 {
   margin: 10px 0 4px;
   font-size: 34px;
@@ -591,6 +668,10 @@ html[data-theme="dark"] .qr-wrap {
 
   .grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .usage-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
   #personaText {

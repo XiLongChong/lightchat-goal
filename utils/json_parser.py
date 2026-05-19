@@ -99,6 +99,7 @@ def parse_agent_output(raw: str) -> dict[str, Any]:
         return {
             "actions": [{"type": "message", "text": text, "delay": 0}],
             "done": True,
+            "_fallback_reason": "invalid_json",
         }
 
     # Ensure required fields exist
@@ -108,6 +109,7 @@ def parse_agent_output(raw: str) -> dict[str, Any]:
         return {
             "actions": [{"type": "message", "text": text, "delay": 0}],
             "done": True,
+            "_fallback_reason": "missing_actions",
         }
 
     return parsed

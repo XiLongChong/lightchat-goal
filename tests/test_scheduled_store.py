@@ -80,3 +80,39 @@ def test_conversation_history_round_trip(tmp_path):
         await store.close()
 
     asyncio.run(run())
+
+
+def test_usage_summary_round_trip(tmp_path):
+    async def run():
+        store = MemoryStore(str(tmp_path / "memory.db"))
+        await store.record_usage_event(
+            event_type="chat_turn",
+            user_id="wxid_me",
+            source="wechat",
+            message_count=3,
+            token_count=120,
+            elapsed_ms=2500,
+        )
+        await store.record_usage_event(
+            event_type="chat_turn",
+            user_id="wxid_me",
+            source="wechat",
+            message_count=2,
+            token_count=80,
+            elapsed_ms=1000,
+            fallback_type="invalid_json",
+            metadata={"detail": "bad json"},
+        )
+
+        summary = await store.get_usage_summary(today_start_ts=0)
+
+        assert summary["today"]["messages"] == 5
+        assert summary["today"]["tokens"] == 200
+        assert summary["today"]["fallbacks"] == 1
+        assert summary["total"]["events"] == 2
+        assert summary["recent_fallbacks"][0]["fallback_type"] == "invalid_json"
+        assert summary["recent_fallbacks"][0]["detail"] == "bad json"
+
+        await store.close()
+
+    asyncio.run(run())
