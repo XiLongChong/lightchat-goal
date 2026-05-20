@@ -235,19 +235,24 @@ class BotProfileManager:
             self._current_bot_id = DEFAULT_BOT_ID
 
     def _create_default_bot(self, bot_cfg: dict[str, Any]) -> BotProfile:
-        """Create default_bot profile from legacy agent config + any bot config overrides."""
-        agent_cfg = self._config.get("agent", {})
+        """Create default_bot profile from legacy agent config + any bot config overrides.
 
-        identity_file = str(
-            bot_cfg.get("identity_file")
-            or bot_cfg.get("persona_file")
-            or "./prompts/bot_identity_default.md"
-        )
+        V2.1.1: default bot identity is now sourced from persona.md.
+        bot_identity_default.md is kept as a compatibility fallback only.
+        """
+        agent_cfg = self._config.get("agent", {})
 
         persona_file = str(
             bot_cfg.get("persona_file")
             or agent_cfg.get("persona_file")
             or "./prompts/persona.md"
+        )
+
+        # V2.1.1: Use persona.md as the primary identity source for default_bot.
+        # bot_identity_default.md is a compatibility fallback.
+        identity_file = str(
+            bot_cfg.get("identity_file")
+            or persona_file  # default to persona.md, not bot_identity_default.md
         )
 
         display_name = str(

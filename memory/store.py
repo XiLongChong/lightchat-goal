@@ -345,6 +345,41 @@ class MemoryStore:
                 updated_at REAL NOT NULL
             )
         """)
+        # V2.1.1: Active topic state (one row per user_id + bot_id)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS active_topics (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                bot_id TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'open',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                last_user_ts REAL NOT NULL DEFAULT 0,
+                last_assistant_ts REAL NOT NULL DEFAULT 0,
+                followup_after_ts REAL NOT NULL DEFAULT 0,
+                expires_at REAL NOT NULL DEFAULT 0,
+                followup_count INTEGER NOT NULL DEFAULT 0,
+                source_turn_id TEXT NOT NULL DEFAULT ''
+            )
+        """)
+        await db.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_active_topics_user_bot
+            ON active_topics(user_id, bot_id)
+        """)
+        # V2.1.1: Proactive schedule state (next-due time tracking)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS proactive_schedule_state (
+                id INTEGER PRIMARY KEY DEFAULT 1,
+                user_id TEXT NOT NULL DEFAULT '',
+                bot_id TEXT NOT NULL DEFAULT '',
+                next_due_ts REAL NOT NULL DEFAULT 0,
+                last_attempt_ts REAL NOT NULL DEFAULT 0,
+                last_sent_ts REAL NOT NULL DEFAULT 0,
+                updated_at REAL NOT NULL DEFAULT 0
+            )
+        """)
         # V2.1: Add bot_id column to existing tables (if not present)
         # Use ALTER TABLE IF NOT EXISTS pattern — SQLite doesn't support
         # conditional column add, so we catch the "duplicate column" error
@@ -1705,6 +1740,226 @@ class MemoryStore:
                 (limit,),
             )
         return [dict(r) for r in rows]
+
+    # ================================================================
+    # V2.1.1: Active topic state
+    # ================================================================
+
+    async def upsert_active_topic(
+        self,
+        user_id: str,
+        bot_id: str,
+        title: str = "",
+        summary: str = "",
+        status: str = "open",
+        followup_after_ts: float = 0,
+        expires_at: float = 0,
+        last_user_ts: float = 0,
+        last_assistant_ts: float = 0,
+        source_turn_id: str = "",
+    ) -> str:
+        """Create or replace the active topic for a user+bot.
+
+        V2.1.1: One row per (user_id, bot_id). New topic replaces old.
+        """
+        import uuid
+        now = time.time()
+        topic_id = f"topic_{uuid.uuid4().hex[:12]}"
+
+        async with self._lock:
+            db = await self._get_db()
+            # Delete existing active topic for this user+bot (single-row model)
+            await db.execute(
+                "DELETE FROM active_topics WHERE user_id = ? AND bot_id = ?",
+                (user_id, bot_id),
+            )
+            await db.execute(
+                """INSERT INTO active_topics
+                   (id, user_id, bot_id, title, summary, status,
+                    created_at, updated_at, last_user_ts, last_assistant_ts,
+                    followup_after_ts, expires_at, followup_count,
+                    source_turn_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)""",
+                (topic_id, user_id, bot_id, title, summary, status,
+                 now, now, last_user_ts, last_assistant_ts,
+                 followup_after_ts, expires_at, source_turn_id),
+            )
+            await db.commit()
+        return topic_id
+
+    async def get_active_topic(
+        self,
+        user_id: str,
+        bot_id: str = "",
+    ) -> dict[str, Any] | None:
+        """Get the current active topic for a user+bot."""
+        db = await self._get_db()
+        rows = await db.execute_fetchall(
+            """SELECT * FROM active_topics
+               WHERE user_id = ? AND bot_id = ?
+               ORDER BY updated_at DESC LIMIT 1""",
+            (user_id, bot_id),
+        )
+        return dict(rows[0]) if rows else None
+
+    async def update_active_topic(
+        self,
+        user_id: str,
+        bot_id: str,
+        title: str | None = None,
+        summary: str | None = None,
+        status: str | None = None,
+        followup_after_ts: float | None = None,
+        expires_at: float | None = None,
+        last_user_ts: float | None = None,
+        last_assistant_ts: float | None = None,
+        source_turn_id: str | None = None,
+    ) -> bool:
+        """Update fields on the current active topic."""
+        now = time.time()
+        async with self._lock:
+            db = await self._get_db()
+            set_parts = ["updated_at = ?"]
+            values: list[Any] = [now]
+            field_map = {
+                "title": title, "summary": summary, "status": status,
+                "followup_after_ts": followup_after_ts,
+                "expires_at": expires_at,
+                "last_user_ts": last_user_ts,
+                "last_assistant_ts": last_assistant_ts,
+                "source_turn_id": source_turn_id,
+            }
+            for field, val in field_map.items():
+                if val is not None:
+                    set_parts.append(f"{field} = ?")
+                    values.append(val)
+            values.extend([user_id, bot_id])
+            cursor = await db.execute(
+                f"UPDATE active_topics SET {', '.join(set_parts)} WHERE user_id = ? AND bot_id = ?",
+                values,
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def close_active_topic(
+        self,
+        user_id: str,
+        bot_id: str,
+        reason: str = "",
+    ) -> bool:
+        """Close the current active topic."""
+        now = time.time()
+        async with self._lock:
+            db = await self._get_db()
+            summary_suffix = f" (closed: {reason})" if reason else " (closed)"
+            cursor = await db.execute(
+                """UPDATE active_topics
+                   SET status = 'closed', updated_at = ?,
+                       summary = summary || ?
+                   WHERE user_id = ? AND bot_id = ?""",
+                (now, summary_suffix[:200], user_id, bot_id),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def mark_active_topic_stale(
+        self,
+        user_id: str,
+        bot_id: str,
+        reason: str = "",
+    ) -> bool:
+        """Mark the current active topic as stale."""
+        now = time.time()
+        async with self._lock:
+            db = await self._get_db()
+            summary_suffix = f" (stale: {reason})" if reason else " (stale)"
+            cursor = await db.execute(
+                """UPDATE active_topics
+                   SET status = 'stale', updated_at = ?,
+                       summary = summary || ?
+                   WHERE user_id = ? AND bot_id = ?""",
+                (now, summary_suffix[:200], user_id, bot_id),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def increment_topic_followup(self, topic_id: str) -> bool:
+        """Increment followup count for a topic."""
+        now = time.time()
+        async with self._lock:
+            db = await self._get_db()
+            cursor = await db.execute(
+                """UPDATE active_topics
+                   SET followup_count = followup_count + 1,
+                       updated_at = ?
+                   WHERE id = ?""",
+                (now, topic_id),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    # ================================================================
+    # V2.1.1: Proactive schedule state (next-due)
+    # ================================================================
+
+    async def get_proactive_schedule_state(
+        self,
+        user_id: str = "",
+        bot_id: str = "",
+    ) -> dict[str, Any]:
+        """Get proactive schedule state for a user+bot."""
+        db = await self._get_db()
+        rows = await db.execute_fetchall(
+            """SELECT * FROM proactive_schedule_state
+               WHERE user_id = ? AND bot_id = ?
+               ORDER BY updated_at DESC LIMIT 1""",
+            (user_id, bot_id),
+        )
+        if rows:
+            return dict(rows[0])
+        return {
+            "next_due_ts": 0,
+            "last_attempt_ts": 0,
+            "last_sent_ts": 0,
+        }
+
+    async def update_proactive_schedule_state(
+        self,
+        user_id: str,
+        bot_id: str,
+        next_due_ts: float | None = None,
+        last_attempt_ts: float | None = None,
+        last_sent_ts: float | None = None,
+    ) -> bool:
+        """Update proactive schedule state."""
+        now = time.time()
+        async with self._lock:
+            db = await self._get_db()
+            # Ensure row exists
+            await db.execute(
+                """INSERT OR IGNORE INTO proactive_schedule_state
+                   (id, user_id, bot_id, updated_at)
+                   VALUES (1, ?, ?, ?)""",
+                (user_id, bot_id, now),
+            )
+            set_parts = ["updated_at = ?"]
+            values: list[Any] = [now]
+            if next_due_ts is not None:
+                set_parts.append("next_due_ts = ?")
+                values.append(next_due_ts)
+            if last_attempt_ts is not None:
+                set_parts.append("last_attempt_ts = ?")
+                values.append(last_attempt_ts)
+            if last_sent_ts is not None:
+                set_parts.append("last_sent_ts = ?")
+                values.append(last_sent_ts)
+            values.extend([user_id, bot_id])
+            await db.execute(
+                f"UPDATE proactive_schedule_state SET {', '.join(set_parts)} WHERE user_id = ? AND bot_id = ?",
+                values,
+            )
+            await db.commit()
+            return True
 
     # ================================================================
     # V2.1: Bot-scoped helpers

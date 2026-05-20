@@ -1,16 +1,27 @@
-"""Proactive messaging scheduler — Safeguard #6.
+"""Proactive messaging scheduler — V2.1.1 due-time + intent model.
 
-Two-phase check:
-  Phase 1: Hard rules (no LLM call) — sleep hours, chat gap, ignore streak
-  Phase 2: LLM decision — only if Phase 1 passes
+V2.1.1 changes:
+  - LLM no longer decides whether to send. Due-time schedule controls it.
+  - Intent selection replaces candidate reason generation.
+  - Only latest eligible topic may be followed up.
+  - Broad memory/recap are NOT passed into proactive generation by default.
 
-Borrowed design from emoRebot scheduler-agent.ts.
+Pipeline stages:
+  1. hard_precheck         — sleep hours, bridge, contact
+  2. due_time_check        — next_due_ts has passed?
+  3. load_latest_topic     — active topic from DB
+  4. select_message_intent — rules-first, LLM fallback
+  5. generate_message      — LLM with intent+constraints
+  6. send_and_record       — send via bridge, record results
+  7. schedule_next_due     — random next due time
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import random as _random
+import time as _time_module
 from datetime import datetime, timezone, timedelta
 from typing import Any, TYPE_CHECKING
 
@@ -22,76 +33,71 @@ logger = logging.getLogger(__name__)
 # Timezone for Chinese users
 CST = timezone(timedelta(hours=8))
 
+# ---- V2.1.1 Prompts ----
 
-SCHEDULER_PROMPT = """你是一个消息调度器。判断现在是否应该主动给用户发一条消息。
+INTENT_SELECTION_PROMPT = """你是一个消息调度器。选择一条主动消息的意图类型。
 
-## 背景
-当前的日期时间、天气、用户状态等信息如下。用户在微信上和你聊天。
-现在用户没有发消息给你，是你在考虑要不要主动发消息。
+当前时间: {now_str}
+活跃话题: {topic_text}
+话题状态: {topic_status}
+已跟进次数: {followup_count}
 
-## 规则
-1. 如果你觉得用户需要安静（深夜、可能在工作、最近对话很少），就不要发
-2. 如果你有有趣的事可以说（天气变化、用户之前提过的事、一个话题），可以发
-3. 消息要短而自然，像朋友随口提起，不要刻意
-4. 如果不确定，选择不发
+可选意图类型：
+- check_in: 简短问候，如"在干嘛""醒了没"
+- latest_topic_followup: 跟进当前活跃话题（仅当话题存在且未关闭/stale/answered时可用）
+- self_share: 分享一个小想法、观察、笑话或随意话题
+- light_ping: 无话题时的极简短轻量 ping
+
+规则：
+- 如果有活跃话题且状态是 open/waiting_user_result，优先选择 latest_topic_followup
+- 如果话题不存在、已关闭、stale 或 answered，不要选 latest_topic_followup
+- 如果没有话题，选 check_in、self_share 或 light_ping
+- 不要提及旧话题、recap 内容或系统状态
 
 ## 输出格式
-{"should_message": false, "message": "", "emotion": "neutral", "reason": ""}
+{{"intent": "check_in", "reason": ""}}"""
 
-## 上下文
-{context}"""
+MESSAGE_GENERATION_PROMPT = """你是一个主动消息生成器。用户是辣椒。
 
-# V2.1: 3-stage proactive pipeline prompt
-CANDIDATE_PROMPT = """你是一个消息调度器。判断现在是否有理由主动给用户发消息。
+根据意图类型生成一条主动消息。
 
-不生成消息内容，只生成候选原因（candidate reason）。
-
-候选原因类型：
-- special_date: 今天是特殊日期（节假日、纪念日等）
-- unfinished_topic: 上次/昨晚的话题没有结束
-- project_push: 用户正在积极推进某个项目
-- long_silence: 用户沉默了很长时间
-- user_reminder: 用户之前明确留了提醒或约定
-- none: 没有任何值得发消息的理由
+## 意图
+类型: {intent}
+理由: {reason}
 
 ## 上下文
 当前时间: {now_str}
-最近对话摘要: {recap_text}
-用户最近记忆: {memories_text}
-距离上次对话: {chat_gap}
-今日已主动发: {proactive_today}
-
-## 输出格式
-{{"reason_type": "none", "reason_detail": "", "confidence": 0.0}}
-
-如果reason_type是"none"，confidence必须为0。"""
-
-GENERATION_PROMPT = """你是一个主动消息生成器。用户是辣椒。
-
-根据候选原因生成一条主动消息。
-
-## 候选原因
-类型: {reason_type}
-详情: {reason_detail}
-
-## 上下文
-当前时间: {now_str}
-关系状态: {rel_text}
-最近记忆: {memories_text}
+活跃话题: {topic_text}
+关系熟悉度: {familiarity}/10
 
 ## 规则
 - 自然简短，像微信朋友随口提起
-- 不要提"系统/调度/自动/候选原因"这些词
+- 不要提"系统/调度/自动/意图/主动/话题状态/proactive"这些词
 - 不要当成用户说过的话来回复
+- 不要说"你刚才说/你问我/你不是要"等
+- {intent_rules}
 - 50字以内
-- 可以不发（输出空消息）
 
 ## 输出格式
 {{"message": "", "emotion": "neutral"}}"""
 
+INTENT_RULES = {
+    "check_in": "简单打招呼或问在做什么，像朋友随口问一句",
+    "latest_topic_followup": "跟进上面活跃话题的最新状态。不要重复话题历史，只问最新进展。不超过2次跟进",
+    "self_share": "分享一个无害的小想法、观察、笑话或闲聊话题。不要声称你做了真人才能做的事。不要用旧话题",
+    "light_ping": "极短、低压力，一句话以内。用户不回也没关系",
+}
+
+FALLBACK_MESSAGES = {
+    "check_in": "在干嘛",
+    "latest_topic_followup": "后来呢",
+    "self_share": "突然想问你个事",
+    "light_ping": "嗯",
+}
+
 
 class SchedulerAgent:
-    """Periodic proactive messaging agent."""
+    """Periodic proactive messaging agent — V2.1.1 due-time model."""
 
     def __init__(
         self,
@@ -107,68 +113,43 @@ class SchedulerAgent:
         cfg = config or {}
         self.sleep_start = cfg.get("sleep_start", 0)
         self.sleep_end = cfg.get("sleep_end", 7)
-        self.min_chat_gap_hours = cfg.get("min_chat_gap_hours", 2)
         self.max_ignored_streak = cfg.get("max_ignored_streak", 3)
         self.max_daily = cfg.get("max_daily_proactive", 5)
-        self.min_interval = cfg.get("min_proactive_interval", 90)
+
+        # V2.1.1 proactive config
+        pro_cfg = cfg.get("proactive", {})
+        timing = pro_cfg.get("timing", {})
+        self.min_interval = timing.get("min_interval_minutes", 30)
+        self.max_interval = timing.get("max_interval_minutes", 60)
+        gen_cfg = pro_cfg.get("generation", {})
+        self.enabled_types = gen_cfg.get("enabled_types",
+            ["check_in", "latest_topic_followup", "self_share", "light_ping"])
+        self.latest_topic_only = gen_cfg.get("latest_topic_only", True)
+        self.allow_llm_skip = gen_cfg.get("allow_llm_skip", False)
+        topic_cfg = pro_cfg.get("topic", {})
+        self.followup_max = topic_cfg.get("followup_max_count", 2)
+        self.topic_expire_minutes = topic_cfg.get("default_expire_minutes", 240)
+
+    # ================================================================
+    # Legacy compatibility (kept for existing callers)
+    # ================================================================
 
     async def should_proactive_message(
         self,
         recent_memories: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """Check if we should send a proactive message.
-
-        Returns:
-            {"should_message": bool, "message": str, "emotion": str, "reason": str}
-        """
-        # ---- Phase 1: Hard rules (no LLM call) ----
-        now_cst = datetime.now(CST)
-        hour = now_cst.hour
-
-        # Sleep hours check
-        if self.sleep_start < self.sleep_end:
-            # Normal range: e.g. 0-7
-            if self.sleep_start <= hour < self.sleep_end:
-                return self._deny("sleep hours")
-        else:
-            # Wraps around midnight: e.g. 23-7
-            if hour >= self.sleep_start or hour < self.sleep_end:
-                return self._deny("sleep hours")
-
-        # Scheduler state from DB
-        state = await self.store.get_scheduler_state()
-        last_chat = state.get("last_chat_time", 0)
-        last_proactive = state.get("last_proactive_time", 0)
-        ignored = state.get("consecutive_ignored", 0)
-        msgs_today = state.get("messages_today", 0)
-
-        # Min chat gap: don't interrupt recent conversation
-        from time import time
-        if last_chat > 0:
-            hours_since_chat = (time() - last_chat) / 3600
-            if hours_since_chat < self.min_chat_gap_hours:
-                return self._deny(f"chat too recent ({hours_since_chat:.1f}h ago)")
-
-        # Ignored streak: user hasn't responded to our proactive messages
-        if ignored >= self.max_ignored_streak:
-            return self._deny(f"ignored {ignored} times in a row")
-
-        # Daily cap
-        if msgs_today >= self.max_daily:
-            return self._deny(f"daily cap reached ({msgs_today}/{self.max_daily})")
-
-        # Min interval between proactive messages
-        if last_proactive > 0:
-            mins_since_last = (time() - last_proactive) / 60
-            if mins_since_last < self.min_interval:
-                return self._deny(f"too soon ({mins_since_last:.0f}m ago)")
-
-        # ---- Phase 2: LLM decision ----
-        try:
-            return await self._llm_decide(now_cst, recent_memories, state)
-        except Exception as e:
-            logger.warning(f"Scheduler LLM call failed: {e}")
-            return self._deny(f"LLM error: {e}")
+        """Legacy path — delegates to V2.1.1 pipeline."""
+        result = await self.run_proactive_pipeline(
+            recent_memories=recent_memories,
+        )
+        if result.get("sent"):
+            return {
+                "should_message": True,
+                "message": result.get("message", ""),
+                "emotion": result.get("emotion", "neutral"),
+                "reason": result.get("reason", ""),
+            }
+        return self._deny(result.get("reason", "unknown"))
 
     def _deny(self, reason: str) -> dict[str, Any]:
         return {
@@ -178,101 +159,8 @@ class SchedulerAgent:
             "reason": reason,
         }
 
-    async def _llm_decide(
-        self,
-        now_cst: datetime,
-        recent_memories: list[dict[str, Any]] | None,
-        state: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Phase 2: Ask LLM to decide if we should message."""
-        import time as time_module
-
-        now_str = now_cst.strftime("%Y年%m月%d日 %H:%M 周%u")
-
-        memories_text = "无"
-        if recent_memories:
-            lines = []
-            for m in recent_memories[:5]:
-                lines.append(f"- {m.get('content', '')}")
-            memories_text = "\n".join(lines)
-
-        context = f"""当前时间: {now_str}
-用户最近相关的记忆:
-{memories_text}
-今日已主动发消息: {state.get('messages_today', 0)}/{self.max_daily} 条
-连续被用户忽略: {state.get('consecutive_ignored', 0)} 次"""
-
-        prompt = SCHEDULER_PROMPT.format(context=context)
-
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": "你是一个消息调度器。只输出JSON。"},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.5,
-            max_tokens=256,
-        )
-
-        raw = response.choices[0].message.content or ""
-
-        import json
-        from utils.json_parser import extract_json
-
-        try:
-            json_str = extract_json(raw)
-            result = json.loads(json_str)
-        except (json.JSONDecodeError, ValueError):
-            return self._deny("JSON parse failed (fallback: don't send)")
-
-        should_send = result.get("should_message", False)
-        if not isinstance(should_send, bool):
-            should_send = False
-
-        message = str(result.get("message", ""))[:200]
-        emotion = str(result.get("emotion", "neutral"))[:20]
-        reason = str(result.get("reason", ""))[:100]
-
-        # Additional safety: refuse empty messages
-        if should_send and not message.strip():
-            should_send = False
-            reason = "empty message refused"
-
-        return {
-            "should_message": should_send,
-            "message": message,
-            "emotion": emotion,
-            "reason": reason,
-        }
-
-    async def record_sent(self):
-        """Call after successfully sending a proactive message."""
-        from time import time
-
-        state = await self.store.get_scheduler_state()
-        await self.store.update_scheduler_state({
-            "messages_today": state.get("messages_today", 0) + 1,
-            "last_proactive_time": time(),
-            "consecutive_ignored": 0,
-        })
-
-    async def record_chat_activity(self):
-        """Call when user sends a message (resets ignore counter)."""
-        from time import time
-
-        await self.store.update_scheduler_state({
-            "last_chat_time": time(),
-            "consecutive_ignored": 0,
-        })
-
-    async def reset_daily_counter(self):
-        """Reset the daily message counter. Call at midnight."""
-        await self.store.update_scheduler_state({
-            "messages_today": 0,
-        })
-
     # ================================================================
-    # V2.1: 3-stage proactive pipeline
+    # V2.1.1: Due-time + intent proactive pipeline
     # ================================================================
 
     async def run_proactive_pipeline(
@@ -282,296 +170,261 @@ class SchedulerAgent:
         bot_id: str = "",
         prerequisites: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """V2.1 3-stage proactive pipeline.
+        """V2.1.1 pipeline: due-time check → intent → generate → send.
 
-        Stage 1: Candidate reason generation
-        Stage 2: Decision gate
-        Stage 3: Message generation (only if gate passes)
-
-        prerequisites dict keys (all checked before any LLM call):
-            bot_active: bool
-            proactive_enabled: bool
-            bridge_available: bool
-            valid_contact: bool
+        No LLM "should send" decision. The scheduler guarantees one attempt
+        after the random due time passes, unless hard blocks apply.
 
         Returns:
-            {"sent": bool, "message": str, "reason_type": str,
-             "reason_detail": str, "stage": str}
+            {"sent": bool, "message": str, "intent": str,
+             "reason": str, "stage": str}
         """
-        from time import time as time_module
+        import time as time_module
 
         now_cst = datetime.now(CST)
         now_ts = time_module()
 
-        # ---- Deployment pre-check (before any LLM call) ----
+        # ---- Stage 1: hard_precheck ----
         prereq = prerequisites or {}
         if not prereq.get("bot_active", True):
-            return self._pipeline_result(
-                False, "bot is not the active/deployed bot", stage="pre_check"
-            )
+            return self._result(False, "bot not active", stage="pre_check")
         if not prereq.get("proactive_enabled", True):
-            return self._pipeline_result(
-                False, "proactive messaging disabled for this bot", stage="pre_check"
-            )
+            return self._result(False, "proactive disabled", stage="pre_check")
         if not prereq.get("bridge_available", True):
-            return self._pipeline_result(
-                False, "WeChat bridge unavailable", stage="pre_check"
-            )
+            return self._result(False, "bridge unavailable", stage="pre_check")
         if not prereq.get("valid_contact", True):
-            return self._pipeline_result(
-                False, "no valid contact target", stage="pre_check"
-            )
+            return self._result(False, "no contact", stage="pre_check")
 
-        # ---- Hard pre-check (before any LLM call) ----
         hour = now_cst.hour
         if self.sleep_start < self.sleep_end:
             if self.sleep_start <= hour < self.sleep_end:
-                return self._pipeline_result(
-                    False, "sleep hours", stage="pre_check"
-                )
+                return self._result(False, "sleep hours", stage="pre_check")
         else:
             if hour >= self.sleep_start or hour < self.sleep_end:
-                return self._pipeline_result(
-                    False, "sleep hours", stage="pre_check"
-                )
+                return self._result(False, "sleep hours", stage="pre_check")
 
-        state = await self.store.get_scheduler_state()
-        last_chat = state.get("last_chat_time", 0)
-        last_proactive = state.get("last_proactive_time", 0)
-        ignored = state.get("consecutive_ignored", 0)
-        msgs_today = state.get("messages_today", 0)
+        # Daily cap
+        today_start = datetime.combine(
+            now_cst.date(),
+            datetime.min.time(),
+            tzinfo=CST,
+        ).timestamp()
+        sent_today = await self.store.count_today_proactive_sent(today_start)
+        if sent_today >= self.max_daily:
+            return self._result(False, f"daily cap ({sent_today}/{self.max_daily})", stage="pre_check")
 
-        if last_chat > 0:
-            hours_since_chat = (now_ts - last_chat) / 3600
-            if hours_since_chat < self.min_chat_gap_hours:
-                return self._pipeline_result(
-                    False, f"chat too recent ({hours_since_chat:.1f}h)",
-                    stage="pre_check"
-                )
+        # ---- Stage 2: due_time_check ----
+        user_id = prereq.get("user_id", "")
+        sched_state = await self.store.get_proactive_schedule_state(
+            user_id=user_id, bot_id=bot_id,
+        )
+        next_due = sched_state.get("next_due_ts", 0)
 
-        if ignored >= self.max_ignored_streak:
-            return self._pipeline_result(
-                False, f"ignored {ignored} times in a row",
-                stage="pre_check"
+        if next_due == 0:
+            # First time — schedule initial due time
+            next_due = self._random_next_due(now_ts)
+            await self.store.update_proactive_schedule_state(
+                user_id=user_id, bot_id=bot_id,
+                next_due_ts=next_due,
             )
+            return self._result(False, f"initial due scheduled ({next_due - now_ts:.0f}s)", stage="due_time")
 
-        if msgs_today >= self.max_daily:
-            return self._pipeline_result(
-                False, f"daily cap ({msgs_today}/{self.max_daily})",
-                stage="pre_check"
-            )
+        if now_ts < next_due:
+            remaining = next_due - now_ts
+            return self._result(False, f"not yet due ({remaining:.0f}s remaining)", stage="due_time")
 
-        if last_proactive > 0:
-            mins_since = (now_ts - last_proactive) / 60
-            if mins_since < self.min_interval:
-                return self._pipeline_result(
-                    False, f"too soon ({mins_since:.0f}m ago)",
-                    stage="pre_check"
-                )
+        # Due time has passed — proceed
+        await self.store.update_proactive_schedule_state(
+            user_id=user_id, bot_id=bot_id,
+            last_attempt_ts=now_ts,
+        )
 
-        # ---- Stage 1: Candidate reason generation ----
+        # ---- Stage 3: load_latest_topic ----
+        topic = await self.store.get_active_topic(user_id, bot_id)
+        topic_eligible = self._topic_is_eligible(topic)
+        topic_text = self._format_topic(topic) if topic_eligible else "无活跃话题"
+        topic_status = topic.get("status", "none") if topic else "none"
+
+        # ---- Stage 4: select_message_intent ----
+        intent = "check_in"
+        intent_reason = ""
         try:
-            candidate = await self._generate_candidates(
-                now_cst, recent_memories, recap_text, state
+            intent, intent_reason = await self._select_intent(
+                now_cst, topic_eligible, topic, topic_text, topic_status
             )
         except Exception as e:
-            logger.warning(f"Stage 1 candidate generation failed: {e}")
-            return self._pipeline_result(
-                False, f"candidate error: {e}", stage="stage1"
-            )
+            logger.warning(f"Intent selection failed, using check_in fallback: {e}")
 
+        if intent == "latest_topic_followup" and not topic_eligible:
+            intent = "check_in"
+            intent_reason = "topic not eligible, fell back to check_in"
+
+        if intent not in self.enabled_types:
+            intent = "check_in"
+
+        # ---- Stage 5: generate_message ----
+        message = ""
+        emotion = "neutral"
+        try:
+            gen = await self._generate_message(
+                now_cst, intent, intent_reason, topic_text,
+                topic.get("followup_count", 0) if topic else 0,
+            )
+            message = gen.get("message", "").strip()[:200]
+            emotion = gen.get("emotion", "neutral")
+        except Exception as e:
+            logger.warning(f"Message generation failed: {e}")
+
+        if not message:
+            message = FALLBACK_MESSAGES.get(intent, "在干嘛")
+
+        # ---- Stage 6: send_and_record ----
+        # Record candidate for observability
         candidate_id = ""
         try:
             candidate_id = await self.store.create_proactive_candidate(
-                reason_type=candidate.get("reason_type", "none"),
-                reason_detail=candidate.get("reason_detail", ""),
+                reason_type=intent,
+                reason_detail=intent_reason,
             )
         except Exception as e:
             logger.warning(f"Failed to persist candidate: {e}")
-
-        reason_type = candidate.get("reason_type", "none")
-        if reason_type == "none":
-            return self._pipeline_result(
-                False, "no candidate reason", stage="stage1",
-                candidate_id=candidate_id,
-            )
-
-        # ---- Stage 2: Decision gate ----
-        gate_result = self._decision_gate(
-            reason_type=reason_type,
-            reason_detail=candidate.get("reason_detail", ""),
-            state=state,
-        )
-        if not gate_result["pass"]:
-            if candidate_id:
-                await self.store.update_proactive_candidate(
-                    candidate_id,
-                    passed_gate=False,
-                    gate_detail=gate_result["reason"],
-                )
-            return self._pipeline_result(
-                False, gate_result["reason"], stage="stage2",
-                reason_type=reason_type,
-                candidate_id=candidate_id,
-            )
 
         if candidate_id:
             await self.store.update_proactive_candidate(
                 candidate_id,
                 passed_gate=True,
-                gate_detail="passed",
-            )
-
-        # ---- Stage 3: Message generation ----
-        try:
-            gen_result = await self._generate_proactive_message(
-                now_cst,
-                reason_type=reason_type,
-                reason_detail=candidate.get("reason_detail", ""),
-                recent_memories=recent_memories,
-            )
-        except Exception as e:
-            logger.warning(f"Stage 3 message generation failed: {e}")
-            return self._pipeline_result(
-                False, f"generation error: {e}", stage="stage3",
-                reason_type=reason_type,
-                candidate_id=candidate_id,
-            )
-
-        message = gen_result.get("message", "").strip()[:200]
-        emotion = gen_result.get("emotion", "neutral")
-
-        if not message:
-            return self._pipeline_result(
-                False, "empty message refused", stage="stage3",
-                reason_type=reason_type,
-                candidate_id=candidate_id,
-            )
-
-        if candidate_id:
-            await self.store.update_proactive_candidate(
-                candidate_id,
+                gate_detail="v2.1.1 due-time",
                 generated_message=message,
             )
+
+        # Increment followup count if applicable
+        if intent == "latest_topic_followup" and topic:
+            await self.store.increment_topic_followup(topic.get("id", ""))
+
+        # ---- Stage 7: schedule_next_due ----
+        next_due = self._random_next_due(now_ts)
+        await self.store.update_proactive_schedule_state(
+            user_id=user_id, bot_id=bot_id,
+            next_due_ts=next_due,
+            last_sent_ts=now_ts,
+        )
 
         return {
             "sent": True,
             "message": message,
             "emotion": emotion,
-            "reason": f"{reason_type}: {candidate.get('reason_detail', '')}",
-            "reason_type": reason_type,
-            "reason_detail": candidate.get("reason_detail", ""),
+            "reason": f"{intent}: {intent_reason}",
+            "intent": intent,
+            "intent_reason": intent_reason,
             "candidate_id": candidate_id,
             "stage": "completed",
         }
 
-    async def _generate_candidates(
+    def _topic_is_eligible(self, topic: dict[str, Any] | None) -> bool:
+        """Check if a topic is eligible for follow-up."""
+        if not topic:
+            return False
+        status = topic.get("status", "")
+        if status in ("closed", "stale", "answered"):
+            return False
+        # Check followup cap
+        count = topic.get("followup_count", 0)
+        if count >= self.followup_max:
+            return False
+        # Check expiration
+        expires = topic.get("expires_at", 0)
+        if expires > 0 and _time_module.time() > expires:
+            return False
+        return True
+
+    @staticmethod
+    def _format_topic(topic: dict[str, Any]) -> str:
+        if not topic:
+            return ""
+        title = topic.get("title", "")
+        summary = topic.get("summary", "")
+        status = topic.get("status", "")
+        parts = [f"[{status}] {title}"]
+        if summary:
+            parts.append(f"摘要: {summary[:120]}")
+        return "\n".join(parts)
+
+    async def _select_intent(
         self,
         now_cst: datetime,
-        recent_memories: list[dict[str, Any]] | None,
-        recap_text: str,
-        state: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Stage 1: Generate candidate reasons for proactive messaging."""
-        from time import time as time_module
+        topic_eligible: bool,
+        topic: dict[str, Any] | None,
+        topic_text: str,
+        topic_status: str,
+    ) -> tuple[str, str]:
+        """Select intent — rules-first, optional LLM refinement."""
+        import time as time_module
 
         now_str = now_cst.strftime("%Y年%m月%d日 %H:%M 周%u")
+        followup_count = topic.get("followup_count", 0) if topic else 0
 
-        memories_text = "无"
-        if recent_memories:
-            lines = [f"- {m.get('content', '')}" for m in recent_memories[:5]]
-            memories_text = "\n".join(lines)
+        # Rule-first: if eligible topic exists, prefer followup
+        if topic_eligible and "latest_topic_followup" in self.enabled_types:
+            return ("latest_topic_followup", "eligible topic exists")
 
-        last_chat = state.get("last_chat_time", 0)
-        if last_chat > 0:
-            hours = (time_module() - last_chat) / 3600
-            chat_gap = f"{hours:.1f}小时"
-        else:
-            chat_gap = "从未聊过"
-
-        proactive_today = state.get("messages_today", 0)
-
-        prompt = CANDIDATE_PROMPT.format(
+        prompt = INTENT_SELECTION_PROMPT.format(
             now_str=now_str,
-            recap_text=recap_text or "无",
-            memories_text=memories_text,
-            chat_gap=chat_gap,
-            proactive_today=proactive_today,
+            topic_text=topic_text,
+            topic_status=topic_status,
+            followup_count=followup_count,
         )
-
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": "你是一个消息调度器。只输出JSON。"},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.4,
-            max_tokens=256,
-        )
-
-        raw = response.choices[0].message.content or ""
-
-        import json
-        from utils.json_parser import extract_json
 
         try:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "你是一个消息调度器。只输出JSON。"},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.4,
+                max_tokens=128,
+            )
+            raw = response.choices[0].message.content or ""
+
+            import json
+            from utils.json_parser import extract_json
             json_str = extract_json(raw)
             result = json.loads(json_str)
-            return {
-                "reason_type": str(result.get("reason_type", "none")),
-                "reason_detail": str(result.get("reason_detail", "")),
-                "confidence": float(result.get("confidence", 0)),
-            }
-        except (json.JSONDecodeError, ValueError):
-            return {"reason_type": "none", "reason_detail": "", "confidence": 0.0}
+            intent = str(result.get("intent", "check_in"))
+            reason = str(result.get("reason", ""))
+            if intent in self.enabled_types:
+                return (intent, reason)
+        except Exception as e:
+            logger.debug(f"LLM intent selection failed: {e}")
 
-    def _decision_gate(
-        self,
-        reason_type: str,
-        reason_detail: str,
-        state: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Stage 2: Decision gate — check whether to proceed.
+        # Fallback: pick first non-followup enabled type
+        fallback = "check_in"
+        for t in self.enabled_types:
+            if t != "latest_topic_followup":
+                fallback = t
+                break
+        return (fallback, "intent selection fallback")
 
-        Pure logic, no LLM call. Returns {"pass": bool, "reason": str}.
-        """
-        # Check reason_type is valid
-        valid_reasons = {
-            "special_date", "unfinished_topic", "project_push",
-            "long_silence", "user_reminder", "morning_greeting",
-        }
-        if reason_type not in valid_reasons:
-            return {"pass": False, "reason": f"invalid reason_type: {reason_type}"}
-
-        # Check reason_detail is concrete enough (at least 3 chars)
-        if len(reason_detail.strip()) < 3:
-            return {"pass": False, "reason": "reason_detail too vague"}
-
-        # All other checks already done in pre_check
-        return {"pass": True, "reason": "ok"}
-
-    async def _generate_proactive_message(
+    async def _generate_message(
         self,
         now_cst: datetime,
-        reason_type: str,
-        reason_detail: str,
-        recent_memories: list[dict[str, Any]] | None,
+        intent: str,
+        intent_reason: str,
+        topic_text: str,
+        followup_count: int = 0,
     ) -> dict[str, Any]:
-        """Stage 3: Generate the actual proactive message text."""
+        """Generate message text for the selected intent."""
         now_str = now_cst.strftime("%Y年%m月%d日 %H:%M 周%u")
-        rel_text = "熟悉度: 5/10 | 氛围: neutral"
+        intent_rules = INTENT_RULES.get(intent, "自然简短的消息")
+        familiarity = 5  # Default
 
-        memories_text = "无"
-        if recent_memories:
-            lines = [f"- {m.get('content', '')}" for m in recent_memories[:3]]
-            memories_text = "\n".join(lines)
-
-        prompt = GENERATION_PROMPT.format(
-            reason_type=reason_type,
-            reason_detail=reason_detail,
+        prompt = MESSAGE_GENERATION_PROMPT.format(
+            intent=intent,
+            reason=intent_reason,
             now_str=now_str,
-            rel_text=rel_text,
-            memories_text=memories_text,
+            topic_text=topic_text,
+            familiarity=familiarity,
+            intent_rules=intent_rules,
         )
 
         response = await self.client.chat.completions.create(
@@ -599,25 +452,53 @@ class SchedulerAgent:
         except (json.JSONDecodeError, ValueError):
             return {"message": "", "emotion": "neutral"}
 
+    def _random_next_due(self, now_ts: float) -> float:
+        """Compute random next due time within configured range."""
+        min_secs = max(1, self.min_interval) * 60
+        max_secs = max(min_secs + 1, self.max_interval * 60)
+        delay = _random.uniform(min_secs, max_secs)
+        return now_ts + delay
+
+    # ================================================================
+    # Record keeping
+    # ================================================================
+
+    async def record_sent(self):
+        """Call after successfully sending a proactive message."""
+        import time as time_module
+        now = time_module()
+        state = await self.store.get_scheduler_state()
+        await self.store.update_scheduler_state({
+            "messages_today": state.get("messages_today", 0) + 1,
+            "last_proactive_time": now,
+            "consecutive_ignored": 0,
+        })
+
+    async def record_chat_activity(self):
+        """Call when user sends a message (resets ignore counter)."""
+        import time as time_module
+        await self.store.update_scheduler_state({
+            "last_chat_time": time_module(),
+            "consecutive_ignored": 0,
+        })
+
+    async def reset_daily_counter(self):
+        """Reset the daily message counter. Call at midnight."""
+        await self.store.update_scheduler_state({"messages_today": 0})
+
     async def record_proactive_sent(self, candidate_id: str):
         """Mark a proactive candidate as sent."""
         await self.store.update_proactive_candidate(candidate_id, sent=True)
         await self.record_sent()
 
     @staticmethod
-    def _pipeline_result(
-        sent: bool,
-        reason: str,
-        stage: str = "",
-        reason_type: str = "",
-        candidate_id: str = "",
-    ) -> dict[str, Any]:
+    def _result(sent: bool, reason: str, stage: str = "", intent: str = "") -> dict[str, Any]:
         return {
             "sent": sent,
             "message": "",
             "emotion": "neutral",
             "reason": reason,
-            "reason_type": reason_type,
-            "candidate_id": candidate_id,
+            "intent": intent,
+            "candidate_id": "",
             "stage": stage,
         }

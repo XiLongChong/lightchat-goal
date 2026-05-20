@@ -1,6 +1,8 @@
 # ============================================================
-# Goal Chat Agent — Configuration
+# Goal Chat Agent — Configuration  (V2.1.1)
 # ============================================================
+
+version: "2.1.1"
 
 model:
   provider: deepseek
@@ -96,39 +98,33 @@ wechat:
 # ---- Scheduler ----
 scheduler:
   enabled: true
-  interval_minutes: 30          # 检查间隔
-  scheduled_check_seconds: 10    # 到期定时消息检查间隔
-  sleep_start: 0                # 免打扰开始（时）
-  sleep_end: 7                  # 免打扰结束（时）
-  min_chat_gap_hours: 2         # 距离上次对话少于此时不打扰
-  max_ignored_streak: 3         # 连续被忽略次数上限
-  max_daily_proactive: 5        # 每天最多主动发几条
-  min_proactive_interval: 90    # 两次主动消息间隔（分钟）
+  interval_minutes: 3             # 检查间隔（频繁检查 due_time）
+  scheduled_check_seconds: 10     # 到期定时消息检查间隔
+  sleep_start: 0                  # 免打扰开始（时）
+  sleep_end: 7                    # 免打扰结束（时）
+  max_daily_proactive: 5          # 每天最多主动发几条
+  max_ignored_streak: 3           # 连续被忽略次数上限
 
-# ---- Proactive 3-stage (V2.1) ---------------------------------------
+# ---- Proactive (V2.1.1 due-time + intent model) ---------------------
+# LLM no longer decides whether to send. Scheduler uses random due-time.
 proactive:
-  # Stage 1: Candidate reason generation
-  candidate_reasons:
-    - special_date          # today is a special date
-    - unfinished_topic      # last night/week topic unfinished
-    - project_push          # user is actively pushing a project
-    - morning_greeting      # fixed morning message
-    - long_silence          # user has been silent for a long time
-    - user_reminder         # user explicitly set a reminder/agreement
-  # Stage 2: Decision gate
-  decision_gate:
-    require_active_bot: true
-    require_bridge_available: true
-    require_valid_contact: true
-    max_daily: 5
-    min_gap_minutes: 90
-    check_previous_ignored: true
-    check_quiet_hours: true
-    check_concrete_reason: true
-  # Stage 3: Message generation
-  message_generation:
-    max_length_chars: 200
-    style: "natural_wechat"
+  timing:
+    mode: random_interval
+    min_interval_minutes: 30
+    max_interval_minutes: 60
+  generation:
+    enabled_types:
+      - check_in
+      - latest_topic_followup
+      - self_share
+      - light_ping
+    latest_topic_only: true
+    allow_llm_skip: false
+  topic:
+    followup_max_count: 2
+    default_expire_minutes: 240
+    meal_followup_min_minutes: 40
+    meal_followup_max_minutes: 90
 
 # ---- Outbound message semantics (V2.1) -------------------------------
 # Every outbound message carries source/author/trigger/visible/send_status

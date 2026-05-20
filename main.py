@@ -13,6 +13,7 @@ Single process, single SQLite file, zero cloud dependencies.
 
 import asyncio
 import io
+import random
 import secrets
 import uuid
 import zipfile
@@ -265,6 +266,23 @@ scheduler_agent = SchedulerAgent(
     config=cfg.get("scheduler"),
 )
 
+# V2.1.1: Inject proactive timing config
+_pro_cfg = cfg.get("proactive", {})
+_timing = _pro_cfg.get("timing", {})
+if _timing:
+    scheduler_agent.min_interval = _timing.get("min_interval_minutes", 30)
+    scheduler_agent.max_interval = _timing.get("max_interval_minutes", 60)
+_gen_cfg = _pro_cfg.get("generation", {})
+if _gen_cfg:
+    scheduler_agent.enabled_types = _gen_cfg.get("enabled_types",
+        ["check_in", "latest_topic_followup", "self_share", "light_ping"])
+    scheduler_agent.latest_topic_only = _gen_cfg.get("latest_topic_only", True)
+    scheduler_agent.allow_llm_skip = _gen_cfg.get("allow_llm_skip", False)
+_topic_cfg = _pro_cfg.get("topic", {})
+if _topic_cfg:
+    scheduler_agent.followup_max = _topic_cfg.get("followup_max_count", 2)
+    scheduler_agent.topic_expire_minutes = _topic_cfg.get("default_expire_minutes", 240)
+
 scheduler = AsyncIOScheduler()
 
 # WeChat iLink bridge (lazy start if config.enabled)
@@ -454,13 +472,17 @@ def public_settings() -> dict:
     return {
         "scheduler": {
             "enabled": cfg.get("scheduler", {}).get("enabled", True),
-            "interval_minutes": cfg.get("scheduler", {}).get("interval_minutes", 30),
+            "interval_minutes": cfg.get("scheduler", {}).get("interval_minutes", 3),
             "scheduled_check_seconds": cfg.get("scheduler", {}).get("scheduled_check_seconds", 10),
             "sleep_start": cfg.get("scheduler", {}).get("sleep_start", 0),
             "sleep_end": cfg.get("scheduler", {}).get("sleep_end", 7),
-            "min_chat_gap_hours": cfg.get("scheduler", {}).get("min_chat_gap_hours", 2),
             "max_daily_proactive": cfg.get("scheduler", {}).get("max_daily_proactive", 5),
-            "min_proactive_interval": cfg.get("scheduler", {}).get("min_proactive_interval", 90),
+            "max_ignored_streak": cfg.get("scheduler", {}).get("max_ignored_streak", 3),
+        },
+        "proactive": {
+            "timing": cfg.get("proactive", {}).get("timing", {}),
+            "generation": cfg.get("proactive", {}).get("generation", {}),
+            "topic": cfg.get("proactive", {}).get("topic", {}),
         },
         "wechat": {
             "message_delay": cfg.get("wechat", {}).get("message_delay", 1.2),
@@ -494,10 +516,24 @@ def apply_runtime_settings(updates: dict):
     scfg = cfg.get("scheduler", {})
     scheduler_agent.sleep_start = scfg.get("sleep_start", 0)
     scheduler_agent.sleep_end = scfg.get("sleep_end", 7)
-    scheduler_agent.min_chat_gap_hours = scfg.get("min_chat_gap_hours", 2)
     scheduler_agent.max_ignored_streak = scfg.get("max_ignored_streak", 3)
     scheduler_agent.max_daily = scfg.get("max_daily_proactive", 5)
-    scheduler_agent.min_interval = scfg.get("min_proactive_interval", 90)
+    # V2.1.1: proactive timing
+    pro_cfg = cfg.get("proactive", {})
+    timing = pro_cfg.get("timing", {})
+    if timing:
+        scheduler_agent.min_interval = timing.get("min_interval_minutes", 30)
+        scheduler_agent.max_interval = timing.get("max_interval_minutes", 60)
+    gen_cfg = pro_cfg.get("generation", {})
+    if gen_cfg:
+        scheduler_agent.enabled_types = gen_cfg.get("enabled_types",
+            ["check_in", "latest_topic_followup", "self_share", "light_ping"])
+        scheduler_agent.latest_topic_only = gen_cfg.get("latest_topic_only", True)
+        scheduler_agent.allow_llm_skip = gen_cfg.get("allow_llm_skip", False)
+    topic_cfg = pro_cfg.get("topic", {})
+    if topic_cfg:
+        scheduler_agent.followup_max = topic_cfg.get("followup_max_count", 2)
+        scheduler_agent.topic_expire_minutes = topic_cfg.get("default_expire_minutes", 240)
     chat_agent.defaults = {
         "default_city": cfg.get("weather", {}).get(
             "default_city",
@@ -1289,6 +1325,15 @@ async def chat(request: Request):
             )
             memory_enqueued = 1
 
+        # V2.1.1: Topic state analysis (fire-and-forget)
+        if len(user_message.strip()) >= 4:
+            asyncio.create_task(
+                _analyze_and_update_topic(
+                    user_id, current_bot_id, user_message,
+                    assistant_text, trigger="user",
+                )
+            )
+
         # Update scheduler state
         await scheduler_agent.record_chat_activity()
 
@@ -1646,31 +1691,30 @@ async def admin_drafts(request: Request, status: str = "", limit: int = 20):
 async def scheduler_tick() -> dict:
     """Periodic scheduler check. Called by APScheduler or manual trigger.
 
-    V2.1: uses 3-stage proactive pipeline (candidate → gate → generation)
-    when available; falls back to legacy should_proactive_message.
+    V2.1.1: uses due-time + intent pipeline.
+    Broad memory/recap are NOT loaded for proactive generation.
+    Only active topic state is loaded.
     """
     try:
         bot_id = bot_manager.current_bot_id
         contact = await memory_store.get_contact_state()
         user_id = contact.get("user_id", "")
 
-        # V2.1: Build deployment prerequisites before pipeline call
+        # V2.1.1: Build deployment prerequisites including user_id for due-time check
         current_bot = bot_manager.current_bot
         prereqs = {
             "bot_active": bot_id == bot_manager.current_bot_id,
             "proactive_enabled": current_bot.proactive_enabled,
             "bridge_available": _bridge is not None and bool(_bridge.token),
             "valid_contact": bool(user_id),
+            "user_id": user_id,
         }
 
-        memories = await memory_store.search_bot("", bot_id=bot_id, top_k=5)
-        latest_recap = await memory_store.get_latest_recap(user_id, bot_id)
-        recap_text = latest_recap["recap_text"] if latest_recap else ""
-
-        # V2.1: Try 3-stage pipeline first (prerequisites checked internally)
+        # V2.1.1: Do NOT load broad memory or recap for proactive generation.
+        # Only active topic state is loaded (inside the pipeline).
         decision = await scheduler_agent.run_proactive_pipeline(
-            recent_memories=memories,
-            recap_text=recap_text,
+            recent_memories=None,
+            recap_text="",
             bot_id=bot_id,
             prerequisites=prereqs,
         )
@@ -1680,6 +1724,12 @@ async def scheduler_tick() -> dict:
             emotion = decision.get("emotion", "neutral")
             reason = decision.get("reason", "")
             candidate_id = decision.get("candidate_id", "")
+            intent = decision.get("intent", "")
+
+            # Guard against empty messages
+            if not msg or not msg.strip():
+                logger.warning("Proactive message empty, skipping send")
+                return {"sent": False, "reason": "empty message", "stage": decision.get("stage", "")}
 
             # V2: Acquire per-user lock
             lock = _get_user_lock(user_id)
@@ -1690,6 +1740,9 @@ async def scheduler_tick() -> dict:
                         [{"text": msg, "delay": 0}],
                         max_messages=1,
                     )
+                    if not guarded:
+                        logger.warning("Proactive message empty after guard, skipping send")
+                        return {"sent": False, "reason": "empty after guard"}
                     await _send_message_batch(
                         user_id=user_id,
                         context_token=contact.get("context_token", ""),
@@ -1711,6 +1764,7 @@ async def scheduler_tick() -> dict:
                     elapsed_ms=0,
                     send_status=send_status,
                     output_messages=1,
+                    metadata={"intent": intent},
                 )
 
             if send_status != "delivered":
@@ -1722,12 +1776,12 @@ async def scheduler_tick() -> dict:
                 user_id=user_id,
                 source="scheduler",
                 message_count=1,
-                metadata={"reason": reason, "emotion": emotion},
+                metadata={"reason": reason, "emotion": emotion, "intent": intent},
             )
             await append_history_async(
                 user_id,
                 "system",
-                f"[主动消息判断] {reason}",
+                f"[主动消息] {intent}: {reason}",
                 source="proactive",
                 bot_id=bot_id,
             )
@@ -1738,18 +1792,18 @@ async def scheduler_tick() -> dict:
                 source="proactive",
                 bot_id=bot_id,
             )
-            # V2.1: Mark candidate as sent
             if candidate_id:
                 await scheduler_agent.record_proactive_sent(candidate_id)
             else:
                 await scheduler_agent.record_sent()
-            logger.info(f"Scheduler: SENT — {reason} (stage={decision.get('stage', '')})")
+            logger.info(f"Scheduler: SENT — {intent}: {reason} (stage={decision.get('stage', '')})")
 
             return {
                 "sent": True,
                 "message": msg,
                 "emotion": emotion,
                 "reason": reason,
+                "intent": intent,
                 "stage": decision.get("stage", ""),
             }
         else:
@@ -2023,15 +2077,41 @@ async def _send_message_batch(
 ):
     """Send a normalized message list through the active WeChat bridge.
 
-    V2: all messages pass through UnifiedOutputGuard before sending.
+    V2.1.1: empty messages are filtered before send.
+    If the final batch is empty, does not call WeChat at all.
     """
     if _bridge is None:
         raise RuntimeError("WeChat bridge is not configured")
     if not context_token:
         raise RuntimeError("missing iLink context_token")
 
+    # V2.1.1: Filter empty messages before even touching guard
+    non_empty = [
+        m for m in messages
+        if isinstance(m, dict) and str(m.get("text", "")).strip()
+    ]
+    if not non_empty:
+        logger.warning("Empty message batch, skipping WeChat send entirely")
+        await memory_store.record_usage_event(
+            event_type="empty_message_batch",
+            user_id=user_id,
+            source="send_guard",
+            metadata={"reason": "all messages empty"},
+        )
+        return
+
     # V2: guard all messages before sending
-    guarded = guard_messages(messages)
+    guarded = guard_messages(non_empty)
+
+    if not guarded:
+        logger.warning("All messages filtered by guard, skipping WeChat send")
+        await memory_store.record_usage_event(
+            event_type="empty_message_batch",
+            user_id=user_id,
+            source="send_guard",
+            metadata={"reason": "all messages filtered by guard"},
+        )
+        return
 
     min_gap = float(cfg.get("wechat", {}).get("message_delay", 1.2) or 1.2)
     for i, m in enumerate(guarded):
@@ -2075,6 +2155,112 @@ def _assistant_history_json(result: dict) -> str:
         {"actions": actions[:cfg["conversation"].get("max_actions_per_turn", 8)], "done": True},
         ensure_ascii=False,
     )
+
+
+async def _analyze_and_update_topic(
+    user_id: str,
+    bot_id: str,
+    user_message: str,
+    assistant_text: str,
+    trigger: str = "user",
+) -> dict[str, Any] | None:
+    """V2.1.1: Rule-first topic state update after normal chat turns.
+
+    Only extracts a topic when the turn contains a follow-up-worthy event.
+    Returns the topic action taken, or None if skipped.
+    """
+    if trigger != "user" or not user_message.strip():
+        return None
+
+    # Rule-first high-confidence cases
+    close_words = {"不要和你讲", "不用管", "算了", "不是发过吗", "别问了", "别管了"}
+    if any(w in user_message for w in close_words):
+        await memory_store.close_active_topic(user_id, bot_id, "user rejection")
+        logger.info(f"Topic closed: user rejection — '{user_message[:50]}'")
+        return {"action": "close", "reason": "user rejection"}
+
+    # Meal/planning/recommendation keywords → waiting_user_result
+    meal_keywords = {"吃", "喝", "午饭", "晚饭", "早餐", "午餐", "晚餐", "菜", "饭", "外卖"}
+    plan_keywords = {"安排", "计划", "下午", "晚上", "今天", "明天", "日程"}
+    project_keywords = {"项目", "代码", "bug", "更新", "改", "做", "写", "弄"}
+
+    is_meal = any(kw in user_message for kw in meal_keywords)
+    is_plan = any(kw in user_message for kw in plan_keywords)
+    is_project = any(kw in user_message for kw in project_keywords)
+
+    now = time.time()
+    pro_cfg = cfg.get("proactive", {}).get("topic", {})
+    default_expire = pro_cfg.get("default_expire_minutes", 240) * 60
+    meal_followup_min = pro_cfg.get("meal_followup_min_minutes", 40) * 60
+    meal_followup_max = pro_cfg.get("meal_followup_max_minutes", 90) * 60
+
+    current = await memory_store.get_active_topic(user_id, bot_id)
+
+    if is_meal or is_plan or is_project:
+        # New meaningful topic → create or replace
+        if is_meal:
+            status = "waiting_user_result"
+            followup_after = now + random.uniform(meal_followup_min, meal_followup_max)
+            expires = now + max(default_expire, meal_followup_max)
+        elif is_project:
+            status = "open"
+            followup_after = now + default_expire / 2
+            expires = now + default_expire
+        else:
+            status = "open"
+            followup_after = now + default_expire / 2
+            expires = now + default_expire
+
+        title = user_message[:50]
+        summary = f"User: {user_message[:80]} | Bot: {assistant_text[:80]}"
+
+        # If different from current topic, mark previous as stale
+        if current:
+            current_title = current.get("title", "")
+            # Simple keyword overlap check — if different enough, stale previous
+            if not _topic_overlap(current_title, user_message):
+                await memory_store.mark_active_topic_stale(
+                    user_id, bot_id, "newer topic created"
+                )
+
+        await memory_store.upsert_active_topic(
+            user_id=user_id,
+            bot_id=bot_id,
+            title=title,
+            summary=summary,
+            status=status,
+            followup_after_ts=followup_after,
+            expires_at=expires,
+            last_user_ts=now,
+            last_assistant_ts=now,
+        )
+        logger.info(f"Topic upserted: [{status}] '{title[:30]}'")
+        return {"action": "upsert", "status": status}
+
+    # Weather/schedule answer → mark topic answered
+    weather_keywords = {"天气", "温度", "下雨", "晴", "风"}
+    if current and any(kw in user_message for kw in weather_keywords):
+        current_status = current.get("status", "")
+        if current_status not in ("closed", "stale"):
+            # If assistant already replied with weather info, mark answered
+            if assistant_text and len(assistant_text) > 10:
+                await memory_store.update_active_topic(
+                    user_id, bot_id, status="answered",
+                )
+                logger.info("Topic marked answered (weather query)")
+                return {"action": "update", "status": "answered"}
+
+    return None
+
+
+def _topic_overlap(title: str, new_message: str) -> bool:
+    """Simple CJK word overlap check for topic comparison."""
+    title_set = set(title)
+    msg_set = set(new_message)
+    if not title_set or not msg_set:
+        return False
+    overlap = len(title_set & msg_set)
+    return overlap >= min(len(title_set), len(msg_set)) * 0.4
 
 
 async def _generate_recap(
@@ -2300,6 +2486,109 @@ async def admin_list_shared_facts(request: Request, limit: int = 20):
     require_admin(request)
     facts = await memory_store.get_shared_facts(limit=limit)
     return {"shared_facts": facts}
+
+
+# ================================================================
+# V2.1.1: Proactive state and topic admin endpoints
+# ================================================================
+
+
+@app.get("/admin/proactive/state")
+async def admin_proactive_state(request: Request):
+    """View proactive schedule state (next due time, last sent, etc.)."""
+    require_admin(request)
+    bot_id = bot_manager.current_bot_id
+    contact = await memory_store.get_contact_state()
+    user_id = contact.get("user_id", "")
+
+    sched_state = await memory_store.get_proactive_schedule_state(user_id, bot_id)
+    scheduler_state = await memory_store.get_scheduler_state()
+
+    import time as time_module
+    now = time_module()
+    next_due = sched_state.get("next_due_ts", 0)
+    last_sent = sched_state.get("last_sent_ts", 0)
+    last_attempt = sched_state.get("last_attempt_ts", 0)
+
+    return {
+        "proactive_schedule": {
+            "next_due_ts": next_due,
+            "next_due_in_seconds": max(0, int(next_due - now)) if next_due else None,
+            "next_due_time": time_module.strftime(
+                "%Y-%m-%d %H:%M:%S", time_module.localtime(next_due)
+            ) if next_due else None,
+            "last_attempt_ts": last_attempt,
+            "last_sent_ts": last_sent,
+            "is_due": next_due > 0 and now >= next_due,
+        },
+        "scheduler_state": scheduler_state,
+        "timing_config": {
+            "min_interval_minutes": scheduler_agent.min_interval,
+            "max_interval_minutes": scheduler_agent.max_interval,
+        },
+    }
+
+
+@app.get("/admin/proactive/topic")
+async def admin_proactive_topic(request: Request):
+    """View current active topic state."""
+    require_admin(request)
+    bot_id = bot_manager.current_bot_id
+    contact = await memory_store.get_contact_state()
+    user_id = contact.get("user_id", "")
+
+    topic = await memory_store.get_active_topic(user_id, bot_id)
+    if topic:
+        return {
+            "active_topic": {
+                "id": topic.get("id"),
+                "title": topic.get("title"),
+                "summary": topic.get("summary"),
+                "status": topic.get("status"),
+                "followup_count": topic.get("followup_count"),
+                "followup_after_ts": topic.get("followup_after_ts"),
+                "expires_at": topic.get("expires_at"),
+                "created_at": topic.get("created_at"),
+                "updated_at": topic.get("updated_at"),
+            }
+        }
+    return {"active_topic": None}
+
+
+@app.post("/admin/proactive/topic/close")
+async def admin_close_topic(request: Request):
+    """Manually close the current active topic."""
+    require_admin(request)
+    bot_id = bot_manager.current_bot_id
+    contact = await memory_store.get_contact_state()
+    user_id = contact.get("user_id", "")
+    if not user_id:
+        raise HTTPException(status_code=400, detail="没有联系人")
+    body = await request.json()
+    reason = str(body.get("reason", "admin manual close"))
+    closed = await memory_store.close_active_topic(user_id, bot_id, reason)
+    return {"status": "ok", "closed": closed}
+
+
+@app.post("/admin/proactive/trigger")
+async def admin_trigger_proactive(request: Request):
+    """Manually trigger a proactive send attempt (ignoring due time)."""
+    require_admin(request)
+    # Temporarily set due time to now to force send
+    bot_id = bot_manager.current_bot_id
+    contact = await memory_store.get_contact_state()
+    user_id = contact.get("user_id", "")
+    if not user_id:
+        raise HTTPException(status_code=400, detail="没有联系人")
+
+    import time as time_module
+    now = time_module()
+    await memory_store.update_proactive_schedule_state(
+        user_id=user_id, bot_id=bot_id,
+        next_due_ts=now,
+    )
+    result = await scheduler_tick()
+    return {"status": "ok", "result": result}
 
 
 # ================================================================
