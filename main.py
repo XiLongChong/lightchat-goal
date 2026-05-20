@@ -172,6 +172,7 @@ async def handle_pending_persona_confirmation(user_message: str) -> dict | None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content + "\n", encoding="utf-8")
     chat_agent.personality = content
+    bot_manager.invalidate_prompt_pack()  # V2.1.1: force re-read .md on next turn
     await memory_store.clear_pending_persona_change()
     return {
         "messages": [{"text": "好 已经写进人设了", "delay": 0}],
@@ -1055,6 +1056,7 @@ async def admin_save_persona(request: Request):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content + "\n", encoding="utf-8")
     chat_agent.personality = content
+    bot_manager.invalidate_prompt_pack()  # V2.1.1: force re-read .md on next turn
     return {"status": "saved", "path": str(path)}
 
 

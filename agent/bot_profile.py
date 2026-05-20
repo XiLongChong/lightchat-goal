@@ -124,6 +124,20 @@ class BotProfileManager:
 
     # ---- prompt pack assembly ---------------------------------------
 
+    def invalidate_prompt_pack(self, bot_id: str | None = None):
+        """Clear cached prompt pack so next load re-reads .md files.
+
+        Call after persona.md or any pack component file changes at runtime.
+        Pass None to invalidate all bots.
+        """
+        if bot_id:
+            bot = self._bots.get(bot_id)
+            if bot:
+                bot.prompt_pack = {}
+        else:
+            for bot in self._bots.values():
+                bot.prompt_pack = {}
+
     def load_prompt_pack(self, bot_id: str) -> dict[str, str]:
         """Load or return cached prompt pack for a bot."""
         bot = self._bots.get(bot_id)
