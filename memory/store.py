@@ -369,9 +369,22 @@ class MemoryStore:
             ON active_topics(user_id, bot_id)
         """)
         # V2.1.1: Proactive schedule state (next-due time tracking)
+        # Must use UUID PK so multiple (user_id, bot_id) rows can coexist.
+        # If the old single-row schema exists (id INTEGER PRIMARY KEY DEFAULT 1),
+        # drop and recreate.
+        cur = await db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='proactive_schedule_state'"
+        )
+        if await cur.fetchone():
+            cur = await db.execute("PRAGMA table_info('proactive_schedule_state')")
+            cols = {row[1]: row[2] for row in await cur.fetchall()}
+            pk_col = cols.get("id", "")
+            if pk_col and "INTEGER" in str(pk_col).upper():
+                # Old single-row schema — drop and recreate
+                await db.execute("DROP TABLE IF EXISTS proactive_schedule_state")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS proactive_schedule_state (
-                id INTEGER PRIMARY KEY DEFAULT 1,
+                id TEXT PRIMARY KEY,
                 user_id TEXT NOT NULL DEFAULT '',
                 bot_id TEXT NOT NULL DEFAULT '',
                 next_due_ts REAL NOT NULL DEFAULT 0,
@@ -379,6 +392,10 @@ class MemoryStore:
                 last_sent_ts REAL NOT NULL DEFAULT 0,
                 updated_at REAL NOT NULL DEFAULT 0
             )
+        """)
+        await db.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_proactive_schedule_user_bot
+            ON proactive_schedule_state(user_id, bot_id)
         """)
         # V2.1: Add bot_id column to existing tables (if not present)
         # Use ALTER TABLE IF NOT EXISTS pattern — SQLite doesn't support
@@ -1931,17 +1948,32 @@ class MemoryStore:
         last_attempt_ts: float | None = None,
         last_sent_ts: float | None = None,
     ) -> bool:
-        """Update proactive schedule state."""
+        """Update proactive schedule state for a user+bot pair.
+
+        Creates a new row if none exists for this (user_id, bot_id).
+        """
+        import uuid
         now = time.time()
         async with self._lock:
             db = await self._get_db()
-            # Ensure row exists
-            await db.execute(
-                """INSERT OR IGNORE INTO proactive_schedule_state
-                   (id, user_id, bot_id, updated_at)
-                   VALUES (1, ?, ?, ?)""",
-                (user_id, bot_id, now),
+            # Check if row exists for this user+bot
+            cur = await db.execute(
+                "SELECT id FROM proactive_schedule_state WHERE user_id = ? AND bot_id = ?",
+                (user_id, bot_id),
             )
+            existing = await cur.fetchone()
+            if existing:
+                row_id = existing[0]
+            else:
+                # Create new row with UUID
+                row_id = f"pss_{uuid.uuid4().hex[:12]}"
+                await db.execute(
+                    """INSERT INTO proactive_schedule_state
+                       (id, user_id, bot_id, updated_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (row_id, user_id, bot_id, now),
+                )
+
             set_parts = ["updated_at = ?"]
             values: list[Any] = [now]
             if next_due_ts is not None:

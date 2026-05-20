@@ -35,7 +35,7 @@ bots:
 
   default_bot:
     display_name: "Yu"
-    identity_file: "./prompts/bot_identity_default.md"
+    identity_file: "./prompts/persona.md"
     persona_file: "./prompts/persona.md"
     enabled_tools:
       - wechat_reply

@@ -163,6 +163,32 @@ def test_topic_ineligible_when_expired():
     assert agent._topic_is_eligible(future)
 
 
+def test_topic_ineligible_before_followup_after():
+    """Topic with future followup_after_ts is not eligible yet."""
+    from agent.scheduler import SchedulerAgent
+
+    agent = SchedulerAgent(
+        store=None, client=None, model="test",  # type: ignore
+    )
+
+    now = time.time()
+    not_yet = {
+        "status": "open",
+        "followup_count": 0,
+        "expires_at": now + 7200,
+        "followup_after_ts": now + 1800,  # 30 min from now
+    }
+    assert not agent._topic_is_eligible(not_yet)
+
+    ready = {
+        "status": "open",
+        "followup_count": 0,
+        "expires_at": now + 7200,
+        "followup_after_ts": now - 100,  # already past
+    }
+    assert agent._topic_is_eligible(ready)
+
+
 def test_topic_none_is_ineligible():
     """None topic is never eligible."""
     from agent.scheduler import SchedulerAgent
@@ -248,6 +274,7 @@ if __name__ == "__main__":
     test_topic_ineligible_when_closed_or_stale()
     test_topic_ineligible_when_followup_max_reached()
     test_topic_ineligible_when_expired()
+    test_topic_ineligible_before_followup_after()
     test_topic_none_is_ineligible()
     test_result_structure_v211()
     test_fallback_messages_all_types()

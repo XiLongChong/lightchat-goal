@@ -1771,6 +1771,14 @@ async def scheduler_tick() -> dict:
                 logger.error(f"Scheduler: send failed, skipping post-send bookkeeping")
                 return {"sent": False, "reason": "send failed"}
 
+            # V2.1.1: Commit state mutations only after confirmed delivery
+            await scheduler_agent.commit_proactive_send(
+                user_id=user_id,
+                bot_id=bot_id,
+                topic_id=decision.get("topic_id", ""),
+                intent=decision.get("intent", ""),
+            )
+
             await memory_store.record_usage_event(
                 event_type="proactive_send",
                 user_id=user_id,
@@ -2504,8 +2512,7 @@ async def admin_proactive_state(request: Request):
     sched_state = await memory_store.get_proactive_schedule_state(user_id, bot_id)
     scheduler_state = await memory_store.get_scheduler_state()
 
-    import time as time_module
-    now = time_module()
+    now = time.time()
     next_due = sched_state.get("next_due_ts", 0)
     last_sent = sched_state.get("last_sent_ts", 0)
     last_attempt = sched_state.get("last_attempt_ts", 0)
@@ -2514,8 +2521,8 @@ async def admin_proactive_state(request: Request):
         "proactive_schedule": {
             "next_due_ts": next_due,
             "next_due_in_seconds": max(0, int(next_due - now)) if next_due else None,
-            "next_due_time": time_module.strftime(
-                "%Y-%m-%d %H:%M:%S", time_module.localtime(next_due)
+            "next_due_time": time.strftime(
+                "%Y-%m-%d %H:%M:%S", time.localtime(next_due)
             ) if next_due else None,
             "last_attempt_ts": last_attempt,
             "last_sent_ts": last_sent,
@@ -2581,8 +2588,7 @@ async def admin_trigger_proactive(request: Request):
     if not user_id:
         raise HTTPException(status_code=400, detail="没有联系人")
 
-    import time as time_module
-    now = time_module()
+    now = time.time()
     await memory_store.update_proactive_schedule_state(
         user_id=user_id, bot_id=bot_id,
         next_due_ts=now,

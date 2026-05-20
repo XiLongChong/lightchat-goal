@@ -179,28 +179,33 @@ class SchedulerAgent:
             {"sent": bool, "message": str, "intent": str,
              "reason": str, "stage": str}
         """
-        import time as time_module
-
         now_cst = datetime.now(CST)
-        now_ts = time_module()
+        now_ts = _time_module.time()
 
         # ---- Stage 1: hard_precheck ----
         prereq = prerequisites or {}
+        pre_user_id = prereq.get("user_id", "")
         if not prereq.get("bot_active", True):
+            await self._reschedule_after_skip(pre_user_id, bot_id, now_ts)
             return self._result(False, "bot not active", stage="pre_check")
         if not prereq.get("proactive_enabled", True):
+            await self._reschedule_after_skip(pre_user_id, bot_id, now_ts)
             return self._result(False, "proactive disabled", stage="pre_check")
         if not prereq.get("bridge_available", True):
+            await self._reschedule_after_skip(pre_user_id, bot_id, now_ts)
             return self._result(False, "bridge unavailable", stage="pre_check")
         if not prereq.get("valid_contact", True):
+            await self._reschedule_after_skip(pre_user_id, bot_id, now_ts)
             return self._result(False, "no contact", stage="pre_check")
 
         hour = now_cst.hour
         if self.sleep_start < self.sleep_end:
             if self.sleep_start <= hour < self.sleep_end:
+                await self._reschedule_after_skip(pre_user_id, bot_id, now_ts)
                 return self._result(False, "sleep hours", stage="pre_check")
         else:
             if hour >= self.sleep_start or hour < self.sleep_end:
+                await self._reschedule_after_skip(pre_user_id, bot_id, now_ts)
                 return self._result(False, "sleep hours", stage="pre_check")
 
         # Daily cap
@@ -211,6 +216,7 @@ class SchedulerAgent:
         ).timestamp()
         sent_today = await self.store.count_today_proactive_sent(today_start)
         if sent_today >= self.max_daily:
+            await self._reschedule_after_skip(pre_user_id, bot_id, now_ts)
             return self._result(False, f"daily cap ({sent_today}/{self.max_daily})", stage="pre_check")
 
         # ---- Stage 2: due_time_check ----
@@ -278,8 +284,7 @@ class SchedulerAgent:
         if not message:
             message = FALLBACK_MESSAGES.get(intent, "在干嘛")
 
-        # ---- Stage 6: send_and_record ----
-        # Record candidate for observability
+        # ---- Stage 6: record candidate (does NOT mutate schedule/topic state) ----
         candidate_id = ""
         try:
             candidate_id = await self.store.create_proactive_candidate(
@@ -297,17 +302,9 @@ class SchedulerAgent:
                 generated_message=message,
             )
 
-        # Increment followup count if applicable
-        if intent == "latest_topic_followup" and topic:
-            await self.store.increment_topic_followup(topic.get("id", ""))
-
-        # ---- Stage 7: schedule_next_due ----
-        next_due = self._random_next_due(now_ts)
-        await self.store.update_proactive_schedule_state(
-            user_id=user_id, bot_id=bot_id,
-            next_due_ts=next_due,
-            last_sent_ts=now_ts,
-        )
+        # State mutations (followup_count, next_due, last_sent_ts) are deferred
+        # to commit_proactive_send(), called by main.py only after WeChat send
+        # succeeds. This avoids state drift when send fails.
 
         return {
             "sent": True,
@@ -317,6 +314,9 @@ class SchedulerAgent:
             "intent": intent,
             "intent_reason": intent_reason,
             "candidate_id": candidate_id,
+            "topic_id": topic.get("id", "") if topic else "",
+            "user_id": user_id,
+            "bot_id": bot_id,
             "stage": "completed",
         }
 
@@ -334,6 +334,10 @@ class SchedulerAgent:
         # Check expiration
         expires = topic.get("expires_at", 0)
         if expires > 0 and _time_module.time() > expires:
+            return False
+        # Check followup not too early (honor followup_after_ts)
+        followup_after = topic.get("followup_after_ts", 0)
+        if followup_after > 0 and _time_module.time() < followup_after:
             return False
         return True
 
@@ -460,13 +464,61 @@ class SchedulerAgent:
         return now_ts + delay
 
     # ================================================================
+    # V2.1.1: Post-send commit and reschedule
+    # ================================================================
+
+    async def _reschedule_after_skip(
+        self, user_id: str, bot_id: str, now_ts: float,
+    ) -> None:
+        """Recompute next_due after a hard-block skip.
+
+        Prevents repeated attempts during quiet hours or while
+        bridge/contact is unavailable.
+        """
+        if not user_id or not bot_id:
+            return
+        try:
+            next_due = self._random_next_due(now_ts)
+            await self.store.update_proactive_schedule_state(
+                user_id=user_id, bot_id=bot_id,
+                next_due_ts=next_due,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to reschedule after skip: {e}")
+
+    async def commit_proactive_send(
+        self,
+        user_id: str,
+        bot_id: str,
+        topic_id: str = "",
+        intent: str = "",
+    ) -> None:
+        """Commit state mutations AFTER a successful WeChat send.
+
+        Called by main.py only when the bridge confirms delivery.
+        This prevents state drift when send fails.
+        """
+        now = _time_module.time()
+
+        # Persist next due time + last_sent_ts
+        next_due = self._random_next_due(now)
+        await self.store.update_proactive_schedule_state(
+            user_id=user_id, bot_id=bot_id,
+            next_due_ts=next_due,
+            last_sent_ts=now,
+        )
+
+        # Increment topic followup count if applicable
+        if intent == "latest_topic_followup" and topic_id:
+            await self.store.increment_topic_followup(topic_id)
+
+    # ================================================================
     # Record keeping
     # ================================================================
 
     async def record_sent(self):
         """Call after successfully sending a proactive message."""
-        import time as time_module
-        now = time_module()
+        now = _time_module.time()
         state = await self.store.get_scheduler_state()
         await self.store.update_scheduler_state({
             "messages_today": state.get("messages_today", 0) + 1,
@@ -476,9 +528,8 @@ class SchedulerAgent:
 
     async def record_chat_activity(self):
         """Call when user sends a message (resets ignore counter)."""
-        import time as time_module
         await self.store.update_scheduler_state({
-            "last_chat_time": time_module(),
+            "last_chat_time": _time_module.time(),
             "consecutive_ignored": 0,
         })
 
