@@ -1,0 +1,719 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LightChat</title>
+  <style>
+    * { box-sizing: border-box; }
+    :root {
+      color-scheme: light;
+      --bg: #eef3ef;
+      --bg2: #f8fbf8;
+      --ink: #102018;
+      --muted: #647267;
+      --line: rgba(16, 32, 24, 0.12);
+      --surface: rgba(255, 255, 255, 0.74);
+      --surface2: rgba(255, 255, 255, 0.9);
+      --primary: #21b455;
+      --primary-dark: #148842;
+      --accent: #a8f0bf;
+      --shadow: 0 24px 80px rgba(36, 45, 36, 0.13);
+      --mx: 50vw;
+      --my: 40vh;
+    }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      overflow-x: hidden;
+      background: var(--bg);
+      color: var(--ink);
+      font: 16px/1.56 -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+      letter-spacing: 0;
+    }
+    a { color: inherit; text-decoration: none; }
+    button, input { font: inherit; }
+    .page {
+      position: relative;
+      min-height: 100vh;
+      background:
+        radial-gradient(circle at var(--mx) var(--my), rgba(33, 180, 85, 0.16), transparent 22rem),
+        radial-gradient(circle at 54% 18%, rgba(168, 240, 191, 0.34), transparent 28rem),
+        linear-gradient(180deg, var(--bg2) 0%, var(--bg) 44%, #f8fbf8 100%);
+      overflow: hidden;
+    }
+    .cursor-glow {
+      position: fixed;
+      left: var(--mx);
+      top: var(--my);
+      z-index: 0;
+      width: 380px;
+      height: 380px;
+      border-radius: 999px;
+      background: radial-gradient(circle, rgba(33, 180, 85, 0.16), transparent 68%);
+      pointer-events: none;
+      transform: translate(-50%, -50%);
+      filter: blur(10px);
+    }
+    .top {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      min-height: 66px;
+      padding: 0 20px;
+      background: rgba(248, 251, 248, 0.72);
+      border-bottom: 1px solid rgba(16, 32, 24, 0.08);
+      backdrop-filter: blur(18px);
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      color: var(--ink);
+      font-size: 20px;
+      font-weight: 950;
+    }
+    .mark {
+      display: grid;
+      place-items: center;
+      width: 34px;
+      height: 34px;
+      border-radius: 12px;
+      background: linear-gradient(135deg, var(--primary-dark), var(--primary), var(--accent));
+      color: #fff;
+      font-weight: 950;
+    }
+    .nav {
+      display: flex;
+      align-items: center;
+      gap: 22px;
+      color: var(--muted);
+      font-weight: 850;
+    }
+    .nav a:hover { color: var(--ink); }
+    .button, .nav button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 42px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.72);
+      color: var(--ink);
+      padding: 0 17px;
+      font-weight: 900;
+      cursor: pointer;
+      backdrop-filter: blur(14px);
+    }
+    .button.primary, .nav button.primary {
+      border-color: transparent;
+      background: linear-gradient(135deg, var(--primary-dark), var(--primary));
+      color: #fff;
+      box-shadow: 0 14px 38px rgba(33, 180, 85, 0.24);
+    }
+    .hero {
+      position: relative;
+      z-index: 1;
+      display: grid;
+      justify-items: center;
+      gap: 28px;
+      width: min(1080px, calc(100% - 36px));
+      min-height: calc(100vh - 66px);
+      margin: 0 auto;
+      padding: 76px 0 92px;
+      text-align: center;
+    }
+    .notice {
+      color: var(--muted);
+      font-size: 15px;
+      font-weight: 800;
+    }
+    h1 {
+      margin: 0;
+      color: var(--primary);
+      font-size: clamp(66px, 13vw, 156px);
+      line-height: 0.9;
+      letter-spacing: -0.065em;
+      text-shadow: 0 22px 70px rgba(33, 180, 85, 0.14);
+    }
+    .tagline {
+      max-width: 920px;
+      margin: 0;
+      color: var(--ink);
+      font-size: clamp(31px, 4vw, 58px);
+      line-height: 1.08;
+      font-weight: 950;
+      letter-spacing: -0.04em;
+    }
+    .desc {
+      max-width: 800px;
+      margin: 0;
+      color: var(--muted);
+      font-size: 19px;
+    }
+    .hero-actions {
+      display: flex;
+      justify-content: center;
+      gap: 14px;
+      flex-wrap: wrap;
+    }
+    .hero-card-row {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+      width: min(920px, 100%);
+      margin-top: 16px;
+    }
+    .glass-card,
+    .feature,
+    .flow-step,
+    .compare,
+    .timeline {
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      background: var(--surface);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(18px);
+    }
+    .glass-card {
+      min-height: 126px;
+      text-align: left;
+      padding: 20px;
+      transform: translateY(var(--float, 0));
+      transition: transform 0.18s ease, border-color 0.18s ease;
+    }
+    .glass-card strong {
+      display: block;
+      color: var(--primary-dark);
+      font-size: 22px;
+      margin-bottom: 8px;
+    }
+    .glass-card span { color: var(--muted); }
+    .wave {
+      position: absolute;
+      left: -8vw;
+      right: -8vw;
+      bottom: -38px;
+      height: 190px;
+      background:
+        repeating-linear-gradient(168deg, rgba(33, 180, 85, 0.16) 0 2px, transparent 2px 18px),
+        linear-gradient(180deg, transparent, rgba(33, 180, 85, 0.12));
+      opacity: 0.58;
+      transform: translateY(calc(var(--scroll, 0) * -18px));
+    }
+    .section {
+      position: relative;
+      z-index: 1;
+      width: min(1180px, calc(100% - 36px));
+      margin: 0 auto;
+      padding: 110px 0;
+    }
+    .section-head {
+      display: grid;
+      gap: 12px;
+      max-width: 780px;
+      margin-bottom: 34px;
+    }
+    .eyebrow {
+      width: fit-content;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.76);
+      color: var(--primary-dark);
+      padding: 7px 12px;
+      font-size: 13px;
+      font-weight: 950;
+    }
+    h2 {
+      margin: 0;
+      font-size: clamp(34px, 5vw, 64px);
+      line-height: 1.05;
+      letter-spacing: -0.04em;
+    }
+    .section-head p,
+    .feature p,
+    .flow-step p,
+    .compare p,
+    .timeline p,
+    .stage-copy p,
+    .cta p {
+      margin: 0;
+      color: var(--muted);
+    }
+    .feature-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 16px;
+    }
+    .feature {
+      min-height: 250px;
+      padding: 22px;
+      transform-style: preserve-3d;
+    }
+    .feature strong,
+    .flow-step strong,
+    .compare strong,
+    .timeline strong {
+      display: block;
+      margin-bottom: 10px;
+      color: var(--ink);
+      font-size: 24px;
+    }
+    .feature .num {
+      display: block;
+      margin-bottom: 42px;
+      color: rgba(33, 180, 85, 0.28);
+      font-size: 54px;
+      font-weight: 950;
+      line-height: 1;
+    }
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 12px;
+      align-items: stretch;
+    }
+    .flow-step {
+      min-height: 180px;
+      padding: 22px;
+    }
+    .product-stage {
+      display: grid;
+      grid-template-columns: minmax(0, 0.85fr) minmax(440px, 1.15fr);
+      gap: 22px;
+      align-items: stretch;
+    }
+    .stage-copy {
+      display: grid;
+      gap: 14px;
+      align-content: center;
+    }
+    .orbit-panel {
+      position: relative;
+      min-height: 520px;
+      border: 1px solid var(--line);
+      border-radius: 28px;
+      background: rgba(255, 255, 255, 0.58);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      backdrop-filter: blur(18px);
+    }
+    .ring {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      border: 1px solid rgba(33, 180, 85, 0.18);
+      border-radius: 50%;
+      transform: translate(-50%, -50%);
+    }
+    .ring.one { width: 220px; height: 220px; }
+    .ring.two { width: 360px; height: 360px; }
+    .ring.three { width: 500px; height: 500px; }
+    .core {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      display: grid;
+      place-items: center;
+      width: 132px;
+      height: 132px;
+      border-radius: 999px;
+      background:
+        radial-gradient(circle at 34% 24%, #fff, transparent 12%),
+        linear-gradient(135deg, var(--primary-dark), var(--primary), var(--accent));
+      box-shadow: 0 0 54px rgba(33, 180, 85, 0.22);
+      color: #fff;
+      font-size: 28px;
+      font-weight: 950;
+      transform: translate(-50%, -50%);
+    }
+    .node {
+      position: absolute;
+      display: grid;
+      gap: 3px;
+      width: 145px;
+      border: 1px solid var(--line);
+      border-radius: 17px;
+      background: rgba(255, 255, 255, 0.82);
+      box-shadow: 0 14px 38px rgba(36, 45, 36, 0.12);
+      padding: 12px;
+      backdrop-filter: blur(16px);
+    }
+    .node strong { color: var(--primary-dark); }
+    .node span { color: var(--muted); font-size: 13px; }
+    .n1 { left: 8%; top: 16%; }
+    .n2 { right: 8%; top: 17%; }
+    .n3 { left: 12%; bottom: 14%; }
+    .n4 { right: 12%; bottom: 14%; }
+    .compare-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+    }
+    .compare { padding: 22px; }
+    .compare.bad { opacity: 0.68; }
+    .timeline {
+      display: grid;
+      grid-template-columns: 88px minmax(0, 1fr);
+      gap: 18px;
+      align-items: start;
+      margin-bottom: 12px;
+      padding: 22px;
+    }
+    .timeline time {
+      color: var(--primary-dark);
+      font-weight: 950;
+    }
+    .cta {
+      display: grid;
+      justify-items: center;
+      gap: 20px;
+      text-align: center;
+      padding-bottom: 130px;
+    }
+    .cta p {
+      max-width: 720px;
+      font-size: 19px;
+    }
+    .reveal {
+      opacity: 0;
+      transform: translateY(26px);
+      transition: opacity 0.7s ease, transform 0.7s ease;
+    }
+    .reveal.in {
+      opacity: 1;
+      transform: translateY(0);
+    }
+    .auth-modal {
+      position: fixed;
+      inset: 0;
+      z-index: 60;
+      display: none;
+      place-items: center;
+      background: rgba(16, 32, 24, 0.28);
+      backdrop-filter: blur(16px);
+      padding: 20px;
+    }
+    .auth-modal.open { display: grid; }
+    .auth-card {
+      display: grid;
+      gap: 18px;
+      width: min(440px, 100%);
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      background: rgba(255, 255, 255, 0.94);
+      box-shadow: var(--shadow);
+      padding: 24px;
+    }
+    .auth-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .auth-head strong {
+      font-size: 24px;
+    }
+    .auth-close {
+      min-height: 38px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.78);
+      color: var(--ink);
+      padding: 0 12px;
+      cursor: pointer;
+    }
+    .auth-form {
+      display: grid;
+      gap: 12px;
+    }
+    label {
+      display: grid;
+      gap: 7px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 850;
+    }
+    input {
+      width: 100%;
+      min-height: 48px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #fbfdfb;
+      color: var(--ink);
+      padding: 0 13px;
+      outline: none;
+    }
+    input:focus {
+      border-color: rgba(33, 180, 85, 0.62);
+      box-shadow: 0 0 0 4px rgba(33, 180, 85, 0.12);
+    }
+    .hint {
+      margin: 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .form-error {
+      display: none;
+      margin: 0;
+      color: #c83232;
+      font-size: 13px;
+      font-weight: 750;
+    }
+    .form-error.show { display: block; }
+    .toast {
+      position: fixed;
+      left: 50%;
+      bottom: 22px;
+      z-index: 80;
+      display: none;
+      width: min(420px, calc(100% - 32px));
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.96);
+      color: var(--ink);
+      box-shadow: var(--shadow);
+      padding: 14px 16px;
+      transform: translateX(-50%);
+      text-align: center;
+    }
+    .toast.show { display: block; }
+    @media (max-width: 980px) {
+      .hero-card-row,
+      .feature-grid,
+      .flow,
+      .product-stage,
+      .compare-grid {
+        grid-template-columns: 1fr;
+      }
+      .orbit-panel { min-height: 560px; }
+    }
+    @media (max-width: 700px) {
+      .top { padding: 0 14px; }
+      .nav { gap: 10px; font-size: 14px; }
+      .nav a[href="#flow"],
+      .nav a[href="#idea"] { display: none; }
+      .hero { padding: 52px 0 76px; }
+      .hero-actions .button,
+      .cta .button { width: 100%; }
+      .section { width: min(100% - 28px, 1180px); padding: 78px 0; }
+      .timeline { grid-template-columns: 1fr; }
+      .node { width: 132px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <div class="cursor-glow" aria-hidden="true"></div>
+    <header class="top">
+      <a class="brand" href="/"><span class="mark">L</span><span>LightChat</span></a>
+      <nav class="nav">
+        <a href="#idea">理念</a>
+        <a href="#flow">如何工作</a>
+        <a href="/admin">后台</a>
+        <button type="button" data-auth-login>登录</button>
+        <button class="primary" type="button" data-register>注册</button>
+      </nav>
+    </header>
+
+    <section class="hero">
+      <div class="notice reveal">一个有记忆、有状态、会主动找你的个人 AI 角色系统</div>
+      <h1 class="reveal">lightchat</h1>
+      <p class="tagline reveal">让 AI 不只是回复，而是真的延续关系。</p>
+      <p class="desc reveal">LightChat 连接微信、角色提示词、长期记忆和主动消息。它会记住重要的事，也会在合适的时候出现；你可以在后台看见它为什么这么说、为什么这次没有打扰你。</p>
+      <div class="hero-actions reveal">
+        <button class="button primary" type="button" data-auth-login>登录</button>
+        <button class="button" type="button" data-register>注册</button>
+      </div>
+      <div class="hero-card-row reveal">
+        <div class="glass-card" data-tilt><strong>会记得</strong><span>稳定事实、最近摘要和当前话题分开管理。</span></div>
+        <div class="glass-card" data-tilt><strong>会变化</strong><span>状态、亲密度、情绪波动都有依据。</span></div>
+        <div class="glass-card" data-tilt><strong>会主动</strong><span>不是定时骚扰，而是判断什么时候该出现。</span></div>
+      </div>
+      <div class="wave" aria-hidden="true"></div>
+    </section>
+
+    <section id="idea" class="section">
+      <div class="section-head reveal">
+        <span class="eyebrow">What LightChat is</span>
+        <h2>它不是一个聊天框，是一个长期陪伴系统。</h2>
+        <p>普通 chatbot 每次对话都像重新认识你。LightChat 的目标是让一个 bot 在长期互动里逐渐形成稳定的记忆、边界和关系状态。</p>
+      </div>
+      <div class="feature-grid">
+        <article class="feature reveal" data-tilt><span class="num">01</span><strong>角色不是固定面具</strong><p>bot 可以高兴、烦、冷淡、担心，也可以因为长期尊重而更主动。变化必须有依据，不靠随机表演。</p></article>
+        <article class="feature reveal" data-tilt><span class="num">02</span><strong>记忆不能靠模型猜</strong><p>稳定事实、最近摘要、当前话题分开存放。没有证据的内容只当候选，不直接变成“它记得”。</p></article>
+        <article class="feature reveal" data-tilt><span class="num">03</span><strong>主动消息要有分寸</strong><p>系统会检查最近上下文、当前话题和打扰风险。该出现时出现，不该出现时安静。</p></article>
+      </div>
+    </section>
+
+    <section id="flow" class="section">
+      <div class="section-head reveal">
+        <span class="eyebrow">How it works</span>
+        <h2>从一句微信消息，到一次有依据的回复。</h2>
+        <p>下面是 LightChat 的核心链路。它把“像真人聊天”的体验拆成可以检查、可以调试、可以持续优化的系统。</p>
+      </div>
+      <div class="flow">
+        <div class="flow-step reveal"><strong>微信接入</strong><p>接收真实聊天，合并连发消息，避免把系统触发当成用户消息。</p></div>
+        <div class="flow-step reveal"><strong>角色理解</strong><p>读取统一提示词和关系状态，决定这次要怎么说。</p></div>
+        <div class="flow-step reveal"><strong>记忆检索</strong><p>只取必要事实和摘要，节省 token，也减少乱记。</p></div>
+        <div class="flow-step reveal"><strong>主动守卫</strong><p>判断是否该主动发，是否会打断当前话题。</p></div>
+        <div class="flow-step reveal"><strong>日志审计</strong><p>记录收到什么、回复什么、工具和发送状态。</p></div>
+      </div>
+    </section>
+
+    <section class="section product-stage">
+      <div class="stage-copy reveal">
+        <span class="eyebrow">Living memory</span>
+        <h2>所有能力，都围绕同一个 bot 运转。</h2>
+        <p>人设、记忆、情绪、主动消息和后台日志不是分散功能。它们共同决定 bot 这一刻怎么理解你、怎么回应你、要不要主动找你。</p>
+      </div>
+      <div class="orbit-panel reveal">
+        <div class="ring one"></div>
+        <div class="ring two"></div>
+        <div class="ring three"></div>
+        <div class="core">bot</div>
+        <div class="node n1"><strong>长期记忆</strong><span>稳定事实和偏好</span></div>
+        <div class="node n2"><strong>当前话题</strong><span>防止突然跳戏</span></div>
+        <div class="node n3"><strong>情绪状态</strong><span>变化必须有原因</span></div>
+        <div class="node n4"><strong>主动消息</strong><span>出现也要有分寸</span></div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-head reveal">
+        <span class="eyebrow">Why different</span>
+        <h2>不是更会哄人，而是更不容易失真。</h2>
+      </div>
+      <div class="compare-grid">
+        <article class="compare bad reveal"><strong>普通角色聊天</strong><p>提示词一改就换人格；主动消息容易像另一个人在说话；模型把猜测当记忆，用户很难知道问题出在哪。</p></article>
+        <article class="compare reveal"><strong>LightChat</strong><p>提示词统一管理；主动消息带最近上下文；记忆有候选和稳定事实之分；后台能看到触发、跳过和发送原因。</p></article>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-head reveal">
+        <span class="eyebrow">What you can inspect</span>
+        <h2>看得见，才调得动。</h2>
+      </div>
+      <article class="timeline reveal"><time>20:41</time><div><strong>收到用户消息</strong><p>“我在更新项目 bug好多”</p></div></article>
+      <article class="timeline reveal"><time>20:41</time><div><strong>模型回复</strong><p>“行 那今天先别硬顶”</p></div></article>
+      <article class="timeline reveal"><time>20:42</time><div><strong>主动消息判断</strong><p>当前话题仍在继续，本次跳过，避免打断。</p></div></article>
+      <article class="timeline reveal"><time>20:42</time><div><strong>记忆候选</strong><p>用户项目压力偏高，但等待后续确认，不写成稳定事实。</p></div></article>
+    </section>
+
+    <section class="section cta reveal">
+      <span class="eyebrow">Start</span>
+      <h2>先让一个 bot 稳定地活起来。</h2>
+      <p>LightChat 现在更像一个个人项目，但它的目标是做成可长期使用、可解释、可管理的 AI 角色系统。</p>
+      <div class="hero-actions">
+        <button class="button primary" type="button" data-auth-login>登录</button>
+        <button class="button" type="button" data-register>注册</button>
+      </div>
+    </section>
+  </main>
+
+  <div id="authModal" class="auth-modal" aria-hidden="true">
+    <section class="auth-card">
+      <div class="auth-head">
+        <div>
+          <strong>登录 LightChat</strong>
+          <p class="hint">输入后台访问密码后进入管理界面。</p>
+        </div>
+        <button class="auth-close" type="button" id="closeAuth">关闭</button>
+      </div>
+      <form id="loginForm" class="auth-form">
+        <label>访问密码<input id="loginPassword" type="password" placeholder="请输入密码" autocomplete="current-password"></label>
+        <p id="loginError" class="form-error">密码不正确</p>
+        <button id="loginSubmit" class="button primary" type="submit">进入后台</button>
+      </form>
+    </section>
+  </div>
+  <div id="toast" class="toast">目前还未开放注册功能</div>
+
+  <script>
+    const root = document.documentElement;
+    const modal = document.getElementById("authModal");
+    const toast = document.getElementById("toast");
+    const loginError = document.getElementById("loginError");
+    const loginSubmit = document.getElementById("loginSubmit");
+
+    addEventListener("pointermove", (event) => {
+      root.style.setProperty("--mx", event.clientX + "px");
+      root.style.setProperty("--my", event.clientY + "px");
+      document.querySelectorAll("[data-tilt]").forEach((card) => {
+        const rect = card.getBoundingClientRect();
+        const dx = (event.clientX - rect.left) / rect.width - 0.5;
+        const dy = (event.clientY - rect.top) / rect.height - 0.5;
+        card.style.transform = `perspective(800px) rotateX(${dy * -4}deg) rotateY(${dx * 5}deg) translateY(var(--float, 0))`;
+      });
+    });
+
+    addEventListener("scroll", () => {
+      const progress = Math.min(scrollY / innerHeight, 1);
+      root.style.setProperty("--scroll", progress.toFixed(3));
+    }, { passive: true });
+
+    const io = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (entry.isIntersecting) entry.target.classList.add("in");
+      }
+    }, { threshold: 0.16 });
+    document.querySelectorAll(".reveal").forEach((el) => io.observe(el));
+
+    function openLogin() {
+      modal.classList.add("open");
+      modal.setAttribute("aria-hidden", "false");
+      loginError.classList.remove("show");
+      setTimeout(() => document.getElementById("loginPassword").focus(), 0);
+    }
+
+    function closeLogin() {
+      modal.classList.remove("open");
+      modal.setAttribute("aria-hidden", "true");
+    }
+
+    function showRegisterToast() {
+      toast.classList.add("show");
+      clearTimeout(showRegisterToast.timer);
+      showRegisterToast.timer = setTimeout(() => toast.classList.remove("show"), 2200);
+    }
+
+    async function login(event) {
+      event.preventDefault();
+      loginSubmit.disabled = true;
+      loginSubmit.textContent = "登录中";
+      loginError.classList.remove("show");
+      try {
+        const res = await fetch("/admin/auth/login", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ password: document.getElementById("loginPassword").value }),
+        });
+        if (!res.ok) throw new Error("login failed");
+        location.href = "/admin";
+      } catch {
+        loginError.classList.add("show");
+      } finally {
+        loginSubmit.disabled = false;
+        loginSubmit.textContent = "进入后台";
+      }
+    }
+
+    document.querySelectorAll("[data-auth-login]").forEach((btn) => btn.addEventListener("click", openLogin));
+    document.querySelectorAll("[data-register]").forEach((btn) => btn.addEventListener("click", showRegisterToast));
+    document.getElementById("loginForm").addEventListener("submit", login);
+    document.getElementById("closeAuth").addEventListener("click", closeLogin);
+    modal.addEventListener("click", (event) => {
+      if (event.target === modal) closeLogin();
+    });
+    addEventListener("keydown", (event) => {
+      if (event.key === "Escape") closeLogin();
+    });
+  </script>
+</body>
+</html>

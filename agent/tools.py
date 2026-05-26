@@ -23,7 +23,7 @@ import pytz
 
 TOOL_DEFINITIONS: dict[str, dict[str, Any]] = {
     "wechat_reply": {
-        "description": "回复微信消息。每次调用发一条消息给辣椒。可以多次调用来分段回复。text 是回复内容，delay 是发送前等待秒数",
+        "description": "回复微信消息。每次调用发一条消息给用户。可以多次调用来分段回复。text 是回复内容，delay 是发送前等待秒数",
         "args": ["text", "delay"],
     },
     "schedule_wechat_message": {

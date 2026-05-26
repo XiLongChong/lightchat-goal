@@ -91,9 +91,10 @@ wechat:
   base_url: "https://ilinkai.weixin.qq.com"
   goal_url: "http://127.0.0.1:8899"
   poll_timeout_ms: 35000
-  message_delay: 1.2
-  buffer_debounce_seconds: 5.0
-  buffer_max_wait_seconds: 12.0
+  message_delay: 0.8
+  max_reply_delay: 3.0
+  buffer_debounce_seconds: 2.0
+  buffer_max_wait_seconds: 8.0
 
 # ---- Scheduler ----
 scheduler:

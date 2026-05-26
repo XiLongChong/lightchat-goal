@@ -200,6 +200,29 @@ def test_topic_none_is_ineligible():
     assert not agent._topic_is_eligible(None)
 
 
+def test_recent_context_formats_recent_turns():
+    """Recent proactive context is compact natural text, not raw JSON."""
+    from agent.scheduler import SchedulerAgent
+
+    turns = [
+        {
+            "user_messages": "我在更新一个项目 有好多 bug",
+            "assistant_actions": '[{"text":"bug多卡在哪了","delay":0}]',
+        },
+        {
+            "user_messages": "不想谈工作",
+            "assistant_actions": '[{"text":"行 那不谈工作","delay":0},{"text":"现在想干点啥","delay":0}]',
+        },
+    ]
+
+    text = SchedulerAgent._format_recent_context(turns)
+
+    assert "用户: 我在更新一个项目" in text
+    assert "栖: 行 那不谈工作 / 现在想干点啥" in text
+    assert "assistant_actions" not in text
+    assert '{"text"' not in text
+
+
 def test_result_structure_v211():
     """V2.1.1 result structure has correct fields."""
     from agent.scheduler import SchedulerAgent

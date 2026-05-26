@@ -23,6 +23,7 @@ import logging
 import random as _random
 import time as _time_module
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -33,53 +34,24 @@ logger = logging.getLogger(__name__)
 # Timezone for Chinese users
 CST = timezone(timedelta(hours=8))
 
-# ---- V2.1.1 Prompts ----
+PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
-INTENT_SELECTION_PROMPT = """你是一个消息调度器。选择一条主动消息的意图类型。
-
+MINIMAL_INTENT_SELECTION_PROMPT = """选择一条主动消息意图。
 当前时间: {now_str}
 活跃话题: {topic_text}
 话题状态: {topic_status}
 已跟进次数: {followup_count}
+只输出 JSON: {{"intent": "check_in", "reason": ""}}"""
 
-可选意图类型：
-- check_in: 简短问候，如"在干嘛""醒了没"
-- latest_topic_followup: 跟进当前活跃话题（仅当话题存在且未关闭/stale/answered时可用）
-- self_share: 分享一个小想法、观察、笑话或随意话题
-- light_ping: 无话题时的极简短轻量 ping
-
-规则：
-- 如果有活跃话题且状态是 open/waiting_user_result，优先选择 latest_topic_followup
-- 如果话题不存在、已关闭、stale 或 answered，不要选 latest_topic_followup
-- 如果没有话题，选 check_in、self_share 或 light_ping
-- 不要提及旧话题、recap 内容或系统状态
-
-## 输出格式
-{{"intent": "check_in", "reason": ""}}"""
-
-MESSAGE_GENERATION_PROMPT = """你是一个主动消息生成器。用户是辣椒。
-
-根据意图类型生成一条主动消息。
-
-## 意图
+MINIMAL_MESSAGE_GENERATION_PROMPT = """生成一条简短主动微信消息。
 类型: {intent}
 理由: {reason}
-
-## 上下文
 当前时间: {now_str}
 活跃话题: {topic_text}
+最近对话背景: {recent_context}
 关系熟悉度: {familiarity}/10
-
-## 规则
-- 自然简短，像微信朋友随口提起
-- 不要提"系统/调度/自动/意图/主动/话题状态/proactive"这些词
-- 不要当成用户说过的话来回复
-- 不要说"你刚才说/你问我/你不是要"等
-- {intent_rules}
-- 50字以内
-
-## 输出格式
-{{"message": "", "emotion": "neutral"}}"""
+规则: 不要假装用户刚说过话。{intent_rules}
+只输出 JSON: {{"message": "", "emotion": "neutral"}}"""
 
 INTENT_RULES = {
     "check_in": "简单打招呼或问在做什么，像朋友随口问一句",
@@ -111,6 +83,16 @@ class SchedulerAgent:
         self.model = model
 
         cfg = config or {}
+        prompts_dir = cfg.get("prompts_dir", "")
+        self.prompts_dir = Path(prompts_dir) if prompts_dir else PROMPTS_DIR
+        self.intent_prompt_template = self._load_prompt_template(
+            "scheduler_intent.md",
+            MINIMAL_INTENT_SELECTION_PROMPT,
+        )
+        self.message_prompt_template = self._load_prompt_template(
+            "scheduler_message.md",
+            MINIMAL_MESSAGE_GENERATION_PROMPT,
+        )
         self.sleep_start = cfg.get("sleep_start", 0)
         self.sleep_end = cfg.get("sleep_end", 7)
         self.max_ignored_streak = cfg.get("max_ignored_streak", 3)
@@ -129,6 +111,15 @@ class SchedulerAgent:
         topic_cfg = pro_cfg.get("topic", {})
         self.followup_max = topic_cfg.get("followup_max_count", 2)
         self.topic_expire_minutes = topic_cfg.get("default_expire_minutes", 240)
+
+    def _load_prompt_template(self, filename: str, fallback: str) -> str:
+        """Load a prompt template from the configured prompts directory."""
+        path = self.prompts_dir / filename
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except OSError:
+            logger.warning("Scheduler prompt missing, using fallback: %s", path)
+            return fallback
 
     # ================================================================
     # Legacy compatibility (kept for existing callers)
@@ -250,6 +241,7 @@ class SchedulerAgent:
         topic_eligible = self._topic_is_eligible(topic)
         topic_text = self._format_topic(topic) if topic_eligible else "无活跃话题"
         topic_status = topic.get("status", "none") if topic else "none"
+        recent_context = await self._load_recent_context(user_id, bot_id)
 
         # ---- Stage 4: select_message_intent ----
         intent = "check_in"
@@ -274,6 +266,7 @@ class SchedulerAgent:
         try:
             gen = await self._generate_message(
                 now_cst, intent, intent_reason, topic_text,
+                recent_context,
                 topic.get("followup_count", 0) if topic else 0,
             )
             message = gen.get("message", "").strip()[:200]
@@ -353,6 +346,43 @@ class SchedulerAgent:
             parts.append(f"摘要: {summary[:120]}")
         return "\n".join(parts)
 
+    async def _load_recent_context(self, user_id: str, bot_id: str) -> str:
+        """Load a tiny recent-turn context for proactive continuity."""
+        try:
+            turns = await self.store.get_recent_turns(user_id, bot_id, limit=3)
+        except Exception as e:
+            logger.debug(f"Failed to load recent proactive context: {e}")
+            return "无"
+        return self._format_recent_context(turns)
+
+    @staticmethod
+    def _format_recent_context(turns: list[dict[str, Any]]) -> str:
+        if not turns:
+            return "无"
+        import json
+
+        lines: list[str] = []
+        for turn in turns[-3:]:
+            user_text = str(turn.get("user_messages", "")).strip()
+            assistant_text = ""
+            raw_actions = str(turn.get("assistant_actions", "") or "")
+            try:
+                parsed = json.loads(raw_actions)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                parsed = []
+            if isinstance(parsed, list):
+                replies = [
+                    str(item.get("text", "")).strip()
+                    for item in parsed
+                    if isinstance(item, dict) and str(item.get("text", "")).strip()
+                ]
+                assistant_text = " / ".join(replies[:2])
+            if user_text:
+                lines.append(f"用户: {user_text[:80]}")
+            if assistant_text:
+                lines.append(f"栖: {assistant_text[:80]}")
+        return "\n".join(lines[-6:]) if lines else "无"
+
     async def _select_intent(
         self,
         now_cst: datetime,
@@ -371,7 +401,7 @@ class SchedulerAgent:
         if topic_eligible and "latest_topic_followup" in self.enabled_types:
             return ("latest_topic_followup", "eligible topic exists")
 
-        prompt = INTENT_SELECTION_PROMPT.format(
+        prompt = self.intent_prompt_template.format(
             now_str=now_str,
             topic_text=topic_text,
             topic_status=topic_status,
@@ -382,7 +412,7 @@ class SchedulerAgent:
             response = await self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": "你是一个消息调度器。只输出JSON。"},
+                    {"role": "system", "content": "只输出JSON。"},
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.4,
@@ -415,6 +445,7 @@ class SchedulerAgent:
         intent: str,
         intent_reason: str,
         topic_text: str,
+        recent_context: str,
         followup_count: int = 0,
     ) -> dict[str, Any]:
         """Generate message text for the selected intent."""
@@ -422,11 +453,12 @@ class SchedulerAgent:
         intent_rules = INTENT_RULES.get(intent, "自然简短的消息")
         familiarity = 5  # Default
 
-        prompt = MESSAGE_GENERATION_PROMPT.format(
+        prompt = self.message_prompt_template.format(
             intent=intent,
             reason=intent_reason,
             now_str=now_str,
             topic_text=topic_text,
+            recent_context=recent_context,
             familiarity=familiarity,
             intent_rules=intent_rules,
         )

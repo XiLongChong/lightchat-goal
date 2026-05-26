@@ -213,7 +213,61 @@ logging.basicConfig(
 )
 logger = logging.getLogger("goal")
 logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 configure_tools(cfg)
+
+
+def _read_recent_log_lines(
+    log_path: str | Path,
+    limit: int = 200,
+    level: str = "",
+    contains: str = "",
+) -> dict[str, Any]:
+    """Return recent log lines without loading a large log file into memory."""
+    path = Path(log_path)
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    limit = max(1, min(int(limit or 200), 1000))
+    level_filter = str(level or "").strip().upper()
+    contains_filter = str(contains or "").strip().lower()
+
+    if not path.exists():
+        return {"path": str(path), "lines": [], "truncated": False, "exists": False}
+
+    chunk_size = 8192
+    max_bytes = 512 * 1024
+    file_size = path.stat().st_size
+    data = b""
+    with path.open("rb") as f:
+        pos = file_size
+        while pos > 0 and len(data) < max_bytes:
+            read_size = min(chunk_size, pos)
+            pos -= read_size
+            f.seek(pos)
+            data = f.read(read_size) + data
+            if data.count(b"\n") > limit * 3:
+                break
+
+    text = data.decode("utf-8", errors="replace")
+    raw_lines = [line.rstrip("\r") for line in text.splitlines() if line.strip()]
+    if file_size > len(data) and raw_lines:
+        raw_lines = raw_lines[1:]
+
+    filtered = []
+    for line in raw_lines:
+        line_lower = line.lower()
+        if level_filter and f"[{level_filter}]" not in line.upper():
+            continue
+        if contains_filter and contains_filter not in line_lower:
+            continue
+        filtered.append(line)
+
+    return {
+        "path": str(path),
+        "lines": filtered[-limit:],
+        "truncated": file_size > len(data),
+        "exists": True,
+    }
 
 # ================================================================
 # Clients and services
@@ -259,13 +313,17 @@ memory_worker = MemoryWorker(
     client=llm_client,
     model=model_name,
     min_importance=cfg["memory"].get("min_importance_save", 0.4),
+    prompts_dir=cfg.get("prompt_pack", {}).get("directory", "./prompts"),
 )
 
 scheduler_agent = SchedulerAgent(
     store=memory_store,
     client=llm_client,
     model=model_name,
-    config=cfg.get("scheduler"),
+    config={
+        **(cfg.get("scheduler") or {}),
+        "prompts_dir": cfg.get("prompt_pack", {}).get("directory", "./prompts"),
+    },
 )
 
 # V2.1.1: Inject proactive timing config
@@ -488,6 +546,9 @@ def public_settings() -> dict:
         },
         "wechat": {
             "message_delay": cfg.get("wechat", {}).get("message_delay", 1.2),
+            "max_reply_delay": cfg.get("wechat", {}).get("max_reply_delay", 3.0),
+            "buffer_debounce_seconds": cfg.get("wechat", {}).get("buffer_debounce_seconds", 5.0),
+            "buffer_max_wait_seconds": cfg.get("wechat", {}).get("buffer_max_wait_seconds", 12.0),
         },
         "weather": {
             "default_city": cfg.get("weather", {}).get("default_city", ""),
@@ -503,6 +564,174 @@ def public_settings() -> dict:
             "username": email_cfg.get("username", ""),
             "use_ssl": email_cfg.get("use_ssl", True),
             "use_starttls": email_cfg.get("use_starttls", False),
+        },
+    }
+
+
+def _safe_json_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if not value:
+        return []
+    try:
+        parsed = json.loads(str(value))
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def _admin_time(ts: Any) -> str:
+    try:
+        value = float(ts or 0)
+    except (TypeError, ValueError):
+        value = 0
+    if not value:
+        return ""
+    return time.strftime("%H:%M", time.localtime(value))
+
+
+def _route_label(route: str) -> str:
+    return {
+        "SystemFast": "快速系统",
+        "ChatLite": "轻量聊天",
+        "ChatFull": "完整聊天",
+    }.get(route or "", route or "未知")
+
+
+def _policy_label(policy: str) -> str:
+    return {
+        "hot_only": "短上下文",
+        "hot+cheap_memory": "短上下文 + 轻量记忆",
+        "hot+full_memory": "短上下文 + 完整记忆",
+    }.get(policy or "", policy or "无")
+
+
+def _send_status_label(status: str) -> str:
+    return {
+        "created": "已生成",
+        "generated": "已生成",
+        "sending": "发送中",
+        "delivered": "已送达",
+        "failed": "发送失败",
+    }.get(status or "", status or "未知")
+
+
+def _source_label(source: str) -> str:
+    return {
+        "wechat": "微信",
+        "user_reply": "用户回复",
+        "scheduler": "主动消息",
+        "proactive": "主动消息",
+        "admin": "后台手动",
+        "scheduled_reminder": "定时提醒",
+        "fixed_morning": "早安消息",
+    }.get(source or "", source or "未知")
+
+
+async def build_admin_event_dashboard(limit: int = 20) -> dict[str, Any]:
+    """Build a compact Chinese admin dashboard for the browser UI."""
+    limit = max(5, min(int(limit or 20), 80))
+    contact = await memory_store.get_contact_state()
+    user_id = contact.get("user_id", "")
+    bot_id = bot_manager.current_bot_id
+
+    turns = await memory_store.get_recent_turns(user_id, bot_id, limit=limit) if user_id else []
+    diagnostics = await memory_store.get_recent_turn_diagnostics(limit=limit, user_id=user_id) if user_id else []
+    diag_by_turn = {d.get("turn_id"): d for d in diagnostics}
+    candidates = await memory_store.get_recent_proactive_candidates(limit=limit)
+    proactive_state = await admin_proactive_state_data(user_id, bot_id)
+    topic = await memory_store.get_active_topic(user_id, bot_id) if user_id else None
+    recaps = await memory_store.get_recaps(user_id, bot_id, limit=5) if user_id else []
+    shared_facts = await memory_store.get_shared_facts(limit=8)
+    outbound = await memory_store.get_outbound_messages(user_id=user_id, limit=limit) if user_id else []
+
+    events: list[dict[str, Any]] = []
+    for turn in turns:
+        turn_id = turn.get("id", "")
+        diag = diag_by_turn.get(turn_id, {})
+        actions = _safe_json_list(turn.get("assistant_actions"))
+        tools = _safe_json_list(turn.get("tool_calls"))
+        replies = [
+            str(a.get("text", "")).strip()
+            for a in actions
+            if isinstance(a, dict) and str(a.get("text", "")).strip()
+        ]
+        events.append({
+            "id": turn_id,
+            "kind": "turn",
+            "time": _admin_time(turn.get("created_at")),
+            "created_at": turn.get("created_at", 0),
+            "title": "收到用户消息",
+            "user_text": turn.get("user_messages", ""),
+            "reply_texts": replies,
+            "tool_calls": tools,
+            "source": _source_label(turn.get("source", "")),
+            "route": _route_label(diag.get("route", "")),
+            "context_policy": _policy_label(diag.get("context_policy", "")),
+            "elapsed_ms": diag.get("elapsed_ms", 0),
+            "token_count": diag.get("token_count", 0),
+            "send_status": _send_status_label(diag.get("send_status") or turn.get("send_status", "")),
+            "memory_enqueued": bool(diag.get("memory_enqueued", 0)),
+        })
+
+    for candidate in candidates[:8]:
+        sent = bool(candidate.get("sent"))
+        events.append({
+            "id": candidate.get("id", ""),
+            "kind": "proactive",
+            "time": _admin_time(candidate.get("created_at")),
+            "created_at": candidate.get("created_at", 0),
+            "title": "主动消息" + ("已发送" if sent else "未发送"),
+            "reason_type": candidate.get("reason_type", ""),
+            "reason_detail": candidate.get("reason_detail", ""),
+            "gate_detail": candidate.get("gate_detail", ""),
+            "generated_message": candidate.get("generated_message", ""),
+            "sent": sent,
+        })
+
+    events.sort(key=lambda item: float(item.get("created_at") or 0), reverse=True)
+
+    return {
+        "contact": contact,
+        "bot": {
+            "current_bot_id": bot_id,
+            "display_name": bot_manager.current_bot.display_name,
+        },
+        "events": events[:limit],
+        "turns": turns[-limit:],
+        "outbound_messages": outbound,
+        "proactive": {
+            "state": proactive_state,
+            "active_topic": dict(topic) if topic else None,
+            "candidates": candidates,
+        },
+        "memory": {
+            "recaps": recaps,
+            "shared_facts": shared_facts,
+        },
+    }
+
+
+async def admin_proactive_state_data(user_id: str, bot_id: str) -> dict[str, Any]:
+    sched_state = await memory_store.get_proactive_schedule_state(user_id, bot_id)
+    scheduler_state = await memory_store.get_scheduler_state()
+    now = time.time()
+    next_due = sched_state.get("next_due_ts", 0)
+    last_sent = sched_state.get("last_sent_ts", 0)
+    last_attempt = sched_state.get("last_attempt_ts", 0)
+    return {
+        "proactive_schedule": {
+            "next_due_ts": next_due,
+            "next_due_in_seconds": max(0, int(next_due - now)) if next_due else None,
+            "next_due_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(next_due)) if next_due else None,
+            "last_attempt_ts": last_attempt,
+            "last_sent_ts": last_sent,
+            "is_due": next_due > 0 and now >= next_due,
+        },
+        "scheduler_state": scheduler_state,
+        "timing_config": {
+            "min_interval_minutes": scheduler_agent.min_interval,
+            "max_interval_minutes": scheduler_agent.max_interval,
         },
     }
 
@@ -544,9 +773,11 @@ def apply_runtime_settings(updates: dict):
     }
 
     if _bridge is not None:
-        _bridge.message_delay = float(
-            cfg.get("wechat", {}).get("message_delay", 1.2)
-        )
+        wcfg = cfg.get("wechat", {})
+        _bridge.message_delay = float(wcfg.get("message_delay", 1.2))
+        _bridge.max_reply_delay = float(wcfg.get("max_reply_delay", 3.0))
+        _bridge.buffer_debounce_seconds = float(wcfg.get("buffer_debounce_seconds", 5.0))
+        _bridge.buffer_max_wait_seconds = float(wcfg.get("buffer_max_wait_seconds", 12.0))
 
     if scheduler.running:
         check_job = scheduler.get_job("deliver_scheduled_messages")
@@ -593,6 +824,7 @@ async def start_internal_wechat_bridge():
         goal_url=wcfg.get("goal_url", "http://127.0.0.1:8899"),
         poll_timeout_ms=wcfg.get("poll_timeout_ms", 35_000),
         message_delay=wcfg.get("message_delay", 1.2),
+        max_reply_delay=wcfg.get("max_reply_delay", 3.0),
         buffer_debounce_seconds=wcfg.get("buffer_debounce_seconds", 5.0),
         buffer_max_wait_seconds=wcfg.get("buffer_max_wait_seconds", 12.0),
     )
@@ -951,6 +1183,15 @@ async def health():
     return {"status": "ok", "model": model_name}
 
 
+@app.get("/", response_class=HTMLResponse)
+async def landing_page():
+    """Public landing page."""
+    html_path = STATIC_DIR / "index.html"
+    if not html_path.exists():
+        raise HTTPException(status_code=404, detail="landing page not found")
+    return HTMLResponse(html_path.read_text(encoding="utf-8"))
+
+
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_page():
     """Mobile-first local admin UI."""
@@ -1066,7 +1307,7 @@ async def admin_save_settings(request: Request):
     require_admin(request)
     body = await request.json()
     allowed = {}
-    for section in ["scheduler", "wechat", "weather", "email"]:
+    for section in ["scheduler", "proactive", "wechat", "weather", "email"]:
         if isinstance(body.get(section), dict):
             allowed[section] = body[section]
     if not allowed:
@@ -1686,6 +1927,32 @@ async def admin_drafts(request: Request, status: str = "", limit: int = 20):
     return {"drafts": drafts}
 
 
+@app.get("/admin/logs")
+async def admin_logs(
+    request: Request,
+    limit: int = 200,
+    level: str = "",
+    contains: str = "",
+):
+    """Read the tail of the runtime log for the admin debug console."""
+    require_admin(request)
+    logging_cfg = cfg.get("logging", {})
+    log_path = logging_cfg.get("file", "./data/agent.log")
+    return _read_recent_log_lines(
+        log_path=log_path,
+        limit=limit,
+        level=level,
+        contains=contains,
+    )
+
+
+@app.get("/admin/events")
+async def admin_events(request: Request, limit: int = 30):
+    """Aggregated Chinese admin dashboard events for the browser UI."""
+    require_admin(request)
+    return await build_admin_event_dashboard(limit=limit)
+
+
 # ================================================================
 # Background tasks
 # ================================================================
@@ -2125,11 +2392,14 @@ async def _send_message_batch(
         return
 
     min_gap = float(cfg.get("wechat", {}).get("message_delay", 1.2) or 1.2)
+    max_reply_delay = float(cfg.get("wechat", {}).get("max_reply_delay", 3.0) or 3.0)
     for i, m in enumerate(guarded):
         text = guard_single_message(m.get("text", ""))
         if not text:
             continue
-        delay = float(m.get("delay", 0) or 0)
+        delay = max(float(m.get("delay", 0) or 0), 0.0)
+        if max_reply_delay:
+            delay = min(delay, max_reply_delay)
         if i == 0:
             await asyncio.sleep(max(delay, 0))
         else:

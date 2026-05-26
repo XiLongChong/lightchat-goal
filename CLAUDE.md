@@ -249,3 +249,25 @@ pytest tests/ -v
 ```
 
 测试覆盖：JSON 解析回退、记忆去重、消息 action 解析、输出守卫、调度器硬规则、定时消息存储、工具白名单。当前 50 passed，5 个 Windows tmp_path 权限错误（环境问题，非代码缺陷）。
+## Admin UI Design Direction
+
+The `/admin` UI follows a WeChat-style personal management console. Keep this
+style for future admin work unless the product direction changes.
+
+- Language: Chinese UI by default. Labels should be short and direct.
+- Layout: desktop uses a quiet left sidebar plus content panels; mobile uses a
+  fixed bottom navigation.
+- Visual style: soft WeChat-like green background, white panels, 8-10px radius,
+  restrained shadows, no decorative gradients or oversized marketing sections.
+- Information density: avoid explanatory subtitles and dense small text. Prefer
+  short section titles, status pills, metric cards, chat bubbles, and compact
+  rows.
+- Conversation diagnostics: represent user/model/system events as chat bubbles
+  when possible. Use structured Chinese summaries before raw logs.
+- Settings: persona editing should be one large textarea. Runtime settings stay
+  grouped by actual feature: proactive, WeChat/tools, email, manual send/tasks.
+- Memory/proactive/logs: keep these as first-class admin pages. Do not hide
+  proactive candidates, active topic state, memory import/export, recap
+  generation, email settings, or raw logs when changing the UI.
+- Mobile: every core page must remain reachable and must not require horizontal
+  scrolling at 390px width.

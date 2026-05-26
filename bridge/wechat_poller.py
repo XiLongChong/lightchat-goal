@@ -26,6 +26,7 @@ class WeChatBridge:
         goal_url: str = "http://127.0.0.1:8899",
         poll_timeout_ms: int = 35_000,
         message_delay: float = 1.2,
+        max_reply_delay: float = 3.0,
         buffer_debounce_seconds: float = 5.0,
         buffer_max_wait_seconds: float = 12.0,
     ):
@@ -34,6 +35,7 @@ class WeChatBridge:
         self.goal_url = goal_url.rstrip("/")
         self.poll_timeout_ms = poll_timeout_ms
         self.message_delay = message_delay
+        self.max_reply_delay = max_reply_delay
         self.buffer_debounce_seconds = buffer_debounce_seconds
         self.buffer_max_wait_seconds = buffer_max_wait_seconds
         self.buf = ""
@@ -81,6 +83,8 @@ class WeChatBridge:
                 if msgs:
                     for msg in msgs:
                         await self._handle_message(msg)
+                else:
+                    await asyncio.sleep(3)
             except asyncio.CancelledError:
                 break
             except Exception:
@@ -179,12 +183,12 @@ class WeChatBridge:
         reply_msgs = data.get("messages", [])
         for i, m in enumerate(reply_msgs):
             reply_text = m.get("text", "")
-            delay = m.get("delay", 0)
+            delay = self._bounded_reply_delay(m.get("delay", 0))
             if reply_text:
                 if i == 0:
-                    await asyncio.sleep(max(float(delay or 0), 0))
+                    await asyncio.sleep(delay)
                 else:
-                    await asyncio.sleep(max(float(delay or 0), self.message_delay))
+                    await asyncio.sleep(max(delay, self.message_delay))
                 await self._send_reply(from_user, reply_text, context_token)
 
         logger.info(
@@ -200,6 +204,18 @@ class WeChatBridge:
             )
         except Exception:
             logger.exception("iLink send failed")
+
+    def _bounded_reply_delay(self, delay: Any) -> float:
+        """Clamp model-proposed per-message delays to keep chat responsive."""
+        try:
+            value = float(delay or 0)
+        except (TypeError, ValueError):
+            value = 0.0
+        value = max(value, 0.0)
+        max_delay = max(float(self.max_reply_delay or 0), 0.0)
+        if max_delay:
+            value = min(value, max_delay)
+        return value
 
     async def send_text(self, to: str, text: str, context_token: str = ""):
         """Public send helper for scheduled/background messages."""

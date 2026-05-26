@@ -8,6 +8,7 @@ Memory extraction happens in background with its own error handling.
 import asyncio
 import json
 import logging
+from pathlib import Path
 from typing import Any
 
 from memory.store import MemoryStore
@@ -16,32 +17,11 @@ from memory.dedup import is_duplicate, compute_importance
 logger = logging.getLogger(__name__)
 
 
-MEMORY_EXTRACTION_PROMPT = """从以下对话中提取值得长期记住的信息。只提取关于用户的、持久的、重要的信息。
+PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
-## 该提取的（YES）：
-- 用户明确表达的偏好："我不喜欢香菜"
-- 关于用户的持久事实："我在杭州工作"、"我养了只猫叫毛球"
-- 用户的重要计划或目标："下个月要搬家去上海"
-- 用户的情感模式："聊到工作就会烦"
-- 用户与你的关系变化："你今天第一次跟我开玩笑"
-
-## 不该提取的（NO）：
-- 一次性闲聊："今天天气不错"
-- 临时状态："好累啊现在"
-- 对时事的讨论
-- 功能性的请求："帮我查下天气"
-- 你（助手）说的关于自己的话
-
-## 重要性评分：
-- 0.0-0.3：琐碎细节
-- 0.4-0.6：一般偏好或事实
-- 0.7-0.9：重要个人信息、强烈偏好
-- 1.0：至关重要（如健康信息、重大人生事件）
-
-## 输出格式：
-{"memories":[{"content":"...", "category":"...", "importance":0.X, "keywords":"kw1,kw2"}]}
-
-分类只能是：preference, identity, relationship, experience, goal, concern, other"""
+MINIMAL_MEMORY_EXTRACTION_PROMPT = """提取值得长期记住的用户信息。
+只输出 JSON:
+{"memories":[{"content":"...", "category":"other", "importance":0.5, "keywords":""}]}"""
 
 
 class MemoryWorker:
@@ -59,11 +39,25 @@ class MemoryWorker:
         client: Any,  # AsyncOpenAI
         model: str,
         min_importance: float = 0.4,
+        prompts_dir: str | Path | None = None,
     ):
         self.store = store
         self.client = client
         self.model = model
         self.min_importance = min_importance
+        self.prompts_dir = Path(prompts_dir) if prompts_dir else PROMPTS_DIR
+        self.extraction_prompt = self._load_prompt_template(
+            "memory_extract.md",
+            MINIMAL_MEMORY_EXTRACTION_PROMPT,
+        )
+
+    def _load_prompt_template(self, filename: str, fallback: str) -> str:
+        path = self.prompts_dir / filename
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except OSError:
+            logger.warning("Memory extraction prompt missing, using fallback: %s", path)
+            return fallback
 
     async def extract(
         self,
@@ -104,7 +98,7 @@ class MemoryWorker:
                 lines.append(f"- [{m.get('category', 'other')}] {m.get('content', '')}")
             existing_text = "\n".join(lines)
 
-        full_prompt = f"""{MEMORY_EXTRACTION_PROMPT}
+        full_prompt = f"""{self.extraction_prompt}
 
 ## 已有记忆：
 {existing_text}
@@ -119,7 +113,7 @@ class MemoryWorker:
             response = await self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": "你是一个记忆提取器。只输出JSON。"},
+                    {"role": "system", "content": "只输出JSON。"},
                     {"role": "user", "content": full_prompt},
                 ],
                 temperature=0.3,
