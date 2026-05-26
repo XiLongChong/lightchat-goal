@@ -272,7 +272,7 @@ class BotProfileManager:
         display_name = str(
             bot_cfg.get("display_name")
             or agent_cfg.get("name")
-            or "Yu"
+            or "bot"
         )
 
         enabled_tools = list(bot_cfg.get(
@@ -405,13 +405,13 @@ class BotProfileManager:
         """Fallback trigger text when trigger_context.md is missing."""
         if trigger == "proactive":
             return (
-                "本轮是系统唤醒，不是辣椒发来的消息。"
-                + "你是在主动开口，不能把唤醒指令当成辣椒说过的话。"
+                "本轮是系统唤醒，不是用户发来的消息。"
+                + "你是在主动开口，不能把唤醒指令当成用户说过的话。"
                 + "不要说'你刚才说/你问我/你不是要'等把系统任务误认成用户消息的话。"
                 + "主动消息要像微信里自然冒出来的一句，短，少解释。"
             )
         return (
-            "本轮是辣椒发来的微信消息。"
+            "本轮是用户发来的微信消息。"
             "历史消息里如果带有时间间隔，要先判断上一句话是不是已经过去一段时间。"
             "隔了十几分钟以上时，不要默认上一句话还在同一个瞬间里。"
         )

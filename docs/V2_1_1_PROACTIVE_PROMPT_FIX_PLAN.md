@@ -74,7 +74,7 @@ Relevant files:
     context, memory policy, and tool policy into one system prompt.
 - `prompts/persona.md`
   - is the original front-end managed bot persona.
-  - it contains Yu-specific identity, relationship style, voice, and examples.
+  - it contains bot-specific identity, relationship style, voice, and examples.
 - `prompts/bot_identity_default.md`
   - duplicates a large part of `persona.md`.
 - `config.yaml`
@@ -273,14 +273,14 @@ The current prompt files need clearer ownership.
 
 ### `persona.md`
 
-This is the front-end managed bot persona. It is Yu-specific and should contain:
+This is the front-end managed bot persona. It is bot-specific and should contain:
 
-- user is "辣椒",
-- bot is Yu,
+- user identity and naming rules,
+- bot identity and naming rules,
 - speaking style,
 - relationship feel,
 - response examples,
-- prohibited Yu-specific expressions,
+- prohibited bot-specific expressions,
 - bot-specific emotional rhythm.
 
 It should not contain:
@@ -313,7 +313,7 @@ Do not claim capabilities outside the current message, provided context, and
 actual tool results.
 ```
 
-The exact JSON schema may remain here, but all Yu personality text should move
+The exact JSON schema may remain here, but all bot personality text should move
 out.
 
 ### `bot_identity_default.md`
@@ -604,7 +604,7 @@ Add focused tests before broad integration.
 ### Prompt Tests
 
 - default bot prompt contains persona text from `prompts/persona.md`,
-- `base_protocol.md` does not duplicate Yu-specific persona content,
+- `base_protocol.md` does not duplicate bot-specific persona content,
 - proactive trigger context says system-triggered tasks are not user messages,
 - broad recap is not injected into proactive generation context.
 
@@ -626,8 +626,8 @@ V2.1.1 is complete when:
 - A newer topic prevents older topics from being followed later.
 - The bot can proactively choose check-in, latest-topic follow-up, self-share,
   or light ping.
-- `prompts/persona.md` is the active editable Yu persona source.
-- system protocol and tool rules no longer duplicate Yu persona text.
+- `prompts/persona.md` is the active editable bot persona source.
+- system protocol and tool rules no longer duplicate bot persona text.
 - empty WeChat messages are filtered before send.
 - admin diagnostics can show why a proactive message was sent or skipped.
 

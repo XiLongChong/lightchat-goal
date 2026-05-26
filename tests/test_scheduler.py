@@ -218,7 +218,7 @@ def test_recent_context_formats_recent_turns():
     text = SchedulerAgent._format_recent_context(turns)
 
     assert "用户: 我在更新一个项目" in text
-    assert "栖: 行 那不谈工作 / 现在想干点啥" in text
+    assert "bot: 行 那不谈工作 / 现在想干点啥" in text
     assert "assistant_actions" not in text
     assert '{"text"' not in text
 

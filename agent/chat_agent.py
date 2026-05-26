@@ -472,7 +472,7 @@ def _format_current_turn(user_message: str, history: list[dict[str, Any]], trigg
     label = _format_ts(now)
     gap = _last_message_gap(history, now)
     if trigger == "user":
-        return f"[辣椒消息 | {label}{gap}]\n{user_message}"
+        return f"[用户消息 | {label}{gap}]\n{user_message}"
 
     # All system-triggered messages: label clearly so the model knows
     # this is NOT a user message
@@ -486,7 +486,7 @@ def _format_current_turn(user_message: str, history: list[dict[str, Any]], trigg
     trigger_label = trigger_labels.get(trigger, f"系统任务 ({trigger})")
     return (
         f"[{trigger_label} | {label}{gap}]\n"
-        "下面是系统任务，不是辣椒发来的消息：\n"
+        "下面是系统任务，不是用户发来的消息：\n"
         f"{user_message}"
     )
 

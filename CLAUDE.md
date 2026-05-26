@@ -6,7 +6,7 @@ V2.1.1 (2026-05-20): 主动消息改为 due-time + intent 模型，LLM 不再决
 
 ## 一句话概括
 
-单进程 Python + FastAPI 服务。DeepSeek 驱动一个叫"余"的 AI 角色，通过微信 iLink 跟用户聊天。有长期记忆、主动消息、定时提醒。所有数据存一个 SQLite 文件，零云依赖。
+单进程 Python + FastAPI 服务。DeepSeek 驱动一个可配置 bot，通过微信 iLink 跟用户聊天。有长期记忆、主动消息、定时提醒。所有数据存一个 SQLite 文件，零云依赖。
 
 ## 跑起来
 

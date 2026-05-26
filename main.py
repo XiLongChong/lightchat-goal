@@ -1764,6 +1764,15 @@ async def delete_memory(mem_id: str, request: Request):
     return {"status": "deleted", "id": mem_id}
 
 
+@app.post("/admin/dev/forget")
+async def developer_forget_all(request: Request):
+    """Developer reset: forget model-visible memory/history state."""
+    require_admin(request)
+    conversation_histories.clear()
+    counts = await memory_store.clear_developer_memory_state()
+    return {"status": "forgotten", "cleared": counts}
+
+
 @app.get("/relationship")
 async def get_relationship(request: Request):
     """Get current relationship state."""
@@ -2106,7 +2115,7 @@ async def fixed_morning_message() -> dict:
     )
     weather_result = await execute_tool("get_weather", {"city": city})
     prompt = (
-        f"现在是早上8点。主动给辣椒发早安消息。"
+        f"现在是早上8点。主动给用户发早安消息。"
         f"天气工具结果：{weather_result}。"
         "基于这个真实结果，用几条短微信说早安、天气、今天可以做的一两件小事。"
         "不要再调用 get_weather，不要编造工具没有返回的天气细节。"
@@ -2121,7 +2130,7 @@ async def fixed_morning_message() -> dict:
 
 async def fixed_night_recap() -> dict:
     prompt = (
-        "现在是晚上11点。请从AI的角度写一小段今天的陪伴日记并发给辣椒。"
+        "现在是晚上11点。请从AI的角度写一小段今天的陪伴日记并发给用户。"
         "基于今天真实聊过的内容，说我今天和你聊到了什么、我看见了什么状态、"
         "我想轻轻替你记住什么。不要冒充用户本人，不要编造没聊过的现实事实。"
         "200字以内，像随手写日记。"

@@ -116,3 +116,52 @@ def test_usage_summary_round_trip(tmp_path):
         await store.close()
 
     asyncio.run(run())
+
+
+def test_developer_forget_clears_model_state_but_keeps_usage(tmp_path):
+    async def run():
+        store = MemoryStore(str(tmp_path / "memory.db"))
+        try:
+            await store.save_memory_bot("用户喜欢夜里写代码", bot_id="default_bot", min_importance=0)
+            await store.save_shared_fact("用户默认城市是成都")
+            await store.append_conversation_history(
+                "wxid_me", "user", "刚才那段对话", bot_id="default_bot"
+            )
+            await store.save_history_summary("wxid_me", "旧摘要", bot_id="default_bot")
+            await store.save_recap("wxid_me", "default_bot", "旧 recap")
+            await store.update_relationship_bot("default_bot", {"familiarity": 8})
+            await store.upsert_active_topic("wxid_me", "default_bot", title="旧话题")
+            await store.create_proactive_candidate("check_in", "old")
+            await store.update_proactive_schedule_state(
+                "wxid_me", "default_bot", next_due_ts=123
+            )
+            await store.create_scheduled_message(
+                "wxid_me",
+                "ctx",
+                [{"text": "old task"}],
+                due_at=123,
+            )
+            await store.record_usage_event("test_event", user_id="wxid_me", message_count=1)
+
+            counts = await store.clear_developer_memory_state()
+
+            assert counts["memories"] == 1
+            assert await store.list_all() == []
+            assert await store.get_shared_facts() == []
+            assert await store.get_recent_conversation_history("wxid_me", bot_id="default_bot") == []
+            assert await store.get_history_summary("wxid_me", bot_id="default_bot") == ""
+            assert await store.get_recaps("wxid_me", "default_bot") == []
+            relationship = await store.get_relationship_bot("default_bot")
+            assert relationship["familiarity"] == 5
+            assert await store.get_active_topic("wxid_me", "default_bot") is None
+            assert await store.get_recent_proactive_candidates() == []
+            schedule_state = await store.get_proactive_schedule_state("wxid_me", "default_bot")
+            assert schedule_state["next_due_ts"] == 0
+            assert await store.list_scheduled_messages() == []
+
+            usage = await store.get_usage_summary(today_start_ts=0)
+            assert usage["total"]["events"] == 1
+        finally:
+            await store.close()
+
+    asyncio.run(run())

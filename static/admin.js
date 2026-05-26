@@ -761,6 +761,18 @@ async function deleteMemory(id) {
   await loadAll();
 }
 
+async function forgetAllDeveloperState() {
+  const ok = window.confirm("确定要彻底遗忘所有对话历史、记忆、摘要、关系状态、主动话题和未发送任务吗？提示词和配置会保留。");
+  if (!ok) return;
+  const data = await api("/admin/dev/forget", {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+  const total = Object.values(data.cleared || {}).reduce((sum, value) => sum + Number(value || 0), 0);
+  toast(`已彻底遗忘 ${total} 条状态记录`);
+  await loadAll();
+}
+
 async function triggerScheduler() {
   const data = await api("/admin/proactive/trigger", {
     method: "POST",
@@ -962,6 +974,7 @@ $("manualSendBtn").addEventListener("click", () => manualSend().catch((err) => t
 $("loadTasksBtn").addEventListener("click", loadTasks);
 $("importMemoryBtn").addEventListener("click", () => importMemory().catch((err) => toast(err.message)));
 $("exportMemoryBtn").addEventListener("click", exportMemory);
+$("forgetAllBtn").addEventListener("click", () => forgetAllDeveloperState().catch((err) => toast(err.message)));
 $("startDeployBtn").addEventListener("click", () => startDeploy().catch((err) => toast(err.message)));
 $("startBridgeBtn").addEventListener("click", () => startSavedBridge().catch((err) => toast(err.message)));
 $("stopBridgeBtn").addEventListener("click", () => stopBridge().catch((err) => toast(err.message)));

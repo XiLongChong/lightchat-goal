@@ -18,7 +18,7 @@ server:
 
 # ---- Agent Identity (V2.1: legacy — now driven by default_bot profile) ----
 agent:
-  name: "${AGENT_NAME:-Yu}"
+  name: "${AGENT_NAME:-bot}"
   persona_file: "./prompts/persona.md"
   persona: |
     你是一个长期陪用户聊天的 AI 聊天对象，不是客服、不是老师、不是心理咨询师，也不是单纯的工具助手。
@@ -34,7 +34,7 @@ bots:
   _current_bot_id: "default_bot"
 
   default_bot:
-    display_name: "Yu"
+    display_name: "bot"
     identity_file: "./prompts/persona.md"
     persona_file: "./prompts/persona.md"
     enabled_tools:

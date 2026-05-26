@@ -532,6 +532,39 @@ class MemoryStore:
             await db.commit()
             return cursor.rowcount
 
+    async def clear_developer_memory_state(self) -> dict[str, int]:
+        """Clear model-visible conversation state while keeping prompts/config.
+
+        This is a developer reset, not a database wipe. It removes persisted
+        data that can affect future model context or reintroduce old content,
+        but leaves prompt files, runtime config, auth/session data, bridge
+        contact state, and usage telemetry intact.
+        """
+        tables = [
+            "memories",
+            "shared_user_facts",
+            "conversation_history",
+            "history_summaries",
+            "turns",
+            "recaps",
+            "relationship_state",
+            "active_topics",
+            "proactive_candidates",
+            "proactive_schedule_state",
+            "scheduled_messages",
+            "turn_drafts",
+            "turn_diagnostics",
+            "outbound_messages",
+        ]
+        counts: dict[str, int] = {}
+        async with self._lock:
+            db = await self._get_db()
+            for table in tables:
+                cursor = await db.execute(f"DELETE FROM {table}")
+                counts[table] = max(0, int(cursor.rowcount or 0))
+            await db.commit()
+        return counts
+
     async def import_memories(
         self,
         entries: list[dict[str, Any]],

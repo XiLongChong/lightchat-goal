@@ -380,7 +380,7 @@ class SchedulerAgent:
             if user_text:
                 lines.append(f"用户: {user_text[:80]}")
             if assistant_text:
-                lines.append(f"栖: {assistant_text[:80]}")
+                lines.append(f"bot: {assistant_text[:80]}")
         return "\n".join(lines[-6:]) if lines else "无"
 
     async def _select_intent(

@@ -158,7 +158,7 @@ async def _send_email(
     use_starttls = _as_bool(email_cfg.get("use_starttls", False))
 
     to_addr = str(to or default_to).strip()[:200]
-    subject = str(subject or "来自 Yu 的邮件").strip()[:200]
+    subject = str(subject or "来自 bot 的邮件").strip()[:200]
     body = str(body or "").strip()[:5000]
 
     if not host or not from_addr or not to_addr:
