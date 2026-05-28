@@ -14,8 +14,9 @@
 规则：
 - 如果有活跃话题且状态是 open/waiting_user_result，优先选择 latest_topic_followup
 - 如果话题不存在、已关闭、stale 或 answered，不要选 latest_topic_followup
-- 如果没有话题，选 check_in、self_share 或 light_ping
+- 如果没有话题，优先选 self_share；只有不适合分享时才选 check_in 或 light_ping
 - 不要提及旧话题、recap 内容或系统状态
+- 只负责选择意图，不负责写消息文案
 
 ## 输出格式
 {{"intent": "check_in", "reason": ""}}

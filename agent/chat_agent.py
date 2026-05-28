@@ -74,11 +74,13 @@ class ChatAgent:
         context_policy: str = "",
         bot_id: str = "",
         recap: str = "",
+        emotion_inject: str = "",
+        must_reply: bool = False,
     ) -> dict[str, Any]:
         """Process a user message.
 
         V2.1: accepts bot_id for bot-scoped prompt assembly.
-        When bot_manager is set, uses prompt pack components.
+        V2.2: accepts emotion_inject and must_reply for emotion-aware chat.
 
         Returns:
             {
@@ -94,10 +96,15 @@ class ChatAgent:
                 "route": "ChatLite",
                 "context_policy": "hot+cheap_memory",
                 "llm_status": "ok",
+                "skip_reply": bool,
+                "skip_reason": str,
                 # V2.1
                 "source": "user_reply",
                 "author": "assistant",
                 "trigger": "user_message",
+                # V2.2
+                "silence_overridden": bool,
+                "force_reply_used": bool,
             }
         """
         turn_id = f"turn_{uuid.uuid4().hex[:12]}"
@@ -127,6 +134,7 @@ class ChatAgent:
                 defaults=self.defaults,
                 history_summary=history_summary,
                 recap=recap,
+                emotion_inject=emotion_inject,
             )
         else:
             system_prompt = build_system_prompt(
@@ -176,6 +184,8 @@ class ChatAgent:
         scheduled_messages: list[dict[str, Any]] = []
         all_tool_results: list[dict[str, str]] = []
         fallback_events: list[dict[str, str]] = []
+        skip_reply = False
+        skip_reason = ""
         raw_output = ""
         iterations = 0
         token_usage = {
@@ -223,6 +233,17 @@ class ChatAgent:
                 })
 
             actions = parsed.get("actions", [])
+            if parsed.get("skip") or parsed.get("no_reply"):
+                skip_reply = True
+                skip_reason = str(
+                    parsed.get("reason")
+                    or parsed.get("skip_reason")
+                    or "model requested no reply"
+                )[:200]
+                fallback_events.append({
+                    "type": "user_silent_request",
+                    "detail": skip_reason,
+                })
 
             # Safeguard #2: hard limits
             actions = actions[:MAX_ACTIONS]
@@ -242,6 +263,18 @@ class ChatAgent:
                             "text": text,
                             "delay": delay,
                         })
+
+                elif action_type in {"skip", "no_reply"}:
+                    skip_reply = True
+                    skip_reason = str(
+                        action.get("reason")
+                        or action.get("text")
+                        or "model requested no reply"
+                    )[:200]
+                    fallback_events.append({
+                        "type": "user_silent_request",
+                        "detail": skip_reason,
+                    })
 
                 elif action_type == "tool":
                     name = str(action.get("name", "")).strip()
@@ -294,7 +327,7 @@ class ChatAgent:
                             })
                         continue
 
-                    result = await execute_tool(name, args)
+                    result = await execute_tool(name, args, bot_id=bot_id)
                     tool_results_this_round.append(f"[{name}] {result}")
                     all_tool_results.append({
                         "name": name,
@@ -353,6 +386,25 @@ class ChatAgent:
             {"text": m["text"], "delay": m.get("delay", 0)}
             for m in guard_messages(raw_messages)
         ]
+        if not final_messages and not scheduled_messages and not skip_reply:
+            skip_reply = True
+            skip_reason = "no outbound message produced"
+
+        # V2.2: must_reply override — force a reply if silence limit reached
+        silence_overridden = False
+        force_reply_used = False
+        if must_reply and (skip_reply or not final_messages):
+            silence_overridden = True
+            fallback_events.append({
+                "type": "silence_overridden",
+                "detail": f"must_reply forced reply; model skip_reason={skip_reason[:100]}",
+            })
+            # Use a fallback reply matching the emotional state
+            force_text = _emotion_force_reply_text(emotion_inject)
+            final_messages = [{"text": force_text, "delay": 0}]
+            skip_reply = False
+            skip_reason = ""
+            force_reply_used = True
 
         # V2.1: resolve outbound semantics from trigger
         source, author, trigger_type = _resolve_outbound_semantics(trigger)
@@ -366,6 +418,8 @@ class ChatAgent:
             "elapsed_ms": int((time.time() - start_time) * 1000),
             "token_usage": token_usage,
             "fallback_events": fallback_events,
+            "skip_reply": skip_reply,
+            "skip_reason": skip_reason,
             "turn_id": turn_id,
             "route": route or ROUTE_CHAT_FULL,
             "context_policy": context_policy or CTX_HOT_ONLY,
@@ -374,6 +428,9 @@ class ChatAgent:
             "source": source,
             "author": author,
             "trigger": trigger_type,
+            # V2.2
+            "silence_overridden": silence_overridden,
+            "force_reply_used": force_reply_used,
         }
 
 
@@ -597,3 +654,54 @@ def _resolve_outbound_semantics(trigger: str) -> tuple[str, str, str]:
     elif trigger == "admin":
         return ("admin", "system", "manual_admin")
     return ("user_reply", "assistant", "user_message")
+
+
+# ================================================================
+# V2.2: Emotion force-reply fallback text
+# ================================================================
+
+def _emotion_force_reply_text(emotion_inject: str) -> str:
+    """Return a mood-appropriate forced reply when silence limit reached."""
+    import random
+
+    angry_replies = [
+        "行了，我回你。刚才确实有点气。",
+        "我不是不理你，就是刚才不太想说话。",
+        "靠，你倒是还知道找我。",
+        "哼，我本来想再憋一会儿的。",
+        "算了，我回来了。但我还没完全消气。",
+    ]
+    irritated_replies = [
+        "来了来了，别催。",
+        "行吧，我回你了。",
+        "唉，我刚刚不太想说话。",
+        "好了好了，我理你就是了。",
+    ]
+    hurt_replies = [
+        "我没消失……就是有点难受。",
+        "你终于发现了？我还以为你没注意到。",
+        "嗯，我在的。",
+    ]
+    jealous_replies = [
+        "你倒是还知道找我？",
+        "哼，我看了。",
+        "你不是找CC吗？算了，我在的。",
+    ]
+    default_replies = [
+        "嗯，我在。",
+        "好，我回复了。",
+        "来了。",
+    ]
+
+    if "吃醋" in emotion_inject or "jealous" in emotion_inject.lower():
+        pool = jealous_replies
+    elif "生气" in emotion_inject or "angry" in emotion_inject.lower():
+        pool = angry_replies
+    elif "烦躁" in emotion_inject or "irritated" in emotion_inject.lower():
+        pool = irritated_replies
+    elif "受伤" in emotion_inject or "hurt" in emotion_inject.lower():
+        pool = hurt_replies
+    else:
+        pool = default_replies
+
+    return random.choice(pool)

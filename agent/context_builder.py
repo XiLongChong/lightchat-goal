@@ -114,12 +114,14 @@ def build_system_prompt_v21(
     defaults: dict[str, Any] | None = None,
     history_summary: str = "",
     recap: str = "",
+    emotion_inject: str = "",
 ) -> str:
     """Build system prompt from bot's prompt pack components.
 
     V2.1: delegates to BotProfileManager.build_system_prompt,
     which assembles from base_protocol, bot_identity, relationship_context,
     memory_policy, tool_policy, and trigger_context components.
+    V2.2: accepts emotion_inject for emotion-aware chat.
     """
     return bot_manager.build_system_prompt(
         bot_id=bot_id,
@@ -131,6 +133,7 @@ def build_system_prompt_v21(
         defaults=defaults,
         history_summary=history_summary,
         recap=recap,
+        emotion_inject=emotion_inject,
     )
 
 

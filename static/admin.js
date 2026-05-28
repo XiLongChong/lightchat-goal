@@ -17,6 +17,7 @@ const pageTitles = {
   chat: "LightChat · 聊天诊断",
   proactive: "LightChat · 主动消息",
   memory: "LightChat · 记忆",
+  emotion: "LightChat · 情绪/对话",
   settings: "LightChat · 设置",
   logs: "LightChat · 日志",
 };
@@ -131,14 +132,26 @@ async function loadConfig() {
   const scheduler = current.settings.scheduler || {};
   const proactive = current.settings.proactive || {};
   const timing = proactive.timing || {};
+  const generation = proactive.generation || {};
   setValue("schedulerEnabled", scheduler.enabled ? "true" : "false");
   setValue("intervalMinutes", scheduler.interval_minutes);
+  setValue("quietHoursEnabled", scheduler.quiet_hours_enabled ? "true" : "false");
   setValue("minProactiveInterval", timing.min_interval_minutes);
   setValue("maxProactiveInterval", timing.max_interval_minutes);
   setValue("maxDailyProactive", scheduler.max_daily_proactive);
   setValue("scheduledCheckSeconds", scheduler.scheduled_check_seconds);
   setValue("sleepStart", scheduler.sleep_start);
   setValue("sleepEnd", scheduler.sleep_end);
+
+  // Clingy settings (independent section)
+  const clingy = current.settings.clingy || {};
+  setValue("clingyEnabled", current.settings?.proactive?.generation?.clingy_mode_enabled ? "true" : "false");
+  setValue("clingyAfterMinutes", current.settings?.proactive?.generation?.clingy_after_minutes || 20);
+  setValue("clingyMaxFollowups", clingy.max_followups_per_unanswered || 3);
+  setValue("clingyCooldownMinutes", clingy.cooldown_minutes || 20);
+  setValue("clingyDailyCap", clingy.daily_cap || 3);
+  setValue("clingyRespectQuietHours", clingy.respect_quiet_hours !== false ? "true" : "false");
+  setValue("clingyDebugForce", clingy.debug_force_trigger_enabled ? "true" : "false");
 
   const wechat = current.settings.wechat || {};
   setValue("messageDelay", wechat.message_delay);
@@ -354,6 +367,9 @@ function labelReason(value) {
   const labels = {
     check_in: "关心问候",
     follow_up: "延续话题",
+    latest_topic_followup: "话题跟进",
+    self_share: "自我分享",
+    light_ping: "轻量问候",
     nudge: "轻提醒",
     topic_followup: "话题跟进",
     idle_check: "空闲问候",
@@ -368,7 +384,20 @@ function labelProactiveDetail(value) {
   let text = String(value || "").trim();
   if (!text) return "";
   const replacements = [
-    [/intent selection fallback/gi, "意图选择兜底"],
+    [/intent selection fallback/gi, "没有活跃话题，按默认策略选择"],
+    [/eligible topic exists/gi, "当前有可跟进话题"],
+    [/topic not eligible, fell back to check_in/gi, "当前话题不适合继续跟进，改为问候"],
+    [/no active topic, prefer self share/gi, "没有活跃话题，优先自我分享"],
+    [/send failed/gi, "微信送达失败"],
+    [/quiet hours/gi, "处于免打扰时段"],
+    [/sleep hours/gi, "处于免打扰时段"],
+    [/not yet due/gi, "还没到计划时间"],
+    [/initial due scheduled/gi, "已安排首次主动时间"],
+    [/daily cap/gi, "达到每日上限"],
+    [/bridge unavailable/gi, "微信桥接不可用"],
+    [/no contact/gi, "还没有可发送联系人"],
+    [/proactive disabled/gi, "主动消息已关闭"],
+    [/bot not active/gi, "当前 bot 未激活"],
     [/v2\.1\.1 due-time/gi, "到达计划时间"],
     [/due-time/gi, "到达计划时间"],
     [/waiting_user_result/gi, "等待用户反馈"],
@@ -446,6 +475,12 @@ function renderOverview() {
   const latestTurn = [...(dashboard.events || [])].find((e) => e.kind === "turn");
   if (!latestTurn) {
     feed.appendChild(bubble("system", "暂无对话记录"));
+  } else if (latestTurn.is_proactive) {
+    feed.appendChild(bubble("system", `主动消息 · ${labelReason(latestTurn.intent || "proactive")}`));
+    for (const msg of latestTurn.reply_texts || []) {
+      feed.appendChild(bubble("bot", msg));
+    }
+    feed.appendChild(bubble("system", `${latestTurn.send_status}`));
   } else {
     feed.appendChild(bubble("user", latestTurn.user_text || "用户消息为空"));
     for (const msg of latestTurn.reply_texts || []) {
@@ -507,7 +542,10 @@ function renderChat() {
       feed.appendChild(bubble("bot", msg));
     }
     const toolText = (event.tool_calls || []).map((tool) => tool.name || tool.type || "工具").join("、");
-    feed.appendChild(bubble("system", `${event.route} · ${event.context_policy} · ${event.elapsed_ms || 0}ms · ${toolText || "0 工具"} · ${event.send_status}`));
+    const traceText = [event.raw_source || event.source, event.trigger, event.send_status, event.candidate_id || event.batch_id]
+      .filter(Boolean)
+      .join(" · ");
+    feed.appendChild(bubble("system", `${event.route} · ${event.context_policy} · ${event.elapsed_ms || 0}ms · ${toolText || "0 工具"} · ${traceText}`));
   }
 
   const detail = $("turnDetail");
@@ -521,6 +559,16 @@ function renderChat() {
   detail.appendChild(row("上下文", latest.context_policy));
   detail.appendChild(row("工具调用", latest.tool_calls?.length ? JSON.stringify(latest.tool_calls, null, 2) : "无"));
   detail.appendChild(row("发送状态", latest.send_status));
+  if (latest.skip_reply || latest.skip_reason) {
+    detail.appendChild(row("跳过回复", latest.skip_reason || "模型选择不回复"));
+  }
+  detail.appendChild(row("链路追踪", [
+    `source=${latest.raw_source || latest.source || ""}`,
+    `trigger=${latest.trigger || ""}`,
+    `send_status=${latest.send_status || ""}`,
+    latest.candidate_id ? `candidate_id=${latest.candidate_id}` : "",
+    latest.batch_id ? `batch_id=${latest.batch_id}` : "",
+  ].filter(Boolean).join("\n")));
   detail.appendChild(row("记忆写入", latest.memory_enqueued ? "已进入后台提取" : "本轮未写入"));
 }
 
@@ -530,6 +578,7 @@ function renderProactive() {
   const schedule = state.proactive_schedule || {};
   const scheduler = state.scheduler_state || {};
   const timing = state.timing_config || {};
+  const clingy = state.clingy_state || {};
   const topic = dashboard.proactive?.active_topic;
   $("proactiveBadge").textContent = schedule.is_due ? "已到时间" : "等待";
   $("proactiveBadge").className = `status ${schedule.is_due ? "ok" : "warn"}`;
@@ -538,6 +587,19 @@ function renderProactive() {
   $("minIntervalText").textContent = `${timing.min_interval_minutes ?? "--"}m`;
   $("maxIntervalText").textContent = `${timing.max_interval_minutes ?? "--"}m`;
 
+  // Clingy state display
+  const clingyPanel = $("clingyPanel");
+  clear(clingyPanel);
+  clingyPanel.appendChild(row("粘人模式", clingy.clingy_mode_enabled ? "已启用" : "已关闭", clingy.clingy_mode_enabled ? "ok" : "warn"));
+  clingyPanel.appendChild(row("等待用户回复", clingy.awaiting_user_reply ? "是" : "否", clingy.awaiting_user_reply ? "ok" : ""));
+  clingyPanel.appendChild(row("上轮意图", clingy.last_proactive_intent || "无"));
+  clingyPanel.appendChild(row("下次粘人检查", clingy.next_clingy_due_at ? formatClock(clingy.next_clingy_due_at) : "暂无"));
+  clingyPanel.appendChild(row("已追问次数", `${clingy.clingy_followup_count || 0} / ${clingy.max_followups || 3}`));
+  clingyPanel.appendChild(row("粘人等待", `${clingy.clingy_after_minutes || 20} 分钟`));
+  if (clingy.next_due_in_seconds != null && clingy.next_due_in_seconds > 0) {
+    clingyPanel.appendChild(row("距下次检查", `${Math.ceil(clingy.next_due_in_seconds / 60)} 分钟`));
+  }
+
   const list = $("proactiveList");
   clear(list);
   const candidates = dashboard.proactive?.candidates || [];
@@ -545,11 +607,21 @@ function renderProactive() {
     list.appendChild(row("暂无主动消息候选"));
   }
   for (const item of candidates.slice(0, 12)) {
-    const title = `${formatClock(item.created_at)} · ${item.sent ? "已发送" : "未发送"} · ${labelReason(item.reason_type)}`;
+    const sendLabel = (s) => {
+      if (s === "delivered" || s === "已送达") return "已送达";
+      if (s === "sending" || s === "发送中") return "发送中";
+      if (s === "failed" || s === "失败") return "失败";
+      if (s === "skipped" || s === "suppressed" || s === "已跳过") return "已跳过";
+      return "";
+    };
+    const statusLabel = sendLabel(item.send_status) || (item.sent ? "已送达" : "未送达");
+    const title = `${formatClock(item.created_at)} · ${statusLabel} · ${labelReason(item.reason_type)}`;
     const body = [
       item.generated_message ? `内容：${item.generated_message}` : "",
       item.reason_detail ? `原因：${labelProactiveDetail(item.reason_detail)}` : "",
-      item.gate_detail ? `限制：${labelProactiveDetail(item.gate_detail)}` : "",
+      item.gate_detail ? `发送门槛：${labelProactiveDetail(item.gate_detail)}` : "",
+      `链路：source=${item.source || "proactive"} · trigger=${item.trigger || "proactive_reason"} · send_status=${item.send_status || (item.sent ? "delivered" : "")}`,
+      item.batch_id || item.candidate_id ? `ID：candidate_id=${item.candidate_id || item.id || ""} · batch_id=${item.batch_id || ""}` : "",
     ].filter(Boolean).join("\n");
     list.appendChild(row(title, body, item.sent ? "ok" : "warn"));
   }
@@ -686,6 +758,7 @@ async function saveScheduler() {
       scheduler: {
         enabled: getBoolSelect("schedulerEnabled"),
         interval_minutes: getNumber("intervalMinutes"),
+        quiet_hours_enabled: getBoolSelect("quietHoursEnabled"),
         max_daily_proactive: getNumber("maxDailyProactive"),
         scheduled_check_seconds: getNumber("scheduledCheckSeconds"),
         sleep_start: getNumber("sleepStart"),
@@ -696,11 +769,126 @@ async function saveScheduler() {
           min_interval_minutes: getNumber("minProactiveInterval"),
           max_interval_minutes: getNumber("maxProactiveInterval"),
         },
+        generation: {
+          enabled_types: ["check_in", "latest_topic_followup", "clingy_followup", "self_share", "light_ping"],
+        },
       },
     }),
   });
   toast("主动设置已保存");
   await loadAll();
+}
+
+async function saveClingy() {
+  const clingyEnabledEl = $("clingyEnabled");
+  if (!clingyEnabledEl) { toast("粘人设置表单未就绪"); return; }
+  try {
+    await api("/admin/settings", {
+      method: "POST",
+      body: JSON.stringify({
+        proactive: {
+          generation: {
+            clingy_mode_enabled: getBoolSelect("clingyEnabled"),
+            clingy_after_minutes: getNumber("clingyAfterMinutes"),
+          },
+          clingy: {
+            max_followups_per_unanswered: getNumber("clingyMaxFollowups"),
+            cooldown_minutes: getNumber("clingyCooldownMinutes"),
+            daily_cap: getNumber("clingyDailyCap"),
+            respect_quiet_hours: getBoolSelect("clingyRespectQuietHours"),
+            debug_force_trigger_enabled: getBoolSelect("clingyDebugForce"),
+          },
+        },
+      }),
+    });
+    toast("粘人设置已保存");
+    await loadAll();
+  } catch (err) {
+    toast(`保存失败: ${err.message}`);
+  }
+}
+
+async function simulateClingy() {
+  const resultEl = $("clingySimulateResult");
+  if (!resultEl) return;
+  resultEl.textContent = "检查中...";
+  try {
+    const data = await api("/admin/clingy/simulate", { method: "POST", body: "{}" });
+    const lines = [];
+    lines.push(`是否满足发送条件: ${data.would_send ? "是" : "否"} (stage=${data.stage})`);
+    lines.push(`原因: ${data.reason}`);
+    if (data.blocked_reasons && data.blocked_reasons.length) {
+      lines.push("阻塞原因:");
+      for (const r of data.blocked_reasons) lines.push(`  - ${r}`);
+    }
+    const cs = data.clingy_state || {};
+    lines.push("");
+    lines.push("--- 粘人状态 ---");
+    lines.push(`模式: ${cs.clingy_mode_enabled ? "启用" : "关闭"}`);
+    lines.push(`等待回复: ${cs.awaiting_user_reply ? "是" : "否"}`);
+    lines.push(`上轮意图: ${cs.last_proactive_intent || "无"} (user_reply=聊天回复, proactive=主动消息)`);
+    lines.push(`已追问: ${cs.clingy_followup_count || 0} / ${cs.max_followups || "?"}`);
+    lines.push(`等待分钟: ${cs.clingy_after_minutes || "?"}`);
+    if (cs.next_due_in_seconds != null && cs.next_due_in_seconds > 0) {
+      lines.push(`距下次检查: ${Math.ceil(cs.next_due_in_seconds / 60)} 分钟`);
+    }
+    if (data.generated_message) {
+      lines.push(`将发送: ${data.generated_message}`);
+    }
+    resultEl.textContent = lines.join("\n");
+  } catch (err) {
+    resultEl.textContent = `错误: ${err.message}`;
+  }
+}
+
+async function forceClingy() {
+  const resultEl = $("clingyForceResult");
+  if (!resultEl) return;
+  resultEl.textContent = "发送中...";
+  try {
+    const data = await api("/admin/clingy/force", { method: "POST", body: "{}" });
+    if (data.status === "blocked") {
+      const lines = [`被阻止: ${data.reason}`];
+      if (data.diagnostics) {
+        const d = data.diagnostics;
+        lines.push("");
+        lines.push("--- 详细诊断 ---");
+        lines.push(`clingly enabled: ${d.clingy_mode_enabled}`);
+        lines.push(`awaiting: ${d.awaiting_user_reply}`);
+        lines.push(`last_proactive_intent: ${d.last_proactive_intent || "(无)"}`);
+        lines.push(`followup count: ${d.clingy_followup_count}`);
+        lines.push(`clingy_after: ${d.clingy_after_minutes}min`);
+        if (d.last_bot_turn_at) lines.push(`上次bot消息: ${formatClock(d.last_bot_turn_at)} (${d.last_bot_turn_source})`);
+        else lines.push("上次bot消息: 无记录");
+        if (d.last_user_turn_at) lines.push(`上次用户消息: ${formatClock(d.last_user_turn_at)} — ${d.last_user_turn_text || ""}`);
+        else lines.push("上次用户消息: 无记录");
+        lines.push("");
+        lines.push("→ 如果 awaiting=false 但 bot 刚回复过，请检查 bot 是否 skip 了");
+        lines.push("→ 可点「设等待」手动进入未回复状态再测试");
+      }
+      resultEl.textContent = lines.join("\n");
+    } else {
+      const r = data.result || {};
+      resultEl.textContent = r.sent
+        ? `已发送: ${r.message || "(空)"} · intent=${r.intent}`
+        : `未发送: ${r.reason || "未知"} (stage=${r.stage})`;
+    }
+    await loadAll();
+  } catch (err) {
+    resultEl.textContent = `错误: ${err.message}`;
+  }
+}
+
+async function primeClingy() {
+  const resultEl = $("clingyForceResult");
+  if (!resultEl) return;
+  try {
+    const data = await api("/admin/clingy/prime", { method: "POST", body: "{}" });
+    resultEl.textContent = data.message || "已设置";
+    await loadAll();
+  } catch (err) {
+    resultEl.textContent = `错误: ${err.message}`;
+  }
 }
 
 async function saveTools() {
@@ -778,8 +966,9 @@ async function triggerScheduler() {
     method: "POST",
     body: JSON.stringify({}),
   });
-  toast(data.result?.sent ? "主动消息已发送" : data.result?.reason || "本次未发送");
-  await loadDashboard();
+  toast(data.message || "调度已触发，稍后刷新查看结果");
+  // Give scheduler a moment, then refresh
+  setTimeout(() => loadDashboard(), 2000);
 }
 
 async function closeTopic() {
@@ -919,12 +1108,163 @@ function showSettingsView(viewId = "settingsHome") {
   });
 }
 
+// ── Emotion / Dialogue state ──────────────────────────────────────
+
+async function loadEmotionState() {
+  try {
+    const [emoResp, dsResp] = await Promise.all([
+      api("/admin/emotion/state"),
+      api("/admin/dialogue/state"),
+    ]);
+    renderEmotionState(emoResp);
+    renderDialogueState(dsResp);
+    renderEmotionEvents(emoResp.recent_events || []);
+    renderDialogueEvents(dsResp.recent_events || []);
+  } catch (e) {
+    toast("加载情绪状态失败: " + e.message);
+  }
+}
+
+function renderEmotionState(data) {
+  const s = data.emotion_state || {};
+  const moodMap = { calm: "平静", cold: "冷淡", warm: "温暖", playful: "调皮", jealous: "吃醋", lonely: "孤独", hurt: "受伤", irritated: "烦躁", angry: "生气", softened: "软化" };
+  const stageMap = { stranger: "陌生人", familiar: "熟人", close: "亲密", attached: "依恋" };
+  $("emotionStateView").innerHTML =
+    `<p>心情: <strong>${moodMap[s.bot_mood] || s.bot_mood}</strong> (强度 ${s.mood_intensity}/100)</p>` +
+    `<p>关系: <strong>${stageMap[s.relationship_stage] || s.relationship_stage}</strong></p>` +
+    `<p>好感: ${s.affection} | 信任: ${s.trust} | 激怒: ${s.irritation} | 依恋: ${s.attachment} | 吃醋: ${s.jealousy}</p>` +
+    `<p class="hint">最后原因: ${s.last_emotion_reason || "--"}</p>`;
+  // Pre-fill form
+  $("emoMoodSelect").value = s.bot_mood || "calm";
+  $("emoAffection").value = s.affection || 10;
+  $("emoTrust").value = s.trust || 10;
+  $("emoIrritation").value = s.irritation || 0;
+}
+
+function renderDialogueState(data) {
+  const s = data.dialogue_state || {};
+  const waitMap = { none: "正常", assistant_waiting_user: "等待Bot回复", user_waiting_assistant: "等待用户回复", topic_closed: "话题结束", paused_by_user: "用户暂停", bot_silent: "Bot沉默中" };
+  const isSilent = s.wait_state === "bot_silent";
+  const proactiveAllowed = !["bot_silent", "user_waiting_assistant", "paused_by_user"].includes(s.wait_state);
+  const clingyAllowed = s.wait_state === "assistant_waiting_user";
+  $("dialogueStateView").innerHTML =
+    `<p>状态: <strong>${waitMap[s.wait_state] || s.wait_state}</strong></p>` +
+    `<p>Bot沉默: <strong>${isSilent ? "是" : "否"}</strong> ${isSilent ? "(原因: " + (s.silent_reason || "--") + ")" : ""}</p>` +
+    `<p>沉默消息数: ${s.user_messages_since_silent} / ${s.silent_must_reply_after_count}</p>` +
+    `<p>主动消息允许: <strong>${proactiveAllowed ? "是" : "否"}</strong> | 粘人允许: <strong>${clingyAllowed ? "是" : "否"}</strong></p>` +
+    `<p>上次用户消息: ${s.last_user_message_excerpt || "--"}</p>` +
+    `<p class="hint">原因: ${s.last_state_reason || "--"}</p>`;
+  $("dsWaitSelect").value = s.wait_state || "none";
+}
+
+function renderEmotionEvents(events) {
+  if (!events || !events.length) { $("emotionEventsView").innerHTML = "<p>暂无事件</p>"; return; }
+  $("emotionEventsView").innerHTML = events.slice(0, 20).map(e =>
+    `<div class="event-row"><span class="tag">${e.event_type || ""}</span> ${(e.reason || "").slice(0, 80)} <span class="hint">conf=${e.confidence?.toFixed(2) || "?"}</span></div>`
+  ).join("");
+}
+
+function renderDialogueEvents(events) {
+  if (!events || !events.length) { $("dialogueEventsView").innerHTML = "<p>暂无事件</p>"; return; }
+  $("dialogueEventsView").innerHTML = events.slice(0, 20).map(e =>
+    `<div class="event-row">${(e.reason || "").slice(0, 100)}</div>`
+  ).join("");
+}
+
+// ── Emotion manual override handlers ──
+
+$("emoUpdateBtn").addEventListener("click", async () => {
+  try {
+    await api("/admin/emotion/update", {
+      method: "POST",
+      body: JSON.stringify({
+        bot_mood: $("emoMoodSelect").value,
+        affection: parseInt($("emoAffection").value) || 10,
+        trust: parseInt($("emoTrust").value) || 10,
+        irritation: parseInt($("emoIrritation").value) || 0,
+      }),
+    });
+    toast("情绪已更新");
+    loadEmotionState();
+  } catch (e) { toast("更新失败: " + e.message); }
+});
+
+$("emoResetBtn").addEventListener("click", async () => {
+  try {
+    await api("/admin/emotion/reset", { method: "POST" });
+    toast("情绪已重置");
+    loadEmotionState();
+  } catch (e) { toast("重置失败: " + e.message); }
+});
+
+$("emotionRefreshBtn").addEventListener("click", loadEmotionState);
+
+// ── Dialogue manual override handlers ──
+
+$("dsUpdateBtn").addEventListener("click", async () => {
+  try {
+    await api("/admin/dialogue/update", {
+      method: "POST",
+      body: JSON.stringify({ wait_state: $("dsWaitSelect").value }),
+    });
+    toast("对话状态已更新");
+    loadEmotionState();
+  } catch (e) { toast("更新失败: " + e.message); }
+});
+
+$("dsResetBtn").addEventListener("click", async () => {
+  try {
+    await api("/admin/dialogue/reset", { method: "POST" });
+    toast("对话状态已重置");
+    loadEmotionState();
+  } catch (e) { toast("重置失败: " + e.message); }
+});
+
+$("dsForceReplyBtn").addEventListener("click", async () => {
+  try {
+    await api("/admin/dialogue/update", {
+      method: "POST",
+      body: JSON.stringify({ wait_state: "assistant_waiting_user", silent_started_at: 0, user_messages_since_silent: 0 }),
+    });
+    toast("已强制进入等待Bot回复状态");
+    loadEmotionState();
+  } catch (e) { toast("失败: " + e.message); }
+});
+
+$("dsBreakSilenceBtn").addEventListener("click", async () => {
+  try {
+    await api("/admin/dialogue/update", {
+      method: "POST",
+      body: JSON.stringify({ wait_state: "assistant_waiting_user", silent_started_at: 0, silent_reason: "admin manual break", user_messages_since_silent: 0 }),
+    });
+    toast("已解除沉默");
+    loadEmotionState();
+  } catch (e) { toast("失败: " + e.message); }
+});
+
+$("dsPauseProactiveBtn").addEventListener("click", async () => {
+  try {
+    const until = Date.now() / 1000 + 3600;
+    await api("/admin/dialogue/update", {
+      method: "POST",
+      body: JSON.stringify({ wait_state: "paused_by_user", proactive_paused_until: until }),
+    });
+    toast("已暂停主动消息1小时");
+    loadEmotionState();
+  } catch (e) { toast("失败: " + e.message); }
+});
+
+// ── End emotion/dialogue ──────────────────────────────────────────
+
 function switchTab(tab) {
   activeTab = tab;
   $("pageTitle").textContent = pageTitles[tab] || "LightChat";
   document.querySelectorAll(".panel").forEach((el) => el.classList.remove("active"));
   document.querySelectorAll(".nav-item, .mobile-item").forEach((el) => el.classList.toggle("active", el.dataset.tab === tab));
   $(tab).classList.add("active");
+  if (tab === "emotion") {
+    loadEmotionState();
+  }
   if (tab === "logs") {
     loadLogs();
     startLogPolling();
@@ -964,8 +1304,12 @@ $("refreshBtn").addEventListener("click", () => loadAll().then(() => toast("已�
 $("overviewRefreshBtn").addEventListener("click", () => loadAll().then(() => toast("已刷新")));
 $("savePersonaBtn").addEventListener("click", savePersona);
 $("saveSchedulerBtn").addEventListener("click", saveScheduler);
+$("saveClingyBtn").addEventListener("click", saveClingy);
 $("saveToolsBtn").addEventListener("click", saveTools);
 $("saveEmailBtn").addEventListener("click", saveTools);
+$("primeClingyBtn").addEventListener("click", primeClingy);
+$("simulateClingyBtn").addEventListener("click", simulateClingy);
+$("forceClingyBtn").addEventListener("click", forceClingy);
 $("botSelect").addEventListener("change", () => switchBot().catch((err) => toast(err.message)));
 $("triggerSchedulerBtn").addEventListener("click", triggerScheduler);
 $("closeTopicBtn").addEventListener("click", closeTopic);

@@ -34,3 +34,27 @@ def test_admin_events_endpoint_returns_dashboard_shape():
     assert "proactive" in payload
     assert "memory" in payload
     assert "bot" in payload
+
+
+def test_stale_or_unbound_contact_is_not_send_ready():
+    import main
+
+    assert main._contact_send_block_reason(
+        {
+            "user_id": "wxid_me",
+            "context_token": "ctx",
+            "bot_id": "other_bot",
+            "updated_at": main.PROCESS_STARTED_AT + 1,
+        },
+        "default_bot",
+    ) == "bot not bound"
+
+    assert main._contact_send_block_reason(
+        {
+            "user_id": "wxid_me",
+            "context_token": "ctx",
+            "bot_id": "default_bot",
+            "updated_at": main.PROCESS_STARTED_AT - 1,
+        },
+        "default_bot",
+    ) == "stale contact binding"

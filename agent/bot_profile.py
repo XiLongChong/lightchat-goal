@@ -162,11 +162,13 @@ class BotProfileManager:
         defaults: dict[str, Any] | None = None,
         history_summary: str = "",
         recap: str = "",
+        emotion_inject: str = "",
     ) -> str:
         """Assemble the full system prompt from the bot's prompt pack.
 
         V2.1: components are loaded from individual .md files and combined
         with runtime context (relationship, memories, time, etc.).
+        V2.2: accepts emotion_inject for emotion-aware chat.
         """
         pack = self.load_prompt_pack(bot_id)
         defaults = defaults or {}
@@ -217,6 +219,9 @@ class BotProfileManager:
 
         sections.append(f"\n## 记忆\n{mem_text}")
         sections.append(f"\n## 工具\n{tool_text}")
+
+        if emotion_inject:
+            sections.append(f"\n{emotion_inject}")
 
         return "\n\n".join(s.strip() for s in sections if s.strip())
 

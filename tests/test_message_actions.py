@@ -109,6 +109,23 @@ def test_schedule_wechat_message_action_is_collected():
     ]
 
 
+def test_skip_action_records_no_reply_reason():
+    raw = """
+    {
+      "actions": [
+        {"type": "skip", "reason": "user explicitly said no reply needed"}
+      ],
+      "done": true
+    }
+    """
+
+    result = _run_agent(raw)
+
+    assert result["messages"] == []
+    assert result["skip_reply"] is True
+    assert result["skip_reason"] == "user explicitly said no reply needed"
+
+
 def test_invalid_json_records_fallback_and_token_usage():
     result = _run_agent("plain text fallback")
 

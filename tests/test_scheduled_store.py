@@ -82,6 +82,78 @@ def test_conversation_history_round_trip(tmp_path):
     asyncio.run(run())
 
 
+def test_proactive_outbound_delivery_status_round_trip(tmp_path):
+    async def run():
+        store = MemoryStore(str(tmp_path / "memory.db"))
+        try:
+            await store.record_outbound_messages(
+                turn_id="turn_proactive",
+                user_id="wxid_me",
+                bot_id="default_bot",
+                messages=[{"text": "还没睡？", "delay": 0}],
+                source="proactive",
+                author="assistant",
+                trigger="proactive_reason",
+                send_status="sending",
+                candidate_id="pc_123",
+                batch_id="turn_proactive",
+            )
+            await store.mark_outbound_batch_status("turn_proactive", "delivered")
+
+            rows = await store.get_outbound_messages(
+                turn_id="turn_proactive",
+                user_id="wxid_me",
+            )
+            assert len(rows) == 1
+            assert rows[0]["source"] == "proactive"
+            assert rows[0]["author"] == "assistant"
+            assert rows[0]["trigger"] == "proactive_reason"
+            assert rows[0]["send_status"] == "delivered"
+            assert rows[0]["candidate_id"] == "pc_123"
+            assert rows[0]["batch_id"] == "turn_proactive"
+            assert rows[0]["text"] == "还没睡？"
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_proactive_candidate_trace_fields_round_trip(tmp_path):
+    async def run():
+        store = MemoryStore(str(tmp_path / "memory.db"))
+        try:
+            candidate_id = await store.create_proactive_candidate(
+                reason_type="self_share",
+                reason_detail="no active topic",
+                user_id="wxid_me",
+                bot_id="default_bot",
+            )
+            await store.update_proactive_candidate(
+                candidate_id,
+                passed_gate=True,
+                gate_detail="v2.1.1 due-time",
+                generated_message="我刚才在想一个问题",
+                sent=True,
+                turn_id="turn_proactive",
+                batch_id="turn_proactive",
+                send_status="delivered",
+            )
+
+            rows = await store.get_recent_proactive_candidates(limit=1)
+            assert rows[0]["id"] == candidate_id
+            assert rows[0]["source"] == "proactive"
+            assert rows[0]["trigger"] == "proactive_reason"
+            assert rows[0]["send_status"] == "delivered"
+            assert rows[0]["turn_id"] == "turn_proactive"
+            assert rows[0]["batch_id"] == "turn_proactive"
+            assert rows[0]["user_id"] == "wxid_me"
+            assert rows[0]["bot_id"] == "default_bot"
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
 def test_usage_summary_round_trip(tmp_path):
     async def run():
         store = MemoryStore(str(tmp_path / "memory.db"))

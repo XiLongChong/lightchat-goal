@@ -104,7 +104,20 @@ def parse_agent_output(raw: str) -> dict[str, Any]:
 
     # Ensure required fields exist
     if "actions" not in parsed:
-        # No actions field — treat as plain response
+        # If the model explicitly requested skip/no_reply, honour that
+        # instead of treating the raw JSON as a text message.
+        if parsed.get("skip") or parsed.get("no_reply"):
+            return {
+                "actions": [],
+                "done": parsed.get("done", True),
+                "skip": True,
+                "skip_reason": str(
+                    parsed.get("reason") or parsed.get("skip_reason") or ""
+                )[:200],
+                "_fallback_reason": "missing_actions_preserved_skip",
+            }
+
+        # No actions field and no skip — treat as plain response
         text = raw.strip()[:500]
         return {
             "actions": [{"type": "message", "text": text, "delay": 0}],

@@ -39,6 +39,11 @@ def test_scheduler_prompt_templates_format():
         now_str="2026年05月26日 15:00 周2",
         topic_text="",
         recent_context="用户: 刚在忙项目",
+        bot_identity="当前 bot 人设",
+        relationship_context="熟悉度: 7/10",
+        memory_context="- 用户喜欢夜里聊天",
+        last_opener="突然想到",
+        max_messages=2,
         familiarity=5,
         intent_rules="短一点",
     )

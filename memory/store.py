@@ -162,6 +162,7 @@ class MemoryStore:
                 id INTEGER PRIMARY KEY DEFAULT 1,
                 user_id TEXT NOT NULL DEFAULT '',
                 context_token TEXT NOT NULL DEFAULT '',
+                bot_id TEXT NOT NULL DEFAULT '',
                 updated_at REAL NOT NULL DEFAULT 0
             )
         """)
@@ -298,6 +299,8 @@ class MemoryStore:
             CREATE TABLE IF NOT EXISTS outbound_messages (
                 id TEXT PRIMARY KEY,
                 turn_id TEXT NOT NULL,
+                batch_id TEXT NOT NULL DEFAULT '',
+                candidate_id TEXT NOT NULL DEFAULT '',
                 user_id TEXT NOT NULL DEFAULT '',
                 bot_id TEXT NOT NULL DEFAULT '',
                 source TEXT NOT NULL DEFAULT '',
@@ -325,6 +328,13 @@ class MemoryStore:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS proactive_candidates (
                 id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL DEFAULT '',
+                bot_id TEXT NOT NULL DEFAULT '',
+                turn_id TEXT NOT NULL DEFAULT '',
+                batch_id TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT 'proactive',
+                trigger TEXT NOT NULL DEFAULT 'proactive_reason',
+                send_status TEXT NOT NULL DEFAULT '',
                 reason_type TEXT NOT NULL,
                 reason_detail TEXT NOT NULL DEFAULT '',
                 passed_gate INTEGER NOT NULL DEFAULT 0,
@@ -397,12 +407,119 @@ class MemoryStore:
             CREATE UNIQUE INDEX IF NOT EXISTS idx_proactive_schedule_user_bot
             ON proactive_schedule_state(user_id, bot_id)
         """)
+        # V2.1.2: Clingy followup state machine — independent of topic/proactive schedule
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS clingy_state (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL DEFAULT '',
+                bot_id TEXT NOT NULL DEFAULT '',
+                awaiting_user_reply INTEGER NOT NULL DEFAULT 0,
+                last_proactive_sent_at REAL NOT NULL DEFAULT 0,
+                last_proactive_intent TEXT NOT NULL DEFAULT '',
+                last_proactive_message_id TEXT NOT NULL DEFAULT '',
+                next_clingy_due_at REAL NOT NULL DEFAULT 0,
+                clingy_followup_count INTEGER NOT NULL DEFAULT 0,
+                last_clingy_sent_at REAL NOT NULL DEFAULT 0,
+                updated_at REAL NOT NULL DEFAULT 0
+            )
+        """)
+        await db.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_clingy_state_user_bot
+            ON clingy_state(user_id, bot_id)
+        """)
+        # V2.2: Bot emotion state
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS bot_emotion_state (
+                user_id TEXT NOT NULL,
+                bot_id TEXT NOT NULL,
+                bot_mood TEXT DEFAULT 'calm',
+                mood_intensity INTEGER DEFAULT 0,
+                relationship_stage TEXT DEFAULT 'stranger',
+                affection INTEGER DEFAULT 10,
+                trust INTEGER DEFAULT 10,
+                irritation INTEGER DEFAULT 0,
+                attachment INTEGER DEFAULT 0,
+                jealousy INTEGER DEFAULT 0,
+                last_emotion_reason TEXT,
+                updated_at REAL NOT NULL,
+                version INTEGER DEFAULT 1,
+                PRIMARY KEY(user_id, bot_id)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS bot_emotion_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                bot_id TEXT NOT NULL,
+                turn_id INTEGER,
+                source TEXT,
+                trigger_type TEXT,
+                event_type TEXT,
+                old_state_json TEXT,
+                new_state_json TEXT,
+                reason TEXT,
+                confidence REAL DEFAULT 0.0,
+                created_at REAL NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_bot_emotion_events_user_bot
+            ON bot_emotion_events(user_id, bot_id, created_at DESC)
+        """)
+        # V2.2: Dialogue wait state
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS dialogue_state (
+                user_id TEXT NOT NULL,
+                bot_id TEXT NOT NULL,
+                wait_state TEXT DEFAULT 'none',
+                last_state_reason TEXT,
+                last_user_message_at REAL,
+                last_assistant_message_at REAL,
+                last_user_message_excerpt TEXT,
+                last_assistant_message_excerpt TEXT,
+                silent_started_at REAL,
+                silent_reason TEXT,
+                user_messages_since_silent INTEGER DEFAULT 0,
+                silent_must_reply_after_count INTEGER DEFAULT 2,
+                silent_must_reply_after_ts REAL,
+                proactive_paused_until REAL,
+                updated_at REAL NOT NULL,
+                version INTEGER DEFAULT 1,
+                PRIMARY KEY(user_id, bot_id)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS dialogue_state_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                bot_id TEXT NOT NULL,
+                turn_id INTEGER,
+                old_state_json TEXT,
+                new_state_json TEXT,
+                reason TEXT,
+                created_at REAL NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_dialogue_state_events_user_bot
+            ON dialogue_state_events(user_id, bot_id, created_at DESC)
+        """)
         # V2.1: Add bot_id column to existing tables (if not present)
         # Use ALTER TABLE IF NOT EXISTS pattern — SQLite doesn't support
         # conditional column add, so we catch the "duplicate column" error
         for col in [("memories", "bot_id", "TEXT NOT NULL DEFAULT ''"),
                      ("relationship_state", "bot_id", "TEXT NOT NULL DEFAULT ''"),
-                     ("conversation_history", "bot_id", "TEXT NOT NULL DEFAULT ''")]:
+                     ("conversation_history", "bot_id", "TEXT NOT NULL DEFAULT ''"),
+                     ("bot_contact_state", "bot_id", "TEXT NOT NULL DEFAULT ''"),
+                     ("proactive_candidates", "user_id", "TEXT NOT NULL DEFAULT ''"),
+                     ("proactive_candidates", "bot_id", "TEXT NOT NULL DEFAULT ''"),
+                     ("proactive_candidates", "turn_id", "TEXT NOT NULL DEFAULT ''"),
+                     ("proactive_candidates", "batch_id", "TEXT NOT NULL DEFAULT ''"),
+                     ("proactive_candidates", "source", "TEXT NOT NULL DEFAULT 'proactive'"),
+                     ("proactive_candidates", "trigger", "TEXT NOT NULL DEFAULT 'proactive_reason'"),
+                     ("proactive_candidates", "send_status", "TEXT NOT NULL DEFAULT ''"),
+                     ("outbound_messages", "batch_id", "TEXT NOT NULL DEFAULT ''"),
+                     ("outbound_messages", "candidate_id", "TEXT NOT NULL DEFAULT ''")]:
             try:
                 await db.execute(
                     f"ALTER TABLE {col[0]} ADD COLUMN {col[1]} {col[2]}"
@@ -513,6 +630,26 @@ class MemoryStore:
         rows = await db.execute_fetchall(
             "SELECT * FROM memories ORDER BY importance DESC"
         )
+        return [dict(r) for r in rows]
+
+    async def list_bot(self, bot_id: str = "", include_shared: bool = False):
+        """List memories for a specific bot.
+
+        Args:
+            bot_id: The bot to list memories for
+            include_shared: If True, also include shared (bot_id='') memories
+        """
+        db = await self._get_db()
+        if include_shared:
+            rows = await db.execute_fetchall(
+                "SELECT * FROM memories WHERE bot_id = ? OR bot_id = '' ORDER BY importance DESC",
+                (bot_id,),
+            )
+        else:
+            rows = await db.execute_fetchall(
+                "SELECT * FROM memories WHERE bot_id = ? ORDER BY importance DESC",
+                (bot_id,),
+            )
         return [dict(r) for r in rows]
 
     async def delete_memory(self, mem_id: str) -> bool:
@@ -937,20 +1074,26 @@ class MemoryStore:
     # Single-user contact state
     # ================================================================
 
-    async def update_contact_state(self, user_id: str, context_token: str = ""):
+    async def update_contact_state(
+        self,
+        user_id: str,
+        context_token: str = "",
+        bot_id: str = "",
+    ):
         """Remember the latest reachable WeChat target for single-user mode."""
         now = time.time()
         async with self._lock:
             db = await self._get_db()
             await db.execute(
                 """INSERT INTO bot_contact_state
-                   (id, user_id, context_token, updated_at)
-                   VALUES (1, ?, ?, ?)
+                   (id, user_id, context_token, bot_id, updated_at)
+                   VALUES (1, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                        user_id = excluded.user_id,
                        context_token = excluded.context_token,
+                       bot_id = excluded.bot_id,
                        updated_at = excluded.updated_at""",
-                (user_id, context_token, now),
+                (user_id, context_token, bot_id, now),
             )
             await db.commit()
 
@@ -1571,10 +1714,13 @@ class MemoryStore:
         trigger: str = "user_message",
         visible_to_user: bool = True,
         send_status: str = "created",
+        candidate_id: str = "",
+        batch_id: str = "",
     ) -> list[str]:
         """Record outbound messages with full V2.1 semantics."""
         import uuid
         now = time.time()
+        batch_id = batch_id or turn_id
         message_ids: list[str] = []
 
         async with self._lock:
@@ -1585,11 +1731,13 @@ class MemoryStore:
                 delay = float(msg.get("delay", 0) or 0)
                 await db.execute(
                     """INSERT INTO outbound_messages
-                       (id, turn_id, user_id, bot_id, source, author,
+                       (id, turn_id, batch_id, candidate_id,
+                        user_id, bot_id, source, author,
                         trigger, visible_to_user, send_status,
                         text, delay, position, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (msg_id, turn_id, user_id, bot_id, source, author,
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (msg_id, turn_id, batch_id, candidate_id,
+                     user_id, bot_id, source, author,
                      trigger, int(visible_to_user), send_status,
                      text, delay, i, now, now),
                 )
@@ -1671,6 +1819,10 @@ class MemoryStore:
         reason_detail: str = "",
         passed_gate: bool = False,
         gate_detail: str = "",
+        user_id: str = "",
+        bot_id: str = "",
+        source: str = "proactive",
+        trigger: str = "proactive_reason",
     ) -> str:
         """Record a proactive candidate reason (V2.1 Stage 1)."""
         import uuid
@@ -1680,11 +1832,12 @@ class MemoryStore:
             db = await self._get_db()
             await db.execute(
                 """INSERT INTO proactive_candidates
-                   (id, reason_type, reason_detail, passed_gate,
+                   (id, user_id, bot_id, source, trigger,
+                    reason_type, reason_detail, passed_gate,
                     gate_detail, generated_message, sent, created_at)
-                   VALUES (?, ?, ?, ?, ?, '', 0, ?)""",
-                (candidate_id, reason_type, reason_detail,
-                 int(passed_gate), gate_detail, now),
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, ?)""",
+                (candidate_id, user_id, bot_id, source, trigger,
+                 reason_type, reason_detail, int(passed_gate), gate_detail, now),
             )
             await db.commit()
         return candidate_id
@@ -1696,6 +1849,9 @@ class MemoryStore:
         gate_detail: str = "",
         generated_message: str = "",
         sent: bool = False,
+        turn_id: str = "",
+        batch_id: str = "",
+        send_status: str = "",
     ):
         """Update a proactive candidate after decision gate or send."""
         now = time.time()
@@ -1714,6 +1870,15 @@ class MemoryStore:
                 values.append(generated_message[:1000])
             if sent:
                 set_parts.append("sent = 1")
+            if turn_id:
+                set_parts.append("turn_id = ?")
+                values.append(turn_id[:120])
+            if batch_id:
+                set_parts.append("batch_id = ?")
+                values.append(batch_id[:120])
+            if send_status:
+                set_parts.append("send_status = ?")
+                values.append(send_status[:40])
             if set_parts:
                 values.append(candidate_id)
                 await db.execute(
@@ -2027,6 +2192,99 @@ class MemoryStore:
             return True
 
     # ================================================================
+    # V2.1.2: Clingy followup state machine
+    # ================================================================
+
+    async def get_clingy_state(
+        self,
+        user_id: str = "",
+        bot_id: str = "",
+    ) -> dict[str, Any]:
+        """Get clingy followup state for a user+bot."""
+        db = await self._get_db()
+        rows = await db.execute_fetchall(
+            """SELECT * FROM clingy_state
+               WHERE user_id = ? AND bot_id = ?
+               ORDER BY updated_at DESC LIMIT 1""",
+            (user_id, bot_id),
+        )
+        if rows:
+            return dict(rows[0])
+        return {
+            "awaiting_user_reply": False,
+            "last_proactive_sent_at": 0,
+            "last_proactive_intent": "",
+            "last_proactive_message_id": "",
+            "next_clingy_due_at": 0,
+            "clingy_followup_count": 0,
+            "last_clingy_sent_at": 0,
+        }
+
+    async def update_clingy_state(
+        self,
+        user_id: str,
+        bot_id: str,
+        **kwargs: Any,
+    ) -> bool:
+        """Update clingy followup state for a user+bot pair."""
+        import uuid
+        now = time.time()
+        allowed = {
+            "awaiting_user_reply", "last_proactive_sent_at",
+            "last_proactive_intent", "last_proactive_message_id",
+            "next_clingy_due_at", "clingy_followup_count",
+            "last_clingy_sent_at",
+        }
+        updates = {k: v for k, v in kwargs.items() if k in allowed}
+        if not updates:
+            return False
+        async with self._lock:
+            db = await self._get_db()
+            cur = await db.execute(
+                "SELECT id FROM clingy_state WHERE user_id = ? AND bot_id = ?",
+                (user_id, bot_id),
+            )
+            existing = await cur.fetchone()
+            if existing:
+                row_id = existing[0]
+            else:
+                row_id = f"cs_{uuid.uuid4().hex[:12]}"
+                await db.execute(
+                    """INSERT INTO clingy_state (id, user_id, bot_id, updated_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (row_id, user_id, bot_id, now),
+                )
+            set_parts = ["updated_at = ?"]
+            values: list[Any] = [now]
+            for field, value in updates.items():
+                set_parts.append(f"{field} = ?")
+                values.append(value)
+            values.extend([user_id, bot_id])
+            await db.execute(
+                f"UPDATE clingy_state SET {', '.join(set_parts)} WHERE user_id = ? AND bot_id = ?",
+                values,
+            )
+            await db.commit()
+            return True
+
+    async def clear_clingy_awaiting(self, user_id: str, bot_id: str) -> bool:
+        """Clear clingy awaiting state when user sends a real message."""
+        now = time.time()
+        async with self._lock:
+            db = await self._get_db()
+            await db.execute(
+                """UPDATE clingy_state
+                   SET awaiting_user_reply = 0,
+                       next_clingy_due_at = 0,
+                       clingy_followup_count = 0,
+                       updated_at = ?
+                   WHERE user_id = ? AND bot_id = ?""",
+                (now, user_id, bot_id),
+            )
+            await db.commit()
+            return True
+
+    # ================================================================
     # V2.1: Bot-scoped helpers
     # ================================================================
 
@@ -2044,7 +2302,7 @@ class MemoryStore:
             return None
         content = content.strip()
 
-        existing = await self.list_all()
+        existing = await self.list_bot(bot_id)
         existing_contents = [{"content": m["content"]} for m in existing]
         if is_duplicate(content, existing_contents):
             return None
@@ -2077,31 +2335,58 @@ class MemoryStore:
         bot_id: str = "",
         top_k: int = 5,
         category: str | None = None,
+        include_shared: bool = False,
     ) -> list[dict[str, Any]]:
-        """Search memories scoped to a bot (or shared)."""
+        """Search memories scoped to a bot.
+
+        Args:
+            include_shared: If True, also include shared (bot_id='') memories
+        """
         db = await self._get_db()
         if category:
-            rows = await db.execute_fetchall(
-                """SELECT * FROM memories
-                   WHERE category = ? AND (bot_id = ? OR bot_id = '')
-                   ORDER BY importance DESC""",
-                (category, bot_id),
-            )
+            if include_shared:
+                rows = await db.execute_fetchall(
+                    """SELECT * FROM memories
+                       WHERE category = ? AND (bot_id = ? OR bot_id = '')
+                       ORDER BY importance DESC""",
+                    (category, bot_id),
+                )
+            else:
+                rows = await db.execute_fetchall(
+                    """SELECT * FROM memories
+                       WHERE category = ? AND bot_id = ?
+                       ORDER BY importance DESC""",
+                    (category, bot_id),
+                )
         else:
-            rows = await db.execute_fetchall(
-                """SELECT * FROM memories
-                   WHERE bot_id = ? OR bot_id = ''
-                   ORDER BY importance DESC""",
-                (bot_id,),
-            )
+            if include_shared:
+                rows = await db.execute_fetchall(
+                    """SELECT * FROM memories
+                       WHERE bot_id = ? OR bot_id = ''
+                       ORDER BY importance DESC""",
+                    (bot_id,),
+                )
+            else:
+                rows = await db.execute_fetchall(
+                    """SELECT * FROM memories
+                       WHERE bot_id = ?
+                       ORDER BY importance DESC""",
+                    (bot_id,),
+                )
 
         scored = []
         for row in rows:
-            memory_content = str(row["content"])
+            rd = dict(row)
+            # Add scope marker
+            if rd.get("bot_id") == "":
+                rd["scope"] = "shared_user_fact"
+            else:
+                rd["scope"] = "bot_private"
+            memory_content = str(rd["content"])
             sim = jaccard_similarity(query, memory_content)
-            importance = float(row["importance"])
+            importance = float(rd["importance"])
             score = sim * 0.5 + importance * 0.5
-            scored.append((score, dict(row)))
+            scored.append((score, rd))
 
         scored.sort(key=lambda x: x[0], reverse=True)
         return [item for _, item in scored[:top_k]]
@@ -2158,3 +2443,294 @@ class MemoryStore:
                 values,
             )
             await db.commit()
+
+    # ================================================================
+    # V2.2: Bot emotion state CRUD
+    # ================================================================
+
+    async def get_bot_emotion_state(
+        self,
+        user_id: str,
+        bot_id: str,
+        defaults: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Get bot emotion state for a user+bot. Returns defaults if no record.
+
+        If `defaults` is provided and no DB row exists, those values are used
+        instead of the hardcoded legacy defaults. `version` is set to 0 so
+        callers can detect an unpersisted state.
+        """
+        db = await self._get_db()
+        rows = await db.execute_fetchall(
+            """SELECT * FROM bot_emotion_state
+               WHERE user_id = ? AND bot_id = ?""",
+            (user_id, bot_id),
+        )
+        if rows:
+            return dict(rows[0])
+        if defaults:
+            return {
+                "user_id": user_id,
+                "bot_id": bot_id,
+                "bot_mood": str(defaults.get("bot_mood", "calm")),
+                "mood_intensity": int(defaults.get("mood_intensity", 0)),
+                "relationship_stage": str(defaults.get("relationship_stage", "stranger")),
+                "affection": int(defaults.get("affection", 10)),
+                "trust": int(defaults.get("trust", 10)),
+                "irritation": int(defaults.get("irritation", 0)),
+                "attachment": int(defaults.get("attachment", 0)),
+                "jealousy": int(defaults.get("jealousy", 0)),
+                "last_emotion_reason": str(defaults.get("last_emotion_reason", "")),
+                "updated_at": time.time(),
+                "version": 0,  # 0 = not persisted yet
+            }
+        return {
+            "user_id": user_id,
+            "bot_id": bot_id,
+            "bot_mood": "calm",
+            "mood_intensity": 0,
+            "relationship_stage": "stranger",
+            "affection": 10,
+            "trust": 10,
+            "irritation": 0,
+            "attachment": 0,
+            "jealousy": 0,
+            "last_emotion_reason": "",
+            "updated_at": time.time(),
+            "version": 1,
+        }
+
+    async def upsert_bot_emotion_state(
+        self,
+        user_id: str,
+        bot_id: str,
+        state: dict[str, Any],
+    ) -> bool:
+        """Insert or replace bot emotion state for a user+bot pair."""
+        now = time.time()
+        async with self._lock:
+            db = await self._get_db()
+            await db.execute(
+                """INSERT OR REPLACE INTO bot_emotion_state
+                   (user_id, bot_id, bot_mood, mood_intensity,
+                    relationship_stage, affection, trust,
+                    irritation, attachment, jealousy,
+                    last_emotion_reason, updated_at, version)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    user_id, bot_id,
+                    str(state.get("bot_mood", "calm")),
+                    int(state.get("mood_intensity", 0)),
+                    str(state.get("relationship_stage", "stranger")),
+                    max(0, min(100, int(state.get("affection", 10)))),
+                    max(0, min(100, int(state.get("trust", 10)))),
+                    max(0, min(100, int(state.get("irritation", 0)))),
+                    max(0, min(100, int(state.get("attachment", 0)))),
+                    max(0, min(100, int(state.get("jealousy", 0)))),
+                    str(state.get("last_emotion_reason", "")),
+                    now,
+                    int(state.get("version", 1)) + 1,
+                ),
+            )
+            await db.commit()
+        return True
+
+    async def insert_bot_emotion_event(
+        self,
+        user_id: str,
+        bot_id: str,
+        turn_id: int = 0,
+        source: str = "",
+        trigger_type: str = "",
+        event_type: str = "",
+        old_state_json: str = "{}",
+        new_state_json: str = "{}",
+        reason: str = "",
+        confidence: float = 0.0,
+        created_at: float | None = None,
+    ) -> int:
+        """Insert an emotion event record. Returns the event id."""
+        now = created_at if created_at is not None else time.time()
+        async with self._lock:
+            db = await self._get_db()
+            cursor = await db.execute(
+                """INSERT INTO bot_emotion_events
+                   (user_id, bot_id, turn_id, source, trigger_type,
+                    event_type, old_state_json, new_state_json,
+                    reason, confidence, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    user_id, bot_id, turn_id, source, trigger_type,
+                    event_type, old_state_json, new_state_json,
+                    reason, confidence, now,
+                ),
+            )
+            await db.commit()
+            return cursor.lastrowid or 0
+
+    async def get_recent_bot_emotion_events(
+        self,
+        user_id: str,
+        bot_id: str,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Get recent emotion events for a user+bot."""
+        db = await self._get_db()
+        rows = await db.execute_fetchall(
+            """SELECT * FROM bot_emotion_events
+               WHERE user_id = ? AND bot_id = ?
+               ORDER BY created_at DESC
+               LIMIT ?""",
+            (user_id, bot_id, limit),
+        )
+        return [dict(r) for r in (rows or [])]
+
+    async def reset_bot_emotion_state(
+        self,
+        user_id: str,
+        bot_id: str,
+    ) -> bool:
+        """Delete the emotion state row for a user+bot, restoring defaults."""
+        async with self._lock:
+            db = await self._get_db()
+            await db.execute(
+                "DELETE FROM bot_emotion_state WHERE user_id = ? AND bot_id = ?",
+                (user_id, bot_id),
+            )
+            await db.commit()
+        return True
+
+    # ================================================================
+    # V2.2: Dialogue state CRUD
+    # ================================================================
+
+    async def get_dialogue_state(
+        self,
+        user_id: str,
+        bot_id: str,
+    ) -> dict[str, Any]:
+        """Get dialogue wait state for a user+bot. Returns defaults if no record."""
+        db = await self._get_db()
+        rows = await db.execute_fetchall(
+            """SELECT * FROM dialogue_state
+               WHERE user_id = ? AND bot_id = ?""",
+            (user_id, bot_id),
+        )
+        if rows:
+            return dict(rows[0])
+        return {
+            "user_id": user_id,
+            "bot_id": bot_id,
+            "wait_state": "none",
+            "last_state_reason": "",
+            "last_user_message_at": 0,
+            "last_assistant_message_at": 0,
+            "last_user_message_excerpt": "",
+            "last_assistant_message_excerpt": "",
+            "silent_started_at": 0,
+            "silent_reason": "",
+            "user_messages_since_silent": 0,
+            "silent_must_reply_after_count": 2,
+            "silent_must_reply_after_ts": 0,
+            "proactive_paused_until": 0,
+            "updated_at": time.time(),
+            "version": 1,
+        }
+
+    async def upsert_dialogue_state(
+        self,
+        user_id: str,
+        bot_id: str,
+        state: dict[str, Any],
+    ) -> bool:
+        """Insert or replace dialogue state for a user+bot pair."""
+        now = time.time()
+        async with self._lock:
+            db = await self._get_db()
+            await db.execute(
+                """INSERT OR REPLACE INTO dialogue_state
+                   (user_id, bot_id, wait_state, last_state_reason,
+                    last_user_message_at, last_assistant_message_at,
+                    last_user_message_excerpt, last_assistant_message_excerpt,
+                    silent_started_at, silent_reason,
+                    user_messages_since_silent, silent_must_reply_after_count,
+                    silent_must_reply_after_ts, proactive_paused_until,
+                    updated_at, version)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    user_id, bot_id,
+                    str(state.get("wait_state", "none")),
+                    str(state.get("last_state_reason", "")),
+                    float(state.get("last_user_message_at", 0)),
+                    float(state.get("last_assistant_message_at", 0)),
+                    str(state.get("last_user_message_excerpt", ""))[:200],
+                    str(state.get("last_assistant_message_excerpt", ""))[:200],
+                    float(state.get("silent_started_at", 0)),
+                    str(state.get("silent_reason", "")),
+                    max(0, int(state.get("user_messages_since_silent", 0))),
+                    max(0, int(state.get("silent_must_reply_after_count", 2))),
+                    float(state.get("silent_must_reply_after_ts", 0)),
+                    float(state.get("proactive_paused_until", 0)),
+                    now,
+                    int(state.get("version", 1)) + 1,
+                ),
+            )
+            await db.commit()
+        return True
+
+    async def insert_dialogue_state_event(
+        self,
+        user_id: str,
+        bot_id: str,
+        turn_id: int = 0,
+        old_state_json: str = "{}",
+        new_state_json: str = "{}",
+        reason: str = "",
+        created_at: float | None = None,
+    ) -> int:
+        """Insert a dialogue state event record. Returns the event id."""
+        now = created_at if created_at is not None else time.time()
+        async with self._lock:
+            db = await self._get_db()
+            cursor = await db.execute(
+                """INSERT INTO dialogue_state_events
+                   (user_id, bot_id, turn_id, old_state_json,
+                    new_state_json, reason, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (user_id, bot_id, turn_id, old_state_json,
+                 new_state_json, reason, now),
+            )
+            await db.commit()
+            return cursor.lastrowid or 0
+
+    async def get_recent_dialogue_state_events(
+        self,
+        user_id: str,
+        bot_id: str,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Get recent dialogue state events for a user+bot."""
+        db = await self._get_db()
+        rows = await db.execute_fetchall(
+            """SELECT * FROM dialogue_state_events
+               WHERE user_id = ? AND bot_id = ?
+               ORDER BY created_at DESC
+               LIMIT ?""",
+            (user_id, bot_id, limit),
+        )
+        return [dict(r) for r in (rows or [])]
+
+    async def reset_dialogue_state(
+        self,
+        user_id: str,
+        bot_id: str,
+    ) -> bool:
+        """Delete the dialogue state row for a user+bot, restoring defaults."""
+        async with self._lock:
+            db = await self._get_db()
+            await db.execute(
+                "DELETE FROM dialogue_state WHERE user_id = ? AND bot_id = ?",
+                (user_id, bot_id),
+            )
+            await db.commit()
+        return True

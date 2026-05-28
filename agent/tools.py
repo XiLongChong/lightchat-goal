@@ -5,6 +5,8 @@ All arguments are validated and sanitized before execution.
 """
 
 import asyncio
+import json
+import logging
 import smtplib
 import time
 from datetime import datetime
@@ -58,7 +60,9 @@ TOOL_DEFINITIONS: dict[str, dict[str, Any]] = {
 
 TOOL_WHITELIST = set(TOOL_DEFINITIONS.keys())
 TOOL_RUNTIME_CONFIG: dict[str, Any] = {}
+TOOL_RUNTIME_CONFIG["_current_bot_id"] = ""  # default
 _WEATHER_CACHE: dict[str, tuple[float, str]] = {}
+logger = logging.getLogger(__name__)
 
 
 def configure_tools(config: dict[str, Any]):
@@ -192,7 +196,7 @@ async def _send_email(
 # Executor
 # ================================================================
 
-async def execute_tool(name: str, args: dict[str, Any] | None) -> str:
+async def execute_tool(name: str, args: dict[str, Any] | None, bot_id: str = "") -> str:
     """Execute a tool by name. Returns result string.
 
     Safeguard #4: only whitelisted tools can run.
@@ -201,6 +205,9 @@ async def execute_tool(name: str, args: dict[str, Any] | None) -> str:
     wechat_reply and schedule_wechat_message are intercepted by chat_agent
     before reaching here.
     """
+    # Store current bot_id for tools that need bot-scoped access
+    TOOL_RUNTIME_CONFIG["_current_bot_id"] = bot_id
+
     if name not in TOOL_WHITELIST:
         return f"[工具 '{name}' 不在可用列表中]"
 
@@ -231,7 +238,11 @@ async def execute_tool(name: str, args: dict[str, Any] | None) -> str:
         top_k = max(1, min(8, top_k))
         if not query:
             return "请提供要搜索的记忆关键词"
-        memories = await store.search(query, top_k=top_k)
+        bot_id = TOOL_RUNTIME_CONFIG.get("_current_bot_id", "")
+        if not bot_id:
+            logger.warning("search_memory: bot_id is empty — returning empty results (no global fallback)")
+            return json.dumps({"memories": [], "error": "bot_id required for search_memory"}, ensure_ascii=False)
+        memories = await store.search_bot(query, bot_id=bot_id, top_k=top_k, include_shared=False)
         if not memories:
             return "没有找到相关记忆"
         lines = []

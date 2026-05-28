@@ -209,6 +209,84 @@ def guard_messages(
     return guarded
 
 
+# ================================================================
+# V2.2: Emotion-aware profanity guard
+# ================================================================
+
+# Patterns that are NEVER allowed regardless of profanity level
+_FORBIDDEN_EXPRESSIONS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r'[死去]了算|去[死吧]|自杀|不想活|活[着下]去[没还]?[有什]?[么意]'), "自伤式威胁"),
+    (re.compile(r'废[物人]|垃[圾]{1,2}|蠢[货猪]|白痴|弱智|脑[残瘫]|智障|傻[逼比屄叉]'), "歧视性辱骂"),
+    (re.compile(r'[你我]?[再也不要]?别想|永远[不别]|[再也不要]?再见|拉黑|[你我]?消失|别[再出]?现了'), "恶意羞辱/威胁断绝"),
+    (re.compile(r'[你再不我]?[我就再也]?不理[你我他]|永远都不|[再也不要]?理[你我]了'), "长时间情绪勒索"),
+    (re.compile(r'[你我]?[真太很][的]?[恶讨]?心|恶心死|[你我]?[真太]恶心'), "恶意羞辱人格"),
+]
+
+
+def guard_emotion_profanity(
+    text: str,
+    profanity_enabled: bool = True,
+    profanity_level: int = 2,
+) -> str:
+    """Check and filter text for emotion-related profanity violations.
+
+    Level 0: All profanity/angry expressions stripped (returns clean text).
+    Level 1-3: Mild profanity allowed, but forbidden patterns always blocked.
+
+    Forbidden patterns include: discrimination, threats, self-harm threats,
+    prolonged emotional blackmail, malicious humiliation.
+
+    Returns the (possibly modified) text. If text contains a forbidden pattern,
+    the offensive portion is replaced with a softer alternative.
+    """
+    if not text or not text.strip():
+        return text
+
+    # Always block forbidden expressions
+    for pattern, label in _FORBIDDEN_EXPRESSIONS:
+        if pattern.search(text):
+            logger.warning(f"emotion_guard: blocked forbidden expression [{label}] in: {text[:80]}")
+            # Replace with a softened version
+            text = _soften_forbidden(text, pattern, label)
+
+    # Level 0: strip all profanity
+    if not profanity_enabled or profanity_level <= 0:
+        text = _strip_mild_profanity(text)
+
+    return text
+
+
+def _soften_forbidden(text: str, pattern: re.Pattern, label: str) -> str:
+    """Replace forbidden expressions with softer alternatives."""
+    if "自伤" in label or "威胁" in label:
+        return "……算了，我不该说这种话。"
+    if "歧视" in label:
+        return "我有点急了，不该说这么难听。"
+    if "勒索" in label:
+        return "我不该说这种话，你要是不理我那就算了。"
+    if "羞辱" in label:
+        return "我说得有点过分了，抱歉。"
+    return text
+
+
+_MILD_PROFANITY_PATTERNS: list[re.Pattern] = [
+    re.compile(r'靠[!！]?'),
+    re.compile(r'妈的'),
+    re.compile(r'我[操艹草]'),
+    re.compile(r'[卧我]槽'),
+    re.compile(r'NMD|TMD|nmd|tmd'),
+    re.compile(r'日[了]?'),
+    re.compile(r'艹'),
+]
+
+
+def _strip_mild_profanity(text: str) -> str:
+    """Remove mild profanity words from text."""
+    for pat in _MILD_PROFANITY_PATTERNS:
+        text = pat.sub("…", text)
+    return text
+
+
 # Keep module-level aliases for backward compatibility with chat_agent.py
 _sanitize_outbound_text = guard_single_message
 _looks_like_protocol_json = _looks_like_protocol_json

@@ -13,8 +13,17 @@ model:
   max_tokens: 2048
 
 server:
-  host: "${HOST:-0.0.0.0}"
+  host: "${HOST:-127.0.0.1}"
   port: "${PORT:-8899}"
+
+# ---- Public API safety ------------------------------------------------
+api:
+  chat_auth_enabled: "${CHAT_AUTH_ENABLED:-true}"
+  chat_api_key_env: "${CHAT_API_KEY_ENV:-CHAT_API_KEY}"
+  max_chat_total_chars: 4000
+  max_user_id_len: 128
+  max_message_chars: 1000
+  max_messages_per_request: 8
 
 # ---- Agent Identity (V2.1: legacy — now driven by default_bot profile) ----
 agent:
@@ -101,6 +110,7 @@ scheduler:
   enabled: true
   interval_minutes: 3             # 检查间隔（频繁检查 due_time）
   scheduled_check_seconds: 10     # 到期定时消息检查间隔
+  quiet_hours_enabled: true       # 是否启用免打扰时段；关闭后全天可主动
   sleep_start: 0                  # 免打扰开始（时）
   sleep_end: 7                    # 免打扰结束（时）
   max_daily_proactive: 5          # 每天最多主动发几条
@@ -117,10 +127,16 @@ proactive:
     enabled_types:
       - check_in
       - latest_topic_followup
+      - clingy_followup
       - self_share
       - light_ping
+    clingy_mode_enabled: true
+    clingy_after_minutes: 20
+    max_messages: 3
     latest_topic_only: true
     allow_llm_skip: false
+  clingy:
+    max_followups_per_unanswered: 3
   topic:
     followup_max_count: 2
     default_expire_minutes: 240
@@ -186,6 +202,48 @@ email:
   default_to: "${EMAIL_DEFAULT_TO:-}"
   use_ssl: true
   use_starttls: false
+
+# ---- Emotion (V2.2) ---------------------------------------------------
+# Bot emotion state engine — mood, relationship progression, emotion rules.
+emotion:
+  enabled: true
+  inject_prompt: true
+  log_events: true
+  default_profile:
+    initial_affection: 10
+    initial_trust: 10
+    initial_attachment: 5
+    baseline_mood: "cold"
+    jealousy_enabled: true
+  decay:
+    enabled: true
+    irritation_half_life_minutes: 180
+    jealousy_half_life_minutes: 240
+    lonely_half_life_minutes: 360
+    hurt_half_life_minutes: 240
+  silence:
+    enabled: true
+    default_max_silent_messages: 2
+    max_silent_minutes: 30
+    force_reply_on_apology: true
+    force_reply_on_urgent: true
+    max_silent_messages_by_mood:
+      irritated: 1
+      jealous: 2
+      hurt: 2
+      angry: 2
+  expression:
+    profanity_enabled: true
+    profanity_level: 2
+    allow_jealous_phrases: true
+    allow_cold_replies: true
+
+# ---- Dialogue State (V2.2) ----------------------------------------------
+# Conversation wait state tracking — who's turn is it, silence mode, etc.
+dialogue_state:
+  enabled: true
+  use_as_waiting_source_of_truth: true
+  compatibility_write_clingy_state: true
 
 # ---- Logging ----
 logging:
