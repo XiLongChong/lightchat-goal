@@ -1141,22 +1141,22 @@ class TestEmotionProactiveInfluence:
     def test_jealous_hint(self):
         from agent.scheduler import SchedulerAgent
         hint = SchedulerAgent._emotion_proactive_hint({"bot_mood": "jealous"})
-        assert "吃醋" in hint
+        assert "jealous" in hint
 
     def test_angry_hint(self):
         from agent.scheduler import SchedulerAgent
         hint = SchedulerAgent._emotion_proactive_hint({"bot_mood": "angry"})
-        assert "短句" in hint or "沉默" in hint
+        assert "angry" in hint and "reduce proactive" in hint
 
     def test_warm_hint(self):
         from agent.scheduler import SchedulerAgent
         hint = SchedulerAgent._emotion_proactive_hint({"bot_mood": "warm"})
-        assert "自然" in hint
+        assert "warm" in hint and "natural" in hint
 
     def test_softened_tone(self):
         from agent.scheduler import SchedulerAgent
         tone = SchedulerAgent._emotion_message_tone({"bot_mood": "softened"})
-        assert "嘴硬" in tone
+        assert "gentler" in tone
 
 
 class TestCommitProactiveSend:
