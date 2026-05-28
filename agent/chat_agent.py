@@ -9,7 +9,8 @@ from typing import Any, TYPE_CHECKING
 from agent.context_builder import build_system_prompt, build_system_prompt_v21
 from agent.output_guard import guard_single_message, guard_messages
 from agent.tools import execute_tool, TOOL_WHITELIST
-from utils.json_parser import parse_agent_output
+from agent.tool_registry import is_action as _is_registry_action
+from utils.json_parser import parse_agent_output, parse_agent_json_output, validate_agent_output
 
 if TYPE_CHECKING:
     from agent.bot_profile import BotProfileManager
@@ -45,22 +46,30 @@ class ChatAgent:
 
     def __init__(
         self,
-        client: Any,  # AsyncOpenAI
         model: str,
         persona: str,
         personality: str,
+        *,
         temperature: float = 0.7,
         defaults: dict[str, Any] | None = None,
         bot_manager: "BotProfileManager | None" = None,
+        llm_gateway: Any,
+        json_output_enabled: bool = True,
+        native_tool_calls: bool = False,
+        native_allowed_tools: list[str] | None = None,
     ):
-        self.client = client
+        self.llm_gateway = llm_gateway
         self.model = model
         self.persona = persona
         self.personality = personality
         self.temperature = temperature
         self.defaults = defaults or {}
         self.bot_manager = bot_manager
+        self.json_output_enabled = json_output_enabled
         self._last_call_time = 0.0
+        # Phase 5A: native tool calls feature flag
+        self.native_tool_calls = native_tool_calls
+        self.native_allowed_tools = native_allowed_tools or []
 
     async def chat(
         self,
@@ -193,23 +202,51 @@ class ChatAgent:
             "completion_tokens": 0,
             "total_tokens": 0,
             "estimated": False,
+            "cache_hit_tokens": 0,
+            "cache_miss_tokens": 0,
+            "reasoning_tokens": 0,
         }
 
         for iteration in range(MAX_TOOL_LOOP):
             iterations = iteration + 1
 
             try:
-                response = await self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    temperature=self.temperature,
-                    max_tokens=2048,
+                from agent.llm_types import LLMRequest
+                response_mode = "json_object" if self.json_output_enabled else "text"
+
+                # Phase 5A: build native tool specs if enabled
+                request_tools = None
+                if self.native_tool_calls:
+                    request_tools = _build_native_tool_specs(
+                        self.native_allowed_tools,
+                    )
+                    if request_tools:
+                        _tool_names = [t["function"]["name"] for t in request_tools]
+                        logger.info(
+                            "native_tools: exposing %d tools: %s",
+                            len(_tool_names), ",".join(_tool_names),
+                        )
+
+                llm_response = await self.llm_gateway.complete(
+                    LLMRequest(
+                        purpose="chat_turn",
+                        model=self.model,
+                        messages=messages,
+                        temperature=self.temperature,
+                        max_tokens=2048,
+                        response_mode=response_mode,
+                        thinking="disabled",
+                        tools=request_tools,
+                        tool_choice="auto" if request_tools else None,
+                        metadata={
+                            "turn_id": turn_id,
+                            "iteration": iteration,
+                        },
+                    )
                 )
-                raw_output = response.choices[0].message.content or ""
-                _merge_token_usage(
-                    token_usage,
-                    _extract_token_usage(response, messages, raw_output),
-                )
+                raw_output = llm_response.content or ""
+                finish_reason = llm_response.finish_reason or ""
+                _merge_llm_usage(token_usage, llm_response.usage)
             except Exception as e:
                 logger.error(f"LLM call failed: {e}")
                 llm_status = "error"
@@ -224,13 +261,213 @@ class ChatAgent:
                 })
                 break
 
-            # Safeguard #1: parse with fallback
-            parsed = parse_agent_output(raw_output)
-            if parsed.get("_fallback_reason"):
+            # Phase 5A: Native tool call processing
+            native_tool_calls = getattr(llm_response, "tool_calls", None) or []
+            if native_tool_calls and self.native_tool_calls:
+                tc_names = [str(getattr(getattr(tc, "function", None), "name", "") or "?") for tc in native_tool_calls]
+                logger.info(
+                    "native_tools: received %d tool_calls iter=%d: %s",
+                    len(native_tool_calls), iterations, ",".join(tc_names),
+                )
+                # Build assistant message with tool_calls for the conversation
+                assistant_msg: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": raw_output or "",
+                }
+                # Serialize tool_calls for the message
+                serialized_tool_calls: list[dict[str, Any]] = []
+                for tc in native_tool_calls:
+                    tc_dict: dict[str, Any] = {
+                        "id": getattr(tc, "id", ""),
+                        "type": "function",
+                        "function": {
+                            "name": getattr(getattr(tc, "function", None), "name", ""),
+                            "arguments": getattr(getattr(tc, "function", None), "arguments", ""),
+                        },
+                    }
+                    serialized_tool_calls.append(tc_dict)
+                assistant_msg["tool_calls"] = serialized_tool_calls
+                messages.append(assistant_msg)
+
+                # Process each tool call
+                for tc in native_tool_calls:
+                    fn = getattr(tc, "function", None)
+                    tool_name = str(getattr(fn, "name", "") if fn else "")
+                    tool_args_raw = str(getattr(fn, "arguments", "") if fn else "")
+
+                    tool_result = await _execute_native_tool(
+                        tool_name=tool_name,
+                        tool_args_raw=tool_args_raw,
+                        native_allowed_tools=self.native_allowed_tools,
+                    )
+                    all_tool_results.append({
+                        "name": tool_name,
+                        "result": tool_result[:500],
+                    })
+                    # Log tool execution result
+                    _result_status = _classify_native_tool_result(tool_result)
+                    logger.info(
+                        "native_tools: result tool=%s status=%s",
+                        tool_name, _result_status,
+                    )
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": getattr(tc, "id", ""),
+                        "content": tool_result,
+                    })
+
+                # Go back to LLM for final JSON actions
+                continue
+
+            # Guard: empty content from provider
+            if not raw_output.strip():
+                logger.warning("chat_agent: empty content from LLM")
                 fallback_events.append({
-                    "type": str(parsed["_fallback_reason"]),
+                    "type": "invalid_response",
+                    "detail": "empty_content",
+                })
+                all_messages.append({
+                    "type": "message",
+                    "text": "（信号不太好，稍等我一下）",
+                    "delay": 0,
+                })
+                break
+
+            # Guard: finish_reason=length means truncated, likely broken JSON.
+            # In strict json mode: retry once; if retry still fails, fallback.
+            # In text mode: log and try to parse as-is (legacy behaviour).
+            if finish_reason == "length":
+                logger.warning("chat_agent: finish_reason=length, output may be truncated")
+                fallback_events.append({
+                    "type": "invalid_response",
+                    "detail": "finish_reason_length",
+                })
+
+                if self.json_output_enabled:
+                    # Strict mode: one retry with identical request
+                    try:
+                        from agent.llm_types import LLMRequest as _LLMR
+                        retry_resp = await self.llm_gateway.complete(
+                            _LLMR(
+                                purpose="chat_turn",
+                                model=self.model,
+                                messages=messages,
+                                temperature=self.temperature,
+                                max_tokens=2048,
+                                response_mode="json_object",
+                                thinking="disabled",
+                                metadata={
+                                    "turn_id": turn_id,
+                                    "iteration": iteration,
+                                    "retry_reason": "length",
+                                },
+                            )
+                        )
+                        _merge_llm_usage(token_usage, retry_resp.usage)
+                        retry_content = retry_resp.content or ""
+                        retry_finish = retry_resp.finish_reason or ""
+
+                        if retry_content.strip() and retry_finish != "length":
+                            raw_output = retry_content
+                            finish_reason = retry_finish
+                            logger.info("chat_agent: finish_reason=length retry succeeded")
+                            fallback_events.append({
+                                "type": "finish_reason_length_retry",
+                                "detail": "success",
+                            })
+                        else:
+                            logger.warning("chat_agent: finish_reason=length retry also failed")
+                            fallback_events.append({
+                                "type": "finish_reason_length_retry",
+                                "detail": "failed",
+                            })
+                            all_messages.append({
+                                "type": "message",
+                                "text": "（信号不太好，稍等我一下）",
+                                "delay": 0,
+                            })
+                            break
+                    except Exception:
+                        logger.warning("chat_agent: finish_reason=length retry error", exc_info=True)
+                        fallback_events.append({
+                            "type": "finish_reason_length_retry",
+                            "detail": "error",
+                        })
+                        all_messages.append({
+                            "type": "message",
+                            "text": "（信号不太好，稍等我一下）",
+                            "delay": 0,
+                        })
+                        break
+                # else: text mode — fall through and parse whatever we got
+
+            # Safeguard #1: parse with strict or legacy parser
+            if self.json_output_enabled:
+                parsed = parse_agent_json_output(raw_output)
+            else:
+                parsed = parse_agent_output(raw_output)
+
+            if parsed.get("_fallback_reason"):
+                reason = str(parsed["_fallback_reason"])
+                fallback_events.append({
+                    "type": reason,
                     "detail": raw_output[:200],
                 })
+                logger.warning(
+                    "chat_agent: JSON parse fallback reason=%s raw_preview=%s",
+                    reason, raw_output[:200],
+                )
+
+            # Schema validation (Phase 3A)
+            schema_errors = validate_agent_output(parsed)
+            if schema_errors:
+                logger.warning(
+                    "chat_agent: schema validation errors: %s",
+                    "; ".join(schema_errors),
+                )
+                for err in schema_errors:
+                    fallback_events.append({
+                        "type": "schema_error",
+                        "detail": err[:200],
+                    })
+                # If parsed was already a fallback (no actions, etc.), keep it.
+                # If it had actions but schema errors, we try to salvage by
+                # dropping invalid actions from the list.
+                if not parsed.get("_fallback_reason"):
+                    actions = parsed.get("actions", [])
+                    valid_actions = _filter_valid_actions(actions)
+                    if valid_actions:
+                        parsed["actions"] = valid_actions
+                        logger.info(
+                            "chat_agent: filtered %d invalid actions, kept %d",
+                            len(actions) - len(valid_actions), len(valid_actions),
+                        )
+                    elif actions:
+                        # All actions were invalid — fallback to a safe message
+                        logger.warning("chat_agent: all actions invalid after schema check")
+                        parsed = {
+                            "actions": [],
+                            "done": True,
+                            "_fallback_reason": "all_actions_invalid",
+                        }
+                        fallback_events.append({
+                            "type": "all_actions_invalid",
+                            "detail": f"dropped {len(actions)} invalid actions",
+                        })
+
+            # Strict json mode: if parse produced a fallback and there are no
+            # salvageable actions, send a safe fallback message to the user.
+            if self.json_output_enabled and parsed.get("_fallback_reason") and not parsed.get("actions"):
+                fallback_events.append({
+                    "type": "strict_json_fallback",
+                    "detail": parsed["_fallback_reason"],
+                })
+                all_messages.append({
+                    "type": "message",
+                    "text": "（信号不太好，稍等我一下）",
+                    "delay": 0,
+                })
+                break
 
             actions = parsed.get("actions", [])
             if parsed.get("skip") or parsed.get("no_reply"):
@@ -281,6 +518,27 @@ class ChatAgent:
                     args = action.get("args", {})
                     if not isinstance(args, dict):
                         args = {}
+
+                    # Phase 4B: Reject unknown action/tool names
+                    from agent.tool_registry import (
+                        is_external_tool as _is_ext_tool,
+                        TOOL_REGISTRY as _TOOL_REG,
+                    )
+                    if not _is_registry_action(name) and not _is_ext_tool(name):
+                        logger.warning("chat_agent: unknown action/tool '%s' rejected", name)
+                        tool_results_this_round.append(
+                            f"[{name}] 未知操作，已忽略"
+                        )
+                        all_tool_results.append({
+                            "name": name,
+                            "result": "未知操作",
+                        })
+                        continue
+
+                    # Log high-side-effect tool usage
+                    tool_def = _TOOL_REG.get(name) if _is_ext_tool(name) else None
+                    if tool_def and tool_def.side_effect_level == "high":
+                        logger.info("chat_agent: executing high-side-effect tool: %s", name)
 
                     # V2.1: Reject tools not enabled for this bot
                     if name not in effective_tools:
@@ -372,11 +630,20 @@ class ChatAgent:
 
         # If we hit max loop, ensure we have at least one message
         if iterations >= MAX_TOOL_LOOP and not all_messages:
+            logger.warning(
+                "native_tools: MAX_TOOL_LOOP exit iterations=%d fallback_message=1",
+                iterations,
+            )
             all_messages.append({
                 "type": "message",
                 "text": "（让我想想...）",
                 "delay": 0,
             })
+        elif iterations >= MAX_TOOL_LOOP:
+            logger.warning(
+                "native_tools: MAX_TOOL_LOOP exit iterations=%d has_messages=%d",
+                iterations, len(all_messages),
+            )
 
         self._last_call_time = start_time
 
@@ -458,51 +725,18 @@ def _safe_float(value: Any, min_val: float, max_val: float) -> float:
         return 0.0
 
 
-def _extract_token_usage(
-    response: Any,
-    messages: list[dict[str, Any]],
-    raw_output: str,
-) -> dict[str, int | bool]:
-    usage = getattr(response, "usage", None)
-    if usage is not None:
-        prompt_tokens = _usage_value(usage, "prompt_tokens")
-        completion_tokens = _usage_value(usage, "completion_tokens")
-        total_tokens = _usage_value(usage, "total_tokens")
-        if total_tokens or prompt_tokens or completion_tokens:
-            return {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": total_tokens or prompt_tokens + completion_tokens,
-                "estimated": False,
-            }
+def _merge_llm_usage(total: dict[str, Any], usage: Any):
+    """Merge LLMUsage dataclass into the token usage dict.
 
-    prompt_text = "\n".join(str(m.get("content", "")) for m in messages)
-    prompt_tokens = _estimate_tokens(prompt_text)
-    completion_tokens = _estimate_tokens(raw_output)
-    return {
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": prompt_tokens + completion_tokens,
-        "estimated": True,
-    }
-
-
-def _usage_value(usage: Any, key: str) -> int:
-    if isinstance(usage, dict):
-        value = usage.get(key, 0)
-    else:
-        value = getattr(usage, key, 0)
-    try:
-        return max(0, int(value or 0))
-    except (TypeError, ValueError):
-        return 0
-
-
-def _merge_token_usage(total: dict[str, Any], item: dict[str, Any]):
-    total["prompt_tokens"] += int(item.get("prompt_tokens", 0) or 0)
-    total["completion_tokens"] += int(item.get("completion_tokens", 0) or 0)
-    total["total_tokens"] += int(item.get("total_tokens", 0) or 0)
-    total["estimated"] = bool(total.get("estimated") or item.get("estimated"))
+    Extends _merge_token_usage with cache_hit / cache_miss / reasoning tokens.
+    """
+    total["prompt_tokens"] += int(getattr(usage, "prompt_tokens", 0) or 0)
+    total["completion_tokens"] += int(getattr(usage, "completion_tokens", 0) or 0)
+    total["total_tokens"] += int(getattr(usage, "total_tokens", 0) or 0)
+    total["estimated"] = bool(total.get("estimated") or getattr(usage, "estimated", False))
+    total["cache_hit_tokens"] = total.get("cache_hit_tokens", 0) + int(getattr(usage, "cache_hit_tokens", 0) or 0)
+    total["cache_miss_tokens"] = total.get("cache_miss_tokens", 0) + int(getattr(usage, "cache_miss_tokens", 0) or 0)
+    total["reasoning_tokens"] = total.get("reasoning_tokens", 0) + int(getattr(usage, "reasoning_tokens", 0) or 0)
 
 
 def _estimate_tokens(text: str) -> int:
@@ -630,6 +864,60 @@ def _parse_schedule_task(args: dict[str, Any]) -> dict[str, Any] | None:
 
 
 # ================================================================
+# Phase 3A: Action schema filter
+# ================================================================
+
+_VALID_ACTION_TYPES = frozenset({"message", "tool", "skip", "no_reply"})
+
+
+def _filter_valid_actions(actions: list) -> list[dict[str, Any]]:
+    """Filter actions to only those passing basic schema checks.
+
+    Invalid actions are dropped with a log warning.
+    Never raises — always returns a (possibly empty) list.
+    """
+    valid: list[dict[str, Any]] = []
+    for i, action in enumerate(actions):
+        if not isinstance(action, dict):
+            logger.warning("chat_agent: dropping action[%d] — not a dict", i)
+            continue
+        action_type = str(action.get("type", "")).strip()
+        if not action_type:
+            logger.warning("chat_agent: dropping action[%d] — missing type", i)
+            continue
+        if action_type == "message":
+            text = str(action.get("text", "")).strip()
+            if not text:
+                logger.warning("chat_agent: dropping action[%d] message — empty text", i)
+                continue
+        elif action_type == "tool":
+            name = str(action.get("name", "")).strip()
+            if not name:
+                logger.warning("chat_agent: dropping action[%d] tool — missing name", i)
+                continue
+            # Validate tool-specific params for runtime tools
+            args = action.get("args", {})
+            if not isinstance(args, dict):
+                args = {}
+            if name == "wechat_reply":
+                text = str(args.get("text", "")).strip()
+                if not text:
+                    logger.warning("chat_agent: dropping action[%d] wechat_reply — empty text", i)
+                    continue
+            elif name == "schedule_wechat_message":
+                delay = args.get("delay_minutes", args.get("minutes"))
+                msgs = args.get("messages")
+                if delay is None and msgs is None:
+                    logger.warning("chat_agent: dropping action[%d] schedule — missing delay and messages", i)
+                    continue
+        elif action_type not in _VALID_ACTION_TYPES:
+            logger.warning("chat_agent: dropping action[%d] — unknown type=%s", i, action_type)
+            continue
+        valid.append(action)
+    return valid
+
+
+# ================================================================
 # V2.1: Outbound message semantics
 # ================================================================
 
@@ -705,3 +993,139 @@ def _emotion_force_reply_text(emotion_inject: str) -> str:
         pool = default_replies
 
     return random.choice(pool)
+
+
+# ================================================================
+# Phase 5A: Native tool call helpers
+# ================================================================
+
+# Hard-coded deny list for native tool calls (independent of config allowed_tools).
+# These must NEVER be exposed as native function-calling tools regardless of
+# any configuration setting or registry flag.
+_NATIVE_TOOL_HARD_DENY = frozenset({
+    "wechat_reply",
+    "schedule_wechat_message",
+    "send_email",
+})
+
+
+def _build_native_tool_specs(allowed_tools: list[str]) -> list[dict[str, Any]] | None:
+    """Build native tool specs from the ToolRegistry filtered by allowed list.
+
+    Returns None if no eligible tools are available (so the caller can
+    skip passing ``tools`` entirely).
+    """
+    from agent.tool_registry import TOOL_REGISTRY
+
+    native_names: set[str] = set()
+    for tool in TOOL_REGISTRY.iter_defs():
+        if not tool.native_tool_call_eligible:
+            continue
+        if tool.name in _NATIVE_TOOL_HARD_DENY:
+            continue
+        if tool.name not in allowed_tools:
+            continue
+        native_names.add(tool.name)
+
+    if not native_names:
+        return None
+
+    # Build a temporary sub-registry with only the allowed tools
+    # to reuse get_native_tool_specs
+    from agent.tool_registry import ToolRegistry
+
+    sub = ToolRegistry()
+    for tool in TOOL_REGISTRY.iter_defs():
+        if tool.name in native_names:
+            sub.register(tool)
+
+    return sub.get_native_tool_specs(eligible_only=True)
+
+
+def _classify_native_tool_result(result: str) -> str:
+    """Classify a native tool execution result for observability logging.
+
+    Returns one of: success, unknown_tool, hard_denied, not_allowed,
+    not_eligible, invalid_arguments_json, missing_required_arg,
+    tool_execution_error.
+
+    Does NOT log the result content itself — only the classification tag.
+    """
+    if not result.startswith("错误"):
+        return "success"
+    if "工具名称为空" in result:
+        return "unknown_tool"
+    if "不允许通过原生 tool call 调用" in result:
+        return "hard_denied"
+    if "不在允许的原生工具列表中" in result:
+        return "not_allowed"
+    if "未找到工具" in result:
+        return "unknown_tool"
+    if "不支持原生 tool call" in result:
+        return "not_eligible"
+    if "JSON 解析失败" in result:
+        return "invalid_arguments_json"
+    if "缺少必需参数" in result:
+        return "missing_required_arg"
+    if "工具执行出错" in result:
+        return "tool_execution_error"
+    return "unknown_error"
+
+
+async def _execute_native_tool(
+    tool_name: str,
+    tool_args_raw: str,
+    native_allowed_tools: list[str],
+) -> str:
+    """Validate and execute a native tool call from the model.
+
+    Returns:
+        Tool result string, or an error message if validation/execution fails.
+        Never raises an exception.
+    """
+    import json as _json
+
+    from agent.tool_registry import TOOL_REGISTRY
+
+    # 1. Validate tool name
+    if not tool_name:
+        return "错误：工具名称为空"
+
+    if tool_name in _NATIVE_TOOL_HARD_DENY:
+        return f"错误：工具 {tool_name} 不允许通过原生 tool call 调用"
+
+    if tool_name not in native_allowed_tools:
+        return f"错误：工具 {tool_name} 不在允许的原生工具列表中"
+
+    tool_def = TOOL_REGISTRY.get(tool_name)
+    if tool_def is None:
+        return f"错误：未找到工具 {tool_name}"
+
+    if not tool_def.native_tool_call_eligible:
+        return f"错误：工具 {tool_name} 不支持原生 tool call"
+
+    # 2. Parse arguments
+    try:
+        args = _json.loads(tool_args_raw) if tool_args_raw.strip() else {}
+    except _json.JSONDecodeError as e:
+        return f"错误：工具参数 JSON 解析失败：{e}"
+
+    if not isinstance(args, dict):
+        return "错误：工具参数必须是 JSON 对象"
+
+    # 3. Validate required arguments from schema
+    if isinstance(tool_def.args_schema, dict):
+        required = tool_def.args_schema.get("required", [])
+        for req_arg in required:
+            if req_arg not in args or args[req_arg] is None:
+                return f"错误：缺少必需参数 {req_arg}"
+
+    # 4. Execute the tool
+    from agent.tools import execute_tool
+
+    try:
+        result = await execute_tool(tool_name, args)
+        return str(result) if result is not None else ""
+    except Exception as e:
+        logger.error("Native tool execution error: tool=%s error=%s", tool_name, e)
+        return f"错误：工具执行出错：{e}"

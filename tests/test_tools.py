@@ -34,7 +34,12 @@ def test_get_time_unknown_timezone_falls_back():
 
 def test_get_weather_without_city():
     """Weather without city returns prompt."""
-    from agent.tools import execute_tool
+    from agent.tools import execute_tool, configure_tools
+
+    # Reset TOOL_RUNTIME_CONFIG to empty so that _default_weather_city()
+    # returns "" regardless of whether main.py's module-level
+    # configure_tools() ran earlier with a real config.
+    configure_tools({})
 
     result = asyncio.run(execute_tool("get_weather", {}))
     assert "指定城市" in result

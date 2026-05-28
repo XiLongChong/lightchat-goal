@@ -1,4 +1,5 @@
 from pathlib import Path
+from unittest.mock import MagicMock
 
 
 PROMPTS = Path(__file__).resolve().parent.parent / "prompts"
@@ -25,7 +26,7 @@ def test_task_prompt_files_exist():
 def test_scheduler_prompt_templates_format():
     from agent.scheduler import SchedulerAgent
 
-    agent = SchedulerAgent(store=None, client=None, model="test")  # type: ignore[arg-type]
+    agent = SchedulerAgent(store=None, model="test", llm_gateway=MagicMock())  # type: ignore[arg-type]
 
     intent_prompt = agent.intent_prompt_template.format(
         now_str="2026年05月26日 15:00 周2",
@@ -56,7 +57,7 @@ def test_scheduler_prompt_templates_format():
 def test_memory_worker_loads_external_extraction_prompt():
     from agent.memory_worker import MemoryWorker
 
-    worker = MemoryWorker(store=None, client=None, model="test")  # type: ignore[arg-type]
+    worker = MemoryWorker(store=None, model="test", llm_gateway=MagicMock())  # type: ignore[arg-type]
 
     assert "从以下对话中提取" in worker.extraction_prompt
     assert "输出格式" in worker.extraction_prompt

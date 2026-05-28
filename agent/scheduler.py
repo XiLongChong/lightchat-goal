@@ -108,12 +108,12 @@ class SchedulerAgent:
     def __init__(
         self,
         store: MemoryStore,
-        client: Any,  # AsyncOpenAI
         model: str,
+        llm_gateway: Any,
         config: dict[str, Any] | None = None,
     ):
         self.store = store
-        self.client = client
+        self.llm_gateway = llm_gateway
         self.model = model
 
         cfg = config or {}
@@ -141,6 +141,11 @@ class SchedulerAgent:
         self.quiet_hours_enabled = cfg.get("quiet_hours_enabled", True)
         self.max_ignored_streak = cfg.get("max_ignored_streak", 3)
         self.max_daily = cfg.get("max_daily_proactive", 5)
+
+        # Phase 3B-1: JSON Output config
+        json_cfg = cfg.get("json_output", {})
+        self.json_intent_enabled = bool(json_cfg.get("scheduler_intent", True))
+        self.json_plan_enabled = bool(json_cfg.get("proactive_plan", True))
 
         # V2.1.1 proactive config
         pro_cfg = cfg.get("proactive", {})
@@ -171,6 +176,35 @@ class SchedulerAgent:
         except OSError:
             logger.warning("Scheduler prompt missing, using fallback: %s", path)
             return fallback
+
+    async def _complete(
+        self,
+        purpose: str,
+        messages: list[dict[str, Any]],
+        *,
+        temperature: float,
+        max_tokens: int,
+        metadata: dict[str, Any] | None = None,
+        response_mode: str = "text",
+    ):
+        """Run a single LLM completion through LLMGateway.
+
+        Returns the full LLMResponse so callers can inspect finish_reason
+        and merge usage across retries.
+        """
+        from agent.llm_types import LLMRequest
+        return await self.llm_gateway.complete(
+            LLMRequest(
+                purpose=purpose,
+                model=self.model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_mode=response_mode,
+                thinking="disabled",
+                metadata=metadata or {},
+            )
+        )
 
     # ================================================================
     # Legacy compatibility (kept for existing callers)
@@ -866,30 +900,83 @@ class SchedulerAgent:
             followup_count=followup_count,
         )
 
+        json_mode = self.json_intent_enabled
+        resp_mode = "json_object" if json_mode else "text"
+        messages = [
+            {"role": "system", "content": "Only output JSON."},
+            {"role": "user", "content": prompt},
+        ]
+
+        import json as _json
+        from utils.json_parser import extract_json
+
+        def _parse_intent(raw_content: str) -> tuple[str, str] | None:
+            if not raw_content.strip():
+                return None
+            json_str = extract_json(raw_content)
+            try:
+                result = _json.loads(json_str)
+            except (_json.JSONDecodeError, ValueError):
+                if json_mode:
+                    logger.warning("scheduler_intent: non-JSON content in strict mode")
+                return None
+            if not isinstance(result, dict):
+                logger.warning("scheduler_intent: top-level not object")
+                return None
+            intent = str(result.get("intent", "")).strip()
+            if not intent:
+                logger.warning("scheduler_intent: missing intent field")
+                return None
+            if intent not in self.enabled_types:
+                logger.warning("scheduler_intent: intent %s not in enabled types", intent)
+                return None
+            reason = str(result.get("reason", ""))[:200]
+            return (intent, reason)
+
         try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "Only output JSON."},
-                    {"role": "user", "content": prompt},
-                ],
+            llm_resp = await self._complete(
+                "scheduler_intent",
+                messages=messages,
                 temperature=0.4,
                 max_tokens=128,
+                response_mode=resp_mode,
             )
-            raw = response.choices[0].message.content or ""
+            raw_content = llm_resp.content or ""
+            finish = llm_resp.finish_reason or ""
 
-            import json
-            from utils.json_parser import extract_json
-            json_str = extract_json(raw)
-            result = json.loads(json_str)
-            intent = str(result.get("intent", "check_in"))
-            reason = str(result.get("reason", ""))
-            if intent in self.enabled_types:
-                return (intent, reason)
+            # finish_reason=length handling (strict mode only)
+            if finish == "length" and json_mode:
+                logger.warning("scheduler_intent: finish_reason=length, retrying")
+                try:
+                    retry_resp = await self._complete(
+                        "scheduler_intent",
+                        messages=messages,
+                        temperature=0.4,
+                        max_tokens=128,
+                        response_mode="json_object",
+                        metadata={"retry_reason": "length"},
+                    )
+                    retry_finish = retry_resp.finish_reason or ""
+                    if retry_finish != "length":
+                        raw_content = retry_resp.content or ""
+                        logger.info("scheduler_intent: length retry succeeded")
+                    else:
+                        logger.warning("scheduler_intent: length retry also failed")
+                        return self._fallback_intent()
+                except Exception:
+                    logger.warning("scheduler_intent: length retry error", exc_info=True)
+                    return self._fallback_intent()
+
+            parsed = _parse_intent(raw_content)
+            if parsed is not None:
+                return parsed
         except Exception as e:
             logger.debug(f"LLM intent selection failed: {e}")
 
-        # Fallback: prefer self_share for no-topic proactive starts.
+        return self._fallback_intent()
+
+    def _fallback_intent(self) -> tuple[str, str]:
+        """Return a safe fallback intent when LLM selection fails."""
         fallback = "self_share" if "self_share" in self.enabled_types else "check_in"
         if fallback not in self.enabled_types:
             for t in self.enabled_types:
@@ -931,17 +1018,15 @@ class SchedulerAgent:
             intent_rules=intent_rules,
         )
 
-        response = await self.client.chat.completions.create(
-            model=self.model,
+        raw = (await self._complete(
+            "proactive_message",
             messages=[
                 {"role": "system", "content": "Only output JSON."},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.7,
             max_tokens=256,
-        )
-
-        raw = response.choices[0].message.content or ""
+        )).content or ""
 
         import json
         from utils.json_parser import extract_json
@@ -987,23 +1072,99 @@ class SchedulerAgent:
             memory_context=memory_context or "none",
             recent_openers=recent_openers or "none",
         )
+        import json as _json
+        from utils.json_parser import extract_json
+
+        VALID_PLAN_STYLES = frozenset({
+            "curious", "playful", "musing", "choice_q", "opinion",
+            "light_touch", "bored",
+        })
+        VALID_PLAN_BASES = frozenset({
+            "inner_thought_only", "active_topic", "memory", "allowed_fact",
+        })
+        VALID_PLAN_RISKS = frozenset({"low", "medium", "high"})
+
+        def _parse_plan(raw_content: str) -> dict[str, Any] | None:
+            if not raw_content.strip():
+                return None
+            json_str = extract_json(raw_content)
+            try:
+                result = _json.loads(json_str)
+            except (_json.JSONDecodeError, ValueError):
+                if json_mode:
+                    logger.warning("proactive_plan: non-JSON content in strict mode")
+                return None
+            if not isinstance(result, dict):
+                logger.warning("proactive_plan: top-level not object")
+                return None
+            # Validate and sanitize fields
+            plan: dict[str, Any] = {}
+            intent = result.get("intent", "")
+            if isinstance(intent, str) and intent.strip():
+                plan["intent"] = intent.strip()
+            else:
+                plan["intent"] = intent_raw
+            style = result.get("style", "curious")
+            plan["style"] = str(style) if isinstance(style, str) and str(style) in VALID_PLAN_STYLES else "curious"
+            safe_basis = result.get("safe_basis", "inner_thought_only")
+            plan["safe_basis"] = str(safe_basis) if isinstance(safe_basis, str) and str(safe_basis) in VALID_PLAN_BASES else "inner_thought_only"
+            topic_seed = result.get("topic_seed", "")
+            plan["topic_seed"] = str(topic_seed)[:40] if isinstance(topic_seed, str) else ""
+            risk = result.get("risk", "low")
+            plan["risk"] = str(risk) if isinstance(risk, str) and str(risk) in VALID_PLAN_RISKS else "low"
+            avoid = result.get("avoid", [])
+            plan["avoid"] = [str(a) for a in avoid if isinstance(a, str)] if isinstance(avoid, list) else []
+            return plan
+
+        json_mode = self.json_plan_enabled
+        resp_mode = "json_object" if json_mode else "text"
+        intent_raw = intent  # capture for fallback inside _parse_plan
+        messages = [
+            {"role": "system", "content": "Only output JSON."},
+            {"role": "user", "content": prompt},
+        ]
+
         try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "Only output JSON."},
-                    {"role": "user", "content": prompt},
-                ],
+            llm_resp = await self._complete(
+                "proactive_plan",
+                messages=messages,
                 temperature=0.5,
                 max_tokens=256,
+                response_mode=resp_mode,
             )
-            raw = response.choices[0].message.content or ""
-            import json as _json
-            from utils.json_parser import extract_json
-            return _json.loads(extract_json(raw))
+            raw_content = llm_resp.content or ""
+            finish = llm_resp.finish_reason or ""
+
+            # finish_reason=length handling (strict mode only)
+            if finish == "length" and json_mode:
+                logger.warning("proactive_plan: finish_reason=length, retrying")
+                try:
+                    retry_resp = await self._complete(
+                        "proactive_plan",
+                        messages=messages,
+                        temperature=0.5,
+                        max_tokens=256,
+                        response_mode="json_object",
+                        metadata={"retry_reason": "length"},
+                    )
+                    retry_finish = retry_resp.finish_reason or ""
+                    if retry_finish != "length":
+                        raw_content = retry_resp.content or ""
+                        logger.info("proactive_plan: length retry succeeded")
+                    else:
+                        logger.warning("proactive_plan: length retry also failed")
+                        return {}
+                except Exception:
+                    logger.warning("proactive_plan: length retry error", exc_info=True)
+                    return {}
+
+            parsed = _parse_plan(raw_content)
+            if parsed is not None:
+                return parsed
         except Exception as e:
             logger.warning(f"Proactive plan generation failed: {e}")
-            return {}
+
+        return {}
 
     async def _generate_message_from_plan(
         self,
@@ -1031,16 +1192,15 @@ class SchedulerAgent:
             relationship_context=relationship_context or "none",
         )
         try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
+            raw = (await self._complete(
+                "proactive_message_v2",
                 messages=[
                     {"role": "system", "content": "Only output JSON."},
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.7,
                 max_tokens=256,
-            )
-            raw = response.choices[0].message.content or ""
+            )).content or ""
             import json as _json
             from utils.json_parser import extract_json
             result = _json.loads(extract_json(raw))

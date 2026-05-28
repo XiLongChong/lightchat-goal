@@ -35,7 +35,6 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from openai import AsyncOpenAI
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -44,6 +43,8 @@ from agent.bot_profile import BotProfileManager, DEFAULT_BOT_ID
 from agent.chat_agent import ChatAgent, ROUTE_SYSTEM_FAST, ROUTE_CHAT_LITE, ROUTE_CHAT_FULL
 from agent.chat_agent import CTX_HOT_ONLY, CTX_HOT_CHEAP, CTX_HOT_FULL
 from agent.context_builder import compact_history
+from agent.llm_gateway import LLMGateway
+from agent.llm_types import LLMRequest
 from agent.memory_worker import MemoryWorker
 from agent.output_guard import guard_messages, guard_single_message
 from agent.scheduler import SchedulerAgent, CST as SCHEDULER_CST
@@ -77,6 +78,15 @@ def load_config(path: str = "config.yaml") -> dict:
 
 
 cfg = load_config()
+
+# Phase 6A: Env-var override for native_tool_calls gray-release.
+# GOAL_NATIVE_TOOL_CALLS=true overrides config.yaml without editing the file.
+_native_override = os.getenv("GOAL_NATIVE_TOOL_CALLS", "").strip().lower()
+if _native_override in ("true", "1", "yes", "on"):
+    _ntc = cfg.setdefault("model", {}).setdefault("native_tool_calls", {})
+    _ntc["chat_agent"] = True
+    if not _ntc.get("allowed_tools"):
+        _ntc["allowed_tools"] = ["get_time", "get_weather"]
 RUNTIME_SETTINGS_PATH = Path("./data/runtime_settings.json")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
 ADMIN_SESSIONS: set[str] = set()
@@ -273,18 +283,26 @@ def _read_recent_log_lines(
 # Clients and services
 # ================================================================
 
-llm_client = AsyncOpenAI(
-    api_key=cfg["model"]["api_key"],
-    base_url=cfg["model"]["base_url"],
-)
+llm_gateway = LLMGateway.from_model_config(cfg["model"])
 
-model_name = cfg["model"]["name"]
+model_name = cfg["model"].get("default_model") or cfg["model"]["name"]
 temperature = cfg["model"].get("temperature", 0.7)
 
 memory_store = MemoryStore(
     db_path=cfg["memory"].get("db_path", "./data/memory.db"),
 )
 configure_runtime(memory_store=memory_store)
+
+# Register LLM trace callback — fires after every gateway.complete() call.
+# Only token counts, latency, and error kinds are persisted; never raw_response
+# or provider raw error strings.
+async def _on_llm_trace(trace: dict):
+    try:
+        await memory_store.save_llm_trace(trace)
+    except Exception:
+        pass  # Trace loss must never affect the caller.
+
+llm_gateway.on_trace(_on_llm_trace)
 
 # V2.1: Bot profile manager
 bot_manager = BotProfileManager(
@@ -294,7 +312,6 @@ bot_manager = BotProfileManager(
 )
 
 chat_agent = ChatAgent(
-    client=llm_client,
     model=model_name,
     persona=cfg["agent"]["persona"],
     personality=read_persona_file(),
@@ -306,23 +323,29 @@ chat_agent = ChatAgent(
         )
     },
     bot_manager=bot_manager,
+    llm_gateway=llm_gateway,
+    json_output_enabled=cfg.get("model", {}).get("json_output", {}).get("chat_agent", True),
+    # Phase 5A: native tool calls feature flag (default: false)
+    native_tool_calls=cfg.get("model", {}).get("native_tool_calls", {}).get("chat_agent", False),
+    native_allowed_tools=cfg.get("model", {}).get("native_tool_calls", {}).get("allowed_tools", []),
 )
 
 memory_worker = MemoryWorker(
     store=memory_store,
-    client=llm_client,
     model=model_name,
     min_importance=cfg["memory"].get("min_importance_save", 0.4),
     prompts_dir=cfg.get("prompt_pack", {}).get("directory", "./prompts"),
+    llm_gateway=llm_gateway,
 )
 
 scheduler_agent = SchedulerAgent(
     store=memory_store,
-    client=llm_client,
     model=model_name,
+    llm_gateway=llm_gateway,
     config={
         **(cfg.get("scheduler") or {}),
         "prompts_dir": cfg.get("prompt_pack", {}).get("directory", "./prompts"),
+        "json_output": cfg.get("model", {}).get("json_output", {}),
     },
 )
 
@@ -374,6 +397,10 @@ if cfg.get("wechat", {}).get("enabled"):
         token=wcfg.get("token", ""),
         base_url=wcfg.get("base_url", ""),
         goal_url=wcfg.get("goal_url", "http://127.0.0.1:8899"),
+        chat_api_key=os.getenv(
+            (cfg.get("api") or {}).get("chat_api_key_env", "CHAT_API_KEY"),
+            "",
+        ),
         poll_timeout_ms=wcfg.get("poll_timeout_ms", 35_000),
         message_delay=wcfg.get("message_delay", 1.2),
         buffer_debounce_seconds=wcfg.get("buffer_debounce_seconds", 5.0),
@@ -413,21 +440,108 @@ def _api_config() -> dict[str, Any]:
     }
 
 
+def _get_chat_api_key() -> str:
+    """Return the configured chat API key, or empty string if not set."""
+    api_cfg = _api_config()
+    return os.getenv(api_cfg["chat_api_key_env"], "")
+
+
+def _startup_validate() -> None:
+    """Run startup self-checks. Log warnings/errors for misconfigurations."""
+    errors: list[str] = []
+    api_cfg = _api_config()
+
+    # 1. If chat_auth_enabled, CHAT_API_KEY must be set
+    if api_cfg["chat_auth_enabled"]:
+        chat_key = _get_chat_api_key()
+        if not chat_key:
+            msg = (
+                "api.chat_auth_enabled=true but CHAT_API_KEY env var is not set; "
+                "/chat will reject all requests with 503"
+            )
+            logger.error(msg)
+            errors.append("chat_auth_key_not_configured")
+        else:
+            logger.info("chat_auth: enabled, CHAT_API_KEY is set")
+
+    # 2. If wechat_poller enabled + chat_auth_enabled, poller must have same key
+    wcfg = cfg.get("wechat", {})
+    wechat_enabled = wcfg.get("enabled", False)
+    if wechat_enabled and api_cfg["chat_auth_enabled"]:
+        chat_key = _get_chat_api_key()
+        if not chat_key:
+            msg = (
+                "wechat.enabled=true AND chat_auth_enabled=true but "
+                "CHAT_API_KEY is not set; internal bridge calls to /chat will fail"
+            )
+            logger.error(msg)
+            errors.append("wechat_poller_missing_chat_api_key")
+
+    # 3. current_bot_id must load a bot profile
+    current_bot_id = bot_manager.current_bot_id
+    active_bot = bot_manager.get_bot(current_bot_id)
+    if active_bot is None:
+        msg = (
+            f"current_bot_id={current_bot_id!r} does not resolve to a bot profile; "
+            "check bots section in config.yaml"
+        )
+        logger.error(msg)
+        errors.append("bot_profile_not_found")
+    else:
+        logger.info(f"Active bot loaded: {current_bot_id} ({active_bot.display_name})")
+
+    # 4. LLM API key must exist
+    llm_key = cfg.get("model", {}).get("api_key", "")
+    if not llm_key:
+        msg = "model.api_key is not set; LLM calls will fail"
+        logger.error(msg)
+        errors.append("llm_api_key_missing")
+    else:
+        logger.info("LLM API key: configured")
+
+    # 5. data dir must be writable
+    db_path = cfg.get("memory", {}).get("db_path", "./data/memory.db")
+    data_dir = str(Path(db_path).parent)
+    try:
+        Path(data_dir).mkdir(parents=True, exist_ok=True)
+        test_file = Path(data_dir) / ".startup_write_test"
+        test_file.write_text("ok")
+        test_file.unlink()
+    except Exception as e:
+        msg = f"data directory {data_dir!r} is not writable: {e}"
+        logger.error(msg)
+        errors.append("data_dir_not_writable")
+
+    if errors:
+        logger.error(
+            f"Startup validation found {len(errors)} issue(s): {', '.join(errors)}"
+        )
+    else:
+        logger.info("Startup validation: all checks passed")
+
+
 def _require_chat_auth(request: Request, api_cfg: dict[str, Any]) -> None:
     if not api_cfg["chat_auth_enabled"]:
         return
 
     expected = os.getenv(api_cfg["chat_api_key_env"], "")
     if not expected:
-        raise HTTPException(status_code=503, detail="Chat API key is not configured")
+        logger.error(
+            "chat_auth_enabled=true but CHAT_API_KEY env var is not set; "
+            "all /chat requests will be rejected"
+        )
+        raise HTTPException(status_code=503, detail="chat_auth_key_not_configured")
 
     auth_header = request.headers.get("authorization", "")
     token = ""
     if auth_header.lower().startswith("bearer "):
         token = auth_header[7:].strip()
     token = token or request.headers.get("x-api-key", "").strip()
-    if not token or not secrets.compare_digest(token, expected):
-        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    if not token:
+        raise HTTPException(status_code=401, detail="chat_auth_missing")
+    if not secrets.compare_digest(token, expected):
+        raise HTTPException(status_code=401, detail="chat_auth_invalid")
 
 
 def _validate_chat_user_id(user_id: str, api_cfg: dict[str, Any]) -> str:
@@ -1007,6 +1121,7 @@ async def start_internal_wechat_bridge():
         token=token,
         base_url=wcfg.get("base_url", ""),
         goal_url=wcfg.get("goal_url", "http://127.0.0.1:8899"),
+        chat_api_key=_get_chat_api_key(),
         poll_timeout_ms=wcfg.get("poll_timeout_ms", 35_000),
         message_delay=wcfg.get("message_delay", 1.2),
         max_reply_delay=wcfg.get("max_reply_delay", 3.0),
@@ -1261,6 +1376,9 @@ def build_memory_export_zip(memories: list[dict]) -> bytes:
 async def lifespan(app: FastAPI):
     """Startup and shutdown."""
     logger.info(f"Starting Goal Chat Agent (model={model_name})")
+
+    # ── Startup validation ───────────────────────────────────────
+    _startup_validate()
 
     # Start background jobs. One-shot reminders are always checked because they
     # are user-requested tasks; proactive messaging is separately configurable.
@@ -1574,6 +1692,39 @@ async def chat(request: Request):
       {"messages": [{"text": "...", "delay": 1.0}, ...], "done": true}
     """
     api_cfg = _api_config()
+
+    # ── readiness / auth gate logging ──────────────────────────
+    chat_api_key_set = bool(os.getenv(api_cfg["chat_api_key_env"], ""))
+    has_auth_header = bool(
+        request.headers.get("authorization", "")
+        or request.headers.get("x-api-key", "")
+    )
+    remote_addr = request.client.host if request.client else "unknown"
+    current_bot_id = bot_manager.current_bot_id
+    active_bot = bot_manager.get_bot(current_bot_id)
+
+    logger.info(
+        f"/chat entry: remote={remote_addr} "
+        f"chat_auth_enabled={api_cfg['chat_auth_enabled']} "
+        f"has_auth_header={has_auth_header} "
+        f"chat_api_key_set={chat_api_key_set} "
+        f"current_bot_id={current_bot_id} "
+        f"active_bot_exists={active_bot is not None} "
+        f"memory_store_ok={memory_store is not None} "
+        f"llm_gateway_ok={llm_gateway is not None}"
+    )
+
+    # Fail early with clear diagnostics if service is not ready
+    if memory_store is None:
+        logger.error("/chat rejected: memory_store_not_ready")
+        raise HTTPException(status_code=503, detail="memory_store_not_ready")
+    if llm_gateway is None:
+        logger.error("/chat rejected: llm_gateway_not_ready")
+        raise HTTPException(status_code=503, detail="llm_gateway_not_ready")
+    if active_bot is None:
+        logger.error(f"/chat rejected: bot_not_ready (current_bot_id={current_bot_id})")
+        raise HTTPException(status_code=503, detail="bot_not_ready")
+
     _require_chat_auth(request, api_cfg)
 
     try:
@@ -2362,7 +2513,7 @@ async def scheduler_tick() -> dict:
             )
 
             if decision.get("block_proactive"):
-                logger.info(f"Scheduler: clingy awaiting but not due — blocking proactive")
+                logger.info("Scheduler: clingy awaiting but not due — blocking proactive")
                 return {"sent": False, "reason": decision.get("reason", "clingy awaiting, proactive blocked"), "stage": "clingy"}
             if not decision.get("sent"):
                 decision = await scheduler_agent.run_proactive_pipeline(
@@ -2577,7 +2728,7 @@ async def fixed_morning_message() -> dict:
     )
     weather_result = await execute_tool("get_weather", {"city": city})
     prompt = (
-        f"现在是早上8点。主动给用户发早安消息。"
+        f"现在是早上7点。主动给用户发早安消息。"
         f"天气工具结果：{weather_result}。"
         "基于这个真实结果，用几条短微信说早安、天气、今天可以做的一两件小事。"
         "不要再调用 get_weather，不要编造工具没有返回的天气细节。"
@@ -2593,14 +2744,14 @@ async def fixed_morning_message() -> dict:
 async def fixed_night_recap() -> dict:
     prompt = (
         "现在是晚上11点。请从AI的角度写一小段今天的陪伴日记并发给用户。"
-        "基于今天真实聊过的内容，说我今天和你聊到了什么、我看见了什么状态、"
+        "基于今天真实聊过的内容，说我今天和你聊到了什么、我看见了什么状态。"
         "我想轻轻替你记住什么。不要冒充用户本人，不要编造没聊过的现实事实。"
         "200字以内，像随手写日记。"
     )
     return await _run_fixed_message_prompt(
         prompt,
         save_diary=True,
-        fallback_messages=[{"text": "今天先收住 明天再慢慢来", "delay": 0}],
+        fallback_messages=[{"text": "今天先收尾 明天再慢慢来", "delay": 0}],
         trigger="fixed_night",
     )
 
@@ -2663,7 +2814,7 @@ async def _run_fixed_message_prompt(
             if m.get("text")
         ]
         if not messages:
-            messages = fallback_messages or [{"text": "我刚刚卡了一下 重新说", "delay": 0}]
+            messages = fallback_messages or [{"text": "我刚刚卡了一下 重新来", "delay": 0}]
 
         # V2: Persist turn draft
         await memory_store.create_turn_draft(
@@ -2764,13 +2915,13 @@ def _morning_fallback_messages(city: str, weather_result: str) -> list[dict]:
     """Task-specific fallback for the fixed 8am greeting."""
     weather_text = str(weather_result or "").strip()
     if not weather_text or "失败" in weather_text or "出错" in weather_text:
-        middle = f"{city}天气我这边没查稳 出门前看一眼"
+        middle = f"{city}天气我这边没查稳 出门前看一下"
     else:
         middle = weather_text[:80]
     return [
         {"text": "早", "delay": 0},
         {"text": middle, "delay": 1},
-        {"text": "今天先慢慢开机", "delay": 1},
+        {"text": "今天先慢慢开始", "delay": 1},
     ]
 
 
@@ -2934,16 +3085,16 @@ async def _analyze_and_update_topic(
         return None
 
     # Rule-first high-confidence cases
-    close_words = {"不要和你讲", "不用管", "算了", "不是发过吗", "别问了", "别管了"}
+    close_words = {"不要和你聊", "不用了", "算了", "不是发过了", "别问了", "别管了"}
     if any(w in user_message for w in close_words):
         await memory_store.close_active_topic(user_id, bot_id, "user rejection")
         logger.info(f"Topic closed: user rejection — '{user_message[:50]}'")
         return {"action": "close", "reason": "user rejection"}
 
-    # Meal/planning/recommendation keywords → waiting_user_result
-    meal_keywords = {"吃", "喝", "午饭", "晚饭", "早餐", "午餐", "晚餐", "菜", "饭", "外卖"}
+    # Meal/planning/recommendation keywords — waiting_user_result
+    meal_keywords = {"吃饭", "吃什么", "午饭", "晚饭", "早餐", "午餐", "晚餐", "餐厅", "点餐", "外卖"}
     plan_keywords = {"安排", "计划", "下午", "晚上", "今天", "明天", "日程"}
-    project_keywords = {"项目", "代码", "bug", "更新", "改", "做", "写", "弄"}
+    project_keywords = {"项目", "代码", "bug", "更新", "实现", "测试", "部署", "修复"}
 
     is_meal = any(kw in user_message for kw in meal_keywords)
     is_plan = any(kw in user_message for kw in plan_keywords)
@@ -2958,7 +3109,7 @@ async def _analyze_and_update_topic(
     current = await memory_store.get_active_topic(user_id, bot_id)
 
     if is_meal or is_plan or is_project:
-        # New meaningful topic → create or replace
+        # New meaningful topic — create or replace
         if is_meal:
             status = "waiting_user_result"
             followup_after = now + random.uniform(meal_followup_min, meal_followup_max)
@@ -2998,8 +3149,8 @@ async def _analyze_and_update_topic(
         logger.info(f"Topic upserted: [{status}] '{title[:30]}'")
         return {"action": "upsert", "status": status}
 
-    # Weather/schedule answer → mark topic answered
-    weather_keywords = {"天气", "温度", "下雨", "晴", "风"}
+    # Weather/schedule answer — mark topic answered
+    weather_keywords = {"天气", "温度", "下雨", "晴", "雨"}
     if current and any(kw in user_message for kw in weather_keywords):
         current_status = current.get("status", "")
         if current_status not in ("closed", "stale"):
@@ -3079,17 +3230,20 @@ async def _generate_recap(
             f"对话记录：\n{turns_summary}"
         )
 
-        response = await llm_client.chat.completions.create(
-            model=model_name,
-            messages=[
-                {"role": "system", "content": "你是一个简洁的对话摘要助手。"},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=float(recap_cfg.get("generation", {}).get("temperature", 0.5)),
-            max_tokens=int(recap_cfg.get("generation", {}).get("max_chars", 500)),
+        llm_response = await llm_gateway.complete(
+            LLMRequest(
+                purpose="recap",
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": "你是一个简洁的对话摘要助手。"},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=float(recap_cfg.get("generation", {}).get("temperature", 0.5)),
+                max_tokens=int(recap_cfg.get("generation", {}).get("max_chars", 500)),
+            )
         )
 
-        recap_text = (response.choices[0].message.content or "").strip()
+        recap_text = llm_response.content.strip()
         if not recap_text:
             return None
 
@@ -3106,6 +3260,7 @@ async def _generate_recap(
             f"({len(new_turns)} turns, bot={bot_id})"
         )
         return recap_id
+
     except Exception as e:
         logger.error(f"Recap generation failed: {e}", exc_info=True)
         return None
@@ -3727,14 +3882,14 @@ async def admin_clingy_simulate(request: Request):
     if not scheduler_agent.clingy_mode_enabled:
         blocked_reasons.append("clingy_mode_disabled")
     if not clingy_state.get("awaiting_user_reply"):
-        blocked_reasons.append("not_awaiting_user_reply — bot 上一轮没有发出消息，或用户已经回复过了")
+        blocked_reasons.append("not_awaiting_user_reply — bot 上一轮没有发出消息，或用户已经回复过")
     next_due = clingy_state.get("next_clingy_due_at", 0)
     if next_due > 0 and now_ts < next_due:
         blocked_reasons.append(f"not_yet_due — 还需等待 {int(next_due - now_ts)}s")
     count = clingy_state.get("clingy_followup_count", 0)
     max_count = scheduler_agent.max_followups_per_unanswered
     if count >= max_count:
-        blocked_reasons.append(f"max_reached — 已追问 {count}/{max_count} 次")
+        blocked_reasons.append(f"max_reached — 已追 {count}/{max_count} 次")
     if scheduler_agent.quiet_hours_enabled and scheduler_agent._is_quiet_hour(now_cst.hour):
         blocked_reasons.append("quiet_hours")
     today_start = dt_module.datetime.combine(
@@ -3815,7 +3970,7 @@ async def admin_clingy_force(request: Request):
             reason_parts.append("没有任何 bot 发出的消息记录")
         elif last_user_turn and last_user_turn["created_at"] and last_bot_turn["created_at"]:
             if last_user_turn["created_at"] > last_bot_turn["created_at"]:
-                reason_parts.append("用户在 bot 消息之后已经回复过了，状态已被清除")
+                reason_parts.append("用户在 bot 消息之后已经回复过了，状态已被清理")
         if diag["last_proactive_intent"]:
             reason_parts.append(f"上次意图: {diag['last_proactive_intent']}")
         reason_parts.append("提示: 先让 bot 回复一条消息（不要 skip），再等用户不回即可触发")

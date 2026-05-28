@@ -24,6 +24,7 @@ class WeChatBridge:
         token: str,
         base_url: str = "",
         goal_url: str = "http://127.0.0.1:8899",
+        chat_api_key: str = "",
         poll_timeout_ms: int = 35_000,
         message_delay: float = 1.2,
         max_reply_delay: float = 3.0,
@@ -33,6 +34,7 @@ class WeChatBridge:
         self.token = token
         self.base_url = base_url
         self.goal_url = goal_url.rstrip("/")
+        self.chat_api_key = chat_api_key
         self.poll_timeout_ms = poll_timeout_ms
         self.message_delay = message_delay
         self.max_reply_delay = max_reply_delay
@@ -163,6 +165,10 @@ class WeChatBridge:
 
         # Forward to Goal Chat Agent
         try:
+            headers = {}
+            if self.chat_api_key:
+                headers["Authorization"] = f"Bearer {self.chat_api_key}"
+
             async with httpx.AsyncClient(timeout=60) as client:
                 resp = await client.post(
                     f"{self.goal_url}/chat",
@@ -171,9 +177,16 @@ class WeChatBridge:
                         "user_id": from_user,
                         "context_token": context_token,
                     },
+                    headers=headers,
                 )
                 resp.raise_for_status()
                 data = resp.json()
+        except httpx.HTTPStatusError as e:
+            logger.error(
+                f"Goal chat HTTP {e.response.status_code}: {e.response.text[:500]}"
+            )
+            await self._send_reply(from_user, "（信号不好，稍等）", context_token)
+            return
         except Exception:
             logger.exception("Goal chat failed")
             await self._send_reply(from_user, "（信号不好，稍等）", context_token)

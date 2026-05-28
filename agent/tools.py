@@ -2,6 +2,9 @@
 
 Only tools listed in TOOL_WHITELIST can be invoked.
 All arguments are validated and sanitized before execution.
+
+Phase 4B: Action/Tool boundary split into ActionRegistry / ToolRegistry.
+Legacy TOOL_DEFINITIONS and TOOL_WHITELIST are kept for backward compat.
 """
 
 import asyncio
@@ -18,47 +21,31 @@ from typing import Any
 import httpx
 import pytz
 
+from agent.tool_registry import (
+    ACTION_REGISTRY,
+    TOOL_REGISTRY,
+    get_all_tool_names,
+    is_action,
+    is_external_tool,
+)
+
 
 # ================================================================
-# Whitelist — add tools here
+# Whitelist — backward-compatible with Phase 4B registries
 # ================================================================
 
-TOOL_DEFINITIONS: dict[str, dict[str, Any]] = {
-    "wechat_reply": {
-        "description": "回复微信消息。每次调用发一条消息给用户。可以多次调用来分段回复。text 是回复内容，delay 是发送前等待秒数",
-        "args": ["text", "delay"],
-    },
-    "schedule_wechat_message": {
-        "description": "安排未来发送的微信消息。代码会持久化任务并在到期后逐条发送，重启后仍然有效",
-        "args": ["delay_minutes", "messages"],
-    },
-    "get_time": {
-        "description": "获取指定时区的当前时间",
-        "args": ["timezone"],
-    },
-    "get_weather": {
-        "description": "查询城市的实时天气",
-        "args": ["city"],
-    },
-    "search_memory": {
-        "description": "按需搜索长期记忆。只有需要过去事实、偏好、项目进展时调用；没有结果就不要编造",
-        "args": ["query", "top_k"],
-    },
-    "read_persona_file": {
-        "description": "读取当前人设文件原文。只能读配置允许的人设文件，不能读任意项目文件",
-        "args": [],
-    },
-    "propose_persona_change": {
-        "description": "提出人设文件修改草案。不会直接写入，系统会发微信让用户确认后再改",
-        "args": ["content", "reason"],
-    },
-    "send_email": {
-        "description": "发送邮件。需要系统已配置 SMTP。args: to, subject, body",
-        "args": ["to", "subject", "body"],
-    },
-}
+TOOL_WHITELIST = get_all_tool_names()
 
-TOOL_WHITELIST = set(TOOL_DEFINITIONS.keys())
+# Backward-compat: rebuild TOOL_DEFINITIONS from registries
+def _build_legacy_definitions() -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for a in ACTION_REGISTRY.iter_defs():
+        result[a.name] = {"description": a.description, "args": list(a.args_schema)}
+    for t in TOOL_REGISTRY.iter_defs():
+        result[t.name] = {"description": t.description, "args": list(t.args_schema)}
+    return result
+
+TOOL_DEFINITIONS = _build_legacy_definitions()
 TOOL_RUNTIME_CONFIG: dict[str, Any] = {}
 TOOL_RUNTIME_CONFIG["_current_bot_id"] = ""  # default
 _WEATHER_CACHE: dict[str, tuple[float, str]] = {}
@@ -202,8 +189,9 @@ async def execute_tool(name: str, args: dict[str, Any] | None, bot_id: str = "")
     Safeguard #4: only whitelisted tools can run.
     All arguments are sanitized before execution.
 
-    wechat_reply and schedule_wechat_message are intercepted by chat_agent
-    before reaching here.
+    Phase 4B: uses ActionRegistry + ToolRegistry for classification.
+    Internal actions (wechat_reply, schedule_wechat_message) are
+    intercepted by chat_agent before reaching here.
     """
     # Store current bot_id for tools that need bot-scoped access
     TOOL_RUNTIME_CONFIG["_current_bot_id"] = bot_id
@@ -213,13 +201,16 @@ async def execute_tool(name: str, args: dict[str, Any] | None, bot_id: str = "")
 
     args = args or {}
 
-    # wechat_reply is handled by chat_agent as a message action.
-    # If it reaches here, it's a no-op (shouldn't happen in normal flow).
-    if name == "wechat_reply":
-        return "已发送"
+    # Internal actions — should be intercepted by chat_agent.
+    # If they reach here, return a safe no-op result.
+    if is_action(name):
+        logger.debug("execute_tool: internal action %s reached executor (no-op)", name)
+        return "已处理"
 
-    if name == "schedule_wechat_message":
-        return "已安排"
+    # Verify this is a registered external tool
+    if not is_external_tool(name):
+        logger.warning("execute_tool: unknown tool %s rejected", name)
+        return f"[未知工具: {name}]"
 
     if name == "get_time":
         tz = str(args.get("timezone", "Asia/Shanghai"))[:30]

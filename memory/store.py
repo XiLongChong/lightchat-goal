@@ -526,12 +526,81 @@ class MemoryStore:
                 )
             except Exception:
                 pass  # Column already exists
+        # LLMGateway trace log (V2.3: LLM observability)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS llm_traces (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id TEXT NOT NULL DEFAULT '',
+                task_type TEXT NOT NULL DEFAULT '',
+                provider TEXT NOT NULL DEFAULT '',
+                model TEXT NOT NULL DEFAULT '',
+                thinking TEXT NOT NULL DEFAULT 'disabled',
+                response_mode TEXT NOT NULL DEFAULT 'text',
+                latency_ms INTEGER NOT NULL DEFAULT 0,
+                attempt_count INTEGER NOT NULL DEFAULT 1,
+                success INTEGER NOT NULL DEFAULT 0,
+                status_code INTEGER,
+                error_type TEXT,
+                prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                completion_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_hit_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_miss_tokens INTEGER NOT NULL DEFAULT 0,
+                reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_llm_traces_created
+            ON llm_traces(created_at DESC)
+        """)
         await db.commit()
 
     async def close(self):
         if self._db:
             await self._db.close()
             self._db = None
+
+    async def save_llm_trace(self, trace: dict) -> int | None:
+        """Persist an LLM gateway trace record.
+
+        trace is a flat dict built by LLMGateway._build_trace(). Only the
+        whitelisted fields are stored; raw_response and reasoning_content are
+        never written.
+        """
+        db = await self._get_db()
+        if db is None:
+            return None
+        cursor = await db.execute(
+            """INSERT INTO llm_traces
+               (request_id, task_type, provider, model, thinking, response_mode,
+                latency_ms, attempt_count, success, status_code, error_type,
+                prompt_tokens, completion_tokens, total_tokens,
+                cache_hit_tokens, cache_miss_tokens, reasoning_tokens, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                trace.get("request_id", ""),
+                trace.get("task_type", ""),
+                trace.get("provider", ""),
+                trace.get("model", ""),
+                trace.get("thinking", "disabled"),
+                trace.get("response_mode", "text"),
+                trace.get("latency_ms", 0),
+                trace.get("attempt_count", 1),
+                trace.get("success", 0),
+                trace.get("status_code"),
+                trace.get("error_type"),
+                trace.get("prompt_tokens", 0),
+                trace.get("completion_tokens", 0),
+                trace.get("total_tokens", 0),
+                trace.get("cache_hit_tokens", 0),
+                trace.get("cache_miss_tokens", 0),
+                trace.get("reasoning_tokens", 0),
+                time.time(),
+            ),
+        )
+        await db.commit()
+        return cursor.lastrowid
 
     # ================================================================
     # Memory CRUD

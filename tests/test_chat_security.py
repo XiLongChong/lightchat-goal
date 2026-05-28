@@ -1,9 +1,10 @@
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
+from fastapi import HTTPException
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -25,6 +26,51 @@ def _client(monkeypatch):
         }
     )
     monkeypatch.setenv("CHAT_API_KEY", "secret")
+    main._user_turn_locks.clear()
+    main._user_turn_lock_access.clear()
+    monkeypatch.setattr(main.chat_agent, "chat", AsyncMock())
+    return TestClient(main.app), main
+
+
+def _client_no_key(monkeypatch):
+    """Like _client but CHAT_API_KEY is NOT set."""
+    import main
+
+    main.cfg.setdefault("api", {})
+    main.cfg["api"].update(
+        {
+            "chat_auth_enabled": True,
+            "chat_api_key_env": "CHAT_API_KEY",
+            "max_chat_total_chars": 40,
+            "max_user_id_len": 12,
+            "max_message_chars": 20,
+            "max_messages_per_request": 2,
+        }
+    )
+    # Ensure CHAT_API_KEY is NOT in env
+    monkeypatch.delenv("CHAT_API_KEY", raising=False)
+    main._user_turn_locks.clear()
+    main._user_turn_lock_access.clear()
+    monkeypatch.setattr(main.chat_agent, "chat", AsyncMock())
+    return TestClient(main.app), main
+
+
+def _client_auth_disabled(monkeypatch):
+    """Like _client but chat_auth_enabled=False."""
+    import main
+
+    main.cfg.setdefault("api", {})
+    main.cfg["api"].update(
+        {
+            "chat_auth_enabled": False,
+            "chat_api_key_env": "CHAT_API_KEY",
+            "max_chat_total_chars": 40,
+            "max_user_id_len": 12,
+            "max_message_chars": 20,
+            "max_messages_per_request": 2,
+        }
+    )
+    monkeypatch.delenv("CHAT_API_KEY", raising=False)
     main._user_turn_locks.clear()
     main._user_turn_lock_access.clear()
     monkeypatch.setattr(main.chat_agent, "chat", AsyncMock())
@@ -204,3 +250,209 @@ async def test_list_bot_respects_include_shared(mock_memory_store):
     all_contents = [r["content"] for r in all_results]
     assert "private_only" in all_contents
     assert "shared_only" in all_contents
+
+
+# ================================================================
+# /chat auth gate tests — V2.2 enhanced auth
+# ================================================================
+
+
+def test_chat_auth_enabled_no_key_returns_chat_auth_key_not_configured(monkeypatch):
+    """chat_auth_enabled=true + CHAT_API_KEY not set → 503."""
+    client, main = _client_no_key(monkeypatch)
+
+    response = client.post("/chat", json={"user_id": "wxid_abc", "messages": ["hello"]})
+
+    assert response.status_code == 503
+    data = response.json()
+    assert data["detail"] == "chat_auth_key_not_configured"
+    assert main.chat_agent.chat.await_count == 0
+
+
+def test_chat_auth_no_header_returns_chat_auth_missing(monkeypatch):
+    """chat_auth_enabled=true + no auth header → 401 chat_auth_missing."""
+    client, main = _client(monkeypatch)  # sets CHAT_API_KEY=secret but sends no header
+
+    response = client.post("/chat", json={"user_id": "wxid_abc", "messages": ["hello"]})
+
+    assert response.status_code == 401
+    data = response.json()
+    assert data["detail"] == "chat_auth_missing"
+    assert main.chat_agent.chat.await_count == 0
+
+
+def test_chat_auth_wrong_key_returns_chat_auth_invalid(monkeypatch):
+    """chat_auth_enabled=true + wrong auth header → 401 chat_auth_invalid."""
+    client, main = _client(monkeypatch)
+
+    response = client.post(
+        "/chat",
+        headers={"Authorization": "Bearer wrong-secret"},
+        json={"user_id": "wxid_abc", "messages": ["hello"]},
+    )
+
+    assert response.status_code == 401
+    data = response.json()
+    assert data["detail"] == "chat_auth_invalid"
+    assert main.chat_agent.chat.await_count == 0
+
+
+def test_chat_auth_disabled_allows_request_without_key(monkeypatch):
+    """chat_auth_enabled=false → auth bypassed, request not rejected as 401/503."""
+    client, main = _client_auth_disabled(monkeypatch)
+
+    # Mock the heavy processing chain that runs after auth
+    # Use monkeypatch.setattr so mocks are cleaned up after the test,
+    # preventing contamination of admin/emotion API tests that rely on
+    # the real memory_store methods (get_bot_emotion_state, get_dialogue_state, etc.)
+    monkeypatch.setattr(main.memory_store, "search_bot", AsyncMock(return_value=[]))
+    monkeypatch.setattr(main.memory_store, "get_relationship_bot", AsyncMock(return_value={}))
+    monkeypatch.setattr(main.memory_store, "get_history_summary", AsyncMock(return_value=""))
+    monkeypatch.setattr(main.memory_store, "get_latest_recap", AsyncMock(return_value=None))
+    monkeypatch.setattr(main.memory_store, "get_bot_emotion_state", AsyncMock(return_value={}))
+    monkeypatch.setattr(main.memory_store, "get_dialogue_state", AsyncMock(return_value={}))
+    monkeypatch.setattr(main.memory_store, "record_usage_event", AsyncMock())
+    monkeypatch.setattr(main.chat_agent, "chat", AsyncMock(return_value={
+        "messages": [{"text": "ok", "delay": 0}],
+        "done": True,
+        "iterations": 1,
+    }))
+    monkeypatch.setattr(main, "append_history_async", AsyncMock())
+    monkeypatch.setattr(main, "get_history_async", AsyncMock(return_value=[]))
+    monkeypatch.setattr(main, "handle_pending_persona_confirmation", AsyncMock(return_value=None))
+
+    response = client.post(
+        "/chat",
+        json={"user_id": "wxid_abc", "messages": ["hello"]},
+    )
+
+    # Auth was bypassed (no 401/503 auth error). Response may be 200 if
+    # processing succeeds, or some other code from later processing.
+    assert response.status_code not in (401, 503)
+
+
+def test_chat_auth_correct_key_passes_auth_gate(monkeypatch):
+    """chat_auth_enabled=true + correct key → auth passes, proceeds to processing."""
+    client, main = _client(monkeypatch)  # sets CHAT_API_KEY=secret
+
+    # Mock heavy processing chain — use monkeypatch.setattr for cleanup
+    monkeypatch.setattr(main.memory_store, "search_bot", AsyncMock(return_value=[]))
+    monkeypatch.setattr(main.memory_store, "get_relationship_bot", AsyncMock(return_value={}))
+    monkeypatch.setattr(main.memory_store, "get_history_summary", AsyncMock(return_value=""))
+    monkeypatch.setattr(main.memory_store, "get_latest_recap", AsyncMock(return_value=None))
+    monkeypatch.setattr(main.memory_store, "get_bot_emotion_state", AsyncMock(return_value={}))
+    monkeypatch.setattr(main.memory_store, "get_dialogue_state", AsyncMock(return_value={}))
+    monkeypatch.setattr(main.memory_store, "record_usage_event", AsyncMock())
+    monkeypatch.setattr(main.chat_agent, "chat", AsyncMock(return_value={
+        "messages": [{"text": "ok", "delay": 0}],
+        "done": True,
+        "iterations": 1,
+    }))
+    monkeypatch.setattr(main, "append_history_async", AsyncMock())
+    monkeypatch.setattr(main, "get_history_async", AsyncMock(return_value=[]))
+    monkeypatch.setattr(main, "handle_pending_persona_confirmation", AsyncMock(return_value=None))
+
+    response = client.post(
+        "/chat",
+        headers={"Authorization": "Bearer secret"},
+        json={"user_id": "wxid_abc", "messages": ["hello"]},
+    )
+
+    # Auth gate should pass; not 401 or 503
+    assert response.status_code not in (401, 503)
+
+
+def test_chat_auth_x_api_key_header_also_works(monkeypatch):
+    """X-API-Key header is accepted as alternative to Authorization: Bearer."""
+    client, main = _client(monkeypatch)
+
+    monkeypatch.setattr(main.memory_store, "search_bot", AsyncMock(return_value=[]))
+    monkeypatch.setattr(main.memory_store, "get_relationship_bot", AsyncMock(return_value={}))
+    monkeypatch.setattr(main.memory_store, "get_history_summary", AsyncMock(return_value=""))
+    monkeypatch.setattr(main.memory_store, "get_latest_recap", AsyncMock(return_value=None))
+    monkeypatch.setattr(main.memory_store, "get_bot_emotion_state", AsyncMock(return_value={}))
+    monkeypatch.setattr(main.memory_store, "get_dialogue_state", AsyncMock(return_value={}))
+    monkeypatch.setattr(main.memory_store, "record_usage_event", AsyncMock())
+    monkeypatch.setattr(main.chat_agent, "chat", AsyncMock(return_value={
+        "messages": [{"text": "ok", "delay": 0}],
+        "done": True,
+        "iterations": 1,
+    }))
+    monkeypatch.setattr(main, "append_history_async", AsyncMock())
+    monkeypatch.setattr(main, "get_history_async", AsyncMock(return_value=[]))
+    monkeypatch.setattr(main, "handle_pending_persona_confirmation", AsyncMock(return_value=None))
+
+    response = client.post(
+        "/chat",
+        headers={"X-API-Key": "secret"},
+        json={"user_id": "wxid_abc", "messages": ["hello"]},
+    )
+
+    assert response.status_code not in (401, 503)
+
+
+# ================================================================
+# _require_chat_auth unit tests
+# ================================================================
+
+
+class _FakeRequest:
+    """Minimal fake for testing _require_chat_auth directly."""
+    def __init__(self, headers: dict | None = None):
+        self.headers = headers or {}
+
+
+def test_require_chat_auth_disabled_does_nothing(monkeypatch):
+    """When chat_auth_enabled=False, function returns without raising."""
+    import main
+    api_cfg = {"chat_auth_enabled": False, "chat_api_key_env": "CHAT_API_KEY"}
+    # Should not raise
+    main._require_chat_auth(_FakeRequest(), api_cfg)
+
+
+def test_require_chat_auth_no_env_key_raises_503(monkeypatch):
+    """When CHAT_API_KEY env is empty, raises 503."""
+    import main
+    monkeypatch.delenv("CHAT_API_KEY", raising=False)
+    api_cfg = {"chat_auth_enabled": True, "chat_api_key_env": "CHAT_API_KEY"}
+    with pytest.raises(HTTPException) as exc:
+        main._require_chat_auth(_FakeRequest(), api_cfg)
+    assert exc.value.status_code == 503
+    assert exc.value.detail == "chat_auth_key_not_configured"
+
+
+def test_require_chat_auth_no_header_raises_401(monkeypatch):
+    """When no auth header is sent, raises 401 chat_auth_missing."""
+    import main
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+    api_cfg = {"chat_auth_enabled": True, "chat_api_key_env": "CHAT_API_KEY"}
+    with pytest.raises(HTTPException) as exc:
+        main._require_chat_auth(_FakeRequest(), api_cfg)
+    assert exc.value.status_code == 401
+    assert exc.value.detail == "chat_auth_missing"
+
+
+def test_require_chat_auth_wrong_key_raises_401(monkeypatch):
+    """When wrong key is sent, raises 401 chat_auth_invalid."""
+    import main
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+    api_cfg = {"chat_auth_enabled": True, "chat_api_key_env": "CHAT_API_KEY"}
+    with pytest.raises(HTTPException) as exc:
+        main._require_chat_auth(
+            _FakeRequest({"authorization": "Bearer wrong"}),
+            api_cfg,
+        )
+    assert exc.value.status_code == 401
+    assert exc.value.detail == "chat_auth_invalid"
+
+
+def test_require_chat_auth_correct_key_passes(monkeypatch):
+    """When correct key is sent, function returns without raising."""
+    import main
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+    api_cfg = {"chat_auth_enabled": True, "chat_api_key_env": "CHAT_API_KEY"}
+    # Should not raise
+    main._require_chat_auth(
+        _FakeRequest({"authorization": "Bearer secret"}),
+        api_cfg,
+    )

@@ -7,40 +7,51 @@ import asyncio
 import json
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from agent.chat_agent import ChatAgent
+from agent.llm_types import LLMResponse, LLMUsage
 
 
-class _FakeCompletions:
+def _make_mock_response(content: str) -> LLMResponse:
+    """Build a minimal LLMResponse for action tests."""
+    return LLMResponse(
+        content=content,
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        usage=LLMUsage(
+            prompt_tokens=10,
+            completion_tokens=5,
+            total_tokens=15,
+            cache_hit_tokens=0,
+            cache_miss_tokens=10,
+            reasoning_tokens=0,
+            estimated=False,
+        ),
+        latency_ms=100,
+        finish_reason="stop",
+    )
+
+
+class _FakeGateway:
+    """LLMGateway stub that returns canned content."""
+
     def __init__(self, content: str):
-        self.content = content
+        self._response = _make_mock_response(content)
+        self.requests = []
 
-    async def create(self, **kwargs):
-        return SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(content=self.content)
-                )
-            ]
-        )
-
-
-class _FakeClient:
-    def __init__(self, content: str):
-        self.chat = SimpleNamespace(
-            completions=_FakeCompletions(content)
-        )
+    async def complete(self, request):
+        self.requests.append(request)
+        return self._response
 
 
 def _run_agent(raw: str):
     agent = ChatAgent(
-        client=_FakeClient(raw),
         model="test",
         persona="test persona",
         personality="test personality",
+        llm_gateway=_FakeGateway(raw),
     )
     return asyncio.run(agent.chat(
         user_message="test",
@@ -129,9 +140,10 @@ def test_skip_action_records_no_reply_reason():
 def test_invalid_json_records_fallback_and_token_usage():
     result = _run_agent("plain text fallback")
 
-    assert result["fallback_events"][0]["type"] == "invalid_json"
+    assert result["fallback_events"][0]["type"] == "non_json_content"
     assert result["token_usage"]["total_tokens"] > 0
-    assert result["token_usage"]["estimated"] is True
+    # Gateway returns real LLMResponse with non-estimated token usage
+    assert result["token_usage"]["estimated"] is False
 
 
 def test_protocol_json_text_is_unwrapped_before_wechat():

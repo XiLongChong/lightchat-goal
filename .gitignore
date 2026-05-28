@@ -5,6 +5,7 @@ __pycache__/
 
 # Local private state
 data/
+config.local.yaml
 
 # Editor / OS
 .DS_Store

@@ -1,18 +1,15 @@
-"""Fire-and-forget memory extraction worker — Safeguard #7.
+"""Fire-and-forget memory extraction worker."""
 
-Runs asynchronously after Chat Agent completes.
-Does NOT block the user response — user gets their reply immediately.
-Memory extraction happens in background with its own error handling.
-"""
+from __future__ import annotations
 
-import asyncio
 import json
 import logging
 from pathlib import Path
 from typing import Any
 
+from agent.llm_types import LLMRequest
+from memory.dedup import is_duplicate
 from memory.store import MemoryStore
-from memory.dedup import is_duplicate, compute_importance
 
 logger = logging.getLogger(__name__)
 
@@ -28,21 +25,21 @@ class MemoryWorker:
     """Async memory extraction worker.
 
     Usage:
-        worker = MemoryWorker(store, client, model)
+        worker = MemoryWorker(store, model, llm_gateway=gateway)
         asyncio.create_task(worker.extract(user_msg, assistant_reply))
-        # Returns immediately, extraction happens in background
+        # Returns immediately, extraction happens in background.
     """
 
     def __init__(
         self,
         store: MemoryStore,
-        client: Any,  # AsyncOpenAI
         model: str,
+        llm_gateway: Any,
         min_importance: float = 0.4,
         prompts_dir: str | Path | None = None,
     ):
         self.store = store
-        self.client = client
+        self.llm_gateway = llm_gateway
         self.model = model
         self.min_importance = min_importance
         self.prompts_dir = Path(prompts_dir) if prompts_dir else PROMPTS_DIR
@@ -69,9 +66,7 @@ class MemoryWorker:
         """Extract and save memories from a conversation turn.
 
         Fire-and-forget: caller should use asyncio.create_task().
-        All errors are caught and logged — never raises to caller.
-
-        V2.1: bot_id scopes memories to a specific bot.
+        All errors are caught and logged, never raised to caller.
         """
         try:
             await self._do_extract(user_message, assistant_reply, existing_memories, bot_id)
@@ -85,7 +80,6 @@ class MemoryWorker:
         existing_memories: list[dict[str, Any]] | None,
         bot_id: str = "",
     ):
-        # Build the extraction prompt
         conversation = f"用户：{user_message}\n助手：{assistant_reply}"
 
         if existing_memories is None:
@@ -94,7 +88,7 @@ class MemoryWorker:
         existing_text = ""
         if existing_memories:
             lines = []
-            for m in existing_memories[:10]:  # Only show top 10
+            for m in existing_memories[:10]:
                 lines.append(f"- [{m.get('category', 'other')}] {m.get('content', '')}")
             existing_text = "\n".join(lines)
 
@@ -108,29 +102,30 @@ class MemoryWorker:
 
 提取值得保存的新记忆。如果已有记忆中有需要更新的，也写出来。"""
 
-        # Call LLM for extraction
         try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "只输出JSON。"},
-                    {"role": "user", "content": full_prompt},
-                ],
-                temperature=0.3,
-                max_tokens=1024,
+            messages = [
+                {"role": "system", "content": "只输出JSON。"},
+                {"role": "user", "content": full_prompt},
+            ]
+            llm_response = await self.llm_gateway.complete(
+                LLMRequest(
+                    purpose="memory_extract",
+                    model=self.model,
+                    messages=messages,
+                    temperature=0.3,
+                    max_tokens=1024,
+                    response_mode="json_object",
+                )
             )
+            raw = llm_response.content
 
-            raw = response.choices[0].message.content or ""
-
-            # Parse the JSON
             from utils.json_parser import extract_json
-            json_str = extract_json(raw)
-            parsed = json.loads(json_str)
+
+            parsed = json.loads(extract_json(raw))
         except Exception as e:
             logger.warning(f"Memory extraction LLM call failed: {e}")
             return
 
-        # Process each extracted memory
         memories_to_save = parsed.get("memories", [])
         if not isinstance(memories_to_save, list):
             return
@@ -154,11 +149,9 @@ class MemoryWorker:
             importance = float(mem.get("importance", 0.5))
             keywords = str(mem.get("keywords", ""))
 
-            # Safeguard #5: don't save low-importance memories
             if importance < self.min_importance:
                 continue
 
-            # Dedup check
             existing_contents = [{"content": e.get("content", "")} for e in existing_memories]
             if is_duplicate(content, existing_contents):
                 continue

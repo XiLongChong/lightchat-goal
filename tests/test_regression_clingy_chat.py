@@ -22,8 +22,30 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pytest
 
+from agent.llm_types import LLMResponse, LLMUsage
+
 
 # ── helpers ──────────────────────────────────────────────────────
+
+class _FakeGateway:
+    """LLMGateway stub for ChatAgent tests. Accepts JSON response content."""
+
+    def __init__(self, response_json: str):
+        self.response_json = response_json
+
+    async def complete(self, request):
+        return LLMResponse(
+            content=self.response_json,
+            provider="fake",
+            model=request.model or "test",
+            usage=LLMUsage(),
+            latency_ms=1,
+            finish_reason="stop",
+        )
+
+
+def _make_mock_gateway(json_content: str):
+    return _FakeGateway(json_content)
 
 def _make_mock_store():
     """Create an in-memory MemoryStore for testing."""
@@ -35,16 +57,6 @@ def _make_mock_store():
 async def _init_store(store):
     await store._migrate()
     return store
-
-
-def _make_mock_llm_response(content: str):
-    """Create a mock OpenAI chat completion response."""
-    choice = MagicMock()
-    choice.message.content = content
-    resp = MagicMock()
-    resp.choices = [choice]
-    resp.usage = None
-    return resp
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -59,16 +71,13 @@ class TestNormalChatMessage:
     def test_chat_agent_produces_reply(self):
         """ChatAgent with a valid message produces assistant output."""
         from agent.chat_agent import ChatAgent
-        mock_client = MagicMock()
-        mock_client.chat = MagicMock()
-        mock_client.chat.completions.create = AsyncMock(
-            return_value=_make_mock_llm_response(
-                '{"actions":[{"type":"message","text":"你好呀","delay":0}],"done":true}'
-            )
+        gw = _make_mock_gateway(
+            '{"actions":[{"type":"message","text":"你好呀","delay":0}],"done":true}'
         )
         agent = ChatAgent(
-            client=mock_client, model="test", persona="test persona",
+            model="test", persona="test persona",
             personality="casual", temperature=0.7,
+            llm_gateway=gw,
         )
 
         async def _run():
@@ -86,16 +95,12 @@ class TestNormalChatMessage:
     def test_chat_agent_records_turn_id(self):
         """Every chat turn gets a unique turn_id."""
         from agent.chat_agent import ChatAgent
-        mock_client = MagicMock()
-        mock_client.chat = MagicMock()
-        mock_client.chat.completions.create = AsyncMock(
-            return_value=_make_mock_llm_response(
-                '{"actions":[{"type":"message","text":"好","delay":0}],"done":true}'
-            )
+        gw = _make_mock_gateway(
+            '{"actions":[{"type":"message","text":"好","delay":0}],"done":true}'
         )
         agent = ChatAgent(
-            client=mock_client, model="test", persona="test", personality="",
-            temperature=0.7,
+            model="test", persona="test", personality="",
+            temperature=0.7, llm_gateway=gw,
         )
 
         async def _run():
@@ -117,16 +122,12 @@ class TestUserSilentRequest:
     def test_chat_agent_skip_action_no_messages(self):
         """Model outputs skip → no messages, skip_reply=True."""
         from agent.chat_agent import ChatAgent
-        mock_client = MagicMock()
-        mock_client.chat = MagicMock()
-        mock_client.chat.completions.create = AsyncMock(
-            return_value=_make_mock_llm_response(
-                '{"actions":[{"type":"skip","reason":"用户明确不需要回复"}],"done":true}'
-            )
+        gw = _make_mock_gateway(
+            '{"actions":[{"type":"skip","reason":"用户明确不需要回复"}],"done":true}'
         )
         agent = ChatAgent(
-            client=mock_client, model="test", persona="test", personality="",
-            temperature=0.7,
+            model="test", persona="test", personality="",
+            temperature=0.7, llm_gateway=gw,
         )
 
         async def _run():
@@ -148,16 +149,12 @@ class TestUserSilentRequest:
     def test_skip_no_fallback_event_for_silent_request(self):
         """Skip should record user_silent_request fallback event."""
         from agent.chat_agent import ChatAgent
-        mock_client = MagicMock()
-        mock_client.chat = MagicMock()
-        mock_client.chat.completions.create = AsyncMock(
-            return_value=_make_mock_llm_response(
-                '{"actions":[{"type":"skip","reason":"用户明确不需要回复"}],"done":true}'
-            )
+        gw = _make_mock_gateway(
+            '{"actions":[{"type":"skip","reason":"用户明确不需要回复"}],"done":true}'
         )
         agent = ChatAgent(
-            client=mock_client, model="test", persona="test", personality="",
-            temperature=0.7,
+            model="test", persona="test", personality="",
+            temperature=0.7, llm_gateway=gw,
         )
 
         async def _run():
@@ -333,7 +330,7 @@ class TestClingyAwaitingTransitions:
         await _init_store(store)
         from agent.scheduler import SchedulerAgent
         agent = SchedulerAgent(
-            store=store, client=None, model="test",
+            store=store, model="test", llm_gateway=MagicMock(),
             config={"proactive": {"generation": {"clingy_mode_enabled": True, "clingy_after_minutes": 20}, "clingy": {"max_followups_per_unanswered": 3}}},
         )
         agent.clingy_mode_enabled = True
@@ -354,7 +351,7 @@ class TestClingyAwaitingTransitions:
         await _init_store(store)
         from agent.scheduler import SchedulerAgent
         agent = SchedulerAgent(
-            store=store, client=None, model="test",
+            store=store, model="test", llm_gateway=MagicMock(),
             config={"proactive": {"generation": {"clingy_mode_enabled": True, "clingy_after_minutes": 20}, "clingy": {"max_followups_per_unanswered": 3}}},
         )
         agent.clingy_mode_enabled = True
@@ -384,7 +381,7 @@ class TestClingyAwaitingTransitions:
         await _init_store(store)
         from agent.scheduler import SchedulerAgent
         agent = SchedulerAgent(
-            store=store, client=None, model="test",
+            store=store, model="test", llm_gateway=MagicMock(),
             config={"proactive": {"generation": {"clingy_mode_enabled": True, "clingy_after_minutes": 20}, "clingy": {"max_followups_per_unanswered": 2}}},
         )
         agent.clingy_mode_enabled = True
@@ -421,7 +418,7 @@ class TestClingyCheckLogic:
         store = _make_mock_store()
         await _init_store(store)
         agent = SchedulerAgent(
-            store=store, client=None, model="test",
+            store=store, model="test", llm_gateway=MagicMock(),
             config={"proactive": {"generation": {"clingy_mode_enabled": True, "clingy_after_minutes": 20}, "clingy": {"max_followups_per_unanswered": 3}}},
         )
         uid, bid = "wxid_test", "test_bot"
@@ -466,7 +463,7 @@ class TestClingyCheckLogic:
         store = _make_mock_store()
         await _init_store(store)
         agent = SchedulerAgent(
-            store=store, client=None, model="test",
+            store=store, model="test", llm_gateway=MagicMock(),
             config={"proactive": {"generation": {"clingy_mode_enabled": False}}},
         )
         prereqs = {"user_id": "u1", "bot_id": "b1"}
@@ -486,7 +483,7 @@ class TestClingyCheckLogic:
         store = _make_mock_store()
         await _init_store(store)
         agent = SchedulerAgent(
-            store=store, client=None, model="test",
+            store=store, model="test", llm_gateway=MagicMock(),
             config={"proactive": {"generation": {"clingy_mode_enabled": True, "clingy_after_minutes": 20}, "clingy": {"max_followups_per_unanswered": 2}}},
         )
         uid, bid = "wxid_test", "test_bot"
@@ -527,14 +524,15 @@ class TestErrorPathNoFalseDelivered:
     def test_chat_agent_llm_error_produces_fallback_not_delivered(self):
         """LLM error → llm_status='error', fallback event recorded."""
         from agent.chat_agent import ChatAgent
-        mock_client = MagicMock()
-        mock_client.chat = MagicMock()
-        mock_client.chat.completions.create = AsyncMock(
-            side_effect=Exception("Connection timeout")
-        )
+        from agent.llm_types import LLMError
+        gw = MagicMock()
+        gw.complete = AsyncMock(side_effect=LLMError(
+            kind="network_error", message="Connection timeout",
+            provider="deepseek", retryable=True,
+        ))
         agent = ChatAgent(
-            client=mock_client, model="test", persona="test", personality="",
-            temperature=0.7,
+            model="test", persona="test", personality="",
+            temperature=0.7, llm_gateway=gw,
         )
 
         async def _run():
@@ -551,14 +549,15 @@ class TestErrorPathNoFalseDelivered:
     def test_chat_agent_llm_error_still_has_turn_id(self):
         """Even on error, a turn_id is generated for diagnostics."""
         from agent.chat_agent import ChatAgent
-        mock_client = MagicMock()
-        mock_client.chat = MagicMock()
-        mock_client.chat.completions.create = AsyncMock(
-            side_effect=Exception("Timeout")
-        )
+        from agent.llm_types import LLMError
+        gw = MagicMock()
+        gw.complete = AsyncMock(side_effect=LLMError(
+            kind="timeout", message="Timeout",
+            provider="deepseek", retryable=True,
+        ))
         agent = ChatAgent(
-            client=mock_client, model="test", persona="test", personality="",
-            temperature=0.7,
+            model="test", persona="test", personality="",
+            temperature=0.7, llm_gateway=gw,
         )
 
         async def _run():

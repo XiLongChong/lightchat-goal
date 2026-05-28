@@ -6,11 +6,26 @@ version: "2.1.1"
 
 model:
   provider: deepseek
-  name: "${DEEPSEEK_MODEL:-deepseek-chat}"
+  default_model: "${DEEPSEEK_MODEL:-deepseek-v4-flash}"
+  smart_model: "${DEEPSEEK_SMART_MODEL:-deepseek-v4-pro}"
+  name: "${DEEPSEEK_MODEL:-deepseek-v4-flash}"  # legacy alias during gateway migration
   api_key: "${DEEPSEEK_API_KEY}"
   base_url: "${DEEPSEEK_BASE_URL:-https://api.deepseek.com}"
   temperature: 0.7
   max_tokens: 2048
+  timeout_s: "${LLM_TIMEOUT_S:-60}"
+  max_retries: "${LLM_MAX_RETRIES:-1}"
+  thinking:
+    default: disabled
+  json_output:
+    chat_agent: true
+    scheduler_intent: true
+    proactive_plan: true
+  native_tool_calls:
+    chat_agent: false
+    allowed_tools:
+      - get_time
+      - get_weather
 
 server:
   host: "${HOST:-127.0.0.1}"
