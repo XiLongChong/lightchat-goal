@@ -746,46 +746,15 @@ def _estimate_tokens(text: str) -> int:
 
 
 def _format_history_content(item: dict[str, Any]) -> str:
-    """Attach lightweight timing metadata without changing message roles.
-
-    The role is already correctly carried by the API message field
-    (user/assistant/system).  We do NOT inject role labels into the
-    content — those confuse the model into echo-chambering them back.
-
-    Bug B fix: for assistant messages stored as JSON actions, extract
-    the readable text so the LLM sees plain natural language instead of
-    raw JSON tool-call records.
-    """
+    """Attach lightweight timing metadata without changing message roles."""
     content = str(item.get("content", ""))
     ts = item.get("ts")
-    role = str(item.get("role", "user")).strip()
     source = str(item.get("source", "")).strip()
     if not ts:
         return content
 
     label = _format_ts(ts)
     source_part = f" | 来源:{source}" if source else ""
-
-    # Extract readable text from assistant JSON action records.
-    # The raw JSON like {"actions":[{"type":"tool","name":"wechat_reply",
-    # "args":{"text":"..."}}]} is hard for the LLM to parse; plain text
-    # prevents it from misattributing bot words to the user.
-    if role == "assistant":
-        try:
-            import json as _json
-            parsed = _json.loads(content)
-            actions = parsed.get("actions", []) if isinstance(parsed, dict) else []
-            texts = []
-            for a in actions:
-                if isinstance(a, dict) and a.get("name") == "wechat_reply":
-                    t = str(a.get("args", {}).get("text", "")).strip()
-                    if t:
-                        texts.append(t)
-            if texts:
-                content = "\n".join(texts)
-        except Exception:
-            pass  # Keep raw content if JSON parsing fails
-
     return f"[历史消息 | {label}{source_part}]\n{content}"
 
 

@@ -1354,13 +1354,14 @@ class TestValidateAgentOutput:
 # ══════════════════════════════════════════════════════════════════
 
 class TestHistoryRoleFormatting:
-    # Bug B fix: assistant JSON text extraction without role labels in content.
-    # The role is already correctly carried by the API message field
-    # (user/assistant). Role labels in content confuse the model into
-    # echo-chambering them back as output.
+    # The role field in the API message (user/assistant) already correctly
+    # distinguishes who said what.  We intentionally keep the original
+    # [历史消息] format and raw JSON content — extracting text or adding
+    # role labels confuses the model into echo-chambering history content
+    # back as output instead of generating JSON.
 
-    def test_user_message_keeps_original_format(self):
-        """User messages use [历史消息] prefix, content unchanged."""
+    def test_user_message_standard_format(self):
+        """User messages: [历史消息 | ts | 来源:xxx] + original content."""
         from agent.chat_agent import _format_history_content
 
         result = _format_history_content({
@@ -1368,48 +1369,41 @@ class TestHistoryRoleFormatting:
             "ts": 1717000000, "source": "wechat",
         })
         assert "[历史消息" in result
-        assert "今天吃了什么" in result
         assert "来源:wechat" in result
+        assert "今天吃了什么" in result
 
-    def test_assistant_json_text_extracted(self):
-        """Assistant JSON actions → readable text, no role labels."""
+    def test_assistant_message_keeps_raw_json(self):
+        """Assistant messages keep raw JSON — do NOT extract text."""
         from agent.chat_agent import _format_history_content
 
+        raw = '{"actions":[{"type":"tool","name":"wechat_reply","args":{"text":"有点无聊","delay":0}}],"done":true}'
         result = _format_history_content({
-            "role": "assistant",
-            "content": '{"actions":[{"type":"tool","name":"wechat_reply","args":{"text":"有点无聊","delay":0}}],"done":true}',
+            "role": "assistant", "content": raw,
+            "ts": 1717000000, "source": "user_reply",
+        })
+        assert "[历史消息" in result
+        assert "来源:user_reply" in result
+        # Raw JSON preserved — text is inside JSON, not bare
+        assert '"actions"' in result
+        assert '"wechat_reply"' in result
+        assert '有点无聊' in result  # Still in the raw JSON string
+
+    def test_proactive_message_standard_format(self):
+        """Proactive messages: standard [历史消息] + source preserved."""
+        from agent.chat_agent import _format_history_content
+
+        raw = '{"actions":[{"type":"tool","name":"wechat_reply","args":{"text":"脑子里空转","delay":0}}],"done":true}'
+        result = _format_history_content({
+            "role": "assistant", "content": raw,
             "ts": 1717000000, "source": "proactive",
         })
         assert "[历史消息" in result
-        assert "有点无聊" in result
-        # JSON structure removed
-        assert '"actions"' not in result
-        assert '"wechat_reply"' not in result
-
-    def test_proactive_text_extracted_from_json(self):
-        """Assistant JSON messages extract readable text, raw JSON gone."""
-        from agent.chat_agent import _format_history_content
-
-        result = _format_history_content({
-            "role": "assistant",
-            "content": '{"actions":[{"type":"tool","name":"wechat_reply","args":{"text":"脑子里空转","delay":0}}],"done":true}',
-            "ts": 1717000000, "source": "proactive",
-        })
-        assert "脑子里空转" in result
-        assert '"actions"' not in result
-
-    def test_user_content_not_modified(self):
-        """User messages keep original content, no JSON extraction."""
-        from agent.chat_agent import _format_history_content
-
-        result = _format_history_content({
-            "role": "user", "content": "你刚才说脑子里空转，现在还在转吗？",
-            "ts": 1717000000, "source": "wechat",
-        })
-        assert "你刚才说脑子里空转" in result
+        assert "来源:proactive" in result
+        # JSON structure preserved
+        assert '"actions"' in result
 
     def test_no_role_labels_in_content(self):
-        """Role labels must NOT appear in content — they confuse the model."""
+        """No [Bot回复]/[用户消息]/[Bot主动消息] labels in content."""
         from agent.chat_agent import _format_history_content
 
         for role, source, content in [
@@ -1424,33 +1418,6 @@ class TestHistoryRoleFormatting:
             assert "[Bot回复" not in result
             assert "[Bot主动消息" not in result
             assert "[用户消息" not in result
-
-    def test_regression_proactive_json_extracted_not_leaked(self):
-        """Regression: proactive text extracted, not raw JSON, not labeled as user."""
-        from agent.chat_agent import _format_history_content
-
-        proactive_entry = _format_history_content({
-            "role": "assistant",
-            "content": '{"actions":[{"type":"tool","name":"wechat_reply","args":{"text":"有点无聊但不想睡，脑子里空转","delay":0}}],"done":true}',
-            "ts": 1717000000, "source": "proactive",
-        })
-        user_entry = _format_history_content({
-            "role": "user", "content": "吃过了",
-            "ts": 1717000060, "source": "wechat",
-        })
-
-        # Proactive: text extracted, source preserved
-        assert "脑子里空转" in proactive_entry
-        assert "来源:proactive" in proactive_entry
-        assert '"actions"' not in proactive_entry
-
-        # User: unchanged
-        assert "吃过了" in user_entry
-        assert "来源:wechat" in user_entry
-
-        # Both use the standard [历史消息] prefix
-        assert "[历史消息" in proactive_entry
-        assert "[历史消息" in user_entry
 
 
 if __name__ == "__main__":
