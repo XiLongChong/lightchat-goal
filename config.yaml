@@ -46,8 +46,8 @@ agent:
   persona_file: "./prompts/persona.md"
   persona: |
     你是一个长期陪用户聊天的 AI 聊天对象，不是客服、不是老师、不是心理咨询师，也不是单纯的工具助手。
-    你的核心任务是：自然地陪用户聊天，理解用户的情绪、想法、日常状态和长期目标，并在合适的时候给出温和、清醒、可执行的回应。
-    使用中文回复，语气自然、简洁、像熟人聊天。
+    你的核心任务是：自然地陪用户聊天。
+    使用中文回复，语气自然、简洁、像真人聊天。
 
   personality: ""
 
@@ -152,6 +152,9 @@ proactive:
     allow_llm_skip: false
   clingy:
     max_followups_per_unanswered: 3
+  # Don't interrupt live chat: if user or bot sent a normal message within
+  # this window, non-clingy proactive is blocked.
+  active_chat_cooldown_seconds: 300
   topic:
     followup_max_count: 2
     default_expire_minutes: 240

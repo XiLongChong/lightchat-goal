@@ -1262,6 +1262,202 @@ class TestPhase3B1FinishReasonLength:
         assert "fallback" in reason
 
 
+# -------------------------------------------------------------------
+# 10. Bug A fix: active chat cooldown guard
+# -------------------------------------------------------------------
+
+def _fake_load_recent_turns(turns: list[dict]):
+    """Return a mock for SchedulerAgent._load_recent_turns that returns canned data."""
+    async def _load(user_id, bot_id, limit=10):
+        return turns
+    return _load
+
+
+class TestActiveChatCooldown:
+    @pytest.mark.asyncio
+    async def test_active_when_user_recently_messaged(self):
+        """Conversation is active if user sent message within cooldown."""
+        from agent.scheduler import SchedulerAgent
+
+        now = time.time()
+        agent = SchedulerAgent(
+            store=MagicMock(), model="test", llm_gateway=MagicMock(),
+            config={
+                "proactive": {
+                    "active_chat_cooldown_seconds": 300,
+                    "generation": {"enabled_types": ["check_in"]},
+                },
+            },
+        )
+        agent._load_recent_turns = _fake_load_recent_turns([
+            {"created_at": now - 30, "source": "wechat",
+             "user_messages": "hello", "assistant_actions": "",
+             "send_status": ""},
+        ])
+
+        is_active, reason = await agent._is_conversation_active(
+            "u1", "b1", now, dialogue_state={"wait_state": "assistant_waiting_user"},
+        )
+        assert is_active is True
+        assert reason == "user_recently_active"
+
+    @pytest.mark.asyncio
+    async def test_active_when_bot_recently_replied(self):
+        """Conversation is active if bot sent normal reply within cooldown."""
+        from agent.scheduler import SchedulerAgent
+
+        now = time.time()
+        agent = SchedulerAgent(
+            store=MagicMock(), model="test", llm_gateway=MagicMock(),
+            config={
+                "proactive": {
+                    "active_chat_cooldown_seconds": 300,
+                    "generation": {"enabled_types": ["check_in"]},
+                },
+            },
+        )
+        agent._load_recent_turns = _fake_load_recent_turns([
+            {"created_at": now - 15, "source": "user_reply",
+             "user_messages": "", "assistant_actions": '{"actions":[]}',
+             "send_status": "delivered"},
+        ])
+
+        is_active, reason = await agent._is_conversation_active(
+            "u1", "b1", now, dialogue_state={"wait_state": "assistant_waiting_user"},
+        )
+        assert is_active is True
+        assert reason == "bot_recently_replied"
+
+    @pytest.mark.asyncio
+    async def test_active_when_user_waiting_assistant(self):
+        """Conversation is active when wait_state=user_waiting_assistant."""
+        from agent.scheduler import SchedulerAgent
+
+        now = time.time()
+        agent = SchedulerAgent(
+            store=MagicMock(), model="test", llm_gateway=MagicMock(),
+            config={"proactive": {"active_chat_cooldown_seconds": 300}},
+        )
+        agent._load_recent_turns = _fake_load_recent_turns([])
+
+        is_active, reason = await agent._is_conversation_active(
+            "u1", "b1", now, dialogue_state={"wait_state": "user_waiting_assistant"},
+        )
+        assert is_active is True
+        assert reason == "user_waiting_assistant"
+
+    @pytest.mark.asyncio
+    async def test_not_active_after_cooldown(self):
+        """Conversation is NOT active after cooldown expired."""
+        from agent.scheduler import SchedulerAgent
+
+        now = time.time()
+        agent = SchedulerAgent(
+            store=MagicMock(), model="test", llm_gateway=MagicMock(),
+            config={
+                "proactive": {
+                    "active_chat_cooldown_seconds": 300,
+                    "generation": {"enabled_types": ["check_in"]},
+                },
+            },
+        )
+        agent._load_recent_turns = _fake_load_recent_turns([
+            {"created_at": now - 600, "source": "wechat",
+             "user_messages": "hello", "assistant_actions": "",
+             "send_status": ""},
+        ])
+
+        is_active, reason = await agent._is_conversation_active(
+            "u1", "b1", now, dialogue_state={"wait_state": "assistant_waiting_user"},
+        )
+        assert is_active is False
+
+    @pytest.mark.asyncio
+    async def test_proactive_source_not_counted_as_normal_reply(self):
+        """Proactive outbound does NOT count as a 'normal reply' for cooldown."""
+        from agent.scheduler import SchedulerAgent
+
+        now = time.time()
+        agent = SchedulerAgent(
+            store=MagicMock(), model="test", llm_gateway=MagicMock(),
+            config={
+                "proactive": {
+                    "active_chat_cooldown_seconds": 300,
+                    "generation": {"enabled_types": ["check_in"]},
+                },
+            },
+        )
+        agent._load_recent_turns = _fake_load_recent_turns([
+            {"created_at": now - 30, "source": "proactive",
+             "user_messages": "", "assistant_actions": '{"actions":[]}',
+             "send_status": "delivered"},
+        ])
+
+        is_active, reason = await agent._is_conversation_active(
+            "u1", "b1", now, dialogue_state={"wait_state": "assistant_waiting_user"},
+        )
+        assert is_active is False
+        assert reason == ""
+
+    @pytest.mark.asyncio
+    async def test_cooldown_zero_disables_check(self):
+        """active_chat_cooldown_seconds=0 disables the check."""
+        from agent.scheduler import SchedulerAgent
+
+        now = time.time()
+        agent = SchedulerAgent(
+            store=MagicMock(), model="test", llm_gateway=MagicMock(),
+            config={"proactive": {"active_chat_cooldown_seconds": 0}},
+        )
+        is_active, reason = await agent._is_conversation_active(
+            "u1", "b1", now,
+        )
+        assert is_active is False
+
+    @pytest.mark.asyncio
+    async def test_run_proactive_skips_when_active(self):
+        """run_proactive_pipeline skips when conversation is active."""
+        from agent.scheduler import SchedulerAgent
+
+        now = time.time()
+        store = MagicMock()
+        store.get_clingy_state = AsyncMock(return_value={})
+        store.get_proactive_schedule_state = AsyncMock(
+            return_value={"next_due_ts": now - 100, "last_attempt_ts": 0}
+        )
+        store.count_today_proactive_sent = AsyncMock(return_value=0)
+        store.update_proactive_schedule_state = AsyncMock()
+
+        agent = SchedulerAgent(
+            store=store, model="test", llm_gateway=MagicMock(),
+            config={
+                "scheduler": {"max_daily_proactive": 10},
+                "proactive": {
+                    "active_chat_cooldown_seconds": 300,
+                    "timing": {"min_interval_minutes": 30, "max_interval_minutes": 60},
+                    "generation": {"enabled_types": ["check_in"]},
+                },
+            },
+        )
+        agent._load_recent_turns = _fake_load_recent_turns([
+            {"created_at": now - 10, "source": "wechat",
+             "user_messages": "hi", "assistant_actions": "",
+             "send_status": ""},
+        ])
+
+        result = await agent.run_proactive_pipeline(
+            prerequisites={
+                "bot_active": True, "proactive_enabled": True,
+                "bridge_available": True, "valid_contact": True,
+                "user_id": "u1", "bot_id": "b1",
+            },
+            bot_id="b1",
+            dialogue_state={"wait_state": "assistant_waiting_user"},
+        )
+        assert result["sent"] is False
+        assert "active_chat_cooldown" in result["reason"]
+
+
 if __name__ == "__main__":
     test_sleep_hours_blocked()
     test_deny_returns_valid_structure()

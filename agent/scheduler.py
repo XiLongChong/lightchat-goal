@@ -167,6 +167,8 @@ class SchedulerAgent:
         topic_cfg = pro_cfg.get("topic", {})
         self.followup_max = topic_cfg.get("followup_max_count", 2)
         self.topic_expire_minutes = topic_cfg.get("default_expire_minutes", 240)
+        # Bug A fix: active chat cooldown — don't interrupt live conversations
+        self.active_chat_cooldown = int(pro_cfg.get("active_chat_cooldown_seconds", 300) or 300)
 
     def _load_prompt_template(self, filename: str, fallback: str) -> str:
         """Load a prompt template from the configured prompts directory."""
@@ -550,6 +552,18 @@ class SchedulerAgent:
                 await self._reschedule_after_skip(pre_user_id, bot_id, now_ts)
                 return self._result(False, "dialogue_state: none but awaiting=1 — skip", stage="pre_check")
 
+        # Bug A fix: active chat cooldown — don't interrupt live conversations
+        is_active, active_reason = await self._is_conversation_active(
+            pre_user_id, bot_id, now_ts, dialogue_state=ds,
+        )
+        if is_active:
+            await self._reschedule_after_skip(pre_user_id, bot_id, now_ts)
+            logger.info(
+                "Proactive: blocked by active_chat_cooldown for %s/%s: %s",
+                pre_user_id, bot_id, active_reason,
+            )
+            return self._result(False, f"active_chat_cooldown: {active_reason}", stage="pre_check")
+
         # Daily cap
         today_start = datetime.combine(
             now_cst.date(),
@@ -846,6 +860,66 @@ class SchedulerAgent:
         if self.sleep_start < self.sleep_end:
             return self.sleep_start <= hour < self.sleep_end
         return hour >= self.sleep_start or hour < self.sleep_end
+
+    async def _is_conversation_active(
+        self,
+        user_id: str,
+        bot_id: str,
+        now_ts: float,
+        dialogue_state: dict[str, Any] | None = None,
+    ) -> tuple[bool, str]:
+        """Check if a live conversation is in progress (Bug A fix).
+
+        Returns (is_active, reason) where reason is the specific blocker:
+        - ``user_recently_active``: user sent a message within cooldown
+        - ``bot_recently_replied``: bot sent a normal reply within cooldown
+        - ``user_waiting_assistant``: dialogue state says user is waiting
+        - ``active_chat_cooldown``: generic cooldown
+        - ``""``: conversation is not active, proactive may proceed
+
+        Uses both the dialogue_state wait_state and the message ledger
+        (recent turns) to determine if the conversation is still hot.
+        """
+        cooldown = self.active_chat_cooldown
+        if cooldown <= 0:
+            return False, ""
+
+        # Check dialogue_state first
+        ds = dialogue_state or {}
+        wait_state = str(ds.get("wait_state", "none"))
+        if wait_state == "user_waiting_assistant":
+            return True, "user_waiting_assistant"
+
+        # Check recent turns from the message ledger
+        recent_turns = await self._load_recent_turns(user_id, bot_id, limit=10)
+        last_user_ts = 0.0
+        last_normal_reply_ts = 0.0
+
+        for t in recent_turns:
+            created = float(t.get("created_at") or 0)
+            source = str(t.get("source", "")).strip()
+            has_user = bool(str(t.get("user_messages", "")).strip())
+            has_assistant = bool(str(t.get("assistant_actions", "")).strip())
+            send_status = str(t.get("send_status", "")).strip()
+
+            # Track last real user message (not a system trigger)
+            if not last_user_ts and has_user and source != "proactive":
+                last_user_ts = created
+
+            # Track last normal bot reply (not a proactive/clingy/scheduled one)
+            if not last_normal_reply_ts and has_assistant:
+                if send_status in ("delivered", "") and source not in (
+                    "proactive", "fixed_morning", "fixed_night", "scheduled", "admin",
+                ):
+                    last_normal_reply_ts = created
+
+        if last_user_ts > 0 and (now_ts - last_user_ts) < cooldown:
+            return True, "user_recently_active"
+
+        if last_normal_reply_ts > 0 and (now_ts - last_normal_reply_ts) < cooldown:
+            return True, "bot_recently_replied"
+
+        return False, ""
 
     @staticmethod
     def _format_relationship(relationship: dict[str, Any]) -> str:

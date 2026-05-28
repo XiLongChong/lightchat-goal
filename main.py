@@ -2564,6 +2564,27 @@ async def scheduler_tick() -> dict:
                 elif not prereqs.get("proactive_enabled"):
                     block_reason = "proactive disabled (re-read)"
 
+                # Bug A fix: pre-send active-chat guard.
+                # If conversation became active since candidate generation,
+                # cancel the send to avoid interrupting the user mid-chat.
+                if not block_reason and intent not in ("clingy_followup",):
+                    proactive_cfg = cfg.get("proactive", {})
+                    cooldown_s = int(proactive_cfg.get("active_chat_cooldown_seconds", 300) or 300)
+                    if cooldown_s > 0:
+                        active, active_reason = await scheduler_agent._is_conversation_active(
+                            user_id, bot_id, now_ts, dialogue_state=ds_final,
+                        )
+                        if active:
+                            block_reason = f"active_chat_cooldown: {active_reason}"
+                            # Mark candidate as cancelled
+                            if candidate_id:
+                                await memory_store.update_proactive_candidate(
+                                    candidate_id,
+                                    passed_gate=False,
+                                    gate_detail=f"pre-send cancelled: {block_reason}",
+                                    send_status="cancelled",
+                                )
+
                 if block_reason:
                     logger.warning(
                         f"Scheduler: final check blocked for {user_id}: {block_reason}"

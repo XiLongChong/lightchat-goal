@@ -746,16 +746,51 @@ def _estimate_tokens(text: str) -> int:
 
 
 def _format_history_content(item: dict[str, Any]) -> str:
-    """Attach lightweight timing metadata without changing message roles."""
+    """Attach role-aware formatting to prevent role confusion (Bug B fix).
+
+    Every history entry is labeled by its actual role so the LLM can
+    unambiguously distinguish user words from bot words, including
+    proactive/clingy/scheduled outbound messages.
+    """
     content = str(item.get("content", ""))
     ts = item.get("ts")
+    role = str(item.get("role", "user")).strip()
     source = str(item.get("source", "")).strip()
     if not ts:
         return content
 
     label = _format_ts(ts)
-    source_part = f" | 来源:{source}" if source else ""
-    return f"[历史消息 | {label}{source_part}]\n{content}"
+
+    # Role-based prefix: unambiguous attribution to user or bot
+    if role == "assistant" and source == "proactive":
+        prefix = f"[Bot主动消息 | {label}]"
+    elif role == "assistant":
+        prefix = f"[Bot回复 | {label}]"
+    elif role == "user":
+        prefix = f"[用户消息 | {label}]"
+    elif role == "system":
+        prefix = f"[系统 | {label}]"
+    else:
+        prefix = f"[{role} | {label}]"
+
+    # For assistant JSON messages, extract the readable text
+    if role == "assistant":
+        try:
+            import json as _json
+            parsed = _json.loads(content)
+            actions = parsed.get("actions", []) if isinstance(parsed, dict) else []
+            texts = []
+            for a in actions:
+                if isinstance(a, dict) and a.get("name") == "wechat_reply":
+                    t = str(a.get("args", {}).get("text", "")).strip()
+                    if t:
+                        texts.append(t)
+            if texts:
+                content = "\n".join(texts)
+        except Exception:
+            pass  # Keep raw content if JSON parsing fails
+
+    return f"{prefix}\n{content}"
 
 
 def _format_current_turn(user_message: str, history: list[dict[str, Any]], trigger: str) -> str:
