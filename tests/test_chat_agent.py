@@ -1354,29 +1354,25 @@ class TestValidateAgentOutput:
 # ══════════════════════════════════════════════════════════════════
 
 class TestHistoryRoleFormatting:
-    def test_user_message_labeled_as_user(self):
-        """User messages get [用户消息] prefix."""
+    # Bug B fix: assistant JSON text extraction without role labels in content.
+    # The role is already correctly carried by the API message field
+    # (user/assistant). Role labels in content confuse the model into
+    # echo-chambering them back as output.
+
+    def test_user_message_keeps_original_format(self):
+        """User messages use [历史消息] prefix, content unchanged."""
         from agent.chat_agent import _format_history_content
 
         result = _format_history_content({
             "role": "user", "content": "今天吃了什么",
             "ts": 1717000000, "source": "wechat",
         })
-        assert "[用户消息" in result
+        assert "[历史消息" in result
         assert "今天吃了什么" in result
+        assert "来源:wechat" in result
 
-    def test_assistant_message_labeled_as_bot_reply(self):
-        """Normal assistant messages get [Bot回复] prefix."""
-        from agent.chat_agent import _format_history_content
-
-        result = _format_history_content({
-            "role": "assistant", "content": '{"actions":[]}',
-            "ts": 1717000000, "source": "user_reply",
-        })
-        assert "[Bot回复" in result
-
-    def test_proactive_message_labeled_as_bot_active(self):
-        """Proactive messages (role=assistant, source=proactive) get [Bot主动消息]."""
+    def test_assistant_json_text_extracted(self):
+        """Assistant JSON actions → readable text, no role labels."""
         from agent.chat_agent import _format_history_content
 
         result = _format_history_content({
@@ -1384,13 +1380,14 @@ class TestHistoryRoleFormatting:
             "content": '{"actions":[{"type":"tool","name":"wechat_reply","args":{"text":"有点无聊","delay":0}}],"done":true}',
             "ts": 1717000000, "source": "proactive",
         })
-        assert "[Bot主动消息" in result
-        # JSON text should be extracted
+        assert "[历史消息" in result
         assert "有点无聊" in result
-        assert "wechat_reply" not in result  # JSON structure removed
+        # JSON structure removed
+        assert '"actions"' not in result
+        assert '"wechat_reply"' not in result
 
     def test_proactive_text_extracted_from_json(self):
-        """Assistant JSON messages extract readable text instead of raw JSON."""
+        """Assistant JSON messages extract readable text, raw JSON gone."""
         from agent.chat_agent import _format_history_content
 
         result = _format_history_content({
@@ -1399,9 +1396,7 @@ class TestHistoryRoleFormatting:
             "ts": 1717000000, "source": "proactive",
         })
         assert "脑子里空转" in result
-        # Raw JSON should NOT appear (text extracted)
         assert '"actions"' not in result
-        assert '"wechat_reply"' not in result
 
     def test_user_content_not_modified(self):
         """User messages keep original content, no JSON extraction."""
@@ -1412,50 +1407,28 @@ class TestHistoryRoleFormatting:
             "ts": 1717000000, "source": "wechat",
         })
         assert "你刚才说脑子里空转" in result
-        assert "[用户消息" in result  # user label, not bot
 
-    def test_proactive_not_labeled_as_user(self):
-        """Proactive messages must NOT get [用户消息] prefix."""
+    def test_no_role_labels_in_content(self):
+        """Role labels must NOT appear in content — they confuse the model."""
         from agent.chat_agent import _format_history_content
 
-        result = _format_history_content({
-            "role": "assistant",
-            "content": '{"actions":[{"type":"tool","name":"wechat_reply","args":{"text":"脑子里空转","delay":0}}],"done":true}',
-            "ts": 1717000000, "source": "proactive",
-        })
-        assert "[用户消息" not in result
-        assert "[Bot主动消息" in result
+        for role, source, content in [
+            ("user", "wechat", "hello"),
+            ("assistant", "user_reply", '{"actions":[{"type":"tool","name":"wechat_reply","args":{"text":"hi","delay":0}}],"done":true}'),
+            ("assistant", "proactive", '{"actions":[{"type":"tool","name":"wechat_reply","args":{"text":"ping","delay":0}}],"done":true}'),
+        ]:
+            result = _format_history_content({
+                "role": role, "content": content,
+                "ts": 1717000000, "source": source,
+            })
+            assert "[Bot回复" not in result
+            assert "[Bot主动消息" not in result
+            assert "[用户消息" not in result
 
-    def test_clingy_message_labeled_as_bot_active(self):
-        """Clingy followup messages also get [Bot主动消息]."""
+    def test_regression_proactive_json_extracted_not_leaked(self):
+        """Regression: proactive text extracted, not raw JSON, not labeled as user."""
         from agent.chat_agent import _format_history_content
 
-        result = _format_history_content({
-            "role": "assistant",
-            "content": '{"actions":[{"type":"tool","name":"wechat_reply","args":{"text":"人呢","delay":0}}],"done":true}',
-            "ts": 1717000000, "source": "proactive",
-        })
-        assert "[Bot主动消息" in result
-        assert "人呢" in result
-
-    def test_scheduled_message_labeled_as_bot_reply(self):
-        """Scheduled outbound (source=scheduled_reminder) with role=assistant → [Bot回复]."""
-        from agent.chat_agent import _format_history_content
-
-        result = _format_history_content({
-            "role": "assistant",
-            "content": '{"actions":[{"type":"tool","name":"wechat_reply","args":{"text":"该吃药了","delay":0}}],"done":true}',
-            "ts": 1717000000, "source": "scheduled_reminder",
-        })
-        assert "[Bot回复" in result
-        assert "该吃药了" in result
-
-    def test_regression_proactive_text_not_attributed_to_user(self):
-        """Regression test for the screenshot scenario: proactive '脑子里空转'
-        followed by user '吃过了' — proactive content labeled as bot, not user."""
-        from agent.chat_agent import _format_history_content
-
-        # Simulate the history from the bug report
         proactive_entry = _format_history_content({
             "role": "assistant",
             "content": '{"actions":[{"type":"tool","name":"wechat_reply","args":{"text":"有点无聊但不想睡，脑子里空转","delay":0}}],"done":true}',
@@ -1466,17 +1439,18 @@ class TestHistoryRoleFormatting:
             "ts": 1717000060, "source": "wechat",
         })
 
-        # Proactive entry must NOT be labeled as user
-        assert "[用户消息" not in proactive_entry
-        assert "[Bot主动消息" in proactive_entry
+        # Proactive: text extracted, source preserved
         assert "脑子里空转" in proactive_entry
+        assert "来源:proactive" in proactive_entry
+        assert '"actions"' not in proactive_entry
 
-        # User entry must be labeled as user
-        assert "[用户消息" in user_entry
+        # User: unchanged
         assert "吃过了" in user_entry
+        assert "来源:wechat" in user_entry
 
-        # The proactive text should not be confused with user text
-        assert "脑子里空转" not in user_entry
+        # Both use the standard [历史消息] prefix
+        assert "[历史消息" in proactive_entry
+        assert "[历史消息" in user_entry
 
 
 if __name__ == "__main__":

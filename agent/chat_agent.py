@@ -746,11 +746,15 @@ def _estimate_tokens(text: str) -> int:
 
 
 def _format_history_content(item: dict[str, Any]) -> str:
-    """Attach role-aware formatting to prevent role confusion (Bug B fix).
+    """Attach lightweight timing metadata without changing message roles.
 
-    Every history entry is labeled by its actual role so the LLM can
-    unambiguously distinguish user words from bot words, including
-    proactive/clingy/scheduled outbound messages.
+    The role is already correctly carried by the API message field
+    (user/assistant/system).  We do NOT inject role labels into the
+    content — those confuse the model into echo-chambering them back.
+
+    Bug B fix: for assistant messages stored as JSON actions, extract
+    the readable text so the LLM sees plain natural language instead of
+    raw JSON tool-call records.
     """
     content = str(item.get("content", ""))
     ts = item.get("ts")
@@ -760,20 +764,12 @@ def _format_history_content(item: dict[str, Any]) -> str:
         return content
 
     label = _format_ts(ts)
+    source_part = f" | 来源:{source}" if source else ""
 
-    # Role-based prefix: unambiguous attribution to user or bot
-    if role == "assistant" and source == "proactive":
-        prefix = f"[Bot主动消息 | {label}]"
-    elif role == "assistant":
-        prefix = f"[Bot回复 | {label}]"
-    elif role == "user":
-        prefix = f"[用户消息 | {label}]"
-    elif role == "system":
-        prefix = f"[系统 | {label}]"
-    else:
-        prefix = f"[{role} | {label}]"
-
-    # For assistant JSON messages, extract the readable text
+    # Extract readable text from assistant JSON action records.
+    # The raw JSON like {"actions":[{"type":"tool","name":"wechat_reply",
+    # "args":{"text":"..."}}]} is hard for the LLM to parse; plain text
+    # prevents it from misattributing bot words to the user.
     if role == "assistant":
         try:
             import json as _json
@@ -790,7 +786,7 @@ def _format_history_content(item: dict[str, Any]) -> str:
         except Exception:
             pass  # Keep raw content if JSON parsing fails
 
-    return f"{prefix}\n{content}"
+    return f"[历史消息 | {label}{source_part}]\n{content}"
 
 
 def _format_current_turn(user_message: str, history: list[dict[str, Any]], trigger: str) -> str:
