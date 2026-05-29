@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -64,6 +65,7 @@ class TurnState(StrEnum):
     END_SKIPPED = "end_skipped"
     END_FALLBACK_SENT = "end_fallback_sent"
     END_FAILED = "end_failed"
+    END_CANCELLED = "end_cancelled"
 
 
 # Set of states that terminate the turn loop
@@ -73,6 +75,7 @@ TERMINAL_STATES: frozenset[TurnState] = frozenset({
     TurnState.END_SKIPPED,
     TurnState.END_FALLBACK_SENT,
     TurnState.END_FAILED,
+    TurnState.END_CANCELLED,
 })
 
 
@@ -182,7 +185,61 @@ class TurnResult:
         return self.terminal_state in (TurnState.END_FAILED,)
 
     @property
+    def was_cancelled(self) -> bool:
+        return self.terminal_state == TurnState.END_CANCELLED
+
+    @property
     def delivered_count(self) -> int:
         return sum(
             1 for r in self.visible_messages if r.get("send_status") == "delivered"
         )
+
+
+# ================================================================
+# Error classification (v0.2 Phase 4)
+# ================================================================
+
+class ErrorClass(StrEnum):
+    RECOVERABLE = "recoverable"
+    FATAL = "fatal"
+
+
+# Callback: () -> bool.  Returns True when the current turn has been
+# superseded by a newer event and should be cancelled.
+InterruptChecker = Callable[[], bool]
+
+
+def classify_error(error_source: str, detail: str = "") -> ErrorClass:
+    """Classify an error as recoverable or fatal.
+
+    Recoverable errors allow the turn to continue with degraded context.
+    Fatal errors force HARD_FALLBACK or END_FAILED.
+    """
+    _recoverable_sources = {
+        "memory_loader",
+        "emotion_loader",
+        "summary_loader",
+        "weather_prefetch",
+        "time_prefetch",
+    }
+    _fatal_sources = {
+        "user_message_lost",
+        "system_prompt_build",
+        "tool_registry_unavailable",
+        "wechat_sender_unavailable",
+        "llm_api_consecutive_failures",
+        "state_machine_internal",
+    }
+
+    source = error_source.strip().lower()
+    if source in _recoverable_sources:
+        return ErrorClass.RECOVERABLE
+    if source in _fatal_sources:
+        return ErrorClass.FATAL
+
+    # Heuristic: errors containing "fatal"/"致命" are fatal
+    if "fatal" in source or "致命" in detail:
+        return ErrorClass.FATAL
+
+    # Default: treat unknown errors as fatal (fail-safe)
+    return ErrorClass.FATAL

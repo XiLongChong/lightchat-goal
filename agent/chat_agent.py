@@ -18,9 +18,12 @@ from typing import Any, Callable, Coroutine
 
 from agent.state_machine import (
     TERMINAL_STATES,
+    ErrorClass,
+    InterruptChecker,
     TurnResult,
     TurnScratchpad,
     TurnState,
+    classify_error,
 )
 from agent.tool_classifier import classify_tool_calls
 from agent.tool_registry import TOOL_REGISTRY
@@ -73,6 +76,25 @@ class ChatAgent:
         self.json_output_enabled = json_output_enabled  # always false in v0.2
         self.test_mode = test_mode
         self._last_call_time = 0.0
+        self._interrupt_checker: InterruptChecker | None = None
+
+    def set_interrupt_checker(self, checker: InterruptChecker | None) -> None:
+        """Inject an interrupt checker. Called at key points in the state machine.
+
+        Signature: () -> bool
+        Returns True when the current turn has been superseded and should
+        be cancelled (END_CANCELLED).
+        """
+        self._interrupt_checker = checker
+
+    def _is_interrupted(self) -> bool:
+        """Check whether the current turn should be cancelled."""
+        if self._interrupt_checker:
+            try:
+                return self._interrupt_checker()
+            except Exception:
+                return False
+        return False
 
     # ================================================================
     # Public entry point
@@ -291,7 +313,14 @@ class ChatAgent:
             return TurnState.HARD_FALLBACK
 
     def _do_handle_model_output(self, turn: TurnScratchpad) -> TurnState:
-        """HANDLE_MODEL_OUTPUT: inspect what the model returned."""
+        """HANDLE_MODEL_OUTPUT: inspect what the model returned.
+
+        Interrupt check #1: after CALL_LLM returns.
+        """
+        if self._is_interrupted():
+            turn.add_fallback_event("interrupted_after_llm", "turn superseded by newer event")
+            return TurnState.END_CANCELLED
+
         response = turn._llm_response
         native_tool_calls = getattr(response, "tool_calls", None) or []
         assistant_content = (response.content or "").strip()
@@ -513,7 +542,14 @@ class ChatAgent:
         return TurnState.GUARD_OUTPUT
 
     def _do_guard_output(self, turn: TurnScratchpad) -> TurnState:
-        """GUARD_OUTPUT: run all output guards on the parsed batch."""
+        """GUARD_OUTPUT: run all output guards on the parsed batch.
+
+        Interrupt check #2: before sending any user-visible content.
+        """
+        if self._is_interrupted():
+            turn.add_fallback_event("interrupted_before_guard", "turn superseded by newer event")
+            return TurnState.END_CANCELLED
+
         from agent.output_guard import guard_send_message_batch
 
         guard_result = guard_send_message_batch(
@@ -549,9 +585,14 @@ class ChatAgent:
     ) -> TurnState:
         """EXEC_SEND_WECHAT: compute delays and send via wechat_sender callback.
 
+        Interrupt check #3: last chance before WeChat send.
         Phase 2: sends the full batch.  If any messages fail, transitions to
         SEND_RETRY_UNDELIVERED_ONLY for automatic retry (max 2 attempts).
         """
+        if self._is_interrupted():
+            turn.add_fallback_event("interrupted_before_send", "turn superseded by newer event")
+            return TurnState.END_CANCELLED
+
         from agent.tools import compute_message_delay
 
         # Record tool result for diagnostics

@@ -1580,6 +1580,8 @@ async def chat(request: Request):
                     send_status = "fallback_sent"
                 case TurnState.END_FAILED:
                     send_status = "failed"
+                case TurnState.END_CANCELLED:
+                    send_status = "cancelled"
                 case _:
                     send_status = "generated"
 
@@ -1652,7 +1654,7 @@ async def chat(request: Request):
                             user_id, "system", f"[fallback] {' '.join(fallback_texts)}",
                             source="system", bot_id=bot_id,
                         )
-            # END_SKIPPED / END_FAILED: no assistant history written
+            # END_SKIPPED / END_FAILED / END_CANCELLED: no assistant history written
 
             # ── Record turn diagnostics ───────────────────────────
             diag_fallback = ",".join(
@@ -1716,6 +1718,8 @@ async def chat(request: Request):
             # ── Mark draft / outbound status ──────────────────────
             if result.was_skipped:
                 await memory_store.mark_turn_draft_status(turn_id, "skipped")
+            elif result.was_cancelled:
+                await memory_store.mark_turn_draft_status(turn_id, "cancelled")
             elif result.was_sent or result.was_fallback:
                 await memory_store.mark_turn_draft_status(turn_id, "delivered")
                 await memory_store.mark_outbound_batch_status(turn_id, "delivered")
