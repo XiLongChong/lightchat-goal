@@ -129,6 +129,13 @@ def guard_single_message(text: str, issues: list[str] | None = None) -> str:
 
     text = str(text).strip()
 
+    # Step 0: Hard block tool_call_id leaks — never let call_xxx reach user
+    if _TOOL_CALL_ID_PATTERN.search(text):
+        logger.warning("output_guard: blocked tool_call_id leak in: %s", text[:80])
+        if issues is not None:
+            issues.append("tool_call_id_blocked")
+        return HARD_FALLBACK_TEXT
+
     # Step 1-2: Protocol leak detection + nested unwrap
     if _looks_like_protocol_json(text):
         extracted = _unwrap_nested_protocol(text)
@@ -287,7 +294,163 @@ def _strip_mild_profanity(text: str) -> str:
     return text
 
 
-# Keep module-level aliases for backward compatibility with chat_agent.py
+# Keep module-level aliases for backward compatibility
 _sanitize_outbound_text = guard_single_message
 _looks_like_protocol_json = _looks_like_protocol_json
 _extract_nested_protocol_reply = _unwrap_nested_protocol
+
+
+# ================================================================
+# Phase 1: send_wechat_messages batch guard
+# ================================================================
+
+import dataclasses
+from dataclasses import dataclass, field
+
+
+@dataclass
+class SendGuardResult:
+    """Result of guarding a send_wechat_messages batch."""
+    messages: list[str] = field(default_factory=list)
+    blocked_count: int = 0
+    blocked_reasons: list[str] = field(default_factory=list)
+    truncated_count: int = 0  # messages dropped because they exceeded max_count
+
+    @property
+    def total(self) -> int:
+        return len(self.messages) + self.blocked_count + self.truncated_count
+
+
+# Hard block: tool_call_id leaks — must NEVER appear in user-visible messages
+_TOOL_CALL_ID_PATTERN: re.Pattern = re.compile(r'\bcall_[A-Za-z0-9_-]{8,}\b')
+
+# Patterns that indicate protocol/text leakage in user-visible messages
+_PROTOCOL_LEAK_PATTERNS: list[re.Pattern] = [
+    _TOOL_CALL_ID_PATTERN,
+    re.compile(r'"actions"\s*:', re.IGNORECASE),
+    re.compile(r'"wechat_reply"', re.IGNORECASE),
+    re.compile(r'"tool_calls?"\s*:', re.IGNORECASE),
+    re.compile(r'"function"\s*:', re.IGNORECASE),
+    re.compile(r'{"name":\s*"(?:get_time|get_weather|send_wechat_messages|search_memory|send_email)"'),
+    re.compile(r'system_prompt|base_protocol|tool_policy|memory_policy', re.IGNORECASE),
+    re.compile(r'You are a (?:long-term )?WeChat', re.IGNORECASE),
+    re.compile(r'<\|endoftext\|>'),
+    # Phase 1: Tool metadata patterns
+    re.compile(r'\bsend_wechat_messages\b'),
+    re.compile(r'\bnative_tools?\b'),
+    re.compile(r'"arguments"\s*:'),
+    re.compile(r'assistant_content_fallback'),
+    re.compile(r'tool_retry'),
+]
+
+# Phase 1: History leak patterns — model must not echo these labels to users
+_HISTORY_LEAK_PATTERNS: list[re.Pattern] = [
+    re.compile(r'\[历史消息'),
+    re.compile(r'历史消息'),
+    re.compile(r'最近对话'),
+    re.compile(r'对话记录'),
+    re.compile(r'上一轮'),
+    re.compile(r'来源:'),
+    re.compile(r'历史记录'),
+    re.compile(r'context_sample'),
+    re.compile(r'fallback_events'),
+    re.compile(r'turn_diagnostics'),
+]
+
+
+def _has_protocol_leak(text: str) -> bool:
+    """Check if text contains internal protocol, prompt fragments, or history labels."""
+    for pat in _PROTOCOL_LEAK_PATTERNS:
+        if pat.search(text):
+            return True
+    for pat in _HISTORY_LEAK_PATTERNS:
+        if pat.search(text):
+            logger.warning("output_guard: history leak pattern matched: %s", pat.pattern)
+            return True
+    # Also check for JSON that looks like an actions payload
+    if _looks_like_protocol_json(text):
+        return True
+    return False
+
+
+def guard_send_message_batch(
+    raw_messages: list,
+    mode: str = "normal",
+    max_single: int = 500,
+    max_total: int = 2000,
+    max_count: int = 12,
+) -> SendGuardResult:
+    """Guard a batch of messages from send_wechat_messages.
+
+    For each message:
+      1. Convert to string, trim
+      2. Reject empty
+      3. Clamp length to max_single
+      4. Filter protocol leaks
+      5. Filter sensitive info
+      6. Strip markdown
+      7. Normalize whitespace
+
+    Does NOT split long messages — that's the model's job.
+
+    Returns SendGuardResult with clean messages and blocked count.
+    """
+    result = SendGuardResult()
+
+    # Truncate to max_count before processing
+    if len(raw_messages) > max_count:
+        result.truncated_count = len(raw_messages) - max_count
+        raw_messages = raw_messages[:max_count]
+        logger.warning(
+            "output_guard: truncated %d messages (max_count=%d)",
+            result.truncated_count, max_count,
+        )
+
+    for i, msg in enumerate(raw_messages):
+        text = str(msg or "").strip()
+
+        # Reject empty
+        if not text:
+            result.blocked_count += 1
+            result.blocked_reasons.append(f"[{i}] empty after trim")
+            continue
+
+        # Length limit (clamp, don't split)
+        if len(text) > max_single:
+            text = text[:max_single - 1] + "…"
+
+        # Protocol leak detection
+        if _has_protocol_leak(text):
+            logger.warning("output_guard: blocked protocol leak in message[%d]: %s", i, text[:80])
+            result.blocked_count += 1
+            result.blocked_reasons.append(f"[{i}] protocol leak")
+            continue
+
+        # Sensitive info filter
+        text = _filter_sensitive(text)
+
+        # Markdown cleanup
+        text = _wechat_cleanup(text)
+
+        # Profanity guard
+        text = guard_emotion_profanity(text)
+
+        # Final emptiness check
+        if not text.strip():
+            result.blocked_count += 1
+            result.blocked_reasons.append(f"[{i}] empty after guards")
+            continue
+
+        result.messages.append(text)
+
+    # Total character limit
+    total_chars = sum(len(m) for m in result.messages)
+    if total_chars > max_total:
+        # Trim the last message to fit
+        excess = total_chars - max_total
+        if result.messages:
+            last = result.messages[-1]
+            new_len = max(10, len(last) - excess)
+            result.messages[-1] = last[:new_len].rstrip() + "…"
+
+    return result

@@ -7,6 +7,7 @@ with a clear diagnostic message instead of erroring.
 import os
 import tempfile
 import warnings
+import asyncio
 
 import pytest
 
@@ -68,3 +69,13 @@ def tmp_path(request, tmp_path_factory):
 
     # Delegate to the built-in fixture logic (tmp_path_factory is scope='session')
     return tmp_path_factory.mktemp(request.node.name, numbered=True)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Close SQLite worker threads left by module-level and temp stores."""
+    try:
+        from memory.store import MemoryStore
+
+        asyncio.run(MemoryStore.close_all())
+    except Exception as exc:
+        warnings.warn(f"failed to close MemoryStore instances: {exc}")

@@ -25,11 +25,10 @@ from agent.tool_registry import (
 # ══════════════════════════════════════════════════════════════════
 
 class TestActionRegistryContent:
-    def test_contains_internal_actions(self):
+    def test_action_registry_is_empty_in_v0_2(self):
+        """v0.2: ActionRegistry is empty — wechat_reply and skip removed."""
         names = ACTION_REGISTRY.names()
-        assert "wechat_reply" in names
-        assert "schedule_wechat_message" in names
-        assert "skip" in names
+        assert len(names) == 0
 
     def test_wechat_reply_not_in_tool_registry(self):
         assert "wechat_reply" not in TOOL_REGISTRY
@@ -43,13 +42,16 @@ class TestActionRegistryContent:
 
 class TestToolRegistryContent:
     def test_contains_external_tools(self):
+        """v0.2: only 4 tools registered."""
         names = TOOL_REGISTRY.names()
         assert "get_time" in names
         assert "get_weather" in names
-        assert "search_memory" in names
-        assert "read_persona_file" in names
-        assert "propose_persona_change" in names
-        assert "send_email" in names
+        assert "send_wechat_messages" in names
+        assert "skip_reply" in names
+        assert "search_memory" not in names
+        assert "send_email" not in names
+        assert "read_persona_file" not in names
+        assert len(names) == 4
 
     def test_get_weather_not_in_action_registry(self):
         assert "get_weather" not in ACTION_REGISTRY
@@ -92,20 +94,30 @@ class TestNativeEligibility:
         assert t is not None
         assert t.native_tool_call_eligible is True
 
-    def test_send_email_not_native_eligible(self):
+    def test_send_email_not_registered(self):
+        """v0.2: send_email removed from registry."""
         t = TOOL_REGISTRY.get("send_email")
-        assert t is not None
-        assert t.native_tool_call_eligible is False
+        assert t is None
 
-    def test_search_memory_not_native_eligible(self):
+    def test_search_memory_not_registered(self):
+        """v0.2: search_memory removed from registry."""
         t = TOOL_REGISTRY.get("search_memory")
-        assert t is not None
-        assert t.native_tool_call_eligible is False
+        assert t is None
 
-    def test_read_persona_not_native_eligible(self):
+    def test_read_persona_not_registered(self):
+        """v0.2: read_persona_file removed from registry."""
         t = TOOL_REGISTRY.get("read_persona_file")
+        assert t is None
+
+    def test_send_wechat_messages_is_native_eligible(self):
+        t = TOOL_REGISTRY.get("send_wechat_messages")
         assert t is not None
-        assert t.native_tool_call_eligible is False
+        assert t.native_tool_call_eligible is True
+
+    def test_skip_reply_is_native_eligible(self):
+        t = TOOL_REGISTRY.get("skip_reply")
+        assert t is not None
+        assert t.native_tool_call_eligible is True
 
     def test_internal_actions_not_in_native_specs(self):
         specs = TOOL_REGISTRY.get_native_tool_specs()
@@ -115,16 +127,20 @@ class TestNativeEligibility:
         assert "skip" not in names
 
     def test_get_native_tool_specs_only_eligible(self):
+        """v0.2: all 4 tools are native-eligible."""
         specs = TOOL_REGISTRY.get_native_tool_specs(eligible_only=True)
         names = {s["function"]["name"] for s in specs}
-        assert names == {"get_time", "get_weather"}
+        assert names == {"get_time", "get_weather", "send_wechat_messages", "skip_reply"}
 
     def test_get_native_tool_specs_includes_all_when_eligible_only_false(self):
+        """v0.2: all 4 tools visible when eligible_only=False."""
         specs = TOOL_REGISTRY.get_native_tool_specs(eligible_only=False)
         names = {s["function"]["name"] for s in specs}
         assert "get_time" in names
         assert "get_weather" in names
-        assert "send_email" in names  # included when eligible_only=False
+        assert "send_wechat_messages" in names
+        assert "skip_reply" in names
+        assert len(names) == 4
 
     def test_native_specs_have_correct_structure(self):
         specs = TOOL_REGISTRY.get_native_tool_specs()
@@ -142,22 +158,16 @@ class TestNativeEligibility:
 # ══════════════════════════════════════════════════════════════════
 
 class TestSendEmailSafety:
-    def test_side_effect_is_high(self):
+    """v0.2: send_email removed. Safety is enforced by not registering it."""
+
+    def test_send_email_not_registered(self):
         t = TOOL_REGISTRY.get("send_email")
+        assert t is None
+
+    def test_send_wechat_messages_has_high_side_effect(self):
+        t = TOOL_REGISTRY.get("send_wechat_messages")
+        assert t is not None
         assert t.side_effect_level == "high"
-
-    def test_requires_confirmation(self):
-        t = TOOL_REGISTRY.get("send_email")
-        assert t.requires_confirmation is True
-
-    def test_not_native_eligible(self):
-        t = TOOL_REGISTRY.get("send_email")
-        assert t.native_tool_call_eligible is False
-
-    def test_has_todo_comment(self):
-        t = TOOL_REGISTRY.get("send_email")
-        assert "todo" in t.metadata or "TODO" in str(t.metadata)
-        assert "confirmation" in str(t.metadata).lower()
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -184,56 +194,60 @@ class TestRegistryMutableMetadata:
 
 class TestRegistryAPI:
     def test_action_registry_has(self):
-        assert ACTION_REGISTRY.has("wechat_reply")
+        """v0.2: ActionRegistry is empty."""
+        assert not ACTION_REGISTRY.has("wechat_reply")
+        assert not ACTION_REGISTRY.has("skip")
         assert not ACTION_REGISTRY.has("nonexistent")
 
     def test_action_registry_contains(self):
-        assert "wechat_reply" in ACTION_REGISTRY
+        assert "wechat_reply" not in ACTION_REGISTRY
         assert "get_time" not in ACTION_REGISTRY
 
     def test_action_registry_get(self):
-        a = ACTION_REGISTRY.get("skip")
-        assert a is not None
-        assert a.name == "skip"
-        assert a.handler_type == "internal"
+        assert ACTION_REGISTRY.get("skip") is None
         assert ACTION_REGISTRY.get("nonexistent") is None
 
     def test_tool_registry_has(self):
         assert TOOL_REGISTRY.has("get_weather")
         assert not TOOL_REGISTRY.has("nonexistent")
+        assert not TOOL_REGISTRY.has("wechat_reply")
 
     def test_tool_registry_contains(self):
         assert "get_time" in TOOL_REGISTRY
         assert "wechat_reply" not in TOOL_REGISTRY
 
     def test_tool_registry_get(self):
-        t = TOOL_REGISTRY.get("search_memory")
+        t = TOOL_REGISTRY.get("get_time")
         assert t is not None
-        assert t.name == "search_memory"
-        assert t.native_tool_call_eligible is False
+        assert t.name == "get_time"
+        assert t.native_tool_call_eligible is True
 
     def test_is_action_helper(self):
-        assert is_action("wechat_reply")
-        assert is_action("skip")
+        """v0.2: ActionRegistry empty, is_action() always False."""
+        assert not is_action("wechat_reply")
+        assert not is_action("skip")
         assert not is_action("get_weather")
 
     def test_is_external_tool_helper(self):
         assert is_external_tool("get_time")
-        assert is_external_tool("send_email")
+        assert is_external_tool("send_wechat_messages")
         assert not is_external_tool("wechat_reply")
+        assert not is_external_tool("send_email")
 
     def test_get_all_tool_names_union(self):
+        """v0.2: 4 tools, ActionRegistry empty."""
         all_names = get_all_tool_names()
-        assert "wechat_reply" in all_names
-        assert "skip" in all_names
         assert "get_time" in all_names
-        assert "send_email" in all_names
-        # 3 actions + 6 tools = 9 unique names
-        assert len(all_names) == 9
+        assert "get_weather" in all_names
+        assert "send_wechat_messages" in all_names
+        assert "skip_reply" in all_names
+        assert "wechat_reply" not in all_names
+        assert "send_email" not in all_names
+        assert len(all_names) == 4
 
     def test_registry_len(self):
-        assert len(ACTION_REGISTRY) == 3
-        assert len(TOOL_REGISTRY) == 6
+        assert len(ACTION_REGISTRY) == 0
+        assert len(TOOL_REGISTRY) == 4
 
     def test_empty_registry(self):
         r = ActionRegistry()
@@ -254,10 +268,14 @@ class TestRegistryAPI:
 
 class TestBackwardCompat:
     def test_tool_whitelist_is_union(self):
+        """v0.2: 4 tools in whitelist, no internal actions."""
         from agent.tools import TOOL_WHITELIST
-        assert "wechat_reply" in TOOL_WHITELIST
         assert "get_time" in TOOL_WHITELIST
-        assert "send_email" in TOOL_WHITELIST
+        assert "get_weather" in TOOL_WHITELIST
+        assert "send_wechat_messages" in TOOL_WHITELIST
+        assert "skip_reply" in TOOL_WHITELIST
+        assert "wechat_reply" not in TOOL_WHITELIST
+        assert "send_email" not in TOOL_WHITELIST
 
     def test_execute_tool_rejects_unknown(self):
         import asyncio
@@ -266,13 +284,13 @@ class TestBackwardCompat:
         result = asyncio.run(execute_tool("nonexistent_tool", {}))
         assert "不在可用列表中" in result
 
-    def test_execute_tool_handles_internal_action_noop(self):
+    def test_execute_tool_rejects_old_wechat_reply(self):
+        """v0.2: wechat_reply not registered, rejected as unknown."""
         import asyncio
         from agent.tools import execute_tool
 
         result = asyncio.run(execute_tool("wechat_reply", {"text": "hi"}))
-        # Internal actions return "已处理" when they reach executor
-        assert "已处理" in result
+        assert "不在可用列表中" in result
 
 
 if __name__ == "__main__":

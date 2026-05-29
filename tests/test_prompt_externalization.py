@@ -7,8 +7,6 @@ PROMPTS = Path(__file__).resolve().parent.parent / "prompts"
 
 def test_task_prompt_files_exist():
     required = [
-        "scheduler_intent.md",
-        "scheduler_message.md",
         "memory_extract.md",
         "persona.md",
         "base_protocol.md",
@@ -23,35 +21,16 @@ def test_task_prompt_files_exist():
         assert path.read_text(encoding="utf-8").strip()
 
 
-def test_scheduler_prompt_templates_format():
-    from agent.scheduler import SchedulerAgent
-
-    agent = SchedulerAgent(store=None, model="test", llm_gateway=MagicMock())  # type: ignore[arg-type]
-
-    intent_prompt = agent.intent_prompt_template.format(
-        now_str="2026年05月26日 15:00 周2",
-        topic_text="",
-        topic_status="none",
-        followup_count=0,
-    )
-    message_prompt = agent.message_prompt_template.format(
-        intent="check_in",
-        reason="test",
-        now_str="2026年05月26日 15:00 周2",
-        topic_text="",
-        recent_context="用户: 刚在忙项目",
-        bot_identity="当前 bot 人设",
-        relationship_context="熟悉度: 7/10",
-        memory_context="- 用户喜欢夜里聊天",
-        last_opener="突然想到",
-        max_messages=2,
-        familiarity=5,
-        intent_rules="短一点",
-    )
-
-    assert "消息调度器" in intent_prompt
-    assert "主动消息生成器" in message_prompt
-    assert "你刚才说" in message_prompt
+def test_scheduler_prompt_files_removed():
+    removed = [
+        "scheduler_intent.md",
+        "scheduler_message.md",
+        "proactive_message_v2.md",
+        "proactive_plan.md",
+        "scheduler_message.md",
+    ]
+    for name in removed:
+        assert not (PROMPTS / name).exists(), f"removed prompt still exists: {name}"
 
 
 def test_memory_worker_loads_external_extraction_prompt():
@@ -59,7 +38,7 @@ def test_memory_worker_loads_external_extraction_prompt():
 
     worker = MemoryWorker(store=None, model="test", llm_gateway=MagicMock())  # type: ignore[arg-type]
 
-    assert "从以下对话中提取" in worker.extraction_prompt
+    assert "提取" in worker.extraction_prompt
     assert "输出格式" in worker.extraction_prompt
 
 
@@ -75,5 +54,4 @@ def test_legacy_context_builder_is_short_fallback():
     )
 
     assert "Legacy fallback prompt" in prompt
-    assert "正常 V2.1 路径" in prompt
     assert len(prompt) < 1500

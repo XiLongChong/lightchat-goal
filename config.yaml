@@ -1,14 +1,14 @@
 # ============================================================
-# Goal Chat Agent — Configuration  (V2.1.1)
+# Goal Chat Agent — Configuration (Phase 1: native tool calls)
 # ============================================================
 
-version: "2.1.1"
+version: "3.0"
 
 model:
   provider: deepseek
   default_model: "${DEEPSEEK_MODEL:-deepseek-v4-flash}"
   smart_model: "${DEEPSEEK_SMART_MODEL:-deepseek-v4-pro}"
-  name: "${DEEPSEEK_MODEL:-deepseek-v4-flash}"  # legacy alias during gateway migration
+  name: "${DEEPSEEK_MODEL:-deepseek-v4-flash}"
   api_key: "${DEEPSEEK_API_KEY}"
   base_url: "${DEEPSEEK_BASE_URL:-https://api.deepseek.com}"
   temperature: 0.7
@@ -18,14 +18,16 @@ model:
   thinking:
     default: disabled
   json_output:
-    chat_agent: true
-    scheduler_intent: true
-    proactive_plan: true
+    chat_agent: false                     # Phase 1: JSON actions disabled
   native_tool_calls:
-    chat_agent: false
+    chat_agent: true                      # v0.2: native tool calls exclusively
     allowed_tools:
       - get_time
       - get_weather
+      - send_wechat_messages
+      - skip_reply
+  streaming:
+    chat_agent: false                     # Phase 1: start with non-streaming
 
 server:
   host: "${HOST:-127.0.0.1}"
@@ -40,7 +42,7 @@ api:
   max_message_chars: 1000
   max_messages_per_request: 8
 
-# ---- Agent Identity (V2.1: legacy — now driven by default_bot profile) ----
+# ---- Agent Identity (single persona) ----------------------------------
 agent:
   name: "${AGENT_NAME:-bot}"
   persona_file: "./prompts/persona.md"
@@ -48,70 +50,22 @@ agent:
     你是一个长期陪用户聊天的 AI 聊天对象，不是客服、不是老师、不是心理咨询师，也不是单纯的工具助手。
     你的核心任务是：自然地陪用户聊天。
     使用中文回复，语气自然、简洁、像真人聊天。
-
   personality: ""
 
-# ---- Bots (V2.1) ----------------------------------------------------
-# Each bot has independent persona, relationship state, recap, and memory.
-# current_bot_id routes the single WeChat entry to one active bot.
-bots:
-  _current_bot_id: "default_bot"
+# ---- Feature toggles (Phase 1) ----------------------------------------
+features:
+  memory: false         # long-term memory & search_memory tool
+  recap: false          # background recap generation
+  relationship: false   # relationship state tracking
+  multi_bot: false      # multiple bot profiles
+  emotion: false        # bot emotion state machine
+  proactive: false      # proactive / scheduled messages
+  email: false          # send_email tool in chat
 
-  default_bot:
-    display_name: "bot"
-    identity_file: "./prompts/persona.md"
-    persona_file: "./prompts/persona.md"
-    enabled_tools:
-      - wechat_reply
-      - schedule_wechat_message
-      - get_time
-      - get_weather
-      - search_memory
-      - read_persona_file
-      - propose_persona_change
-      - send_email
-    proactive_enabled: true
-
-# ---- Prompt Pack (V2.1) ---------------------------------------------
-# Split prompt components loaded from prompts/ directory.
-# Files: base_protocol.md, relationship_context.md, memory_policy.md,
-#        tool_policy.md, trigger_context.md
-# Bot identity file is specified per-bot above.
-prompt_pack:
-  directory: "./prompts"
-  components:
-    - base_protocol
-    - relationship_context
-    - memory_policy
-    - tool_policy
-    - trigger_context
-    
-
-
-# ---- Memory ----
-memory:
-  db_path: "./data/memory.db"
-  max_context_memories: 5      # 每次对话注入的记忆条数
-  min_importance_save: 0.4     # 重要性低于此值不存
-  dedup_threshold: 0.75        # Jaccard 相似度高于此值视为重复
-  decay:
-    enabled: true
-    week_factor: 0.95           # 7天后重要性乘以此值
-    month_factor: 0.90          # 30天后重要性乘以此值
-
-# ---- Conversation ----
-conversation:
-  max_history_turns: 20         # 保留最近N轮对话原文
-  compact_at_turns: 40          # 超过此轮数触发旧对话摘要
-  max_actions_per_turn: 8       # 模型一次输出的最大action数
-  max_message_chars: 500        # 单条消息最大字符数
-  max_total_chars: 2000         # 一轮回复总字符上限
-  max_tool_loop: 5              # done:false 最大循环次数
-
-# ---- WeChat iLink Bridge ----
+# ---- WeChat iLink Bridge -----------------------------------------------
 wechat:
-  enabled: false             # set to true to enable iLink polling
-  token: ""                  # bot token from QR login
+  enabled: false
+  token: ""
   base_url: "https://ilinkai.weixin.qq.com"
   goal_url: "http://127.0.0.1:8899"
   poll_timeout_ms: 35000
@@ -119,89 +73,52 @@ wechat:
   max_reply_delay: 3.0
   buffer_debounce_seconds: 2.0
   buffer_max_wait_seconds: 8.0
-
-# ---- Scheduler ----
-scheduler:
-  enabled: true
-  interval_minutes: 3             # 检查间隔（频繁检查 due_time）
-  scheduled_check_seconds: 10     # 到期定时消息检查间隔
-  quiet_hours_enabled: true       # 是否启用免打扰时段；关闭后全天可主动
-  sleep_start: 0                  # 免打扰开始（时）
-  sleep_end: 7                    # 免打扰结束（时）
-  max_daily_proactive: 5          # 每天最多主动发几条
-  max_ignored_streak: 3           # 连续被忽略次数上限
-
-# ---- Proactive (V2.1.1 due-time + intent model) ---------------------
-# LLM no longer decides whether to send. Scheduler uses random due-time.
-proactive:
-  timing:
-    mode: random_interval
-    min_interval_minutes: 30
-    max_interval_minutes: 60
-  generation:
-    enabled_types:
-      - check_in
-      - latest_topic_followup
-      - clingy_followup
-      - self_share
-      - light_ping
-    clingy_mode_enabled: true
-    clingy_after_minutes: 20
-    max_messages: 3
-    latest_topic_only: true
-    allow_llm_skip: false
-  clingy:
-    max_followups_per_unanswered: 3
-  # Don't interrupt live chat: if user or bot sent a normal message within
-  # this window, non-clingy proactive is blocked.
-  active_chat_cooldown_seconds: 300
-  topic:
-    followup_max_count: 2
-    default_expire_minutes: 240
-    meal_followup_min_minutes: 40
-    meal_followup_max_minutes: 90
-
-# ---- Outbound message semantics (V2.1) -------------------------------
-# Every outbound message carries source/author/trigger/visible/send_status
-outbound:
-  track_all: true
-  visible_only_after_delivered: true
-  sources:
-    - user_reply
-    - fixed_morning
-    - scheduled_reminder
-    - proactive
-    - admin
-  authors:
-    - assistant
-    - system
-
-# ---- Recap (V2.1) ----------------------------------------------------
-recap:
-  enabled: true
-  trigger:
-    every_n_turns: 8              # summarize every N turns
-    raw_messages_threshold: 200   # or when raw messages exceed this
-    on_restart: true              # or service restart finds unsummarized turns
-  generation:
-    max_chars: 500
-    temperature: 0.5
-  exclude_from_recap:
-    - permanent_user_facts          # belongs in long-term memory
-    - speculative_psychology        # no labels without evidence
-    - raw_history_details           # belongs in L1 raw_messages only
-
-# ---- Fixed proactive messages ----
-fixed_messages:
-  morning:
+  # Phase 1: send delay config
+  send_delay:
     enabled: true
-    hour: 8
-    minute: 0
-    city: "成都"
-  night_recap:
-    enabled: false
-    hour: 23
-    minute: 0
+    test_mode_zero_delay: false
+    min_seconds: 0.4
+    max_seconds: 3.5
+    first_min: 0.2
+    first_max: 0.8
+    subsequent_short_min: 0.8
+    subsequent_short_max: 1.8
+    subsequent_long_min: 1.5
+    subsequent_long_max: 3.5
+    short_threshold_chars: 60
+    jitter_enabled: true
+  # Phase 1: message limits
+  messages:
+    max_count: 12
+    soft_normal_count: 4
+    max_single_chars: 500
+    max_total_chars: 2000
+
+# ---- History (short-term only in Phase 1) -----------------------------
+history:
+  short_term_turns: 12
+  max_history_turns: 20
+  compact_at_turns: 40
+
+# ---- Memory (disabled in Phase 1, schema kept for compat) -------------
+memory:
+  db_path: "./data/memory.db"
+  max_context_memories: 5
+  min_importance_save: 0.4
+  dedup_threshold: 0.75
+  decay:
+    enabled: true
+    week_factor: 0.95
+    month_factor: 0.90
+
+# ---- Conversation (kept for compat, limits still applied) -------------
+conversation:
+  max_history_turns: 20
+  compact_at_turns: 40
+  max_actions_per_turn: 8
+  max_message_chars: 500
+  max_total_chars: 2000
+  max_tool_loop: 5
 
 # ---- Weather ----
 weather:
@@ -209,7 +126,7 @@ weather:
   timeout_seconds: 4
   cache_ttl_seconds: 600
 
-# ---- Email ----
+# ---- Email (disabled in chat, SMTP config kept for admin) -------------
 email:
   enabled: "${EMAIL_ENABLED:-false}"
   smtp_host: "${EMAIL_SMTP_HOST:-}"
@@ -221,49 +138,56 @@ email:
   use_ssl: true
   use_starttls: false
 
-# ---- Emotion (V2.2) ---------------------------------------------------
-# Bot emotion state engine — mood, relationship progression, emotion rules.
-emotion:
-  enabled: true
-  inject_prompt: true
-  log_events: true
-  default_profile:
-    initial_affection: 10
-    initial_trust: 10
-    initial_attachment: 5
-    baseline_mood: "cold"
-    jealousy_enabled: true
-  decay:
-    enabled: true
-    irritation_half_life_minutes: 180
-    jealousy_half_life_minutes: 240
-    lonely_half_life_minutes: 360
-    hurt_half_life_minutes: 240
-  silence:
-    enabled: true
-    default_max_silent_messages: 2
-    max_silent_minutes: 30
-    force_reply_on_apology: true
-    force_reply_on_urgent: true
-    max_silent_messages_by_mood:
-      irritated: 1
-      jealous: 2
-      hurt: 2
-      angry: 2
-  expression:
-    profanity_enabled: true
-    profanity_level: 2
-    allow_jealous_phrases: true
-    allow_cold_replies: true
-
-# ---- Dialogue State (V2.2) ----------------------------------------------
-# Conversation wait state tracking — who's turn is it, silence mode, etc.
-dialogue_state:
-  enabled: true
-  use_as_waiting_source_of_truth: true
-  compatibility_write_clingy_state: true
-
 # ---- Logging ----
 logging:
   level: "${LOG_LEVEL:-INFO}"
   file: "./data/agent.log"
+
+# ---- Legacy sections (kept for backward compat, not in main path) -----
+bots:
+  _current_bot_id: "default_bot"
+  default_bot:
+    display_name: "bot"
+    identity_file: "./prompts/persona.md"
+    persona_file: "./prompts/persona.md"
+    enabled_tools:
+      - wechat_reply
+      - get_time
+      - get_weather
+      - search_memory
+      - read_persona_file
+      - propose_persona_change
+      - send_email
+
+prompt_pack:
+  directory: "./prompts"
+  components:
+    - base_protocol
+    - relationship_context
+    - memory_policy
+    - tool_policy
+    - trigger_context
+
+outbound:
+  track_all: true
+  visible_only_after_delivered: true
+  sources:
+    - user_reply
+    - admin
+  authors:
+    - assistant
+    - system
+
+recap:
+  enabled: false
+  trigger:
+    every_n_turns: 8
+    raw_messages_threshold: 200
+    on_restart: true
+  generation:
+    max_chars: 500
+    temperature: 0.5
+  exclude_from_recap:
+    - permanent_user_facts
+    - speculative_psychology
+    - raw_history_details

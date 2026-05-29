@@ -1,4 +1,4 @@
-"""Bot profile management — V2.1 bot identity and prompt pack boundaries.
+﻿"""Bot profile management — V2.1 bot identity and prompt pack boundaries.
 
 Per V2.1 design:
 - Each bot has independent persona, relationship state, recap, and memory
@@ -38,7 +38,6 @@ class BotProfile:
     display_name: str = ""
     identity_file: str = ""           # Path to bot identity .md
     enabled_tools: list[str] = field(default_factory=list)
-    proactive_enabled: bool = True
     prompt_pack: dict[str, str] = field(default_factory=dict)
     # Backward compat
     persona_file: str = ""
@@ -162,13 +161,11 @@ class BotProfileManager:
         defaults: dict[str, Any] | None = None,
         history_summary: str = "",
         recap: str = "",
-        emotion_inject: str = "",
     ) -> str:
         """Assemble the full system prompt from the bot's prompt pack.
 
         V2.1: components are loaded from individual .md files and combined
         with runtime context (relationship, memories, time, etc.).
-        V2.2: accepts emotion_inject for emotion-aware chat.
         """
         pack = self.load_prompt_pack(bot_id)
         defaults = defaults or {}
@@ -219,9 +216,6 @@ class BotProfileManager:
 
         sections.append(f"\n## 记忆\n{mem_text}")
         sections.append(f"\n## 工具\n{tool_text}")
-
-        if emotion_inject:
-            sections.append(f"\n{emotion_inject}")
 
         return "\n\n".join(s.strip() for s in sections if s.strip())
 
@@ -283,14 +277,12 @@ class BotProfileManager:
         enabled_tools = list(bot_cfg.get(
             "enabled_tools",
             [
-                "wechat_reply", "schedule_wechat_message",
+                "wechat_reply",
                 "get_time", "get_weather",
                 "search_memory", "read_persona_file",
                 "propose_persona_change", "send_email",
             ],
         ))
-
-        proactive = bool(bot_cfg.get("proactive_enabled", True))
 
         # Build initial prompt pack from files
         pack = self._assemble_prompt_pack_from_files(identity_file)
@@ -301,7 +293,6 @@ class BotProfileManager:
             identity_file=identity_file,
             persona_file=persona_file,
             enabled_tools=enabled_tools,
-            proactive_enabled=proactive,
             prompt_pack=pack,
         )
 
@@ -315,13 +306,11 @@ class BotProfileManager:
         persona_file = str(bot_cfg.get("persona_file", identity_file))
         display_name = str(bot_cfg.get("display_name", bot_id))
         enabled_tools = list(bot_cfg.get("enabled_tools", [
-            "wechat_reply", "schedule_wechat_message",
+            "wechat_reply",
             "get_time", "get_weather",
             "search_memory", "read_persona_file",
             "propose_persona_change", "send_email",
         ]))
-        proactive = bool(bot_cfg.get("proactive_enabled", True))
-
         pack = self._assemble_prompt_pack_from_files(identity_file)
 
         return BotProfile(
@@ -330,7 +319,6 @@ class BotProfileManager:
             identity_file=identity_file,
             persona_file=persona_file,
             enabled_tools=enabled_tools,
-            proactive_enabled=proactive,
             prompt_pack=pack,
         )
 
@@ -408,13 +396,6 @@ class BotProfileManager:
     @staticmethod
     def _legacy_trigger_text(trigger: str) -> str:
         """Fallback trigger text when trigger_context.md is missing."""
-        if trigger == "proactive":
-            return (
-                "本轮是系统唤醒，不是用户发来的消息。"
-                + "你是在主动开口，不能把唤醒指令当成用户说过的话。"
-                + "不要说'你刚才说/你问我/你不是要'等把系统任务误认成用户消息的话。"
-                + "主动消息要像微信里自然冒出来的一句，短，少解释。"
-            )
         return (
             "本轮是用户发来的微信消息。"
             "历史消息里如果带有时间间隔，要先判断上一句话是不是已经过去一段时间。"
@@ -488,3 +469,4 @@ def _legacy_rel_text(relationship: dict[str, Any]) -> str:
     if boundary:
         rel_text += f"\n边界: {boundary}"
     return rel_text
+

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>LightChat 后台</title>
-  <link rel="stylesheet" href="/static/admin.css?v=wechat-20260526-5">
+  <link rel="stylesheet" href="/static/admin.css?v=cleanup-20260529">
 </head>
 <body>
   <main id="loginView" class="login-shell">
@@ -12,12 +12,9 @@
       <div class="login-brand">
         <span>LightChat</span>
         <h1>进入控制台</h1>
-        <p>查看对话、记忆、主动消息和运行日志。</p>
+        <p>查看对话、记忆、设置和运行日志。</p>
       </div>
-      <label class="field">
-        <span>访问密码</span>
-        <input id="loginPassword" type="password" autocomplete="current-password" placeholder="请输入密码">
-      </label>
+      <label class="field"><span>访问密码</span><input id="loginPassword" type="password" autocomplete="current-password"></label>
       <p id="loginError" class="form-error" hidden></p>
       <button id="loginBtn" class="primary">进入后台</button>
     </section>
@@ -26,9 +23,7 @@
   <main id="appView" hidden>
     <header class="topbar">
       <strong id="pageTitle">LightChat · 总览</strong>
-      <div class="top-actions">
-        <button id="refreshBtn">刷新</button>
-      </div>
+      <div class="top-actions"><button id="refreshBtn">刷新</button></div>
     </header>
 
     <div class="app-layout">
@@ -36,17 +31,15 @@
         <nav class="side-nav" aria-label="主导航">
           <button class="nav-item active" data-tab="overview">总览</button>
           <button class="nav-item" data-tab="chat">聊天</button>
-          <button class="nav-item" data-tab="proactive">主动</button>
           <button class="nav-item" data-tab="memory">记忆</button>
           <button class="nav-item" data-tab="settings">设置</button>
-          <button class="nav-item" data-tab="emotion">情绪</button>
           <button class="nav-item" data-tab="logs">日志</button>
         </nav>
       </aside>
 
       <section id="overview" class="panel active">
         <div class="hero">
-          <h1 id="overviewTitle">运行总览</h1>
+          <h1>运行总览</h1>
           <button id="overviewRefreshBtn" class="primary">刷新状态</button>
         </div>
         <div id="qrWrap" class="qr-wrap" hidden>
@@ -60,19 +53,15 @@
           <div class="metric"><span>今日 token</span><strong id="usageTodayTokens">--</strong></div>
           <div class="metric"><span>今日兜底</span><strong id="usageTodayFallbacks">--</strong></div>
           <div class="metric"><span>运行时长</span><strong id="usageUptime">--</strong></div>
-          <div class="metric"><span>下次主动</span><strong id="nextProactiveTime">--</strong></div>
           <div class="metric"><span>当前 bot</span><strong id="currentBot">--</strong></div>
         </div>
         <div class="page-grid">
           <section class="card">
-            <div class="card-head">
-              <h2>最新对话</h2>
-              <span id="bridgeBadge" class="status">读取中</span>
-            </div>
+            <div class="card-head"><h2>最新对话</h2><span id="bridgeBadge" class="status">读取中</span></div>
             <div id="overviewChat" class="chat-feed compact"></div>
           </section>
           <aside class="card">
-            <h2>当前关注</h2>
+            <h2>当前连接</h2>
             <div class="admin-actions">
               <select id="botSelect" title="切换 bot"></select>
               <button id="startDeployBtn">微信部署</button>
@@ -89,64 +78,13 @@
           <h1>聊天诊断</h1>
           <div class="segmented">
             <button class="active" data-chat-filter="all">最近</button>
-            <button data-chat-filter="issues">只看异常</button>
-            <button data-chat-filter="tools">工具调用</button>
+            <button data-chat-filter="issues">异常</button>
+            <button data-chat-filter="tools">工具</button>
           </div>
         </div>
         <div class="page-grid chat-layout">
-          <section class="card">
-            <div id="chatFeed" class="chat-feed"></div>
-          </section>
-          <aside class="card sticky-card">
-            <h2>本轮详情</h2>
-            <div id="turnDetail" class="row-list"></div>
-          </aside>
-        </div>
-      </section>
-
-      <section id="proactive" class="panel">
-        <div class="hero">
-          <h1>主动消息中心</h1>
-          <button id="triggerSchedulerBtn" class="primary">模拟触发</button>
-        </div>
-        <div class="page-grid">
-          <section class="card">
-            <div class="card-head">
-              <h2>决策时间线</h2>
-              <span id="proactiveBadge" class="status">读取中</span>
-            </div>
-            <div id="proactiveList" class="row-list"></div>
-          </section>
-          <aside class="card">
-            <h2>发送规则</h2>
-            <div class="metric-grid two">
-              <div class="metric"><span>每日上限</span><strong id="maxDailyProactiveText">--</strong></div>
-              <div class="metric"><span>今日已发</span><strong id="messagesTodayText">--</strong></div>
-              <div class="metric"><span>最小间隔</span><strong id="minIntervalText">--</strong></div>
-              <div class="metric"><span>最大间隔</span><strong id="maxIntervalText">--</strong></div>
-            </div>
-            <div id="topicPanel" class="row-list"></div>
-            <button id="closeTopicBtn">关闭当前话题</button>
-          </aside>
-        </div>
-        <div class="page-grid" style="margin-top: 12px;">
-          <section class="card">
-            <div class="card-head">
-              <h2>粘人追问 · Clingy</h2>
-              <span id="clingyBadge" class="status">读取中</span>
-            </div>
-            <div id="clingyPanel" class="row-list"></div>
-          </section>
-          <aside class="card">
-            <h2>调试</h2>
-            <div class="form-actions">
-              <button id="primeClingyBtn">设等待</button>
-              <button id="simulateClingyBtn">模拟粘人检查</button>
-              <button id="forceClingyBtn" class="primary">强制触发粘人</button>
-            </div>
-            <pre id="clingySimulateResult" class="log-block" style="max-height:200px;margin-top:8px;"></pre>
-            <pre id="clingyForceResult" class="log-block" style="max-height:80px;margin-top:4px;"></pre>
-          </aside>
+          <section class="card"><div id="chatFeed" class="chat-feed"></div></section>
+          <aside class="card sticky-card"><h2>本轮详情</h2><div id="turnDetail" class="row-list"></div></aside>
         </div>
       </section>
 
@@ -161,10 +99,7 @@
         </div>
         <div class="page-grid">
           <section class="card">
-            <div class="card-head">
-              <h2>最近记忆</h2>
-              <button id="importMemoryBtn">导入</button>
-            </div>
+            <div class="card-head"><h2>最近记忆</h2><button id="importMemoryBtn">导入</button></div>
             <div class="import-row">
               <input id="memoryFile" type="file" accept=".zip,.json,.md,.txt,application/zip,application/json,text/markdown,text/plain">
               <label><input id="clearBeforeImport" type="checkbox"> 导入前清空</label>
@@ -172,114 +107,32 @@
             <p id="memoryImportHint" class="hint"></p>
             <div id="memoryList" class="row-list"></div>
           </section>
-          <aside class="card">
-            <h2>摘要与共享事实</h2>
-            <div id="recapList" class="row-list"></div>
-          </aside>
+          <aside class="card"><h2>摘要与共享事实</h2><div id="recapList" class="row-list"></div></aside>
         </div>
       </section>
 
       <section id="settings" class="panel">
         <div id="settingsHome" class="settings-view active">
-          <div class="hero">
-            <h1>设置</h1>
-          </div>
+          <div class="hero"><h1>设置</h1></div>
           <div class="settings-grid">
-            <button class="settings-entry" data-settings-view="personaSettings">
-              <strong>人设提示词</strong>
-              <span>单独编辑角色底层提示词</span>
-            </button>
-            <button class="settings-entry" data-settings-view="schedulerSettings">
-              <strong>主动消息</strong>
-              <span>频率、上限、免打扰和扫描间隔</span>
-            </button>
-            <button class="settings-entry" data-settings-view="clingySettings">
-              <strong>粘人追问</strong>
-              <span>未回复追问、触发延迟和上限</span>
-            </button>
-            <button class="settings-entry" data-settings-view="toolsSettings">
-              <strong>微信与工具</strong>
-              <span>消息延迟、连发缓冲、天气工具</span>
-            </button>
-            <button class="settings-entry" data-settings-view="emailSettings">
-              <strong>邮箱</strong>
-              <span>SMTP 与默认收件人</span>
-            </button>
-            <button class="settings-entry" data-settings-view="manualSettings">
-              <strong>手动发送与任务</strong>
-              <span>向最近联系人发送消息，查看定时任务</span>
-            </button>
-            <button class="settings-entry" data-settings-view="accountSettings">
-              <strong>账号</strong>
-              <span>退出当前后台会话</span>
-            </button>
+            <button class="settings-entry" data-settings-view="personaSettings"><strong>人设提示词</strong><span>编辑角色底层提示词</span></button>
+            <button class="settings-entry" data-settings-view="toolsSettings"><strong>微信与工具</strong><span>消息延迟、缓冲、天气工具</span></button>
+            <button class="settings-entry" data-settings-view="emailSettings"><strong>邮箱</strong><span>SMTP 与默认收件人</span></button>
+            <button class="settings-entry" data-settings-view="manualSettings"><strong>手动发送</strong><span>向最近联系人立即发送消息</span></button>
+            <button class="settings-entry" data-settings-view="accountSettings"><strong>账号</strong><span>退出当前后台会话</span></button>
           </div>
         </div>
 
         <div id="personaSettings" class="settings-view">
-          <div class="sub-hero">
-            <button class="back-settings">← 返回设置</button>
-            <h1>人设提示词</h1>
-          </div>
+          <div class="sub-hero"><button class="back-settings">← 返回设置</button><h1>人设提示词</h1></div>
           <section class="card">
-            <label class="field">
-              <textarea id="personaText" spellcheck="false"></textarea>
-            </label>
-            <div class="form-actions">
-              <button id="savePersonaBtn" class="primary">保存人设</button>
-            </div>
-          </section>
-        </div>
-
-        <div id="schedulerSettings" class="settings-view">
-          <div class="sub-hero">
-            <button class="back-settings">← 返回设置</button>
-            <h1>主动消息 · Proactive</h1>
-          </div>
-          <section class="card">
-            <div class="form-grid two-col">
-              <label class="field"><span>主动消息</span><select id="schedulerEnabled"><option value="true">启用</option><option value="false">关闭</option></select></label>
-              <label class="field"><span>检查间隔</span><input id="intervalMinutes" type="number" min="1" max="1440"></label>
-              <label class="field"><span>最小主动间隔</span><input id="minProactiveInterval" type="number" min="1" max="1440"></label>
-              <label class="field"><span>最大主动间隔</span><input id="maxProactiveInterval" type="number" min="1" max="1440"></label>
-              <label class="field"><span>每日上限</span><input id="maxDailyProactive" type="number" min="0" max="50"></label>
-              <label class="field"><span>定时任务扫描</span><input id="scheduledCheckSeconds" type="number" min="2" max="300"></label>
-              <label class="field"><span>免打扰时段</span><select id="quietHoursEnabled"><option value="true">启用</option><option value="false">关闭</option></select></label>
-              <label class="field"><span>免打扰开始</span><input id="sleepStart" type="number" min="0" max="23"></label>
-              <label class="field"><span>免打扰结束</span><input id="sleepEnd" type="number" min="0" max="23"></label>
-            </div>
-            <div class="form-actions">
-              <button id="saveSchedulerBtn" class="primary">保存主动设置</button>
-            </div>
-          </section>
-        </div>
-
-        <div id="clingySettings" class="settings-view">
-          <div class="sub-hero">
-            <button class="back-settings">← 返回设置</button>
-            <h1>粘人追问 · Clingy Followup</h1>
-          </div>
-          <section class="card">
-            <div class="form-grid two-col">
-              <label class="field"><span>粘人模式</span><select id="clingyEnabled"><option value="true">启用</option><option value="false">关闭</option></select></label>
-              <label class="field"><span>等待分钟后追问</span><input id="clingyAfterMinutes" type="number" min="1" max="1440"></label>
-              <label class="field"><span>每次未回复最多追问</span><input id="clingyMaxFollowups" type="number" min="1" max="10"></label>
-              <label class="field"><span>追问间隔冷却</span><input id="clingyCooldownMinutes" type="number" min="1" max="1440"></label>
-              <label class="field"><span>粘人每日上限</span><input id="clingyDailyCap" type="number" min="0" max="20"></label>
-              <label class="field"><span>遵守免打扰</span><select id="clingyRespectQuietHours"><option value="true">遵守</option><option value="false">不遵守</option></select></label>
-              <label class="field"><span>调试强制触发</span><select id="clingyDebugForce"><option value="true">允许</option><option value="false">关闭</option></select></label>
-            </div>
-            <div class="form-actions">
-              <button id="saveClingyBtn" class="primary">保存粘人设置</button>
-            </div>
+            <label class="field"><textarea id="personaText" spellcheck="false"></textarea></label>
+            <div class="form-actions"><button id="savePersonaBtn" class="primary">保存人设</button></div>
           </section>
         </div>
 
         <div id="toolsSettings" class="settings-view">
-          <div class="sub-hero">
-            <button class="back-settings">← 返回设置</button>
-            <h1>微信与工具</h1>
-          </div>
+          <div class="sub-hero"><button class="back-settings">← 返回设置</button><h1>微信与工具</h1></div>
           <section class="card">
             <div class="form-grid two-col">
               <label class="field"><span>微信消息最小间隔</span><input id="messageDelay" type="number" min="0.2" max="10" step="0.1"></label>
@@ -290,17 +143,12 @@
               <label class="field"><span>天气超时</span><input id="weatherTimeout" type="number" min="1" max="20" step="0.5"></label>
               <label class="field"><span>天气缓存</span><input id="weatherCache" type="number" min="0" max="86400"></label>
             </div>
-            <div class="form-actions">
-              <button id="saveToolsBtn" class="primary">保存工具设置</button>
-            </div>
+            <div class="form-actions"><button id="saveToolsBtn" class="primary">保存工具设置</button></div>
           </section>
         </div>
 
         <div id="emailSettings" class="settings-view">
-          <div class="sub-hero">
-            <button class="back-settings">← 返回设置</button>
-            <h1>邮箱</h1>
-          </div>
+          <div class="sub-hero"><button class="back-settings">← 返回设置</button><h1>邮箱</h1></div>
           <section class="card">
             <div class="form-grid two-col">
               <label class="field"><span>邮箱工具</span><select id="emailEnabled"><option value="true">启用</option><option value="false">关闭</option></select></label>
@@ -310,81 +158,22 @@
               <label class="field"><span>发件人</span><input id="emailFrom" autocomplete="off"></label>
               <label class="field"><span>默认收件人</span><input id="emailDefaultTo" autocomplete="off"></label>
             </div>
-            <div class="form-actions">
-              <button id="saveEmailBtn" class="primary">保存邮箱设置</button>
-            </div>
+            <div class="form-actions"><button id="saveEmailBtn" class="primary">保存邮箱设置</button></div>
           </section>
         </div>
 
         <div id="manualSettings" class="settings-view">
-          <div class="sub-hero">
-            <button class="back-settings">← 返回设置</button>
-            <h1>手动发送与任务</h1>
-          </div>
+          <div class="sub-hero"><button class="back-settings">← 返回设置</button><h1>手动发送</h1></div>
           <section class="card">
             <label class="field"><textarea id="manualText" placeholder="发给最近一次微信联系人"></textarea></label>
-            <div class="hero-actions">
-              <button id="manualSendBtn" class="primary">发送</button>
-              <button id="loadTasksBtn">刷新任务</button>
-            </div>
+            <div class="hero-actions"><button id="manualSendBtn" class="primary">发送</button></div>
             <p id="sendHint" class="hint"></p>
-            <div id="taskList" class="row-list"></div>
           </section>
         </div>
 
         <div id="accountSettings" class="settings-view">
-          <div class="sub-hero">
-            <button class="back-settings">← 返回设置</button>
-            <h1>账号</h1>
-          </div>
-          <section class="card">
-            <button id="logoutBtn" class="danger">退出登录</button>
-          </section>
-        </div>
-      </section>
-
-      <section id="emotion" class="panel">
-        <div class="hero">
-          <h1>情绪 / 对话状态</h1>
-          <button id="emotionRefreshBtn" class="primary">刷新</button>
-        </div>
-        <div class="card-grid">
-          <div class="card">
-            <h3>情绪状态</h3>
-            <div id="emotionStateView" class="kv-list">加载中...</div>
-          </div>
-          <div class="card">
-            <h3>对话状态</h3>
-            <div id="dialogueStateView" class="kv-list">加载中...</div>
-          </div>
-        </div>
-        <div class="card-grid">
-          <div class="card">
-            <h3>手动调整情绪</h3>
-            <div class="form-row">
-              <label>心情 <select id="emoMoodSelect"><option value="calm">平静</option><option value="cold">冷淡</option><option value="warm">温暖</option><option value="playful">调皮</option><option value="jealous">吃醋</option><option value="lonely">孤独</option><option value="hurt">受伤</option><option value="irritated">烦躁</option><option value="angry">生气</option><option value="softened">软化</option></select></label>
-              <label>好感 <input id="emoAffection" type="number" min="0" max="100" size="4"></label>
-              <label>信任 <input id="emoTrust" type="number" min="0" max="100" size="4"></label>
-              <label>激怒 <input id="emoIrritation" type="number" min="0" max="100" size="4"></label>
-              <button id="emoUpdateBtn">更新情绪</button>
-              <button id="emoResetBtn" class="danger">重置</button>
-            </div>
-          </div>
-          <div class="card">
-            <h3>手动调整对话</h3>
-            <div class="form-row">
-              <label>状态 <select id="dsWaitSelect"><option value="none">正常</option><option value="assistant_waiting_user">等待Bot</option><option value="user_waiting_assistant">等待用户</option><option value="bot_silent">Bot沉默</option><option value="topic_closed">话题结束</option><option value="paused_by_user">用户暂停</option></select></label>
-              <button id="dsForceReplyBtn">强制进入等待Bot</button>
-              <button id="dsBreakSilenceBtn">解除沉默</button>
-              <button id="dsPauseProactiveBtn">暂停主动消息</button>
-              <button id="dsUpdateBtn">更新状态</button>
-              <button id="dsResetBtn" class="danger">重置</button>
-            </div>
-          </div>
-        </div>
-        <div class="card-grid">
-          <div class="card"><h3>最近情绪事件</h3><div id="emotionEventsView">--</div></div>
-          <div class="card"><h3>最近对话事件</h3><div id="dialogueEventsView">--</div></div>
+          <div class="sub-hero"><button class="back-settings">← 返回设置</button><h1>账号</h1></div>
+          <section class="card"><button id="logoutBtn" class="danger">退出登录</button></section>
         </div>
       </section>
 
@@ -398,15 +187,8 @@
           </div>
         </div>
         <div class="page-grid">
-          <section class="card">
-            <h2>中文摘要</h2>
-            <div id="logSummary" class="row-list"></div>
-          </section>
-          <aside class="card">
-            <h2>原始日志</h2>
-            <p id="logMeta" class="hint"></p>
-            <div id="logConsole" class="log-console" role="log" aria-live="polite"></div>
-          </aside>
+          <section class="card"><h2>摘要</h2><div id="logSummary" class="row-list"></div></section>
+          <aside class="card"><h2>原始日志</h2><p id="logMeta" class="hint"></p><div id="logConsole" class="log-console" role="log" aria-live="polite"></div></aside>
         </div>
       </section>
     </div>
@@ -414,15 +196,13 @@
     <nav class="mobile-nav" aria-label="移动导航">
       <button class="mobile-item active" data-tab="overview">总览</button>
       <button class="mobile-item" data-tab="chat">聊天</button>
-      <button class="mobile-item" data-tab="proactive">主动</button>
       <button class="mobile-item" data-tab="memory">记忆</button>
       <button class="mobile-item" data-tab="settings">设置</button>
-      <button class="mobile-item" data-tab="emotion">情绪</button>
       <button class="mobile-item" data-tab="logs">日志</button>
     </nav>
   </main>
 
   <div id="toast" class="toast" hidden></div>
-  <script src="/static/admin.js?v=wechat-20260526-5"></script>
+  <script src="/static/admin.js?v=cleanup-20260529"></script>
 </body>
 </html>

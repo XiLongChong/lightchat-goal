@@ -302,15 +302,10 @@ def test_chat_auth_disabled_allows_request_without_key(monkeypatch):
     client, main = _client_auth_disabled(monkeypatch)
 
     # Mock the heavy processing chain that runs after auth
-    # Use monkeypatch.setattr so mocks are cleaned up after the test,
-    # preventing contamination of admin/emotion API tests that rely on
-    # the real memory_store methods (get_bot_emotion_state, get_dialogue_state, etc.)
     monkeypatch.setattr(main.memory_store, "search_bot", AsyncMock(return_value=[]))
     monkeypatch.setattr(main.memory_store, "get_relationship_bot", AsyncMock(return_value={}))
     monkeypatch.setattr(main.memory_store, "get_history_summary", AsyncMock(return_value=""))
     monkeypatch.setattr(main.memory_store, "get_latest_recap", AsyncMock(return_value=None))
-    monkeypatch.setattr(main.memory_store, "get_bot_emotion_state", AsyncMock(return_value={}))
-    monkeypatch.setattr(main.memory_store, "get_dialogue_state", AsyncMock(return_value={}))
     monkeypatch.setattr(main.memory_store, "record_usage_event", AsyncMock())
     monkeypatch.setattr(main.chat_agent, "chat", AsyncMock(return_value={
         "messages": [{"text": "ok", "delay": 0}],
@@ -340,8 +335,6 @@ def test_chat_auth_correct_key_passes_auth_gate(monkeypatch):
     monkeypatch.setattr(main.memory_store, "get_relationship_bot", AsyncMock(return_value={}))
     monkeypatch.setattr(main.memory_store, "get_history_summary", AsyncMock(return_value=""))
     monkeypatch.setattr(main.memory_store, "get_latest_recap", AsyncMock(return_value=None))
-    monkeypatch.setattr(main.memory_store, "get_bot_emotion_state", AsyncMock(return_value={}))
-    monkeypatch.setattr(main.memory_store, "get_dialogue_state", AsyncMock(return_value={}))
     monkeypatch.setattr(main.memory_store, "record_usage_event", AsyncMock())
     monkeypatch.setattr(main.chat_agent, "chat", AsyncMock(return_value={
         "messages": [{"text": "ok", "delay": 0}],
@@ -370,8 +363,6 @@ def test_chat_auth_x_api_key_header_also_works(monkeypatch):
     monkeypatch.setattr(main.memory_store, "get_relationship_bot", AsyncMock(return_value={}))
     monkeypatch.setattr(main.memory_store, "get_history_summary", AsyncMock(return_value=""))
     monkeypatch.setattr(main.memory_store, "get_latest_recap", AsyncMock(return_value=None))
-    monkeypatch.setattr(main.memory_store, "get_bot_emotion_state", AsyncMock(return_value={}))
-    monkeypatch.setattr(main.memory_store, "get_dialogue_state", AsyncMock(return_value={}))
     monkeypatch.setattr(main.memory_store, "record_usage_event", AsyncMock())
     monkeypatch.setattr(main.chat_agent, "chat", AsyncMock(return_value={
         "messages": [{"text": "ok", "delay": 0}],

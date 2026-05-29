@@ -1,19 +1,14 @@
-"""Tool whitelist and execution — Safeguard #4.
+"""Tool implementations — v0.2 Phase 1.
 
-Only tools listed in TOOL_WHITELIST can be invoked.
-All arguments are validated and sanitized before execution.
-
-Phase 4B: Action/Tool boundary split into ActionRegistry / ToolRegistry.
-Legacy TOOL_DEFINITIONS and TOOL_WHITELIST are kept for backward compat.
+Fact tools: get_time, get_weather.
+Terminal tools (send_wechat_messages, skip_reply) are handled by the state machine.
+Dead tools removed: send_email, search_memory, read_persona_file, propose_persona_change.
 """
 
-import asyncio
 import json
 import logging
-import smtplib
 import time
 from datetime import datetime
-from email.message import EmailMessage
 from pathlib import Path
 from urllib.parse import quote
 from typing import Any
@@ -22,7 +17,6 @@ import httpx
 import pytz
 
 from agent.tool_registry import (
-    ACTION_REGISTRY,
     TOOL_REGISTRY,
     get_all_tool_names,
     is_action,
@@ -31,7 +25,7 @@ from agent.tool_registry import (
 
 
 # ================================================================
-# Whitelist — backward-compatible with Phase 4B registries
+# Whitelist
 # ================================================================
 
 TOOL_WHITELIST = get_all_tool_names()
@@ -39,15 +33,13 @@ TOOL_WHITELIST = get_all_tool_names()
 # Backward-compat: rebuild TOOL_DEFINITIONS from registries
 def _build_legacy_definitions() -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
-    for a in ACTION_REGISTRY.iter_defs():
-        result[a.name] = {"description": a.description, "args": list(a.args_schema)}
     for t in TOOL_REGISTRY.iter_defs():
         result[t.name] = {"description": t.description, "args": list(t.args_schema)}
     return result
 
 TOOL_DEFINITIONS = _build_legacy_definitions()
 TOOL_RUNTIME_CONFIG: dict[str, Any] = {}
-TOOL_RUNTIME_CONFIG["_current_bot_id"] = ""  # default
+TOOL_RUNTIME_CONFIG["_current_bot_id"] = ""
 _WEATHER_CACHE: dict[str, tuple[float, str]] = {}
 logger = logging.getLogger(__name__)
 
@@ -129,54 +121,40 @@ async def _get_weather(city: str = "") -> str:
         return f"天气查询出错：{e}"
 
 
-async def _send_email(
-    to: str = "",
-    subject: str = "",
-    body: str = "",
-) -> str:
-    """Send email through configured SMTP."""
-    email_cfg = TOOL_RUNTIME_CONFIG.get("email", {})
-    if not _as_bool(email_cfg.get("enabled", False)):
-        return "邮件功能未启用"
+# ================================================================
+# send_wechat_messages -- delay computation
+# ================================================================
 
-    host = str(email_cfg.get("smtp_host", "")).strip()
-    port = int(email_cfg.get("smtp_port", 465) or 465)
-    username = str(email_cfg.get("username", "")).strip()
-    password = str(email_cfg.get("password", "")).strip()
-    from_addr = str(email_cfg.get("from_addr", username)).strip()
-    default_to = str(email_cfg.get("default_to", "")).strip()
-    use_ssl = _as_bool(email_cfg.get("use_ssl", True))
-    use_starttls = _as_bool(email_cfg.get("use_starttls", False))
+def compute_message_delay(index: int, text: str, total: int, test_mode: bool = False) -> float:
+    """Compute natural-feeling delay between WeChat messages.
 
-    to_addr = str(to or default_to).strip()[:200]
-    subject = str(subject or "来自 bot 的邮件").strip()[:200]
-    body = str(body or "").strip()[:5000]
+    Args:
+        index: 0-based position in the message batch
+        text: the message content
+        total: total number of messages in the batch
+        test_mode: if True, return 0 delay for fast tests
 
-    if not host or not from_addr or not to_addr:
-        return "邮件配置不完整"
-    if not body:
-        return "邮件正文为空，未发送"
+    Rules:
+        - First message (index 0): 0.3-0.7s
+        - Subsequent short messages (<60 chars): 0.8-1.6s
+        - Subsequent longer messages: 1.5-3.0s
+        - Light jitter applied in production mode
+    """
+    import random as _random
 
-    def send_blocking():
-        msg = EmailMessage()
-        msg["From"] = from_addr
-        msg["To"] = to_addr
-        msg["Subject"] = subject
-        msg.set_content(body)
+    if test_mode:
+        return 0.0
 
-        smtp_cls = smtplib.SMTP_SSL if use_ssl else smtplib.SMTP
-        with smtp_cls(host, port, timeout=15) as smtp:
-            if use_starttls and not use_ssl:
-                smtp.starttls()
-            if username and password:
-                smtp.login(username, password)
-            smtp.send_message(msg)
+    text_len = len(str(text or ""))
 
-    try:
-        await asyncio.to_thread(send_blocking)
-        return f"邮件已发送给 {to_addr}"
-    except Exception as e:
-        return f"邮件发送失败：{e}"
+    if index == 0:
+        base = 0.3 + _random.random() * 0.4
+    elif text_len < 60:
+        base = 0.8 + _random.random() * 0.8
+    else:
+        base = 1.5 + _random.random() * 1.5
+
+    return round(base, 2)
 
 
 # ================================================================
@@ -186,28 +164,20 @@ async def _send_email(
 async def execute_tool(name: str, args: dict[str, Any] | None, bot_id: str = "") -> str:
     """Execute a tool by name. Returns result string.
 
-    Safeguard #4: only whitelisted tools can run.
-    All arguments are sanitized before execution.
-
-    Phase 4B: uses ActionRegistry + ToolRegistry for classification.
-    Internal actions (wechat_reply, schedule_wechat_message) are
-    intercepted by chat_agent before reaching here.
+    v0.2 Phase 1: only fact tools (get_time, get_weather) are dispatched here.
+    Terminal tools (send_wechat_messages, skip_reply) are handled by the state machine.
     """
-    # Store current bot_id for tools that need bot-scoped access
     TOOL_RUNTIME_CONFIG["_current_bot_id"] = bot_id
-
-    if name not in TOOL_WHITELIST:
-        return f"[工具 '{name}' 不在可用列表中]"
 
     args = args or {}
 
-    # Internal actions — should be intercepted by chat_agent.
-    # If they reach here, return a safe no-op result.
     if is_action(name):
         logger.debug("execute_tool: internal action %s reached executor (no-op)", name)
         return "已处理"
 
-    # Verify this is a registered external tool
+    if name not in TOOL_WHITELIST:
+        return f"[工具 '{name}' 不在可用列表中]"
+
     if not is_external_tool(name):
         logger.warning("execute_tool: unknown tool %s rejected", name)
         return f"[未知工具: {name}]"
@@ -220,65 +190,7 @@ async def execute_tool(name: str, args: dict[str, Any] | None, bot_id: str = "")
         city = str(args.get("city", ""))[:50]
         return await _get_weather(city)
 
-    if name == "search_memory":
-        store = TOOL_RUNTIME_CONFIG.get("_memory_store")
-        if store is None:
-            return "记忆系统未连接"
-        query = str(args.get("query", "")).strip()[:500]
-        top_k = int(args.get("top_k", 5) or 5)
-        top_k = max(1, min(8, top_k))
-        if not query:
-            return "请提供要搜索的记忆关键词"
-        bot_id = TOOL_RUNTIME_CONFIG.get("_current_bot_id", "")
-        if not bot_id:
-            logger.warning("search_memory: bot_id is empty — returning empty results (no global fallback)")
-            return json.dumps({"memories": [], "error": "bot_id required for search_memory"}, ensure_ascii=False)
-        memories = await store.search_bot(query, bot_id=bot_id, top_k=top_k, include_shared=False)
-        if not memories:
-            return "没有找到相关记忆"
-        lines = []
-        for i, memory in enumerate(memories, 1):
-            lines.append(f"{i}. [{memory.get('category', 'other')}] {memory.get('content', '')}")
-        return "\n".join(lines)[:2000]
-
-    if name == "read_persona_file":
-        path = _persona_path()
-        try:
-            return path.read_text(encoding="utf-8")[:4000]
-        except FileNotFoundError:
-            return "人设文件不存在"
-        except Exception as e:
-            return f"读取人设文件失败：{e}"
-
-    if name == "propose_persona_change":
-        store = TOOL_RUNTIME_CONFIG.get("_memory_store")
-        if store is None:
-            return "确认系统未连接，无法提交修改草案"
-        content = str(args.get("content", "")).strip()
-        reason = str(args.get("reason", "")).strip()[:300]
-        if not content:
-            return "修改草案为空，未提交"
-        await store.set_pending_persona_change(content=content, reason=reason)
-        return "已提交人设修改草案，等待用户在微信回复“确认/保存/可以”后写入"
-
-    if name == "send_email":
-        return await _send_email(
-            to=str(args.get("to", "")),
-            subject=str(args.get("subject", "")),
-            body=str(args.get("body", "")),
-        )
-
     return f"[未知工具: {name}]"
-
-
-def _persona_path() -> Path:
-    agent_cfg = TOOL_RUNTIME_CONFIG.get("agent", {})
-    configured = Path(agent_cfg.get("persona_file", "./prompts/persona.md"))
-    root = Path.cwd().resolve()
-    path = (root / configured).resolve() if not configured.is_absolute() else configured.resolve()
-    if root not in path.parents and path != root:
-        raise ValueError("persona_file must stay inside project root")
-    return path
 
 
 def _default_weather_city() -> str:

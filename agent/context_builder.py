@@ -114,14 +114,12 @@ def build_system_prompt_v21(
     defaults: dict[str, Any] | None = None,
     history_summary: str = "",
     recap: str = "",
-    emotion_inject: str = "",
 ) -> str:
     """Build system prompt from bot's prompt pack components.
 
     V2.1: delegates to BotProfileManager.build_system_prompt,
     which assembles from base_protocol, bot_identity, relationship_context,
     memory_policy, tool_policy, and trigger_context components.
-    V2.2: accepts emotion_inject for emotion-aware chat.
     """
     return bot_manager.build_system_prompt(
         bot_id=bot_id,
@@ -133,7 +131,6 @@ def build_system_prompt_v21(
         defaults=defaults,
         history_summary=history_summary,
         recap=recap,
-        emotion_inject=emotion_inject,
     )
 
 
@@ -194,6 +191,79 @@ def compact_history(
             compacted.append({"role": "assistant", "content": t["assistant"]})
 
     return compacted, summary
+
+
+def build_chat_system_prompt(
+    persona: str,
+    personality: str = "",
+    default_city: str = "",
+    tool_names: list[str] | None = None,
+) -> str:
+    """Phase 1: Build a minimal chat system prompt.
+
+    Only includes persona, time, and tools.
+    No memory_policy, relationship_context, recap, or multi-bot components.
+    """
+    from datetime import datetime
+
+    now = datetime.now().strftime("%Y年%m月%d日 %H:%M 周%u")
+    tool_list = ", ".join(tool_names) if tool_names else "send_wechat_messages, get_time, get_weather"
+
+    sections = [
+        persona,
+        personality if personality else "",
+        f"当前时间：{now}",
+    ]
+
+    if default_city:
+        sections.append(
+            f"用户默认天气城市：{default_city}。"
+            "用户只问天气时，直接查这个城市，不要反问。"
+        )
+
+    sections.append(
+        f"可用工具：{tool_list}\n"
+    )
+
+    # Add base protocol from prompts/ if available
+    protocol = _read_prompt_component("base_protocol")
+    if protocol:
+        sections.append(protocol)
+
+    # Add tool policy from prompts/ if available
+    tool_policy = _read_prompt_component("tool_policy")
+    if tool_policy:
+        sections.append(tool_policy)
+
+    return "\n\n".join(s.strip() for s in sections if s.strip())
+
+
+def _read_prompt_component(name: str) -> str:
+    """Read a prompt component from prompts/ directory. Returns '' if missing."""
+    from pathlib import Path
+    path = Path("prompts") / f"{name}.md"
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+        # Filter out sections that reference disabled features
+        lines = text.split("\n")
+        filtered: list[str] = []
+        skip_block = False
+        for line in lines:
+            stripped = line.strip().lower()
+            if any(kw in stripped for kw in (
+                "search_memory", "## other managed tools",
+                "send_email", "schedule_wechat_message",
+                "proactive", "emotion", "multi-bot",
+            )):
+                skip_block = True
+                continue
+            if skip_block and stripped.startswith("##"):
+                skip_block = False
+            if not skip_block:
+                filtered.append(line)
+        return "\n".join(filtered)
+    except Exception:
+        return ""
 
 
 def build_chat_messages(

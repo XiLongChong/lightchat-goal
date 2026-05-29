@@ -76,11 +76,14 @@ class MemoryStore:
     SQLite WAL mode allows concurrent reads during writes.
     """
 
+    _instances: set["MemoryStore"] = set()
+
     def __init__(self, db_path: str = "./data/memory.db"):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = asyncio.Lock()
         self._db: aiosqlite.Connection | None = None
+        self._instances.add(self)
 
     async def _get_db(self) -> aiosqlite.Connection:
         if self._db is None:
@@ -560,6 +563,12 @@ class MemoryStore:
         if self._db:
             await self._db.close()
             self._db = None
+        self._instances.discard(self)
+
+    @classmethod
+    async def close_all(cls):
+        for store in list(cls._instances):
+            await store.close()
 
     async def save_llm_trace(self, trace: dict) -> int | None:
         """Persist an LLM gateway trace record.
@@ -1272,15 +1281,19 @@ class MemoryStore:
         limit: int = 40,
         bot_id: str = "",
     ) -> list[dict[str, Any]]:
-        """Load recent raw messages in chronological order, scoped by bot."""
+        """Load recent raw messages in chronological order, scoped by bot.
+
+        V7.5: ORDER BY ts DESC, id DESC ensures stable ordering when
+        multiple rows share the same ts value.
+        """
         if not user_id:
             return []
         db = await self._get_db()
         rows = await db.execute_fetchall(
-            """SELECT role, content, source, ts
+            """SELECT id, role, content, source, ts
                FROM conversation_history
                WHERE user_id = ? AND bot_id = ?
-               ORDER BY ts DESC
+               ORDER BY ts DESC, id DESC
                LIMIT ?""",
             (user_id, bot_id, max(1, int(limit))),
         )

@@ -31,7 +31,7 @@ def test_admin_events_endpoint_returns_dashboard_shape():
     assert response.status_code == 200
     payload = response.json()
     assert isinstance(payload["events"], list)
-    assert "proactive" in payload
+    assert "proactive" not in payload
     assert "memory" in payload
     assert "bot" in payload
 

@@ -195,9 +195,9 @@ def parse_agent_json_output(raw: str) -> dict[str, Any]:
 
 # Known action type/name fields across the project.
 # Compatible with: type="message", type="tool" + name="wechat_reply",
-# type="skip"/"no_reply", type="tool" + name="schedule_wechat_message", etc.
+# type="skip"/"no_reply", etc.
 _VALID_ACTION_TYPES = frozenset({"message", "tool", "skip", "no_reply"})
-_RUNTIME_TOOL_NAMES = frozenset({"wechat_reply", "schedule_wechat_message"})
+_RUNTIME_TOOL_NAMES = frozenset({"wechat_reply"})
 
 
 def validate_agent_output(parsed: dict[str, Any]) -> list[str]:
@@ -254,15 +254,6 @@ def validate_agent_output(parsed: dict[str, Any]) -> list[str]:
                 text = str(args.get("text", "")).strip() if isinstance(args, dict) else ""
                 if not text:
                     errors.append(f"schema_error: action[{i}]_wechat_reply_empty_text")
-
-            elif name == "schedule_wechat_message":
-                if isinstance(args, dict):
-                    delay = args.get("delay_minutes", args.get("minutes"))
-                    msgs = args.get("messages")
-                    if delay is None:
-                        errors.append(f"schema_error: action[{i}]_schedule_missing_delay")
-                    if msgs is None:
-                        errors.append(f"schema_error: action[{i}]_schedule_missing_messages")
 
         elif action_type in {"skip", "no_reply"}:
             pass  # valid, no further checks

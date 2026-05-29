@@ -1,9 +1,9 @@
-"""ActionRegistry and ToolRegistry — Phase 4B tool/action boundary.
+﻿"""ActionRegistry and ToolRegistry — Phase 4B tool/action boundary.
 
 Splits the legacy "工具" concept into two clear categories:
 
   ActionRegistry  — internal actions interpreted by the system
-                     (wechat_reply, schedule_wechat_message, skip)
+                     (wechat_reply, skip)
   ToolRegistry    — external tools executed by the backend
                      (get_time, get_weather, search_memory, send_email, …)
 
@@ -61,6 +61,7 @@ class ToolDef:
     side_effect_level: SideEffectLevel = "none"
     requires_confirmation: bool = False
     native_tool_call_eligible: bool = False
+    tool_category: str = "fact_tool"  # v0.2: fact_tool | terminal_tool | state_tool
     # Optional: runtime check before execution (e.g. SMTP configured)
     enabled_check: Callable[[], bool] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -195,32 +196,18 @@ TOOL_REGISTRY = ToolRegistry()
 
 
 def _build_default_registries() -> None:
-    """Populate the module-level registries with the current tool set."""
+    """Populate the module-level registries with the v0.2 Phase 1 tool set.
+
+    Only tools that are actively exposed to the model are registered.
+    Dead features (search_memory, send_email, read_persona_file,
+    propose_persona_change, wechat_reply, skip) are removed.
+    """
 
     # ── Internal actions ──────────────────────────────────────────
-    ACTION_REGISTRY.register(ActionDef(
-        name="wechat_reply",
-        description="回复微信消息。每次调用发一条消息给用户。可以多次调用来分段回复。text 是回复内容，delay 是发送前等待秒数",
-        args_schema=["text", "delay"],
-        side_effect_level="internal_message",
-        handler_type="internal",
-    ))
-    ACTION_REGISTRY.register(ActionDef(
-        name="schedule_wechat_message",
-        description="安排未来发送的微信消息。代码会持久化任务并在到期后逐条发送，重启后仍然有效",
-        args_schema=["delay_minutes", "messages"],
-        side_effect_level="medium",
-        handler_type="internal",
-    ))
-    ACTION_REGISTRY.register(ActionDef(
-        name="skip",
-        description="不回复当前消息，只在用户明确表示不需要回复或话题自然结束时使用",
-        args_schema=["reason"],
-        side_effect_level="none",
-        handler_type="internal",
-    ))
+    # v0.2: wechat_reply and skip are removed.
+    # ActionRegistry kept empty for future SYSTEM_HOOK needs.
 
-    # ── External tools ────────────────────────────────────────────
+    # ── Fact tools ────────────────────────────────────────────────
     TOOL_REGISTRY.register(ToolDef(
         name="get_time",
         description="获取指定时区的当前时间。默认返回中国时区 (Asia/Shanghai) 的时间",
@@ -235,6 +222,7 @@ def _build_default_registries() -> None:
         },
         side_effect_level="none",
         native_tool_call_eligible=True,
+        tool_category="fact_tool",
     ))
     TOOL_REGISTRY.register(ToolDef(
         name="get_weather",
@@ -250,43 +238,58 @@ def _build_default_registries() -> None:
         },
         side_effect_level="none",
         native_tool_call_eligible=True,
+        tool_category="fact_tool",
     ))
+
+    # ── Terminal tools ────────────────────────────────────────────
     TOOL_REGISTRY.register(ToolDef(
-        name="search_memory",
-        description="按需搜索长期记忆。只有需要过去事实、偏好、项目进展时调用；没有结果就不要编造",
-        args_schema=["query", "top_k"],
-        side_effect_level="none",
-        native_tool_call_eligible=False,  # involves memory strategy — keep JSON-action
-        # TODO(native-tools): evaluate search_memory only after bot-scoped
-        # context injection, rate limits, and overuse guards are designed.
-    ))
-    TOOL_REGISTRY.register(ToolDef(
-        name="read_persona_file",
-        description="读取当前人设文件原文。只能读配置允许的人设文件，不能读任意项目文件",
-        args_schema=[],
-        side_effect_level="low",
-        native_tool_call_eligible=False,  # internal management — keep JSON-action
-    ))
-    TOOL_REGISTRY.register(ToolDef(
-        name="propose_persona_change",
-        description="提出人设文件修改草案。不会直接写入，系统会发微信让用户确认后再改",
-        args_schema=["content", "reason"],
-        side_effect_level="low",
-        native_tool_call_eligible=False,  # confirmation flow — keep JSON-action
-    ))
-    TOOL_REGISTRY.register(ToolDef(
-        name="send_email",
-        description="发送邮件。需要系统已配置 SMTP。args: to, subject, body",
-        args_schema=["to", "subject", "body"],
-        side_effect_level="high",
-        requires_confirmation=True,
-        native_tool_call_eligible=False,  # high risk — must never be native tool call
-        metadata={
-            "todo": (
-                "TODO(safety): route send_email through draft/confirmation "
-                "flow before enabling broad autonomous use."
-            ),
+        name="send_wechat_messages",
+        description=(
+            "发送一条或多条微信消息给用户。messages 数组的每个元素是一条独立的微信消息气泡。"
+            "像真人聊天一样：简单回复可以只发 1 条，需要分段解释或表达情绪时可以发 2-4 条。"
+            "不要为了凑数量而拆分，也不要发重复内容。"
+        ),
+        args_schema={
+            "properties": {
+                "messages": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "微信消息数组，每个字符串是一条消息。最少 1 条，最多 12 条。",
+                    "minItems": 1,
+                    "maxItems": 12,
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["normal", "long", "short"],
+                    "description": "发送模式：normal=日常聊天, long=允许较长内容, short=短消息模式",
+                },
+            },
+            "required": ["messages"],
         },
+        side_effect_level="high",
+        requires_confirmation=False,
+        native_tool_call_eligible=True,
+        tool_category="terminal_tool",
+    ))
+    TOOL_REGISTRY.register(ToolDef(
+        name="skip_reply",
+        description=(
+            "明确决定不回复当前消息。仅在用户消息不需要回复时调用。"
+            "例如：用户说'晚安''好的''嗯''知道了'等自然结束对话的消息。"
+            "调用后本轮结束，不发送任何微信消息。"
+        ),
+        args_schema={
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "简短说明为什么不需要回复，如'用户说晚安，对话自然结束'",
+                },
+            },
+            "required": [],
+        },
+        side_effect_level="none",
+        native_tool_call_eligible=True,
+        tool_category="terminal_tool",
     ))
 
 
@@ -309,3 +312,4 @@ def is_action(name: str) -> bool:
 
 def is_external_tool(name: str) -> bool:
     return name in TOOL_REGISTRY
+
