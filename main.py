@@ -359,14 +359,17 @@ def build_system_prompt_for_turn() -> str:
         tool_names=tool_names,
     )
 
-# Phase 1: wechat_sender callback — sends messages via WeChat bridge
+# v0.2: wechat_sender callback — pure WeChat transport, no guard logic.
+# Messages arrive already guarded (by state machine GUARD_OUTPUT or
+# _send_message_batch guard_messages).  This callback only handles
+# transport: delay, send, status tracking.
 async def wechat_sender(user_id: str, context_token: str, messages: list[dict]) -> list[dict]:
     """Send messages through the WeChat bridge with delivery tracking.
 
     Args:
         user_id: WeChat user to send to
         context_token: iLink session token
-        messages: [{"text": str, "delay": float}, ...]
+        messages: [{"text": str, "delay": float}, ...] (already guarded upstream)
 
     Returns:
         Same messages with send_status added ("delivered" | "failed")
@@ -382,10 +385,10 @@ async def wechat_sender(user_id: str, context_token: str, messages: list[dict]) 
     max_reply_delay = float(wechat_cfg.get("max_reply_delay", 3.0) or 3.0)
 
     for i, m in enumerate(messages):
-        text = guard_single_message(str(m.get("text", "")))
+        text = str(m.get("text", "")).strip()
         if not text:
             m["send_status"] = "blocked"
-            m["send_error"] = "empty after guard"
+            m["send_error"] = "empty text"
             continue
 
         delay = max(0.0, float(m.get("delay", 0) or 0))

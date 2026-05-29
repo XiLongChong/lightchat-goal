@@ -68,16 +68,17 @@ def test_guard_single_message_blocks_empty():
     assert guard_single_message("") == ""
 
 
-def test_guard_single_message_unwraps_protocol():
+def test_guard_single_message_blocks_protocol_json():
+    """v0.2: protocol JSON is hard-blocked, not unwrapped."""
     leaked = '{"actions":[{"type":"tool","name":"wechat_reply","args":{"text":"nested reply"}}],"done":true}'
     issues = []
     result = guard_single_message(leaked, issues=issues)
-    assert result == "nested reply"
-    assert "protocol_text_unwrapped" in issues
+    assert result == "我刚刚卡了一下 重新说"
+    assert "protocol_text_blocked" in issues
 
 
 def test_guard_single_message_hard_fallback_for_bare_protocol():
-    # Protocol JSON with no extractable natural text
+    # Protocol JSON with no extractable natural text — still hard-blocked
     bare = '{"actions":[{"type":"tool","name":"get_weather","args":{"city":"beijing"}}],"done":true}'
     result = guard_single_message(bare)
     assert result == "我刚刚卡了一下 重新说"
@@ -111,9 +112,11 @@ def test_guard_messages_limits_count():
 
 
 def test_guard_messages_collects_issues():
+    """v0.2: protocol leaks are hard-blocked and collected in issues."""
     leaked = '{"actions":[{"type":"tool","name":"wechat_reply","args":{"text":"ok"}}],"done":true}'
     issues = []
     result = guard_messages([{"text": leaked, "delay": 0}], issues=issues)
     assert len(result) == 1
-    assert result[0]["text"] == "ok"
+    assert result[0]["text"] == "我刚刚卡了一下 重新说"
     assert len(issues) > 0
+    assert "protocol_text_blocked" in issues

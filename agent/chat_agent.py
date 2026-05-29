@@ -194,6 +194,9 @@ class ChatAgent:
         elif state == TurnState.EXEC_SEND_WECHAT:
             return await self._do_exec_send_wechat(turn, wechat_sender)
 
+        elif state == TurnState.SEND_RETRY_UNDELIVERED_ONLY:
+            return await self._do_send_retry(turn, wechat_sender)
+
         elif state == TurnState.DECIDE_SEND_TERMINAL:
             return self._do_decide_send_terminal(turn)
 
@@ -544,7 +547,11 @@ class ChatAgent:
     async def _do_exec_send_wechat(
         self, turn: TurnScratchpad, wechat_sender: WeChatSender | None,
     ) -> TurnState:
-        """EXEC_SEND_WECHAT: compute delays and send via wechat_sender callback."""
+        """EXEC_SEND_WECHAT: compute delays and send via wechat_sender callback.
+
+        Phase 2: sends the full batch.  If any messages fail, transitions to
+        SEND_RETRY_UNDELIVERED_ONLY for automatic retry (max 2 attempts).
+        """
         from agent.tools import compute_message_delay
 
         # Record tool result for diagnostics
@@ -560,14 +567,15 @@ class ChatAgent:
             turn.add_fallback_event("send_no_sender", "no wechat_sender callback")
             return TurnState.DECIDE_SEND_TERMINAL
 
-        # Compute delays
+        # Compute delays and tag each message with its index for retry merging
         total = len(turn.guarded_batch)
         for i, m in enumerate(turn.guarded_batch):
             m["delay"] = compute_message_delay(
                 i, m["text"], total, test_mode=self.test_mode,
             )
+            m["_idx"] = i  # transient: used for retry result merging
 
-        # Send (Phase 1: single attempt; Phase 2 will add retry loop)
+        # Send
         try:
             turn.sent_results = await wechat_sender(turn.guarded_batch)
             logger.info(
@@ -580,6 +588,57 @@ class ChatAgent:
             for m in turn.guarded_batch:
                 m["send_status"] = "failed"
             turn.sent_results = list(turn.guarded_batch)
+
+        # Check for undelivered → retry
+        undelivered = [r for r in turn.sent_results if r.get("send_status") != "delivered"]
+        if undelivered and turn.send_attempt < turn.max_send_retries:
+            return TurnState.SEND_RETRY_UNDELIVERED_ONLY
+
+        return TurnState.DECIDE_SEND_TERMINAL
+
+    async def _do_send_retry(
+        self, turn: TurnScratchpad, wechat_sender: WeChatSender | None,
+    ) -> TurnState:
+        """SEND_RETRY_UNDELIVERED_ONLY: retry only undelivered messages.
+
+        Does NOT re-invoke the model.  Sends the same text batch again.
+        Merges retry results back into sent_results by index.
+        """
+        if not wechat_sender:
+            turn.add_fallback_event("send_retry_no_sender", "cannot retry without sender")
+            return TurnState.DECIDE_SEND_TERMINAL
+
+        # Collect undelivered messages with their original indices
+        undelivered: list[dict[str, Any]] = []
+        for r in turn.sent_results:
+            if r.get("send_status") != "delivered":
+                undelivered.append({"text": r["text"], "delay": r.get("delay", 0), "_idx": r.get("_idx")})
+
+        if not undelivered:
+            return TurnState.DECIDE_SEND_TERMINAL
+
+        turn.send_attempt += 1
+        turn.add_fallback_event(
+            "send_retry_attempt",
+            f"retrying {len(undelivered)} undelivered messages (attempt {turn.send_attempt})",
+        )
+        logger.info(
+            "state_machine: send_retry attempt=%d undelivered=%d",
+            turn.send_attempt, len(undelivered),
+        )
+
+        try:
+            retry_results = await wechat_sender(undelivered)
+        except Exception as e:
+            logger.error("state_machine: send_retry failed: %s", e)
+            turn.add_fallback_event("send_retry_error", str(e)[:200])
+            return TurnState.DECIDE_SEND_TERMINAL
+
+        # Merge retry results back by index
+        for rr in retry_results:
+            idx = rr.get("_idx")
+            if idx is not None and idx < len(turn.sent_results):
+                turn.sent_results[idx] = rr
 
         return TurnState.DECIDE_SEND_TERMINAL
 

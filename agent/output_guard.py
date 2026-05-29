@@ -136,21 +136,14 @@ def guard_single_message(text: str, issues: list[str] | None = None) -> str:
             issues.append("tool_call_id_blocked")
         return HARD_FALLBACK_TEXT
 
-    # Step 1-2: Protocol leak detection + nested unwrap
-    if _looks_like_protocol_json(text):
-        extracted = _unwrap_nested_protocol(text)
-        if extracted:
-            logger.warning("output_guard: unwrapped nested protocol JSON")
-            if issues is not None:
-                issues.append("protocol_text_unwrapped")
-            text = extracted
-        else:
-            logger.warning("output_guard: blocked unrecoverable protocol JSON leak")
-            if issues is not None:
-                issues.append("protocol_text_blocked")
-            return HARD_FALLBACK_TEXT
+    # Step 1: Protocol leak detection (v0.2: no JSON unwrap — leaks are hard-blocked)
+    if _has_protocol_leak(text):
+        logger.warning("output_guard: blocked protocol leak in: %s", text[:80])
+        if issues is not None:
+            issues.append("protocol_text_blocked")
+        return HARD_FALLBACK_TEXT
 
-    # Step 3: Empty reply fallback (after unwrap, text might be empty)
+    # Step 2: Empty reply fallback
     if not text.strip():
         return HARD_FALLBACK_TEXT
 
@@ -335,12 +328,13 @@ _PROTOCOL_LEAK_PATTERNS: list[re.Pattern] = [
     re.compile(r'system_prompt|base_protocol|tool_policy|memory_policy', re.IGNORECASE),
     re.compile(r'You are a (?:long-term )?WeChat', re.IGNORECASE),
     re.compile(r'<\|endoftext\|>'),
-    # Phase 1: Tool metadata patterns
-    re.compile(r'\bsend_wechat_messages\b'),
+    # v0.2: Tool metadata patterns (send_wechat_messages is a legitimate tool name,
+    # but other internal patterns should still be blocked)
     re.compile(r'\bnative_tools?\b'),
     re.compile(r'"arguments"\s*:'),
     re.compile(r'assistant_content_fallback'),
     re.compile(r'tool_retry'),
+    re.compile(r'protocol_retry'),
 ]
 
 # Phase 1: History leak patterns — model must not echo these labels to users
