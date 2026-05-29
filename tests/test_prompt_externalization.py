@@ -42,16 +42,15 @@ def test_memory_worker_loads_external_extraction_prompt():
     assert "输出格式" in worker.extraction_prompt
 
 
-def test_legacy_context_builder_is_short_fallback():
-    from agent.context_builder import build_system_prompt
+def test_context_builder_produces_reasonable_prompt():
+    """v0.2: build_chat_system_prompt produces a reasonably sized prompt."""
+    from agent.context_builder import build_chat_system_prompt
 
-    prompt = build_system_prompt(
+    prompt = build_chat_system_prompt(
         persona="test persona",
         personality="",
-        memories=[],
-        relationship={},
-        tool_names=["wechat_reply"],
+        tool_names=["send_wechat_messages", "get_time", "get_weather", "skip_reply"],
     )
 
-    assert "Legacy fallback prompt" in prompt
-    assert len(prompt) < 1500
+    assert "test persona" in prompt
+    assert len(prompt) < 5000  # includes base_protocol + tool_policy from prompts/
