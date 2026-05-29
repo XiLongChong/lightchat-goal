@@ -330,11 +330,14 @@ chat_agent = ChatAgent(
     test_mode=cfg.get("wechat", {}).get("send_delay", {}).get("test_mode_zero_delay", False),
 )
 
-# Phase 1: Memory worker kept as code but not started.
-# Only create if features.memory is enabled.
-memory_worker = None
+# v0.2 Phase 5: Memory hook — wires MemoryStore + MemoryWorker into
+# LOAD_MEMORY_CONTEXT and UPDATE_MEMORY positions.
+# Controlled by features.memory flag (default false).
+memory_hook = None
 if _feature_on("memory"):
     from agent.memory_worker import MemoryWorker
+    from agent.memory_hook import MemoryHook
+
     memory_worker = MemoryWorker(
         store=memory_store,
         model=model_name,
@@ -342,8 +345,19 @@ if _feature_on("memory"):
         prompts_dir=cfg.get("prompt_pack", {}).get("directory", "./prompts"),
         llm_gateway=llm_gateway,
     )
+    memory_hook = MemoryHook(
+        store=memory_store,
+        worker=memory_worker,
+        bot_id=BOT_ID,
+        max_context_memories=cfg["memory"].get("max_context_memories", 3),
+    )
+    logger.info("Memory hook: enabled (LOAD_MEMORY_CONTEXT + UPDATE_MEMORY)")
+else:
+    memory_worker = None
+    memory_hook = None
 
-# Phase 1: System prompt builder — simple, no memory/recap/relationship
+# v0.2: System prompt builder — minimal, no memory/recap/relationship.
+# Memory context is loaded separately via build_enriched_system_prompt().
 def build_system_prompt_for_turn() -> str:
     """Build minimal system prompt for a chat turn."""
     persona = _read_persona()
@@ -358,6 +372,19 @@ def build_system_prompt_for_turn() -> str:
         default_city=default_city,
         tool_names=tool_names,
     )
+
+
+async def build_enriched_system_prompt(user_id: str, user_message: str) -> str:
+    """Build system prompt, optionally enriched with memory context."""
+    prompt = build_system_prompt_for_turn()
+    if memory_hook:
+        try:
+            mem_ctx = await memory_hook.load_context(user_id, user_message)
+            if mem_ctx:
+                prompt = prompt + "\n\n" + mem_ctx
+        except Exception:
+            logger.warning("Memory context load failed, continuing without", exc_info=True)
+    return prompt
 
 # v0.2: wechat_sender callback — pure WeChat transport, no guard logic.
 # Messages arrive already guarded (by state machine GUARD_OUTPUT or
@@ -1549,8 +1576,8 @@ async def chat(request: Request):
             # Short-term history only (Phase 1: no memory search, no recap, no relationship)
             history = await get_history_async(user_id, bot_id=bot_id)
 
-            # Build simple system prompt
-            system_prompt = build_system_prompt_for_turn()
+            # Build system prompt (with memory context if enabled)
+            system_prompt = await build_enriched_system_prompt(user_id, user_message)
 
             # Build wechat_sender bound to this user/context
             async def _bound_sender(messages: list[dict]) -> list[dict]:
@@ -1655,6 +1682,18 @@ async def chat(request: Request):
                             source="system", bot_id=bot_id,
                         )
             # END_SKIPPED / END_FAILED / END_CANCELLED: no assistant history written
+
+            # ── POST_TURN_HOOKS: memory extraction (fire-and-forget) ─
+            assistant_text = "\n".join(
+                m["text"] for m in result.visible_messages
+                if m.get("text") and m.get("send_status") == "delivered"
+            )
+            if memory_hook and assistant_text:
+                await memory_hook.update(
+                    user_message=user_message,
+                    assistant_text=assistant_text,
+                    user_id=user_id,
+                )
 
             # ── Record turn diagnostics ───────────────────────────
             diag_fallback = ",".join(
