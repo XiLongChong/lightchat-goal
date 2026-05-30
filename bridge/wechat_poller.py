@@ -101,12 +101,13 @@ class WeChatBridge:
         from_user = msg.get("from_user_id", "")
         context_token = msg.get("context_token", "")
         items = msg.get("item_list", [])
-        msg_id = (
+        raw_id = (
             msg.get("msg_id")
             or msg.get("id")
             or msg.get("message_id")
             or f"ilink_{uuid.uuid4().hex[:12]}"
         )
+        msg_id = str(raw_id) if raw_id is not None else f"ilink_{uuid.uuid4().hex[:12]}"
 
         # Extract text from message items
         text_parts = []
