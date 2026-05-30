@@ -138,6 +138,9 @@ class ChatAgent:
         source: str = "user_message",
         input_message_ids: list[str] | None = None,
         interrupt_checker: InterruptChecker | None = None,
+        # ── v1.2 Phase 5C: per-request post-terminal callbacks ──
+        write_model_history: PostTerminalCallback | None = None,
+        post_turn_hooks: list[PostTerminalCallback] | None = None,
     ) -> TurnResult:
         """Process a user message through the v1.2 state machine.
 
@@ -183,8 +186,15 @@ class ChatAgent:
             turn.iteration += 1
 
         # ── v1.2: Post-terminal pipeline (inside ChatAgent) ─────
+        # Per-request callbacks override instance-level ones.
+        # post_terminal_completed = True only when callbacks were injected
+        # and executed here.  False means main.py must run them manually.
+        _wmh = write_model_history if write_model_history is not None else self._write_model_history
+        _pth = post_turn_hooks if post_turn_hooks is not None else self._post_turn_hooks
+        _has_callbacks = bool(_wmh or _pth)
         turn.terminal_state = state
-        await self._run_post_terminal_pipeline(turn, state)
+        if _has_callbacks:
+            await self._run_post_terminal_pipeline(turn, state, _wmh, _pth)
 
         # ── Build result (after pipeline completes) ─────────────
         self._last_call_time = time.time()
@@ -218,7 +228,7 @@ class ChatAgent:
             author=author,
             trigger=trigger_type,
             context_sample=context_sample,
-            post_terminal_completed=True,
+            post_terminal_completed=_has_callbacks,
         )
 
     # ================================================================
@@ -458,24 +468,29 @@ class ChatAgent:
     # ================================================================
 
     async def _run_post_terminal_pipeline(
-        self, turn: TurnScratchpad, terminal_state: TurnState,
+        self,
+        turn: TurnScratchpad,
+        terminal_state: TurnState,
+        write_model_history: PostTerminalCallback | None = None,
+        post_turn_hooks: list[PostTerminalCallback] | None = None,
     ) -> None:
         """Execute WRITE_MODEL_HISTORY → POST_TURN_HOOKS after terminal state.
 
-        v1.2: hooks must NOT modify terminal_state.
+        v1.2: callbacks are injected per-request via chat() params, or
+        at instance level via __init__.  Hooks must NOT modify terminal_state.
         Individual hook failures do not block other hooks.
         This runs BEFORE TurnResult is assembled.
         """
         # Step 1: Write model history
-        if self._write_model_history:
+        if write_model_history:
             try:
-                await self._write_model_history(turn, terminal_state)
+                await write_model_history(turn, terminal_state)
             except Exception as e:
                 logger.error("write_model_history callback failed: %s", e)
                 turn.add_fallback_event("write_model_history_error", str(e)[:200])
 
-        # Step 2: Post-turn hooks (UPDATE_SUMMARY, UPDATE_MEMORY, etc.)
-        for hook in self._post_turn_hooks:
+        # Step 2: Post-turn hooks
+        for hook in (post_turn_hooks or []):
             try:
                 await hook(turn, terminal_state)
             except Exception as e:

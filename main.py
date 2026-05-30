@@ -43,7 +43,7 @@ from agent.context_builder import compact_history, build_chat_system_prompt
 from agent.llm_gateway import LLMGateway
 from agent.llm_types import LLMRequest
 from agent.output_guard import guard_messages, guard_single_message
-from agent.state_machine import TurnResult, TurnState
+from agent.state_machine import TurnResult, TurnScratchpad, TurnState
 from agent.tools import configure_runtime, configure_tools, execute_tool, compute_message_delay
 from bridge.wechat_poller import WeChatBridge, login_qr
 from memory.store import MemoryStore
@@ -1739,6 +1739,179 @@ async def _run_all_post_turn_hooks(
             logger.exception("post_turn_hook %s failed", name)
 
 
+# ================================================================
+# v1.2 Phase 5C: Build ChatAgent-compatible callbacks
+# ================================================================
+
+def _visible_messages_as_dicts(turn: TurnScratchpad) -> list[dict[str, Any]]:
+    """Convert VisibleMessage list to backward-compat dict list."""
+    return [
+        {
+            "text": vm.guarded_text or vm.original_text,
+            "delay": vm.delay,
+            "send_status": vm.delivery_status,
+            "delivery_status": vm.delivery_status,
+        }
+        for vm in turn.visible_messages
+    ]
+
+
+def _build_chatagent_write_model_history(
+    user_id: str, bot_id: str,
+):
+    """Return a PostTerminalCallback that writes model history from TurnScratchpad."""
+    async def _cb(turn: TurnScratchpad, terminal_state: TurnState) -> None:
+        visible = _visible_messages_as_dicts(turn)
+        # Build minimal TurnResult-like wrapper
+        was_sent = terminal_state in (TurnState.END_SENT, TurnState.END_PARTIAL_SENT)
+        was_fallback = terminal_state == TurnState.END_FALLBACK_SENT
+
+        await append_history_async(
+            user_id, "user", turn.user_message, source="wechat", bot_id=bot_id,
+        )
+        if was_sent:
+            delivered_texts = [
+                m["text"] for m in visible
+                if (m.get("send_status") in _IS_DELIVERED
+                    or m.get("delivery_status") in _IS_DELIVERED)
+                and m.get("text")
+            ]
+            if delivered_texts:
+                await append_history_async(
+                    user_id, "assistant", "\n".join(delivered_texts),
+                    source="assistant", bot_id=bot_id,
+                )
+        elif was_fallback:
+            fallback_texts = [m["text"] for m in visible if m.get("text")]
+            if fallback_texts:
+                await append_history_async(
+                    user_id, "assistant", "\n".join(fallback_texts),
+                    source="assistant:fallback", bot_id=bot_id,
+                )
+    return _cb
+
+
+def _build_chatagent_post_turn_hooks(
+    user_id: str,
+    bot_id: str,
+    route: str,
+    context_policy: str,
+    raw_messages: list[str],
+    send_status: str,
+    memory_hook: Any,
+    memory_store: Any,
+) -> list:
+    """Return a list of PostTerminalCallback hooks for ChatAgent.
+
+    Each hook receives (turn: TurnScratchpad, terminal_state: TurnState).
+    Individual failures are caught inside each hook and logged.
+    """
+
+    async def _hook_memory(turn: TurnScratchpad, terminal_state: TurnState) -> None:
+        if not memory_hook:
+            return
+        visible = _visible_messages_as_dicts(turn)
+        assistant_text = "\n".join(
+            m["text"] for m in visible
+            if m.get("text")
+            and (m.get("send_status") in _IS_DELIVERED
+                 or m.get("delivery_status") in _IS_DELIVERED)
+        )
+        if assistant_text:
+            await memory_hook.update(
+                user_message=turn.user_message,
+                assistant_text=assistant_text,
+                user_id=user_id,
+            )
+
+    async def _hook_dev_logs(turn: TurnScratchpad, terminal_state: TurnState) -> None:
+        visible = _visible_messages_as_dicts(turn)
+        delivered_count = sum(
+            1 for m in visible
+            if (m.get("send_status") in _IS_DELIVERED
+                or m.get("delivery_status") in _IS_DELIVERED)
+        )
+        diag_fallback = ",".join(
+            e.get("type", "") for e in (turn.fallback_events or [])[:3]
+        ) if turn.fallback_events else ""
+        token_count = turn.token_usage.get("total_tokens", 0)
+
+        await memory_store.record_turn_diagnostics(
+            turn_id=turn.turn_id,
+            user_id=user_id,
+            source="wechat",
+            route=route,
+            context_policy=context_policy,
+            llm_status=turn.llm_status,
+            token_count=token_count,
+            elapsed_ms=turn.elapsed_ms,
+            fallback_type=diag_fallback,
+            send_status=send_status,
+            memory_enqueued=0,
+            input_chars=len(turn.user_message),
+            output_messages=delivered_count,
+            tool_calls=len(turn.tool_results),
+            metadata={
+                "terminal_state": str(terminal_state),
+                "context_sample": [],
+            },
+        )
+        await memory_store.record_usage_event(
+            event_type="chat_turn",
+            user_id=user_id,
+            source="wechat",
+            message_count=len(raw_messages) + delivered_count,
+            token_count=token_count,
+            elapsed_ms=turn.elapsed_ms,
+            fallback_type=diag_fallback,
+            metadata={
+                "input_chars": len(turn.user_message),
+                "output_messages": delivered_count,
+                "tool_calls": len(turn.tool_results),
+                "token_estimated": bool(turn.token_usage.get("estimated")),
+                "turn_id": turn.turn_id,
+                "route": route,
+                "context_policy": context_policy,
+                "terminal_state": str(terminal_state),
+            },
+        )
+        # Mark draft / outbound status
+        was_sent = terminal_state in (TurnState.END_SENT, TurnState.END_PARTIAL_SENT)
+        was_fallback = terminal_state == TurnState.END_FALLBACK_SENT
+        was_skipped = terminal_state == TurnState.END_SKIPPED
+        was_cancelled = terminal_state == TurnState.END_CANCELLED
+        was_failed = terminal_state == TurnState.END_FAILED
+        if was_skipped:
+            await memory_store.mark_turn_draft_status(turn.turn_id, "skipped")
+        elif was_cancelled:
+            await memory_store.mark_turn_draft_status(turn.turn_id, "cancelled")
+        elif was_sent or was_fallback:
+            await memory_store.mark_turn_draft_status(turn.turn_id, "delivered")
+            await memory_store.mark_outbound_batch_status(turn.turn_id, "delivered")
+        elif was_failed:
+            await memory_store.mark_turn_draft_status(turn.turn_id, "failed")
+        else:
+            await memory_store.mark_turn_draft_status(turn.turn_id, "generated")
+        await memory_store.update_turn_send_status(turn.turn_id, send_status)
+
+    async def _hook_summary(turn: TurnScratchpad, terminal_state: TurnState) -> None:
+        pass  # placeholder
+
+    async def _hook_emotion(turn: TurnScratchpad, terminal_state: TurnState) -> None:
+        pass  # placeholder
+
+    async def _hook_quality(turn: TurnScratchpad, terminal_state: TurnState) -> None:
+        pass  # placeholder
+
+    return [
+        _hook_summary,
+        _hook_memory,
+        _hook_emotion,
+        _hook_dev_logs,
+        _hook_quality,
+    ]
+
+
 @app.post("/chat")
 async def chat(request: Request):
     """Phase 1 chat endpoint — native tool calls primary.
@@ -1836,19 +2009,47 @@ async def chat(request: Request):
             async def _bound_sender(messages: list[dict]) -> list[dict]:
                 return await wechat_sender(user_id, context_token, messages)
 
+            # ── v1.2 Phase 5C: Post-terminal-in-agent compat switch ──
+            _pta_enabled = cfg.get("features", {}).get("post_terminal_in_agent", False)
+
             # Run Chat Agent (v1.2 state machine)
             interrupt_checker = _make_interrupt_checker(user_id)
-            result: TurnResult = await chat_agent.chat(
-                user_message=user_message,
-                history=history,
-                trigger="user",
-                route=route,
-                context_policy=context_policy,
-                bot_id=bot_id,
-                system_prompt=system_prompt,
-                wechat_sender=_bound_sender,
-                interrupt_checker=interrupt_checker,
-            )
+
+            if _pta_enabled:
+                # New path: callbacks injected into ChatAgent
+                _wmh_cb = _build_chatagent_write_model_history(user_id, bot_id)
+                _hook_cbs = _build_chatagent_post_turn_hooks(
+                    user_id=user_id, bot_id=bot_id,
+                    route=route, context_policy=context_policy,
+                    raw_messages=raw_messages, send_status="",
+                    memory_hook=memory_hook, memory_store=memory_store,
+                )
+                result: TurnResult = await chat_agent.chat(
+                    user_message=user_message,
+                    history=history,
+                    trigger="user",
+                    route=route,
+                    context_policy=context_policy,
+                    bot_id=bot_id,
+                    system_prompt=system_prompt,
+                    wechat_sender=_bound_sender,
+                    interrupt_checker=interrupt_checker,
+                    write_model_history=_wmh_cb,
+                    post_turn_hooks=_hook_cbs,
+                )
+            else:
+                # Old path: main.py handles post-terminal manually
+                result: TurnResult = await chat_agent.chat(
+                    user_message=user_message,
+                    history=history,
+                    trigger="user",
+                    route=route,
+                    context_policy=context_policy,
+                    bot_id=bot_id,
+                    system_prompt=system_prompt,
+                    wechat_sender=_bound_sender,
+                    interrupt_checker=interrupt_checker,
+                )
 
             turn_id = result.turn_id
 
@@ -1911,23 +2112,23 @@ async def chat(request: Request):
 
             scheduled_task_ids: list[str] = []
 
-            # ── v1.2 Phase 5A: Write model history ─────────────────
-            await _write_model_history(result, user_id, bot_id, user_message)
-
-            # ── v1.2 Phase 5B: Post-turn hooks ─────────────────────
-            await _run_all_post_turn_hooks(
-                result=result,
-                turn_id=turn_id,
-                user_id=user_id,
-                bot_id=bot_id,
-                route=route,
-                context_policy=context_policy,
-                user_message=user_message,
-                raw_messages=raw_messages,
-                send_status=send_status,
-                memory_hook=memory_hook,
-                memory_store=memory_store,
-            )
+            # ── v1.2 Phase 5C: Post-terminal handled by ChatAgent or main.py ──
+            if not result.post_terminal_completed:
+                # Compat path: main.py runs post-terminal manually
+                await _write_model_history(result, user_id, bot_id, user_message)
+                await _run_all_post_turn_hooks(
+                    result=result,
+                    turn_id=turn_id,
+                    user_id=user_id,
+                    bot_id=bot_id,
+                    route=route,
+                    context_policy=context_policy,
+                    user_message=user_message,
+                    raw_messages=raw_messages,
+                    send_status=send_status,
+                    memory_hook=memory_hook,
+                    memory_store=memory_store,
+                )
 
             logger.info(
                 f"[{user_id}] terminal_state={result.terminal_state} "
