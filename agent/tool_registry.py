@@ -196,18 +196,14 @@ TOOL_REGISTRY = ToolRegistry()
 
 
 def _build_default_registries() -> None:
-    """Populate the module-level registries with the v0.2 Phase 1 tool set.
+    """Populate the module-level registries with the v1.5 strict CC tool set.
 
-    Only tools that are actively exposed to the model are registered.
-    Dead features (search_memory, send_email, read_persona_file,
-    propose_persona_change, wechat_reply, skip) are removed.
+    v1.5 model-visible tools: get_time, get_weather, wechat_reply, done.
+    Old tools (send_wechat_messages, skip_reply) kept registered but
+    native_tool_call_eligible=False — they are NOT exposed to the model.
     """
 
-    # ── Internal actions ──────────────────────────────────────────
-    # v0.2: wechat_reply and skip are removed.
-    # ActionRegistry kept empty for future SYSTEM_HOOK needs.
-
-    # ── Fact tools ────────────────────────────────────────────────
+    # ── Fact tools (model-visible) ──────────────────────────────
     TOOL_REGISTRY.register(ToolDef(
         name="get_time",
         description="获取指定时区的当前时间。默认返回中国时区 (Asia/Shanghai) 的时间",
@@ -241,56 +237,88 @@ def _build_default_registries() -> None:
         tool_category="fact_tool",
     ))
 
-    # ── Terminal tools ────────────────────────────────────────────
+    # ── v1.5: wechat_reply — single bubble, NOT terminal ────────
+    # Registered as fact_tool but routed by tool_name in chat_agent.
+    # Must NEVER enter EXEC_FACT_TOOLS path.
     TOOL_REGISTRY.register(ToolDef(
-        name="send_wechat_messages",
+        name="wechat_reply",
         description=(
-            "发送一条或多条微信消息给用户。messages 数组的每个元素是一条独立的微信消息气泡。"
-            "每个元素是一条完整发送的消息——不要在单个消息内用换行符分隔多条内容。"
-            "如果想发多条微信，必须用多个数组元素，而不是在一个元素里换行。"
-            "像真人聊天一样：简单回复可以只发 1 条，需要分段表达、吐槽、补刀、追问时可以发 2-4 条。"
-            "不要为了凑数量而拆分，也不要发重复内容。"
+            "发送一条微信消息给用户。每次调用只发送一条微信气泡。"
+            "如果想发多条微信，请多次调用此工具，每次传入一条消息。"
+            "发送成功后你会收到工具结果，然后可以决定是否继续发下一条。"
+            "text 不能包含任何换行符。"
         ),
         args_schema={
             "properties": {
-                "messages": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "微信消息数组，每个字符串是一条消息。最少 1 条，最多 12 条。",
-                    "minItems": 1,
-                    "maxItems": 12,
-                },
-                "mode": {
+                "text": {
                     "type": "string",
-                    "enum": ["normal", "long", "short"],
-                    "description": "发送模式：normal=日常聊天, long=允许较长内容, short=短消息模式",
+                    "description": "要发送的一条微信消息内容。不能为空。不能包含任何换行符（\\n）。想发多条请多次调用此工具。",
                 },
             },
-            "required": ["messages"],
+            "required": ["text"],
         },
         side_effect_level="high",
         requires_confirmation=False,
         native_tool_call_eligible=True,
+        tool_category="action_tool",
+    ))
+
+    # ── v1.5: done — only normal terminal tool ──────────────────
+    TOOL_REGISTRY.register(ToolDef(
+        name="done",
+        description=(
+            "显式结束本轮对话。每轮必须以调用 done 结束。"
+            "已发过微信回复 → done(status='replied')。"
+            "判断不需要回复 → done(status='no_reply', note='原因')。"
+            "发生无法继续的错误 → done(status='failed', note='原因')。"
+        ),
+        args_schema={
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "enum": ["replied", "no_reply", "failed"],
+                    "description": "replied=已回复, no_reply=不需回复, failed=失败",
+                },
+                "note": {
+                    "type": "string",
+                    "description": "简短说明。status=replied 时可省略；no_reply/failed 时必填。",
+                },
+            },
+            "required": ["status"],
+        },
+        side_effect_level="none",
+        native_tool_call_eligible=True,
+        tool_category="terminal_tool",
+    ))
+
+    # ── v1.5 deprecated: NOT exposed to model ───────────────────
+    # Kept registered for backward-compat diagnostics and old data readability.
+    # Models calling these → PROTOCOL_RETRY with migration hint.
+    TOOL_REGISTRY.register(ToolDef(
+        name="send_wechat_messages",
+        description="[已废弃] 请使用 wechat_reply 逐条发送，最后用 done 结束。",
+        args_schema={
+            "properties": {
+                "messages": {"type": "array", "items": {"type": "string"}},
+                "mode": {"type": "string", "enum": ["normal", "long", "short"]},
+            },
+            "required": ["messages"],
+        },
+        side_effect_level="high",
+        native_tool_call_eligible=False,           # NOT exposed to model
         tool_category="terminal_tool",
     ))
     TOOL_REGISTRY.register(ToolDef(
         name="skip_reply",
-        description=(
-            "明确决定不回复当前消息。仅在用户消息不需要回复时调用。"
-            "例如：用户说'晚安''好的''嗯''知道了'等自然结束对话的消息。"
-            "调用后本轮结束，不发送任何微信消息。"
-        ),
+        description="[已废弃] 请使用 done(status='no_reply', note='原因')。",
         args_schema={
             "properties": {
-                "reason": {
-                    "type": "string",
-                    "description": "简短说明为什么不需要回复，如'用户说晚安，对话自然结束'",
-                },
+                "reason": {"type": "string", "description": "简短说明"},
             },
             "required": [],
         },
         side_effect_level="none",
-        native_tool_call_eligible=True,
+        native_tool_call_eligible=False,           # NOT exposed to model
         tool_category="terminal_tool",
     ))
 

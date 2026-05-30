@@ -248,9 +248,9 @@ async def _run_single(
     record.fallback_happened = bool(result.get("fallback_events"))
     record.native_loop_iterations = result.get("iterations", 0)
 
-    # Check if MAX_TOOL_LOOP was hit
-    from agent.chat_agent import MAX_TOOL_LOOP
-    record.max_tool_loop_exit = record.iterations >= MAX_TOOL_LOOP
+    # Check if MAX_LLM_STEPS_PER_TURN was hit
+    from agent.state_machine import MAX_LLM_STEPS_PER_TURN
+    record.max_tool_loop_exit = record.iterations >= MAX_LLM_STEPS_PER_TURN
 
     # Token usage
     tu = result.get("token_usage", {})

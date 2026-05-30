@@ -1,4 +1,4 @@
-"""State machine types — v1.2 Phase 1.
+"""State machine types — v1.5 strict CC causal chain.
 
 TurnState enum, TurnScratchpad (turn-local mutable state), TurnResult
 (the immutable result returned to callers after the turn ends),
@@ -16,9 +16,10 @@ from typing import Any
 
 
 class TurnState(StrEnum):
-    """Level-1 state machine states per v1.2 design.
+    """v1.5 strict CC causal chain state machine.
 
-    Non-terminal states:
+    One tool call per LLM response.  wechat_reply = one bubble (not terminal).
+    done = only normal terminal tool.
     """
 
     # --- lifecycle ---
@@ -34,57 +35,76 @@ class TurnState(StrEnum):
 
     # --- output handling ---
     HANDLE_MODEL_OUTPUT = "handle_model_output"
-    CLASSIFY_TOOL_CALLS = "classify_tool_calls"
+    CLASSIFY_ONE_TOOL_CALL = "classify_one_tool_call"       # v1.5: exactly 1 tool call
 
-    # --- fact / state tools ---
+    # --- fact tools ---
     EXEC_FACT_TOOLS = "exec_fact_tools"
-    EXEC_STATE_TOOLS = "exec_state_tools"
-    CLASSIFY_TOOL_ERROR = "classify_tool_error"
+
+    # --- wechat_reply pipeline (v1.5: action tool, NOT terminal) ---
+    VALIDATE_REPLY_ARGS = "validate_reply_args"
+    GUARD_OUTPUT = "guard_output"
+    PRE_SEND_INTERRUPT_CHECK = "pre_send_interrupt_check"
+    EXEC_SEND_ONE = "exec_send_one"                         # single bubble send
+    APPEND_SEND_RESULT = "append_send_result"
+    POST_SEND_INTERRUPT_CHECK = "post_send_interrupt_check"
+    LIMIT_CHECK = "limit_check"
+
+    # --- done pipeline (v1.5: only normal terminal) ---
+    VALIDATE_DONE_ARGS = "validate_done_args"
 
     # --- protocol ---
     PROTOCOL_RETRY = "protocol_retry"
 
-    # --- terminal action ---
-    TERMINAL_ACTION_BRANCH = "terminal_action_branch"
-
-    # --- send path ---
-    PARSE_VISIBLE_BATCH = "parse_visible_batch"
-    GUARD_OUTPUT = "guard_output"
-    EXEC_SEND_WECHAT = "exec_send_wechat"
-    SEND_RETRY_UNDELIVERED_ONLY = "send_retry_undelivered_only"
-    DECIDE_SEND_TERMINAL = "decide_send_terminal"
-
-    # --- skip path ---
-    EXEC_SKIP_REPLY = "exec_skip_reply"
-
-    # ── v1.3: model routing ──
+    # ── v1.3: model routing (kept) ──
     FLASH_TO_PRO_UPGRADE = "flash_to_pro_upgrade"
-    ROUTE_RETRY_MODEL = "route_retry_model"
 
     # --- fallback ---
     HARD_FALLBACK = "hard_fallback"
 
-    # --- post-turn (executed inside ChatAgent after terminal state reached) ---
+    # --- post-turn ---
     WRITE_MODEL_HISTORY = "write_model_history"
     POST_TURN_HOOKS = "post_turn_hooks"
 
-    # === Terminal states ===
+    # === v1.5 Terminal states ===
+    END_REPLIED = "end_replied"                     # done(status="replied")
+    END_NO_REPLY = "end_no_reply"                   # done(status="no_reply")
+    END_FAILED = "end_failed"
+    END_FALLBACK_SENT = "end_fallback_sent"
+    END_CANCELLED = "end_cancelled"
+    END_SUPERSEDED_BEFORE_SEND = "end_superseded_before_send"
+    END_INTERRUPTED_DURING_REPLY_SEQUENCE = "end_interrupted_during_reply_sequence"
+    END_MAX_LIMIT = "end_max_limit"
+    END_PROTOCOL_ERROR = "end_protocol_error"
+    END_ABORTED_BY_SYSTEM = "end_aborted_by_system"
+
+    # === v1.2 legacy (kept for TurnResult compat; not produced by v1.5 state machine) ===
     END_SENT = "end_sent"
     END_PARTIAL_SENT = "end_partial_sent"
     END_SKIPPED = "end_skipped"
-    END_FALLBACK_SENT = "end_fallback_sent"
-    END_FAILED = "end_failed"
-    END_CANCELLED = "end_cancelled"
+    CLASSIFY_TOOL_CALLS = "classify_tool_calls"
+    CLASSIFY_TOOL_ERROR = "classify_tool_error"
+    TERMINAL_ACTION_BRANCH = "terminal_action_branch"
+    PARSE_VISIBLE_BATCH = "parse_visible_batch"
+    EXEC_SEND_WECHAT = "exec_send_wechat"
+    SEND_RETRY_UNDELIVERED_ONLY = "send_retry_undelivered_only"
+    DECIDE_SEND_TERMINAL = "decide_send_terminal"
+    EXEC_SKIP_REPLY = "exec_skip_reply"
+    ROUTE_RETRY_MODEL = "route_retry_model"
+    EXEC_STATE_TOOLS = "exec_state_tools"
 
 
-# Set of states that terminate the turn loop (stay in TERMINAL_STATES per v1.2)
+# v1.5 terminal states
 TERMINAL_STATES: frozenset[TurnState] = frozenset({
-    TurnState.END_SENT,
-    TurnState.END_PARTIAL_SENT,
-    TurnState.END_SKIPPED,
-    TurnState.END_FALLBACK_SENT,
+    TurnState.END_REPLIED,
+    TurnState.END_NO_REPLY,
     TurnState.END_FAILED,
+    TurnState.END_FALLBACK_SENT,
     TurnState.END_CANCELLED,
+    TurnState.END_SUPERSEDED_BEFORE_SEND,
+    TurnState.END_INTERRUPTED_DURING_REPLY_SEQUENCE,
+    TurnState.END_MAX_LIMIT,
+    TurnState.END_PROTOCOL_ERROR,
+    TurnState.END_ABORTED_BY_SYSTEM,
 })
 
 
@@ -108,18 +128,25 @@ class DeliveryStatus(StrEnum):
 
 @dataclass(slots=True)
 class VisibleMessage:
-    """One visible WeChat message tracked through the send pipeline."""
+    """One visible WeChat message tracked through the send pipeline.
 
-    visible_message_id: str           # vm_{turn_id}_{index}
-    index: int                        # position in the batch
-    original_text: str = ""           # raw text from model tool args
-    guarded_text: str = ""            # text after GUARD_OUTPUT
+    v1.5: each wechat_reply tool call produces exactly one VisibleMessage.
+    """
+
+    visible_message_id: str           # vm_{turn_id}_{reply_index}
+    index: int                        # reply_index (1-based sent order)
+    original_text: str = ""           # raw text from wechat_reply(text=...)
+    guarded_text: str = ""            # text after GUARD_OUTPUT (this is what was sent)
     guard_status: str = ""            # PASSED / SANITIZED / BLOCKED
     delivery_status: str = ""         # DeliveryStatus value
     attempt_count: int = 0
     wechat_message_id: str = ""       # WeChat-side message id (if available)
     error_code: str = ""
     delay: float = 0.0
+    # ── v1.5 ──
+    tool_call_id: str = ""            # LLM tool_call_id for this bubble
+    idempotency_key: str = ""         # turn_id + tool_call_id
+    sent_at_timestamp: float = 0.0
 
 
 # ================================================================
@@ -174,26 +201,29 @@ class ContextBuildResult:
 
 @dataclass
 class TurnScratchpad:
-    """Turn-local mutable state. Never persisted. Never enters model context."""
+    """Turn-local mutable state. Never persisted. Never enters model context.
+
+    v1.5: per-bubble wechat_reply tracking, done validation, interrupt differentiation.
+    """
 
     turn_id: str = field(default_factory=lambda: f"turn_{uuid.uuid4().hex[:12]}")
     start_time: float = field(default_factory=time.time)
 
     # Input
     user_message: str = ""
-    trigger: str = "user"  # user | admin
+    trigger: str = "user"  # user | admin | proactive
 
-    # ── v1.2: Turn lifecycle metadata ──────────────────────────
+    # ── v1.5: Turn lifecycle metadata ──────────────────────────
     source: str = "user_message"       # TURN_SOURCE: user_message | proactive_trigger | ...
+    proactive_meta: dict[str, Any] | None = None  # v1.5: proactive trigger metadata
     input_message_ids: list[str] = field(default_factory=list)
-    input_first_seq: int = 0           # seq of first message in this batch
-    input_latest_seq: int = 0          # seq of last message in this batch
-    input_cutoff_time: float = 0.0     # max received_at in this batch
-    interrupt_token: str = ""          # set by CREATE_TURN
-    status: str = "created"            # created → running → cancelled / ended
+    input_first_seq: int = 0
+    input_latest_seq: int = 0
+    input_cutoff_time: float = 0.0
+    interrupt_token: str = ""
+    status: str = "created"
     terminal_state: TurnState | None = None
     context_warnings: list[dict[str, str]] = field(default_factory=list)
-    # transient: where to resume after INTERRUPT_CHECK passes
     _resume_state: TurnState | None = field(default=None, repr=False)
 
     # LLM message array (grows through the turn)
@@ -205,29 +235,49 @@ class TurnScratchpad:
     # ── v1.3: Model routing ────────────────────────────────────
     model_attempts: list["ModelAttempt"] = field(default_factory=list)
     _current_attempt: "ModelAttempt | None" = field(default=None, repr=False)
-    _force_model_label: str = ""          # 强制下一次选模，消费后清空
-    _force_model_upgraded_from: str = ""  # 升级来源，消费后清空
+    _force_model_label: str = ""
+    _force_model_upgraded_from: str = ""
     max_flash_upgrade_attempts: int = 1
     flash_upgrade_count: int = 0
-    route: str = ""                       # ChatLite / ChatFull / SystemFastPath
+    route: str = ""
 
-    # ── v1.2: Send path — VisibleMessage tracking ─────────────
+    # ── v1.5: Per-bubble send tracking ─────────────────────────
     visible_messages: list[VisibleMessage] = field(default_factory=list)
-    # legacy compat (removed in Phase 4)
+    sent_results: list[dict[str, Any]] = field(default_factory=list)
+    _sent_idempotency_keys: set[str] = field(default_factory=set)
+    _guarded_text: str = ""              # guarded text for current wechat_reply
+    _current_reply_text: str = ""        # original text for current wechat_reply
+    _current_tool_call_id: str = ""      # tool_call_id for current wechat_reply
+
+    # ── v1.5: Reply sequence counters ──────────────────────────
+    reply_sequence_status: str = "in_progress"  # in_progress | completed | no_reply | failed | interrupted_by_user | max_limit_reached | protocol_error
+    sent_message_count: int = 0          # successfully delivered this turn
+    send_failure_count: int = 0          # failed delivery attempts this turn
+    fact_tool_call_count: int = 0        # fact tool calls this turn
+    done_status: str = ""                # done(status=...)
+    done_note: str = ""                  # done(note=...)
+
+    # ── v1.5: Pending wechat_reply (for interrupt differentiation) ──
+    _has_pending_wechat_reply: bool = False  # model generated wechat_reply but not yet sent
+
+    # legacy compat
     visible_batch: list[str] = field(default_factory=list)
     guarded_batch: list[dict[str, Any]] = field(default_factory=list)
-    sent_results: list[dict[str, Any]] = field(default_factory=list)
 
     # Counters
-    iteration: int = 0          # total state transitions
-    llm_call_count: int = 0     # LLM calls only
+    iteration: int = 0
+    llm_call_count: int = 0
     protocol_retry_count: int = 0
     send_attempt: int = 0
 
-    # Limits
-    max_iterations: int = 5
-    max_protocol_retries: int = 1
-    max_send_retries: int = 2
+    # ── v1.5 limits ────────────────────────────────────────────
+    max_iterations: int = 5                 # kept for compatibility
+    max_llm_steps_per_turn: int = 20        # v1.5
+    max_reply_messages_per_turn: int = 15   # v1.5
+    max_protocol_retries: int = 2           # v1.5
+    max_send_failures_per_turn: int = 2     # v1.5
+    max_send_retries: int = 2               # kept
+    proactive_soft_reply_limit: int = 0     # v1.5: set for proactive turns (0 = n/a)
 
     # Diagnostics
     fallback_events: list[dict[str, Any]] = field(default_factory=list)
@@ -242,7 +292,7 @@ class TurnScratchpad:
     })
 
     # Errors
-    llm_status: str = "ok"  # ok | error
+    llm_status: str = "ok"
     error_info: dict[str, Any] | None = None
 
     @property
@@ -288,16 +338,20 @@ class TurnResult:
     # Context sample (last N messages, for diagnostics)
     context_sample: list[dict[str, str]] = field(default_factory=list)
 
-    # ── v1.2: post-terminal pipeline marker ────────────────────
+    # ── v1.5 ──
     post_terminal_completed: bool = False
+    reply_sequence_status: str = ""          # v1.5
+    sent_message_count: int = 0              # v1.5
+    done_status: str = ""                    # v1.5
+    done_note: str = ""                      # v1.5
 
     @property
     def was_sent(self) -> bool:
-        return self.terminal_state in (TurnState.END_SENT, TurnState.END_PARTIAL_SENT)
+        return self.terminal_state in (TurnState.END_REPLIED, TurnState.END_SENT, TurnState.END_PARTIAL_SENT)
 
     @property
     def was_skipped(self) -> bool:
-        return self.terminal_state == TurnState.END_SKIPPED
+        return self.terminal_state in (TurnState.END_NO_REPLY, TurnState.END_SKIPPED)
 
     @property
     def was_fallback(self) -> bool:
@@ -312,10 +366,18 @@ class TurnResult:
         return self.terminal_state == TurnState.END_CANCELLED
 
     @property
+    def was_interrupted(self) -> bool:
+        return self.terminal_state in (
+            TurnState.END_SUPERSEDED_BEFORE_SEND,
+            TurnState.END_INTERRUPTED_DURING_REPLY_SEQUENCE,
+        )
+
+    @property
     def delivered_count(self) -> int:
         return sum(
             1 for r in self.visible_messages
             if r.get("send_status") in ("delivered", "sent_confirmed")
+            or r.get("delivery_status") in ("sent_confirmed",)
         )
 
 
@@ -339,6 +401,18 @@ InterruptChecker = Callable[[str], bool]
 # post_turn_hook callback (single hook):
 #   (turn: TurnScratchpad, terminal_state: TurnState) -> Awaitable[None]
 PostTerminalCallback = Callable[["TurnScratchpad", TurnState], Awaitable[None]]
+
+
+# ================================================================
+# v1.5 Turn limits
+# ================================================================
+
+MAX_REPLY_MESSAGES_PER_TURN = 15
+MAX_LLM_STEPS_PER_TURN = 20
+MAX_FACT_TOOL_CALLS_PER_TURN = 3
+MAX_PROTOCOL_RETRIES_PER_TURN = 2
+MAX_SEND_FAILURES_PER_TURN = 2
+PROACTIVE_SOFT_REPLY_LIMIT = 3
 
 
 # ================================================================

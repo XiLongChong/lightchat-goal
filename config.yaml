@@ -24,8 +24,8 @@ model:
     allowed_tools:
       - get_time
       - get_weather
-      - send_wechat_messages
-      - skip_reply
+      - wechat_reply
+      - done
 
   # ── v1.3: Model routing ──────────────────────────────
   routing_mode: auto                      # auto | manual_flash | manual_pro
@@ -133,10 +133,9 @@ memory:
 conversation:
   max_history_turns: 20
   compact_at_turns: 40
-  max_actions_per_turn: 8
+  max_llm_steps: 20
   max_message_chars: 500
   max_total_chars: 2000
-  max_tool_loop: 5
 
 # ---- Weather ----
 weather:

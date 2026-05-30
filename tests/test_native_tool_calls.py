@@ -9,6 +9,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from agent.state_machine import TurnState
 from agent.chat_agent import (
     _build_native_tool_specs,
     _execute_native_fact_tool,
@@ -62,11 +63,12 @@ class TestFeatureFlag:
         names = {s["function"]["name"] for s in (specs or [])}
         assert "send_email" not in names
 
-    def test_send_wechat_messages_in_specs(self):
-        specs = _build_native_tool_specs(["send_wechat_messages", "get_time"])
+    def test_wechat_reply_in_specs(self):
+        """v1.5: wechat_reply is native-eligible."""
+        specs = _build_native_tool_specs(["wechat_reply", "get_time"])
         names = {s["function"]["name"] for s in (specs or [])}
-        assert "send_wechat_messages" in names
-        assert "wechat_reply" not in names
+        assert "wechat_reply" in names
+        assert "send_wechat_messages" not in names   # deprecated, not eligible
 
     def test_schedule_wechat_message_not_in_specs(self):
         specs = _build_native_tool_specs(["schedule_wechat_message", "get_weather"])
@@ -74,12 +76,13 @@ class TestFeatureFlag:
         assert "schedule_wechat_message" not in names
 
     def test_mixed_config_correctly_filtered(self):
+        """v1.5: only native-eligible allowed_tools appear in specs."""
         specs = _build_native_tool_specs([
-            "get_time", "send_email", "send_wechat_messages",
-            "get_weather", "search_memory",
+            "get_time", "send_email", "wechat_reply",
+            "get_weather", "search_memory", "done",
         ])
         names = {s["function"]["name"] for s in (specs or [])}
-        assert names == {"send_wechat_messages", "get_time", "get_weather"}
+        assert names == {"wechat_reply", "get_time", "get_weather", "done"}
 
 
 # 2. Native tool specs structure
@@ -121,7 +124,8 @@ class TestNativeToolSpecs:
 
 # 3. Phase 1: ChatAgent native tool call integration
 class TestChatAgentPhase1:
-    def test_send_wechat_messages_native(self):
+    def test_old_send_wechat_messages_rejected(self):
+        """v1.5: deprecated send_wechat_messages → PROTOCOL_RETRY, no messages sent."""
         from agent.chat_agent import ChatAgent
 
         tc = _make_tc("send_wechat_messages", '{"messages":["hello"]}')
@@ -130,25 +134,26 @@ class TestChatAgentPhase1:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
+            native_allowed_tools=["wechat_reply", "done"],
             test_mode=True,
         )
         import asyncio
         result = asyncio.run(agent.chat(
             user_message="hi", history=[], trigger="user",
         ))
-        assert len(result.tool_results) >= 1
-        assert result.tool_results[0]["name"] == "send_wechat_messages"
+        # Should go to PROTOCOL_RETRY → eventually END_FAILED or END_PROTOCOL_ERROR
+        assert result.terminal_state in (TurnState.END_FAILED, TurnState.END_PROTOCOL_ERROR, TurnState.END_FALLBACK_SENT)
+        # No messages actually sent via deprecated tool
+        assert result.sent_message_count == 0
 
-    def test_fact_tool_then_send(self):
+    def test_fact_tool_then_wechat_reply_native(self):
         from agent.chat_agent import ChatAgent
 
         call_count = [0]
         responses = [
-            _make_response("", tool_calls=[_make_tc("get_time", '{}')],
-                           prompt_tokens=50, total_tokens=65),
-            _make_response("", tool_calls=[_make_tc("send_wechat_messages", '{"messages":["3pm"]}')],
-                           prompt_tokens=80, total_tokens=90),
+            _make_response("", tool_calls=[_make_tc("get_time", '{}')]),
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"3pm"}')]),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
         ]
 
         class MGW:
@@ -157,24 +162,31 @@ class TestChatAgentPhase1:
 
             async def complete(self, req):
                 self.requests.append(req)
-                idx = call_count[0]
+                idx = min(call_count[0], len(responses) - 1)
                 call_count[0] += 1
                 return responses[idx]
+
+        sent_msgs = []
+        async def fake_sender(messages):
+            for m in messages: m["send_status"] = "delivered"
+            sent_msgs.extend(messages)
+            return messages
 
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=MGW(),
             native_tool_calls=True,
-            native_allowed_tools=["get_time", "send_wechat_messages"],
-            test_mode=True,
+            native_allowed_tools=["get_time", "wechat_reply", "done"],
+            test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
         result = asyncio.run(agent.chat(
             user_message="time?", history=[], trigger="user",
+            wechat_sender=fake_sender,
         ))
-        assert result.iterations == 2
+        assert result.terminal_state == TurnState.END_REPLIED
         assert result.tool_results[0]["name"] == "get_time"
-        assert result.tool_results[1]["name"] == "send_wechat_messages"
+        assert result.sent_message_count == 1
 
 
 # 4. Native tool execution validation
@@ -216,13 +228,13 @@ class TestNativeToolExecution:
         assert "错误" in result  # not native eligible
 
     @pytest.mark.asyncio
-    async def test_wechat_reply_not_found(self):
-        result = await _execute_native_fact_tool(
-            tool_name="wechat_reply",
-            tool_args_raw='{"text":"hello"}',
-            native_allowed_tools=["wechat_reply"],
-        )
-        assert "错误" in result  # not in TOOL_REGISTRY
+    async def test_wechat_reply_is_action_tool(self):
+        """v1.5: wechat_reply IS registered as action_tool — routed by name, not category."""
+        from agent.tool_registry import TOOL_REGISTRY
+        t = TOOL_REGISTRY.get("wechat_reply")
+        assert t is not None
+        assert t.native_tool_call_eligible is True
+        assert t.tool_category == "action_tool"
 
     @pytest.mark.asyncio
     async def test_not_in_allowed_list_blocked(self):
@@ -378,12 +390,12 @@ class TestDeepSeekAdapterPayload:
 # 6. ToolRegistry native specs tests
 class TestToolRegistryNativeSpecs:
     def test_registry_has_native_eligible_tools(self):
-        """v0.2: all 4 tools are native-tool-call-eligible."""
+        """v1.5: 4 tools are native-eligible (get_time, get_weather, wechat_reply, done)."""
         native_names = {
             t.name for t in TOOL_REGISTRY.iter_defs()
             if t.native_tool_call_eligible
         }
-        assert native_names == {"get_time", "get_weather", "send_wechat_messages", "skip_reply"}
+        assert native_names == {"get_time", "get_weather", "wechat_reply", "done"}
 
     def test_send_email_not_registered(self):
         """v0.2: send_email is removed from the registry entirely."""
@@ -445,9 +457,11 @@ class TestToolCategorySafety:
         assert tool is not None
         assert tool.tool_category == "fact_tool"
 
-    def test_wechat_reply_not_registered(self):
-        """wechat_reply should NOT be registered (removed in v0.2)."""
-        assert TOOL_REGISTRY.get("wechat_reply") is None
+    def test_wechat_reply_is_registered(self):
+        """v1.5: wechat_reply IS registered as a native tool."""
+        t = TOOL_REGISTRY.get("wechat_reply")
+        assert t is not None
+        assert t.native_tool_call_eligible is True
 
     def test_skip_action_not_registered(self):
         """old skip action should NOT be registered."""

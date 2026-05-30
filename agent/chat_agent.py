@@ -38,10 +38,7 @@ from agent.tool_registry import TOOL_REGISTRY
 logger = logging.getLogger(__name__)
 
 # Safeguard constants
-MAX_TOOL_LOOP = 5                 # legacy, replaced by MAX_LLM_STEPS_PER_TURN
 MAX_MESSAGE_LEN = 500
-MAX_MESSAGES_PER_TURN = 16        # legacy, kept for output_guard.py compat
-LEGACY_MAX_MESSAGE_COUNT = 8
 
 # Route constants (kept for diagnostics)
 ROUTE_SYSTEM_FAST = "SystemFastPath"
