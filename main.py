@@ -486,8 +486,13 @@ def _make_interrupt_checker(user_id: str, input_latest_seq: int):
     """
     def _check(_interrupt_token: str) -> bool:
         latest_seq = _user_latest_inbound_seq.get(user_id, 0)
-        # Only seq strictly greater than input boundary counts
-        return latest_seq > input_latest_seq
+        interrupted = latest_seq > input_latest_seq
+        if interrupted:
+            logging.getLogger("goal").info(
+                "interrupt_check: latest_seq=%d > input_latest_seq=%d -> interrupted=True",
+                latest_seq, input_latest_seq,
+            )
+        return interrupted
 
     return _check
 
@@ -1984,6 +1989,13 @@ async def chat(request: Request):
         f"seq={input_first_seq}-{input_latest_seq} count={len(input_message_ids)}"
     )
 
+    # ── v1.2: update inbound registry OUTSIDE lock ──────────────
+    # Seq-based checking is safe here: input_latest_seq is this batch's
+    # boundary.  A concurrent old turn with input_latest_seq=N will see
+    # latest_seq=M > N and cancel itself.  This batch won't cancel itself
+    # because latest_seq == input_latest_seq, and > is strict.
+    _record_user_message_arrival(user_id, seq=input_latest_seq)
+
     lock = _get_user_lock(user_id)
     turn_id = ""
     send_status = ""
@@ -2023,8 +2035,7 @@ async def chat(request: Request):
             async def _bound_sender(messages: list[dict]) -> list[dict]:
                 return await wechat_sender(user_id, context_token, messages)
 
-            # ── v1.2: Record arrival & build seq-based checker (inside lock) ──
-            _record_user_message_arrival(user_id, seq=input_latest_seq)
+            # ── v1.2: Build seq-based checker (arrival already recorded outside lock) ──
             interrupt_checker = _make_interrupt_checker(user_id, input_latest_seq)
 
             # Run Chat Agent (v1.2 state machine)
