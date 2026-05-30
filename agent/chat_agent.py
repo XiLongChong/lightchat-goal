@@ -1,6 +1,5 @@
-"""ChatAgent — v0.2 Phase 1 state-machine-driven chat loop.
+"""ChatAgent — v1.2 Level-1 state-machine-driven chat loop.
 
-Replaces the old procedural for-loop with an explicit Level-0 state machine.
 All visible WeChat output must go through: native tool calls → guard → wechat_sender.
 assistant.content is never directly sent to WeChat.
 send_wechat_messages tool result is never fed back to the model.
@@ -18,11 +17,15 @@ from typing import Any, Callable, Coroutine
 
 from agent.state_machine import (
     TERMINAL_STATES,
+    ContextBuildResult,
+    DeliveryStatus,
     ErrorClass,
     InterruptChecker,
+    PostTerminalCallback,
     TurnResult,
     TurnScratchpad,
     TurnState,
+    VisibleMessage,
     classify_error,
 )
 from agent.tool_classifier import classify_tool_calls
@@ -49,7 +52,7 @@ WeChatSender = Callable[[list[dict[str, Any]]], Coroutine[Any, Any, list[dict[st
 
 
 class ChatAgent:
-    """Main chat agent — v0.2 explicit state machine (Phase 1)."""
+    """Main chat agent — v1.2 explicit Level-1 state machine."""
 
     def __init__(
         self,
@@ -64,6 +67,9 @@ class ChatAgent:
         native_allowed_tools: list[str] | None = None,
         json_output_enabled: bool = False,
         test_mode: bool = False,
+        # ── v1.2: post-terminal callbacks injected by main.py ─────
+        write_model_history: PostTerminalCallback | None = None,
+        post_turn_hooks: list[PostTerminalCallback] | None = None,
     ):
         self.llm_gateway = llm_gateway
         self.model = model
@@ -73,28 +79,46 @@ class ChatAgent:
         self.defaults = defaults or {}
         self.native_tool_calls = native_tool_calls
         self.native_allowed_tools = native_allowed_tools or []
-        self.json_output_enabled = json_output_enabled  # always false in v0.2
+        self.json_output_enabled = json_output_enabled
         self.test_mode = test_mode
         self._last_call_time = 0.0
         self._interrupt_checker: InterruptChecker | None = None
+        # v1.2: post-terminal pipeline callbacks
+        self._write_model_history: PostTerminalCallback | None = write_model_history
+        self._post_turn_hooks: list[PostTerminalCallback] = list(post_turn_hooks or [])
+
+        # v1.2: active turn's interrupt token
+        self._active_interrupt_token: str = ""
 
     def set_interrupt_checker(self, checker: InterruptChecker | None) -> None:
-        """Inject an interrupt checker. Called at key points in the state machine.
+        """Inject an interrupt checker. Called before each turn.
 
-        Signature: () -> bool
-        Returns True when the current turn has been superseded and should
-        be cancelled (END_CANCELLED).
+        v1.2 signature: (interrupt_token: str) -> bool
+        Returns True when the turn identified by interrupt_token has been
+        superseded and should be cancelled (END_CANCELLED).
+
+        In test_mode, a missing checker defaults to always-false.
+        In production, a checker MUST be provided — ValueError otherwise.
         """
         self._interrupt_checker = checker
 
     def _is_interrupted(self) -> bool:
-        """Check whether the current turn should be cancelled."""
-        if self._interrupt_checker:
-            try:
-                return self._interrupt_checker()
-            except Exception:
+        """Check whether the current turn should be cancelled.
+
+        Production: checker is required. If missing, raises ValueError.
+        Test mode: missing checker defaults to always-false.
+        """
+        if not self._interrupt_checker:
+            if self.test_mode:
                 return False
-        return False
+            raise ValueError(
+                "interrupt_checker is required in production mode. "
+                "Inject via chat(interrupt_checker=...) or set_interrupt_checker()."
+            )
+        try:
+            return self._interrupt_checker(self._active_interrupt_token)
+        except Exception:
+            return False
 
     # ================================================================
     # Public entry point
@@ -111,13 +135,27 @@ class ChatAgent:
         bot_id: str = "default",
         system_prompt: str = "",
         wechat_sender: WeChatSender | None = None,
+        source: str = "user_message",
+        input_message_ids: list[str] | None = None,
+        interrupt_checker: InterruptChecker | None = None,
     ) -> TurnResult:
-        """Process a user message through the v0.2 state machine.
+        """Process a user message through the v1.2 state machine.
 
         Returns TurnResult with terminal_state, visible_messages, and diagnostics.
+        WRITE_MODEL_HISTORY and POST_TURN_HOOKS execute inside this method
+        before TurnResult is assembled.
         """
-        turn = TurnScratchpad(user_message=user_message, trigger=trigger)
-        state = TurnState.BUILD_CONTEXT
+        # ── Inject interrupt checker for this turn ──────────────
+        if interrupt_checker is not None:
+            self._interrupt_checker = interrupt_checker
+
+        turn = TurnScratchpad(
+            user_message=user_message,
+            trigger=trigger,
+            source=source,
+            input_message_ids=list(input_message_ids or []),
+        )
+        state = TurnState.RECEIVE_EVENT
 
         # ── State machine loop ──────────────────────────────────
         while state not in TERMINAL_STATES:
@@ -131,7 +169,6 @@ class ChatAgent:
                     f"reached {turn.llm_call_count} LLM calls",
                 )
                 state = TurnState.HARD_FALLBACK
-                # Continue the loop so HARD_FALLBACK is handled below
 
             if logger.isEnabledFor(logging.DEBUG) and state == TurnState.CALL_LLM:
                 _dump_llm_payload(turn.messages, turn.turn_id, turn.llm_call_count)
@@ -145,26 +182,37 @@ class ChatAgent:
             )
             turn.iteration += 1
 
-        # ── Build result ────────────────────────────────────────
+        # ── v1.2: Post-terminal pipeline (inside ChatAgent) ─────
+        turn.terminal_state = state
+        await self._run_post_terminal_pipeline(turn, state)
+
+        # ── Build result (after pipeline completes) ─────────────
         self._last_call_time = time.time()
-        source, author, trigger_type = _resolve_outbound_semantics(trigger)
+        source_out, author, trigger_type = _resolve_outbound_semantics(trigger)
         context_sample = _build_context_sample(turn.messages)
+
+        legacy_visible = [
+            {"text": vm.guarded_text or vm.original_text, "delay": vm.delay,
+             "send_status": vm.delivery_status}
+            for vm in turn.visible_messages
+        ]
 
         return TurnResult(
             terminal_state=state,
             turn_id=turn.turn_id,
             user_message=turn.user_message,
-            visible_messages=turn.sent_results,
+            visible_messages=legacy_visible if legacy_visible else turn.sent_results,
             tool_results=turn.tool_results,
             fallback_events=turn.fallback_events,
             token_usage=turn.token_usage,
             iterations=turn.llm_call_count,
             elapsed_ms=turn.elapsed_ms,
             llm_status=turn.llm_status,
-            source=source,
+            source=source_out,
             author=author,
             trigger=trigger_type,
             context_sample=context_sample,
+            post_terminal_completed=True,
         )
 
     # ================================================================
@@ -183,8 +231,23 @@ class ChatAgent:
     ) -> TurnState:
         """Route each state to its handler. Returns the next state."""
 
-        if state == TurnState.BUILD_CONTEXT:
+        if state == TurnState.RECEIVE_EVENT:
+            return self._do_receive_event(turn)
+
+        elif state == TurnState.CREATE_TURN:
+            return self._do_create_turn(turn)
+
+        elif state == TurnState.INTERRUPT_CHECK:
+            return self._do_interrupt_check(turn)
+
+        elif state == TurnState.BUILD_CONTEXT:
             return self._do_build_context(turn, system_prompt, history, trigger)
+
+        elif state == TurnState.CLASSIFY_CONTEXT_ERROR:
+            return self._do_classify_context_error(turn)
+
+        elif state == TurnState.OPTIONAL_PREPROCESS:
+            return await self._do_optional_preprocess(turn)
 
         elif state == TurnState.CALL_LLM:
             return await self._do_call_llm(turn)
@@ -200,6 +263,9 @@ class ChatAgent:
 
         elif state == TurnState.EXEC_STATE_TOOLS:
             return await self._do_exec_state_tools(turn)
+
+        elif state == TurnState.CLASSIFY_TOOL_ERROR:
+            return self._do_classify_tool_error(turn)
 
         elif state == TurnState.PROTOCOL_RETRY:
             return self._do_protocol_retry(turn)
@@ -234,8 +300,139 @@ class ChatAgent:
             return TurnState.HARD_FALLBACK
 
     # ================================================================
-    # State handlers
+    # v1.2: Lifecycle state handlers
     # ================================================================
+
+    def _do_receive_event(self, turn: TurnScratchpad) -> TurnState:
+        """RECEIVE_EVENT: normalize turn input → CREATE_TURN."""
+        turn.status = "receiving"
+        return TurnState.CREATE_TURN
+
+    def _do_create_turn(self, turn: TurnScratchpad) -> TurnState:
+        """CREATE_TURN: assign turn metadata, generate interrupt_token.
+
+        v1.2 §4.2: generates turn_id (already done in TurnScratchpad init),
+        interrupt_token, sets status to running.
+        Then immediately enters INTERRUPT_CHECK before any processing.
+        """
+        turn.interrupt_token = f"it_{turn.turn_id}_{int(time.time() * 1000)}"
+        self._active_interrupt_token = turn.interrupt_token
+        turn.status = "running"
+        turn._resume_state = TurnState.BUILD_CONTEXT
+        return TurnState.INTERRUPT_CHECK
+
+    def _do_interrupt_check(self, turn: TurnScratchpad) -> TurnState:
+        """INTERRUPT_CHECK: verify current turn is still valid.
+
+        Resume to _resume_state if valid, else END_CANCELLED.
+        """
+        if self._is_interrupted():
+            turn.add_fallback_event(
+                "interrupted_at_check",
+                f"turn {turn.turn_id} superseded by newer event",
+            )
+            return TurnState.END_CANCELLED
+        return turn._resume_state or TurnState.BUILD_CONTEXT
+
+    # ================================================================
+    # v1.2: Context lifecycle handlers
+    # ================================================================
+
+    def _do_classify_context_error(self, turn: TurnScratchpad) -> TurnState:
+        """CLASSIFY_CONTEXT_ERROR: inspect ContextBuildResult.
+
+        FATAL error → HARD_FALLBACK.
+        RECOVERABLE warnings → propagate to turn.context_warnings, continue.
+        No errors → OPTIONAL_PREPROCESS.
+        """
+        result: ContextBuildResult = getattr(turn, "_context_result", None)
+        if result is None:
+            turn.add_fallback_event("context_result_missing", "no ContextBuildResult found")
+            return TurnState.HARD_FALLBACK
+
+        turn.messages = result.messages
+        turn.context_warnings = list(result.warnings)
+
+        if result.fatal_error:
+            turn.add_fallback_event("fatal_context_error", result.fatal_error)
+            return TurnState.HARD_FALLBACK
+
+        return TurnState.OPTIONAL_PREPROCESS
+
+    async def _do_optional_preprocess(self, turn: TurnScratchpad) -> TurnState:
+        """OPTIONAL_PREPROCESS: pre-fetch deterministic facts.
+
+        v1.2 §7: only pre-fetches current time (no weather auto-fetch).
+        Cannot generate replies, send WeChat, or write assistant history.
+        """
+        # Pre-fetch current time
+        try:
+            from datetime import datetime
+            now = datetime.now().strftime("%Y年%m月%d日 %H:%M 周%u")
+            turn.messages.append({
+                "role": "system",
+                "content": f"[系统] 当前时间：{now}",
+            })
+        except Exception as e:
+            turn.context_warnings.append({
+                "source": "time_prefetch",
+                "detail": f"pre_fetch_time failed: {e}",
+            })
+
+        return TurnState.CALL_LLM
+
+    # ================================================================
+    # v1.2: CLASSIFY_TOOL_ERROR handler
+    # ================================================================
+
+    def _do_classify_tool_error(self, turn: TurnScratchpad) -> TurnState:
+        """CLASSIFY_TOOL_ERROR: classify tool execution results.
+
+        All success / recoverable failures → back to CALL_LLM.
+        Fatal failure → HARD_FALLBACK.
+        Invalid tool args (protocol error) → PROTOCOL_RETRY.
+        """
+        tool_results = turn.tool_results
+        # Check for fatal errors
+        for tr in tool_results:
+            detail = str(tr.get("result", ""))
+            if "工具注册表损坏" in detail or "工具执行器不可用" in detail:
+                turn.add_fallback_event("fatal_tool_error", detail)
+                return TurnState.HARD_FALLBACK
+            if "工具名称为空" in detail or "未找到工具" in detail:
+                turn.add_fallback_event("invalid_tool_args", detail)
+                return TurnState.PROTOCOL_RETRY
+
+        return TurnState.CALL_LLM
+
+    # ================================================================
+    # v1.2: Post-terminal pipeline (inside ChatAgent)
+    # ================================================================
+
+    async def _run_post_terminal_pipeline(
+        self, turn: TurnScratchpad, terminal_state: TurnState,
+    ) -> None:
+        """Execute WRITE_MODEL_HISTORY → POST_TURN_HOOKS after terminal state.
+
+        v1.2: hooks must NOT modify terminal_state.
+        Individual hook failures do not block other hooks.
+        This runs BEFORE TurnResult is assembled.
+        """
+        # Step 1: Write model history
+        if self._write_model_history:
+            try:
+                await self._write_model_history(turn, terminal_state)
+            except Exception as e:
+                logger.error("write_model_history callback failed: %s", e)
+                turn.add_fallback_event("write_model_history_error", str(e)[:200])
+
+        # Step 2: Post-turn hooks (UPDATE_SUMMARY, UPDATE_MEMORY, etc.)
+        for hook in self._post_turn_hooks:
+            try:
+                await hook(turn, terminal_state)
+            except Exception as e:
+                logger.error("post_turn_hook failed: %s", e)
+                turn.add_fallback_event("hook_error", str(e)[:200])
 
     def _do_build_context(
         self,
@@ -244,12 +441,31 @@ class ChatAgent:
         history: list[dict[str, Any]],
         trigger: str,
     ) -> TurnState:
-        """BUILD_CONTEXT: assemble the initial messages array."""
+        """BUILD_CONTEXT: assemble ContextBuildResult → CLASSIFY_CONTEXT_ERROR.
+
+        v1.2: system_prompt empty is a CONTEXT WARNING (recorded),
+        NOT a fatal error. An empty or whitespace-only system_prompt
+        that was explicitly passed in is still used. The caller
+        (main.py) is responsible for providing a non-empty prompt.
+        Only a genuinely missing/broken prompt construction is FATAL.
+        """
+        warnings: list[dict[str, str]] = []
+        fatal_error = ""
+
+        # System prompt — build or validate
+        prompt = system_prompt.strip() if system_prompt else ""
+        if not prompt:
+            prompt = self._default_system_prompt()
+            warnings.append({
+                "source": "system_prompt_build",
+                "detail": "no system_prompt provided by caller, using default",
+            })
+
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": system_prompt or self._default_system_prompt()},
+            {"role": "system", "content": prompt},
         ]
 
-        # Short-term history: last 24 messages (12 turns)
+        # Short-term history
         recent = history[-24:] if len(history) > 24 else history
         for h in recent:
             role = h.get("role", "user")
@@ -265,8 +481,14 @@ class ChatAgent:
         else:
             messages.append({"role": "system", "content": turn.user_message})
 
-        turn.messages = messages
-        return TurnState.CALL_LLM
+        # Store result on scratchpad
+        result = ContextBuildResult(
+            messages=messages,
+            warnings=warnings,
+            fatal_error=fatal_error,
+        )
+        turn._context_result = result  # transient, consumed by CLASSIFY_CONTEXT_ERROR
+        return TurnState.CLASSIFY_CONTEXT_ERROR
 
     async def _do_call_llm(self, turn: TurnScratchpad) -> TurnState:
         """CALL_LLM: invoke the LLM via gateway."""
@@ -436,16 +658,28 @@ class ChatAgent:
         return TurnState.CALL_LLM
 
     async def _do_exec_state_tools(self, turn: TurnScratchpad) -> TurnState:
-        """EXEC_STATE_TOOLS: execute state tools. Phase 1 — no instances yet.
+        """EXEC_STATE_TOOLS: execute state tools (v1.2 strict mode).
 
-        Reserved for future STATE_TOOL registration (e.g. propose_memory_update).
-        Always returns to CALL_LLM after execution.
+        No STATE_TOOL registrations exist yet — reaching this state means
+        the classifier allowed a tool that shouldn't be here.
+        Future: registered STATE_TOOLs execute → INTERRUPT_CHECK →
+        CLASSIFY_TOOL_ERROR → CALL_LLM.
         """
-        turn.add_fallback_event(
-            "state_tools_noop",
-            "state tools not yet implemented, returning to LLM",
+        # Check if any STATE_TOOL is registered
+        has_state_tools = any(
+            t.tool_category == "state_tool" for t in TOOL_REGISTRY.iter_defs()
         )
-        return TurnState.CALL_LLM
+        if not has_state_tools:
+            # Should never reach here — classifier would catch unknown tools
+            turn.add_fallback_event(
+                "state_tools_unreachable",
+                "no STATE_TOOL registered; protocol error",
+            )
+            return TurnState.PROTOCOL_RETRY
+
+        # v1.2: registered STATE_TOOLs — execute (future)
+        turn._resume_state = TurnState.CLASSIFY_TOOL_ERROR
+        return TurnState.INTERRUPT_CHECK
 
     def _do_protocol_retry(self, turn: TurnScratchpad) -> TurnState:
         """PROTOCOL_RETRY: model didn't follow protocol.
@@ -737,6 +971,8 @@ class ChatAgent:
     ) -> TurnState:
         """HARD_FALLBACK: system fixed fallback text.
 
+        v1.2: INTERRUPT_CHECK before sending — superseded turns must not
+        send fallback text either.
         Uses unified HARD_FALLBACK_TEXT from output_guard.
         Does NOT use model content.
         Still goes through guard and wechat_sender.
@@ -744,6 +980,11 @@ class ChatAgent:
         from agent.output_guard import HARD_FALLBACK_TEXT, guard_single_message
 
         turn.add_fallback_event("hard_fallback_enter", "entering hard fallback")
+
+        # v1.2: interrupt check before sending fallback
+        if self._is_interrupted():
+            turn.add_fallback_event("interrupted_before_fallback", "turn superseded by newer event")
+            return TurnState.END_CANCELLED
 
         # Guard the hard fallback text
         guarded = guard_single_message(HARD_FALLBACK_TEXT)

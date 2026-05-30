@@ -1,28 +1,32 @@
-"""State machine types — v0.2 Phase 1.
+"""State machine types — v1.2 Phase 1.
 
-TurnState enum, TurnScratchpad (turn-local mutable state), and TurnResult
-(the immutable result returned to callers after the turn ends).
+TurnState enum, TurnScratchpad (turn-local mutable state), TurnResult
+(the immutable result returned to callers after the turn ends),
+VisibleMessage, DeliveryStatus, ContextBuildResult.
 """
 
 from __future__ import annotations
 
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
 
 class TurnState(StrEnum):
-    """Level-0 state machine states per v0.2 design.
+    """Level-1 state machine states per v1.2 design.
 
     Non-terminal states:
     """
 
     # --- lifecycle ---
+    RECEIVE_EVENT = "receive_event"
     CREATE_TURN = "create_turn"
+    INTERRUPT_CHECK = "interrupt_check"
     BUILD_CONTEXT = "build_context"
+    CLASSIFY_CONTEXT_ERROR = "classify_context_error"
     OPTIONAL_PREPROCESS = "optional_preprocess"
 
     # --- LLM ---
@@ -35,6 +39,7 @@ class TurnState(StrEnum):
     # --- fact / state tools ---
     EXEC_FACT_TOOLS = "exec_fact_tools"
     EXEC_STATE_TOOLS = "exec_state_tools"
+    CLASSIFY_TOOL_ERROR = "classify_tool_error"
 
     # --- protocol ---
     PROTOCOL_RETRY = "protocol_retry"
@@ -55,7 +60,7 @@ class TurnState(StrEnum):
     # --- fallback ---
     HARD_FALLBACK = "hard_fallback"
 
-    # --- post-turn ---
+    # --- post-turn (executed inside ChatAgent after terminal state reached) ---
     WRITE_MODEL_HISTORY = "write_model_history"
     POST_TURN_HOOKS = "post_turn_hooks"
 
@@ -68,7 +73,7 @@ class TurnState(StrEnum):
     END_CANCELLED = "end_cancelled"
 
 
-# Set of states that terminate the turn loop
+# Set of states that terminate the turn loop (stay in TERMINAL_STATES per v1.2)
 TERMINAL_STATES: frozenset[TurnState] = frozenset({
     TurnState.END_SENT,
     TurnState.END_PARTIAL_SENT,
@@ -78,6 +83,57 @@ TERMINAL_STATES: frozenset[TurnState] = frozenset({
     TurnState.END_CANCELLED,
 })
 
+
+# ================================================================
+# Delivery status (v1.2 §13.3 — five-state model + PENDING)
+# ================================================================
+
+class DeliveryStatus(StrEnum):
+    """Per-message delivery status for the send path."""
+    PENDING = "pending"                      # 待发送
+    FAILED_BEFORE_SEND = "failed_before_send"  # 发送前失败（可重试）
+    UNKNOWN_AFTER_ATTEMPT = "unknown_after_attempt"  # 发送后未知（默认不重试）
+    SENT_CONFIRMED = "sent_confirmed"        # 确认已送达
+    FAILED_CONFIRMED = "failed_confirmed"    # 确认失败（可重试）
+    BLOCKED_BY_GUARD = "blocked_by_guard"    # 被输出保护拦截（不重试）
+
+
+# ================================================================
+# VisibleMessage — per-message tracking (v1.2 §13.2)
+# ================================================================
+
+@dataclass(slots=True)
+class VisibleMessage:
+    """One visible WeChat message tracked through the send pipeline."""
+
+    visible_message_id: str           # vm_{turn_id}_{index}
+    index: int                        # position in the batch
+    original_text: str = ""           # raw text from model tool args
+    guarded_text: str = ""            # text after GUARD_OUTPUT
+    guard_status: str = ""            # PASSED / SANITIZED / BLOCKED
+    delivery_status: str = ""         # DeliveryStatus value
+    attempt_count: int = 0
+    wechat_message_id: str = ""       # WeChat-side message id (if available)
+    error_code: str = ""
+    delay: float = 0.0
+
+
+# ================================================================
+# ContextBuildResult — internal to _do_build_context (v1.2 §6)
+# ================================================================
+
+@dataclass(slots=True)
+class ContextBuildResult:
+    """Result of BUILD_CONTEXT, consumed by CLASSIFY_CONTEXT_ERROR."""
+
+    messages: list[dict[str, Any]]
+    warnings: list[dict[str, str]]     # [{"source": "summary_loader", "detail": "..."}, ...]
+    fatal_error: str = ""              # non-empty means fatal — route to HARD_FALLBACK
+
+
+# ================================================================
+# TurnScratchpad (v1.2 expanded)
+# ================================================================
 
 @dataclass
 class TurnScratchpad:
@@ -90,17 +146,27 @@ class TurnScratchpad:
     user_message: str = ""
     trigger: str = "user"  # user | admin
 
+    # ── v1.2: Turn lifecycle metadata ──────────────────────────
+    source: str = "user_message"       # TURN_SOURCE: user_message | proactive_trigger | ...
+    input_message_ids: list[str] = field(default_factory=list)
+    interrupt_token: str = ""          # set by CREATE_TURN
+    status: str = "created"            # created → running → cancelled / ended
+    terminal_state: TurnState | None = None  # set after terminal state reached
+    context_warnings: list[dict[str, str]] = field(default_factory=list)
+    # transient: where to resume after INTERRUPT_CHECK passes
+    _resume_state: TurnState | None = field(default=None, repr=False)
+
     # LLM message array (grows through the turn)
     messages: list[dict[str, Any]] = field(default_factory=list)
 
     # Tool results (diagnostic only)
     tool_results: list[dict[str, Any]] = field(default_factory=list)
 
-    # Send path state
-    visible_batch: list[str] = field(default_factory=list)  # raw parsed messages
-    guarded_batch: list[dict[str, Any]] = field(
-        default_factory=list
-    )  # [{"text": str, "delay": float}, ...]
+    # ── v1.2: Send path — VisibleMessage tracking ─────────────
+    visible_messages: list[VisibleMessage] = field(default_factory=list)
+    # legacy compat (removed in Phase 4)
+    visible_batch: list[str] = field(default_factory=list)
+    guarded_batch: list[dict[str, Any]] = field(default_factory=list)
     sent_results: list[dict[str, Any]] = field(default_factory=list)
 
     # Counters
@@ -138,18 +204,23 @@ class TurnScratchpad:
         self.fallback_events.append({"type": event_type, "detail": detail[:500]})
 
 
+# ================================================================
+# TurnResult (v1.2 — assembled after post-terminal pipeline)
+# ================================================================
+
 @dataclass
 class TurnResult:
     """Immutable result returned to main.py after the turn ends.
 
-    main.py uses this to write history, record diagnostics, and respond to bridge.
+    Assembled AFTER WRITE_MODEL_HISTORY and POST_TURN_HOOKS complete.
+    main.py reads this for transport-layer operations and HTTP response.
     """
 
     terminal_state: TurnState
     turn_id: str
     user_message: str
 
-    # Messages actually sent to WeChat (may be empty for skip/fail)
+    # Messages actually sent to WeChat (VisibleMessage list or legacy dicts)
     visible_messages: list[dict[str, Any]] = field(default_factory=list)
 
     # Diagnostics
@@ -167,6 +238,9 @@ class TurnResult:
 
     # Context sample (last N messages, for diagnostics)
     context_sample: list[dict[str, str]] = field(default_factory=list)
+
+    # ── v1.2: post-terminal pipeline marker ────────────────────
+    post_terminal_completed: bool = False
 
     @property
     def was_sent(self) -> bool:
@@ -191,22 +265,40 @@ class TurnResult:
     @property
     def delivered_count(self) -> int:
         return sum(
-            1 for r in self.visible_messages if r.get("send_status") == "delivered"
+            1 for r in self.visible_messages
+            if r.get("send_status") in ("delivered", "sent_confirmed")
         )
 
 
 # ================================================================
-# Error classification (v0.2 Phase 4)
+# Interrupt checker (v1.2: token-based)
+# ================================================================
+
+# Callback: (interrupt_token: str) -> bool.
+# Returns True when the turn identified by interrupt_token has been
+# superseded by a newer event and should be cancelled.
+# Signature: Callable[[str], bool]
+InterruptChecker = Callable[[str], bool]
+
+
+# ================================================================
+# v1.2 unified callback signatures
+# ================================================================
+
+# write_model_history callback:
+#   (turn: TurnScratchpad, terminal_state: TurnState) -> Awaitable[None]
+# post_turn_hook callback (single hook):
+#   (turn: TurnScratchpad, terminal_state: TurnState) -> Awaitable[None]
+PostTerminalCallback = Callable[["TurnScratchpad", TurnState], Awaitable[None]]
+
+
+# ================================================================
+# Error classification (v1.2: kept from v0.2 Phase 4)
 # ================================================================
 
 class ErrorClass(StrEnum):
     RECOVERABLE = "recoverable"
     FATAL = "fatal"
-
-
-# Callback: () -> bool.  Returns True when the current turn has been
-# superseded by a newer event and should be cancelled.
-InterruptChecker = Callable[[], bool]
 
 
 def classify_error(error_source: str, detail: str = "") -> ErrorClass:

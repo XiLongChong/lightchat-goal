@@ -109,6 +109,7 @@ class TestSendWechatMessages:
             llm_gateway=gw,
             native_tool_calls=True,
             native_allowed_tools=["send_wechat_messages"],
+            test_mode=True,
         )
         result = _run(agent)
         assert len(result.visible_messages) >= 1
