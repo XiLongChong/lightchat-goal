@@ -1702,10 +1702,14 @@ async def chat(request: Request):
             await append_history_async(user_id, "user", user_message, source="wechat", bot_id=bot_id)
 
             if result.was_sent:
-                # END_SENT / END_PARTIAL_SENT: write only delivered messages
+                # END_SENT / END_PARTIAL_SENT: write only confirmed deliveries
+                def _is_delivered(st: str) -> bool:
+                    return st in ("delivered", "sent_confirmed")
+
                 delivered_texts = [
                     m["text"] for m in result.visible_messages
-                    if m.get("send_status") == "delivered" and m.get("text")
+                    if _is_delivered(m.get("send_status", "") or m.get("delivery_status", ""))
+                    and m.get("text")
                 ]
                 if delivered_texts:
                     await append_history_async(
@@ -1713,22 +1717,28 @@ async def chat(request: Request):
                         source="assistant", bot_id=bot_id,
                     )
             elif result.was_fallback:
-                # END_FALLBACK_SENT: log as system event, not regular assistant
+                # END_FALLBACK_SENT: default no regular assistant history
+                # v1.2: if must write, mark as assistant:fallback via source
                 if result.visible_messages:
                     fallback_texts = [
                         m["text"] for m in result.visible_messages if m.get("text")
                     ]
                     if fallback_texts:
                         await append_history_async(
-                            user_id, "system", f"[fallback] {' '.join(fallback_texts)}",
-                            source="system", bot_id=bot_id,
+                            user_id, "assistant", "\n".join(fallback_texts),
+                            source="assistant:fallback", bot_id=bot_id,
                         )
             # END_SKIPPED / END_FAILED / END_CANCELLED: no assistant history written
 
             # ── POST_TURN_HOOKS: memory extraction (fire-and-forget) ─
+            def _is_delivered(st: str) -> bool:
+                return st in ("delivered", "sent_confirmed")
+
             assistant_text = "\n".join(
                 m["text"] for m in result.visible_messages
-                if m.get("text") and m.get("send_status") == "delivered"
+                if m.get("text") and _is_delivered(
+                    m.get("send_status", "") or m.get("delivery_status", "")
+                )
             )
             if memory_hook and assistant_text:
                 await memory_hook.update(

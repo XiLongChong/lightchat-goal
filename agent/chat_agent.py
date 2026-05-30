@@ -191,9 +191,15 @@ class ChatAgent:
         source_out, author, trigger_type = _resolve_outbound_semantics(trigger)
         context_sample = _build_context_sample(turn.messages)
 
+        # v1.2: build backward-compat dict from VisibleMessage objects
+        # Include both old key (send_status) and new key (delivery_status)
         legacy_visible = [
-            {"text": vm.guarded_text or vm.original_text, "delay": vm.delay,
-             "send_status": vm.delivery_status}
+            {
+                "text": vm.guarded_text or vm.original_text,
+                "delay": vm.delay,
+                "send_status": vm.delivery_status,        # legacy key
+                "delivery_status": vm.delivery_status,     # v1.2 key
+            }
             for vm in turn.visible_messages
         ]
 
@@ -811,9 +817,14 @@ class ChatAgent:
     # ── Send path ───────────────────────────────────────────────
 
     def _do_parse_visible_batch(self, turn: TurnScratchpad) -> TurnState:
-        """PARSE_VISIBLE_BATCH: extract messages from send_wechat_messages args."""
+        """PARSE_VISIBLE_BATCH: extract messages from send_wechat_messages args.
+
+        v1.2: creates VisibleMessage objects with visible_message_id,
+        original_text, and index.  Also populates legacy turn.visible_batch
+        for guard_send_message_batch compatibility.
+        """
         classified = turn._classified
-        tc = classified.terminal_tools[0]  # Guaranteed exactly one terminal tool
+        tc = classified.terminal_tools[0]
         fn = tc.get("function", {})
         args_raw = fn.get("arguments", "")
 
@@ -841,27 +852,54 @@ class ChatAgent:
             )
             return TurnState.PROTOCOL_RETRY
 
-        turn.visible_batch = [str(m) for m in raw_messages]
-        # Store mode for guard
+        raw_texts = [str(m) for m in raw_messages]
+
+        # v1.2: create VisibleMessage for each parsed message
+        turn.visible_messages = [
+            VisibleMessage(
+                visible_message_id=f"vm_{turn.turn_id}_{i}",
+                index=i,
+                original_text=text,
+            )
+            for i, text in enumerate(raw_texts)
+        ]
+
+        # Legacy compat: still populate visible_batch for guard_send_message_batch
+        turn.visible_batch = raw_texts
         turn._send_mode = str(args.get("mode", "normal") or "normal")
 
         logger.info(
             "state_machine: parsed %d visible messages, mode=%s",
-            len(turn.visible_batch), turn._send_mode,
+            len(turn.visible_messages), turn._send_mode,
         )
         return TurnState.GUARD_OUTPUT
 
     def _do_guard_output(self, turn: TurnScratchpad) -> TurnState:
-        """GUARD_OUTPUT: run all output guards on the parsed batch.
+        """GUARD_OUTPUT: run output guard on every parsed VisibleMessage.
 
-        Interrupt check #2: before sending any user-visible content.
+        v1.2: each VisibleMessage gets guarded_text and guard_status populated
+        individually.  Messages blocked by guard get delivery_status =
+        BLOCKED_BY_GUARD.  If all are blocked → HARD_FALLBACK.
+        Interrupt check before guard.
         """
         if self._is_interrupted():
             turn.add_fallback_event("interrupted_before_guard", "turn superseded by newer event")
             return TurnState.END_CANCELLED
 
-        from agent.output_guard import guard_send_message_batch
+        from agent.output_guard import guard_single_message, guard_send_message_batch
 
+        # ── Per-message guard (populates VisibleMessage fields) ──
+        for vm in turn.visible_messages:
+            guarded = guard_single_message(vm.original_text)
+            if guarded:
+                vm.guarded_text = guarded
+                vm.guard_status = "PASSED" if guarded == vm.original_text else "SANITIZED"
+            else:
+                vm.guarded_text = ""
+                vm.guard_status = "BLOCKED"
+                vm.delivery_status = DeliveryStatus.BLOCKED_BY_GUARD
+
+        # ── Batch guard (for count/char limits and backward compat) ──
         guard_result = guard_send_message_batch(
             turn.visible_batch, mode=getattr(turn, "_send_mode", "normal"),
         )
@@ -877,7 +915,10 @@ class ChatAgent:
                 f"truncated {guard_result.truncated_count} messages",
             )
 
-        if not guard_result.messages:
+        # ── Build legacy guarded_batch for wechat_sender callback ──
+        passed = [vm for vm in turn.visible_messages if vm.guard_status != "BLOCKED"]
+
+        if not passed:
             turn.add_fallback_event(
                 "guard_all_blocked",
                 "all messages blocked by output guard",
@@ -885,19 +926,20 @@ class ChatAgent:
             return TurnState.HARD_FALLBACK
 
         turn.guarded_batch = [
-            {"text": text, "delay": 0.0}
-            for text in guard_result.messages
+            {"text": vm.guarded_text, "delay": 0.0, "_vm_index": vm.index}
+            for vm in passed
         ]
         return TurnState.EXEC_SEND_WECHAT
 
     async def _do_exec_send_wechat(
         self, turn: TurnScratchpad, wechat_sender: WeChatSender | None,
     ) -> TurnState:
-        """EXEC_SEND_WECHAT: compute delays and send via wechat_sender callback.
+        """EXEC_SEND_WECHAT: send via wechat_sender, map to five-state delivery.
 
-        Interrupt check #3: last chance before WeChat send.
-        Phase 2: sends the full batch.  If any messages fail, transitions to
-        SEND_RETRY_UNDELIVERED_ONLY for automatic retry (max 2 attempts).
+        v1.2: maps old send_status → DeliveryStatus on each VisibleMessage.
+        Only FAILED_BEFORE_SEND and FAILED_CONFIRMED trigger retry.
+        SENT_CONFIRMED, UNKNOWN_AFTER_ATTEMPT, BLOCKED_BY_GUARD do NOT retry.
+        Interrupt check before sending.
         """
         if self._is_interrupted():
             turn.add_fallback_event("interrupted_before_send", "turn superseded by newer event")
@@ -905,44 +947,85 @@ class ChatAgent:
 
         from agent.tools import compute_message_delay
 
-        # Record tool result for diagnostics
         turn.tool_results.append({
             "name": "send_wechat_messages",
             "result": f"prepared {len(turn.guarded_batch)} messages",
         })
 
         if not wechat_sender:
-            for m in turn.guarded_batch:
-                m["send_status"] = "generated"
+            for vm in turn.visible_messages:
+                if vm.guard_status != "BLOCKED":
+                    vm.delivery_status = DeliveryStatus.PENDING
             turn.sent_results = list(turn.guarded_batch)
             turn.add_fallback_event("send_no_sender", "no wechat_sender callback")
             return TurnState.DECIDE_SEND_TERMINAL
 
-        # Compute delays and tag each message with its index for retry merging
+        # Compute delays
         total = len(turn.guarded_batch)
         for i, m in enumerate(turn.guarded_batch):
             m["delay"] = compute_message_delay(
                 i, m["text"], total, test_mode=self.test_mode,
             )
-            m["_idx"] = i  # transient: used for retry result merging
 
-        # Send
+        # Send via callback
         try:
-            turn.sent_results = await wechat_sender(turn.guarded_batch)
+            raw_results = await wechat_sender(turn.guarded_batch)
             logger.info(
                 "state_machine: sent %d messages via wechat_sender",
-                len(turn.sent_results),
+                len(raw_results),
             )
         except Exception as e:
             logger.error("state_machine: wechat_sender failed: %s", e)
             turn.add_fallback_event("send_error", str(e)[:200])
+            # All attempted messages → UNKNOWN_AFTER_ATTEMPT (don't know if sent)
             for m in turn.guarded_batch:
-                m["send_status"] = "failed"
+                vm_idx = m.get("_vm_index")
+                if vm_idx is not None and vm_idx < len(turn.visible_messages):
+                    vm = turn.visible_messages[vm_idx]
+                    if vm.delivery_status != DeliveryStatus.BLOCKED_BY_GUARD:
+                        vm.delivery_status = DeliveryStatus.UNKNOWN_AFTER_ATTEMPT
+                        vm.error_code = str(e)[:200]
             turn.sent_results = list(turn.guarded_batch)
+            return TurnState.DECIDE_SEND_TERMINAL
 
-        # Check for undelivered → retry
-        undelivered = [r for r in turn.sent_results if r.get("send_status") != "delivered"]
-        if undelivered and turn.send_attempt < turn.max_send_retries:
+        # ── Map results back to VisibleMessage (v1.2 five-state) ──
+        turn.sent_results = raw_results
+        for r in raw_results:
+            vm_idx = r.get("_vm_index")
+            if vm_idx is None or vm_idx >= len(turn.visible_messages):
+                continue
+            vm = turn.visible_messages[vm_idx]
+            if vm.delivery_status == DeliveryStatus.BLOCKED_BY_GUARD:
+                continue  # already blocked
+            old_status = r.get("send_status", "")
+            if old_status == "delivered":
+                vm.delivery_status = DeliveryStatus.SENT_CONFIRMED
+                vm.attempt_count += 1
+            elif old_status == "failed":
+                error = r.get("send_error", "")
+                if "no_bridge" in str(error).lower():
+                    vm.delivery_status = DeliveryStatus.FAILED_BEFORE_SEND
+                else:
+                    vm.delivery_status = DeliveryStatus.UNKNOWN_AFTER_ATTEMPT
+                vm.error_code = str(error)[:200]
+            elif old_status == "blocked":
+                vm.delivery_status = DeliveryStatus.FAILED_BEFORE_SEND
+                vm.error_code = r.get("send_error", "empty text")
+            elif old_status == "generated":
+                vm.delivery_status = DeliveryStatus.PENDING
+            else:
+                vm.delivery_status = DeliveryStatus.UNKNOWN_AFTER_ATTEMPT
+            vm.attempt_count += 1
+
+        # ── Retry decision (v1.2: only specific statuses) ──
+        retryable = [
+            vm for vm in turn.visible_messages
+            if vm.delivery_status in (
+                DeliveryStatus.FAILED_BEFORE_SEND,
+                DeliveryStatus.FAILED_CONFIRMED,
+            )
+        ]
+        if retryable and turn.send_attempt < turn.max_send_retries:
             return TurnState.SEND_RETRY_UNDELIVERED_ONLY
 
         return TurnState.DECIDE_SEND_TERMINAL
@@ -950,72 +1033,115 @@ class ChatAgent:
     async def _do_send_retry(
         self, turn: TurnScratchpad, wechat_sender: WeChatSender | None,
     ) -> TurnState:
-        """SEND_RETRY_UNDELIVERED_ONLY: retry only undelivered messages.
+        """SEND_RETRY_UNDELIVERED_ONLY: retry only retry-safe messages.
 
-        Does NOT re-invoke the model.  Sends the same text batch again.
-        Merges retry results back into sent_results by index.
+        v1.2 §13.4: only retries FAILED_BEFORE_SEND and FAILED_CONFIRMED.
+        Never retries SENT_CONFIRMED, UNKNOWN_AFTER_ATTEMPT, BLOCKED_BY_GUARD.
+        Does NOT re-invoke the model.
         """
         if not wechat_sender:
             turn.add_fallback_event("send_retry_no_sender", "cannot retry without sender")
             return TurnState.DECIDE_SEND_TERMINAL
 
-        # Collect undelivered messages with their original indices
-        undelivered: list[dict[str, Any]] = []
-        for r in turn.sent_results:
-            if r.get("send_status") != "delivered":
-                undelivered.append({"text": r["text"], "delay": r.get("delay", 0), "_idx": r.get("_idx")})
-
-        if not undelivered:
+        # v1.2: only collect retryable messages
+        retryable_vms = [
+            vm for vm in turn.visible_messages
+            if vm.delivery_status in (
+                DeliveryStatus.FAILED_BEFORE_SEND,
+                DeliveryStatus.FAILED_CONFIRMED,
+            )
+        ]
+        if not retryable_vms:
             return TurnState.DECIDE_SEND_TERMINAL
 
         turn.send_attempt += 1
         turn.add_fallback_event(
             "send_retry_attempt",
-            f"retrying {len(undelivered)} undelivered messages (attempt {turn.send_attempt})",
+            f"retrying {len(retryable_vms)} messages (attempt {turn.send_attempt})",
         )
         logger.info(
-            "state_machine: send_retry attempt=%d undelivered=%d",
-            turn.send_attempt, len(undelivered),
+            "state_machine: send_retry attempt=%d retryable=%d",
+            turn.send_attempt, len(retryable_vms),
         )
 
+        # Build retry batch
+        retry_batch: list[dict[str, Any]] = [
+            {"text": vm.guarded_text or vm.original_text,
+             "delay": vm.delay,
+             "_vm_index": vm.index}
+            for vm in retryable_vms
+        ]
+
         try:
-            retry_results = await wechat_sender(undelivered)
+            retry_results = await wechat_sender(retry_batch)
         except Exception as e:
             logger.error("state_machine: send_retry failed: %s", e)
             turn.add_fallback_event("send_retry_error", str(e)[:200])
+            for vm in retryable_vms:
+                if vm.delivery_status in (DeliveryStatus.FAILED_BEFORE_SEND, DeliveryStatus.FAILED_CONFIRMED):
+                    vm.delivery_status = DeliveryStatus.UNKNOWN_AFTER_ATTEMPT
+                    vm.error_code = str(e)[:200]
             return TurnState.DECIDE_SEND_TERMINAL
 
-        # Merge retry results back by index
+        # Map retry results back to VisibleMessage
         for rr in retry_results:
-            idx = rr.get("_idx")
-            if idx is not None and idx < len(turn.sent_results):
-                turn.sent_results[idx] = rr
+            vm_idx = rr.get("_vm_index")
+            if vm_idx is None or vm_idx >= len(turn.visible_messages):
+                continue
+            vm = turn.visible_messages[vm_idx]
+            old_status = rr.get("send_status", "")
+            if old_status == "delivered":
+                vm.delivery_status = DeliveryStatus.SENT_CONFIRMED
+            elif old_status in ("failed", "blocked"):
+                vm.delivery_status = DeliveryStatus.UNKNOWN_AFTER_ATTEMPT
+                vm.error_code = rr.get("send_error", "")[:200]
+            vm.attempt_count += 1
+
+        # Also update legacy sent_results for diagnostics
+        for rr in retry_results:
+            vm_idx = rr.get("_vm_index")
+            if vm_idx is not None and vm_idx < len(turn.sent_results):
+                turn.sent_results[vm_idx] = rr
 
         return TurnState.DECIDE_SEND_TERMINAL
 
     def _do_decide_send_terminal(self, turn: TurnScratchpad) -> TurnState:
-        """DECIDE_SEND_TERMINAL: determine END_SENT / END_PARTIAL_SENT / END_FAILED."""
-        if not turn.sent_results:
+        """DECIDE_SEND_TERMINAL: determine END_SENT / END_PARTIAL_SENT / END_FAILED.
+
+        v1.2 §13.5: uses DeliveryStatus.SENT_CONFIRMED on VisibleMessage
+        objects to decide.  SENT_CONFIRMED → successful; anything else → not.
+        """
+        if not turn.visible_messages:
             return TurnState.END_FAILED
 
-        delivered = [r for r in turn.sent_results if r.get("send_status") == "delivered"]
-        failed = [r for r in turn.sent_results if r.get("send_status") != "delivered"]
+        confirmed = [
+            vm for vm in turn.visible_messages
+            if vm.delivery_status == DeliveryStatus.SENT_CONFIRMED
+        ]
+        attempted = [
+            vm for vm in turn.visible_messages
+            if vm.guard_status != "BLOCKED" and vm.delivery_status
+        ]
+        non_confirmed = [vm for vm in attempted if vm.delivery_status != DeliveryStatus.SENT_CONFIRMED]
 
-        if not delivered and not failed:
+        if not confirmed and not non_confirmed:
             return TurnState.END_FAILED
 
-        if delivered and not failed:
+        if confirmed and not non_confirmed:
             return TurnState.END_SENT
 
-        if delivered and failed:
+        if confirmed and non_confirmed:
             turn.add_fallback_event(
                 "partial_send",
-                f"{len(delivered)} delivered, {len(failed)} failed",
+                f"{len(confirmed)} sent_confirmed, {len(non_confirmed)} not confirmed",
             )
             return TurnState.END_PARTIAL_SENT
 
-        # All failed
-        turn.add_fallback_event("send_all_failed", f"{len(failed)} messages all failed")
+        # All non-confirmed
+        turn.add_fallback_event(
+            "send_all_failed",
+            f"{len(non_confirmed)} messages all non-confirmed",
+        )
         return TurnState.END_FAILED
 
     # ── Skip path ────────────────────────────────────────────────
@@ -1047,11 +1173,8 @@ class ChatAgent:
     ) -> TurnState:
         """HARD_FALLBACK: system fixed fallback text.
 
-        v1.2: INTERRUPT_CHECK before sending — superseded turns must not
-        send fallback text either.
-        Uses unified HARD_FALLBACK_TEXT from output_guard.
-        Does NOT use model content.
-        Still goes through guard and wechat_sender.
+        v1.2: INTERRUPT_CHECK before sending.  Uses VisibleMessage for
+        fallback tracking.  Does NOT use model content.
         """
         from agent.output_guard import HARD_FALLBACK_TEXT, guard_single_message
 
@@ -1071,25 +1194,38 @@ class ChatAgent:
             )
             return TurnState.END_FAILED
 
-        # Send
+        # v1.2: create VisibleMessage for fallback
+        fallback_vm = VisibleMessage(
+            visible_message_id=f"vm_fallback_{turn.turn_id}",
+            index=0,
+            original_text=HARD_FALLBACK_TEXT,
+            guarded_text=guarded,
+            guard_status="PASSED" if guarded == HARD_FALLBACK_TEXT else "SANITIZED",
+            delivery_status=DeliveryStatus.PENDING,
+        )
+        turn.visible_messages = [fallback_vm]
+
         if wechat_sender:
             try:
-                fallback_msg = [{"text": guarded, "delay": 0.3}]
-                result = await wechat_sender(fallback_msg)
+                fallback_batch = [{"text": guarded, "delay": 0.3, "_vm_index": 0}]
+                result = await wechat_sender(fallback_batch)
                 turn.sent_results = result
-                delivered = [r for r in result if r.get("send_status") == "delivered"]
-                if delivered:
+                old_status = (result[0].get("send_status", "") if result else "")
+                if old_status == "delivered":
+                    fallback_vm.delivery_status = DeliveryStatus.SENT_CONFIRMED
                     turn.add_fallback_event("hard_fallback_sent", "fallback delivered")
                     return TurnState.END_FALLBACK_SENT
                 else:
+                    fallback_vm.delivery_status = DeliveryStatus.UNKNOWN_AFTER_ATTEMPT
                     turn.add_fallback_event("hard_fallback_send_failed", "fallback not delivered")
                     return TurnState.END_FAILED
             except Exception as e:
                 logger.error("hard_fallback: send failed: %s", e)
+                fallback_vm.delivery_status = DeliveryStatus.UNKNOWN_AFTER_ATTEMPT
+                fallback_vm.error_code = str(e)[:200]
                 turn.add_fallback_event("hard_fallback_send_error", str(e)[:200])
                 return TurnState.END_FAILED
         else:
-            # No sender — record prepared message for diagnostics
             turn.sent_results = [{"text": guarded, "delay": 0.0, "send_status": "generated"}]
             turn.add_fallback_event("hard_fallback_no_sender", "no wechat_sender, message prepared")
             return TurnState.END_FALLBACK_SENT
