@@ -2180,9 +2180,11 @@ async def chat(request: Request):
 
         # Lock released — return response.
         # Messages were already sent via wechat_sender callback.
-        # Return empty so the bridge poller doesn't double-send.
+        # Return empty messages so the bridge poller doesn't double-send.
+        # delivered_count gives the bridge accurate stats for logging.
         return {
             "messages": [],
+            "delivered_count": result.delivered_count,
             "tool_calls": result.tool_results,
             "scheduled_task_ids": scheduled_task_ids,
             "iterations": result.iterations,

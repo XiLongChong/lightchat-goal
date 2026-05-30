@@ -227,21 +227,13 @@ class WeChatBridge:
             await self._send_reply(from_user, "（信号不好，稍等）", context_token)
             return
 
-        # Send each reply message back via iLink
-        reply_msgs = data.get("messages", [])
-        for i, m in enumerate(reply_msgs):
-            reply_text = m.get("text", "")
-            delay = self._bounded_reply_delay(m.get("delay", 0))
-            if reply_text:
-                if i == 0:
-                    await asyncio.sleep(delay)
-                else:
-                    await asyncio.sleep(max(delay, self.message_delay))
-                await self._send_reply(from_user, reply_text, context_token)
-
+        # v1.2: messages already sent via wechat_sender callback inside ChatAgent.
+        # delivered_count reflects actual deliveries; messages is always [] to prevent double-send.
+        delivered = data.get("delivered_count", 0)
+        terminal = data.get("terminal_state", "?")
         logger.info(
-            f"WeChat [{from_user}]: replied {len(reply_msgs)} msgs, "
-            f"{data.get('iterations', 0)} iters"
+            f"WeChat [{from_user}]: delivered={delivered} msgs, "
+            f"{data.get('iterations', 0)} iters, terminal={terminal}"
         )
 
     async def _send_reply(self, to: str, text: str, context_token: str):
