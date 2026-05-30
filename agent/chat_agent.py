@@ -339,11 +339,11 @@ class ChatAgent:
     # ================================================================
 
     def _do_classify_context_error(self, turn: TurnScratchpad) -> TurnState:
-        """CLASSIFY_CONTEXT_ERROR: inspect ContextBuildResult.
+        """CLASSIFY_CONTEXT_ERROR: inspect ContextBuildResult + registry health.
 
-        FATAL error → HARD_FALLBACK.
-        RECOVERABLE warnings → propagate to turn.context_warnings, continue.
-        No errors → OPTIONAL_PREPROCESS.
+        v1.2 §6: checks both ContextBuildResult.fatal_error AND global
+        fatal conditions (tool registry unavailable, terminal tool schema
+        missing).  RECOVERABLE warnings → continue.  FATAL → HARD_FALLBACK.
         """
         result: ContextBuildResult = getattr(turn, "_context_result", None)
         if result is None:
@@ -353,9 +353,37 @@ class ChatAgent:
         turn.messages = result.messages
         turn.context_warnings = list(result.warnings)
 
+        # ── Check ContextBuildResult fatal_error ──────────────────
         if result.fatal_error:
             turn.add_fallback_event("fatal_context_error", result.fatal_error)
             return TurnState.HARD_FALLBACK
+
+        # ── v1.2 §6.4: Global fatal checks ────────────────────────
+        # Tool registry must have at least one reachable terminal tool
+        registry_empty = not list(TOOL_REGISTRY.iter_defs())
+        if registry_empty:
+            turn.add_fallback_event("fatal_context_error", "tool_registry_unavailable")
+            return TurnState.HARD_FALLBACK
+
+        # At least one terminal tool must be registered and have a schema
+        terminal_names = {
+            t.name for t in TOOL_REGISTRY.iter_defs()
+            if t.tool_category == "terminal_tool"
+        }
+        if not terminal_names:
+            turn.add_fallback_event("fatal_context_error", "no_terminal_tool_registered")
+            return TurnState.HARD_FALLBACK
+
+        # Validate we can build tool specs for the allowed tools
+        if self.native_tool_calls and self.native_allowed_tools:
+            specs = _build_native_tool_specs(self.native_allowed_tools)
+            if not specs:
+                turn.add_fallback_event(
+                    "fatal_context_error",
+                    "tool_schema_validation: no native tool specs could be built "
+                    f"for allowed_tools={self.native_allowed_tools}",
+                )
+                return TurnState.HARD_FALLBACK
 
         return TurnState.OPTIONAL_PREPROCESS
 
