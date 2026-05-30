@@ -198,6 +198,15 @@ class ChatAgent:
                 )
                 state = TurnState.HARD_FALLBACK
 
+            if turn.elapsed_ms / 1000 > turn.turn_timeout_seconds:
+                logger.warning(
+                    "turn timeout: elapsed=%.1fs turn_id=%s",
+                    turn.elapsed_ms / 1000, turn.turn_id,
+                )
+                turn.reply_sequence_status = "max_limit_reached"
+                state = TurnState.END_MAX_LIMIT
+                break
+
             if logger.isEnabledFor(logging.DEBUG) and state == TurnState.CALL_LLM:
                 _dump_llm_payload(turn.messages, turn.turn_id, turn.llm_call_count)
 
@@ -1155,7 +1164,7 @@ class ChatAgent:
         """EXEC_SEND_ONE: send a single WeChat bubble.
 
         v1.5: sends turn._guarded_text (NOT original_text).
-        Checks wechat_sender return value for delivered/failed/blocked/unknown.
+        Checks wechat_sender return value for delivered/failed/rate_limited/blocked/unknown.
         Only delivered → sent_message_count += 1.
         Idempotency: turn_id + tool_call_id.
         """
@@ -1251,6 +1260,10 @@ class ChatAgent:
                           "reason": "send_failed",
                           "hint": f"发送失败：{error_detail[:100]}。可以重试或 done。"}
             logger.info("exec_send_one: failed error=%s", error_detail[:80])
+        elif send_status == "rate_limited":
+            result = {"status": "error", "recoverable": True,
+                      "reason": "rate_limited",
+                      "hint": "发送太快被微信限流，请等待几秒后重试或调用 done(status='failed')。"}
         elif send_status == "blocked":
             result = {"status": "error", "recoverable": True,
                       "reason": "send_blocked",

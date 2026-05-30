@@ -208,6 +208,7 @@ class TurnScratchpad:
 
     turn_id: str = field(default_factory=lambda: f"turn_{uuid.uuid4().hex[:12]}")
     start_time: float = field(default_factory=time.time)
+    turn_timeout_seconds: float = 60.0
 
     # Input
     user_message: str = ""

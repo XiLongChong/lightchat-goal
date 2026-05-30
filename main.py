@@ -455,8 +455,12 @@ async def wechat_sender(user_id: str, context_token: str, messages: list[dict]) 
             m["send_status"] = "delivered"
         except Exception as e:
             logger.error(f"wechat_sender: failed to send message[{i}]: {e}")
-            m["send_status"] = "failed"
-            m["send_error"] = str(e)[:200]
+            err_msg = str(e)[:200]
+            if "请稍后再试" in err_msg or "rate" in err_msg.lower():
+                m["send_status"] = "rate_limited"
+            else:
+                m["send_status"] = "failed"
+            m["send_error"] = err_msg
 
     return messages
 
