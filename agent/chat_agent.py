@@ -569,6 +569,21 @@ class ChatAgent:
                     len(_tool_names), ",".join(_tool_names),
                 )
 
+        tool_choice = "auto" if request_tools else None
+        # v1.2 diagnostic: log last 3 message roles (no content — privacy)
+        _last_roles = [m.get("role", "?") for m in turn.messages[-3:]]
+
+        logger.info(
+            "call_llm: iter=%d model=%s tools_count=%d tool_names=%s "
+            "tool_choice=%s last_roles=%s",
+            turn.llm_call_count,
+            self.model,
+            len(request_tools) if request_tools else 0,
+            ",".join(_tool_names) if request_tools else "",
+            tool_choice,
+            _last_roles,
+        )
+
         try:
             response = await self.llm_gateway.complete(
                 LLMRequest(
@@ -580,7 +595,7 @@ class ChatAgent:
                     response_mode="text",
                     thinking="disabled",
                     tools=request_tools,
-                    tool_choice="auto" if request_tools else None,
+                    tool_choice=tool_choice,
                     metadata={
                         "turn_id": turn.turn_id,
                         "iteration": turn.iteration,
@@ -588,7 +603,7 @@ class ChatAgent:
                 )
             )
             _merge_llm_usage(turn.token_usage, getattr(response, "usage", None))
-            turn._llm_response = response  # transient, consumed by HANDLE_MODEL_OUTPUT
+            turn._llm_response = response
             return TurnState.HANDLE_MODEL_OUTPUT
 
         except Exception as e:
@@ -609,6 +624,19 @@ class ChatAgent:
         response = turn._llm_response
         native_tool_calls = getattr(response, "tool_calls", None) or []
         assistant_content = (response.content or "").strip()
+        finish_reason = getattr(response, "finish_reason", "") or ""
+
+        # ── v1.2 diagnostic log: HANDLE_MODEL_OUTPUT ─────────────
+        logger.info(
+            "handle_model_output: finish_reason=%s has_content=%s content_preview=%s "
+            "raw_tool_calls=%d parsed_tool_calls=%d iter=%d",
+            finish_reason,
+            bool(assistant_content),
+            assistant_content[:120].replace("\n", "\\n"),
+            len(native_tool_calls) if native_tool_calls else 0,
+            len(native_tool_calls),
+            turn.iteration,
+        )
 
         if native_tool_calls:
             # Serialize and append assistant message with tool_calls
@@ -636,40 +664,49 @@ class ChatAgent:
                 len(native_tool_calls), turn.iteration, ",".join(tc_names),
             )
 
-            turn._tool_calls = native_tool_calls  # transient
+            turn._tool_calls = native_tool_calls
             return TurnState.CLASSIFY_TOOL_CALLS
 
-        # No tool calls
+        # No tool calls — diagnose violation reason
         if assistant_content:
-            turn.add_fallback_event(
-                "assistant_content_no_tool_call",
-                f"model returned {len(assistant_content)} chars without tool calls",
-            )
-            # Check for old JSON actions — flag it
             if '"actions"' in assistant_content.lower():
+                violation = "old_json_actions"
                 turn.add_fallback_event(
                     "old_json_actions_detected",
                     "model output looks like old JSON actions format",
                 )
+            else:
+                violation = "assistant_content_only"
+            turn.add_fallback_event(
+                "assistant_content_no_tool_call",
+                f"model returned {len(assistant_content)} chars without tool calls",
+            )
         else:
+            violation = "empty_response"
             turn.add_fallback_event(
                 "empty_response",
                 "no tool calls and no assistant content",
             )
 
+        logger.info(
+            "handle_model_output: violation_reason=%s iter=%d",
+            violation, turn.iteration,
+        )
         return TurnState.PROTOCOL_RETRY
 
     def _do_classify_tool_calls(self, turn: TurnScratchpad) -> TurnState:
         """CLASSIFY_TOOL_CALLS: classify tools and check parallel-call legality."""
         tool_calls = turn._tool_calls
         classified = classify_tool_calls(tool_calls, TOOL_REGISTRY)
-        turn._classified = classified  # transient
+        turn._classified = classified
 
         if not classified.is_legal:
-            turn.add_fallback_event(
-                "illegal_tool_combination",
-                classified.violation_reason(),
+            violation = classified.violation_reason()
+            logger.info(
+                "classify_tool_calls: violation_reason=invalid_tool_combo detail=%s iter=%d",
+                violation, turn.iteration,
             )
+            turn.add_fallback_event("illegal_tool_combination", violation)
             return TurnState.PROTOCOL_RETRY
 
         if classified.has_terminal:
@@ -682,6 +719,11 @@ class ChatAgent:
             return TurnState.EXEC_STATE_TOOLS
 
         # Shouldn't reach here if tool_calls were present, but safety
+        logger.info(
+            "classify_tool_calls: violation_reason=no_tool_calls "
+            "total=%d iter=%d",
+            classified.total, turn.iteration,
+        )
         turn.add_fallback_event("no_actionable_tools", "all tools classified but none actionable")
         return TurnState.PROTOCOL_RETRY
 
@@ -1217,6 +1259,26 @@ class ChatAgent:
         fallback tracking.  Does NOT use model content.
         """
         from agent.output_guard import HARD_FALLBACK_TEXT, guard_single_message
+
+        # ── v1.2 diagnostic: why we reached HARD_FALLBACK ─────────
+        fallback_reason = "unknown"
+        last_violation = ""
+        for ev in reversed(turn.fallback_events):
+            t = ev.get("type", "")
+            if t in ("assistant_content_no_tool_call", "empty_response",
+                     "old_json_actions_detected", "illegal_tool_combination",
+                     "protocol_retry_exceeded", "llm_error",
+                     "fatal_context_error", "fatal_tool_error",
+                     "guard_all_blocked", "max_iterations_exceeded"):
+                fallback_reason = t
+                last_violation = ev.get("detail", "")[:200]
+                break
+
+        logger.info(
+            "hard_fallback: reason=%s last_violation=%s protocol_retry_count=%d iter=%d",
+            fallback_reason, last_violation,
+            turn.protocol_retry_count, turn.iteration,
+        )
 
         turn.add_fallback_event("hard_fallback_enter", "entering hard fallback")
 
