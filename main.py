@@ -464,6 +464,43 @@ _user_turn_lock_access: dict[str, float] = {}
 _MAX_USER_TURN_LOCKS = 512
 _USER_ID_RE = re.compile(r"^[A-Za-z0-9_.:@-]+$")
 
+# ── v1.2: Interrupt checker — track latest message per user ───
+# Maps user_id → timestamp (seconds) of the most recent inbound message.
+_user_latest_message_ts: dict[str, float] = {}
+
+
+def _record_user_message_arrival(user_id: str) -> None:
+    """Record that a message arrived for user_id right now."""
+    _user_latest_message_ts[user_id] = time.time()
+
+
+def _make_interrupt_checker(user_id: str):
+    """Return an InterruptChecker for the given user.
+
+    Format of interrupt_token:  it_{turn_id}_{timestamp_ms}
+    The checker extracts the turn's creation timestamp and compares it
+    against the latest message arrival time for this user.
+
+    Returns a callable: (interrupt_token: str) -> bool
+    """
+    # Capture the user_id in closure
+    def _check(interrupt_token: str) -> bool:
+        try:
+            # Extract timestamp from token:  it_xxxxxxxxxxxx_1234567890123
+            parts = interrupt_token.rsplit("_", 1)
+            if len(parts) != 2:
+                return False
+            turn_start_ms = int(parts[1])
+            turn_start_s = turn_start_ms / 1000.0
+        except (ValueError, IndexError):
+            return False
+
+        latest = _user_latest_message_ts.get(user_id, 0)
+        # If a message arrived after the turn started, interrupt
+        return latest > turn_start_s
+
+    return _check
+
 
 def _as_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, bool):
@@ -1540,6 +1577,9 @@ async def chat(request: Request):
     user_id = _validate_chat_user_id(str(body.get("user_id", "default")), api_cfg)
     context_token = str(body.get("context_token", ""))
     inbound_trigger = str(body.get("trigger") or "user")
+
+    # ── v1.2: Record message arrival for interrupt checking ──
+    _record_user_message_arrival(user_id) if inbound_trigger == "user" else None
     inbound_source = str(body.get("source") or "wechat")
 
     logger.info(f"[{user_id}] Received {len(str(user_message))} chars")
@@ -1583,7 +1623,8 @@ async def chat(request: Request):
             async def _bound_sender(messages: list[dict]) -> list[dict]:
                 return await wechat_sender(user_id, context_token, messages)
 
-            # Run Chat Agent (v0.2 state machine)
+            # Run Chat Agent (v1.2 state machine)
+            interrupt_checker = _make_interrupt_checker(user_id)
             result: TurnResult = await chat_agent.chat(
                 user_message=user_message,
                 history=history,
@@ -1593,6 +1634,7 @@ async def chat(request: Request):
                 bot_id=bot_id,
                 system_prompt=system_prompt,
                 wechat_sender=_bound_sender,
+                interrupt_checker=interrupt_checker,
             )
 
             turn_id = result.turn_id

@@ -388,19 +388,33 @@ class ChatAgent:
     def _do_classify_tool_error(self, turn: TurnScratchpad) -> TurnState:
         """CLASSIFY_TOOL_ERROR: classify tool execution results.
 
-        All success / recoverable failures → back to CALL_LLM.
-        Fatal failure → HARD_FALLBACK.
-        Invalid tool args (protocol error) → PROTOCOL_RETRY.
+        v1.2 §10.3:
+        - success / recoverable (timeout, general failure) → CALL_LLM
+        - invalid args (JSON parse, missing required) → PROTOCOL_RETRY
+        - fatal (registry corrupted, executor unavailable) → HARD_FALLBACK
         """
-        tool_results = turn.tool_results
-        # Check for fatal errors
-        for tr in tool_results:
-            detail = str(tr.get("result", ""))
-            if "工具注册表损坏" in detail or "工具执行器不可用" in detail:
-                turn.add_fallback_event("fatal_tool_error", detail)
-                return TurnState.HARD_FALLBACK
-            if "工具名称为空" in detail or "未找到工具" in detail:
-                turn.add_fallback_event("invalid_tool_args", detail)
+        for tr in turn.tool_results:
+            result = str(tr.get("result", ""))
+            et = _classify_tool_result(result)
+
+            if et == "success":
+                continue  # ok
+
+            if et in ("tool_execution_error", "unknown_error"):
+                # Recoverable: feed failure to model → CALL_LLM
+                logger.warning("classify_tool_error: recoverable error for %s: %s",
+                               tr.get("name", "?"), result[:80])
+                continue
+
+            if et in ("invalid_arguments_json", "missing_required_arg"):
+                turn.add_fallback_event("tool_invalid_args",
+                                        f"{tr.get('name', '?')}: {result[:200]}")
+                return TurnState.PROTOCOL_RETRY
+
+            if et in ("unknown_tool", "not_allowed", "not_eligible"):
+                # Should have been caught by classifier; treat as protocol error
+                turn.add_fallback_event("tool_protocol_mismatch",
+                                        f"{tr.get('name', '?')}: {result[:200]}")
                 return TurnState.PROTOCOL_RETRY
 
         return TurnState.CALL_LLM
@@ -625,37 +639,71 @@ class ChatAgent:
     async def _do_exec_fact_tools(self, turn: TurnScratchpad) -> TurnState:
         """EXEC_FACT_TOOLS: execute fact tools (get_time, get_weather).
 
-        Results are appended to messages and the model is called again.
+        v1.2: multiple FACT_TOOLs execute in parallel via asyncio.gather.
+        Single-tool failures do not abort sibling tools.
+        Results are merged in original tool_call order and appended to messages.
+        After execution → INTERRUPT_CHECK → CLASSIFY_TOOL_ERROR.
         Fact tools can NOT end the turn.
         """
-        classified = turn._classified
-        tool_calls = turn._tool_calls
+        import asyncio
 
-        for tc in tool_calls:
+        tool_calls = turn._tool_calls
+        fact_tcs = [
+            tc for tc in tool_calls
+            if str(getattr(getattr(tc, "function", None), "name", "") if getattr(tc, "function", None) else "")
+            in ("get_time", "get_weather")
+        ]
+
+        if not fact_tcs:
+            turn.add_fallback_event("fact_tools_empty", "no fact tools to execute")
+            return TurnState.CALL_LLM
+
+        async def _run_one(tc) -> dict[str, Any]:
             fn = getattr(tc, "function", None)
             tool_name = str(getattr(fn, "name", "") if fn else "")
             tool_args_raw = str(getattr(fn, "arguments", "") if fn else "")
+            call_id = getattr(tc, "id", "")
+            try:
+                result_text = await _execute_native_fact_tool(
+                    tool_name=tool_name,
+                    tool_args_raw=tool_args_raw,
+                    native_allowed_tools=self.native_allowed_tools,
+                )
+                return {
+                    "tool_name": tool_name,
+                    "call_id": call_id,
+                    "result": result_text[:500],
+                    "success": not result_text.startswith("错误"),
+                    "error_type": _classify_tool_result(result_text),
+                }
+            except Exception as e:
+                logger.error("fact_tool %s exception: %s", tool_name, e)
+                return {
+                    "tool_name": tool_name,
+                    "call_id": call_id,
+                    "result": f"错误：工具执行异常：{e}",
+                    "success": False,
+                    "error_type": "tool_execution_error",
+                }
 
-            if tool_name not in ("get_time", "get_weather"):
-                continue
+        tasks = [_run_one(tc) for tc in fact_tcs]
+        results = await asyncio.gather(*tasks)
 
-            result = await _execute_native_fact_tool(
-                tool_name=tool_name,
-                tool_args_raw=tool_args_raw,
-                native_allowed_tools=self.native_allowed_tools,
-            )
-            turn.tool_results.append({"name": tool_name, "result": result[:500]})
+        # Merge results in original order
+        for r in results:
+            turn.tool_results.append({"name": r["tool_name"], "result": r["result"]})
             turn.messages.append({
                 "role": "tool",
-                "tool_call_id": getattr(tc, "id", ""),
-                "content": result,
+                "tool_call_id": r["call_id"],
+                "content": r["result"],
             })
             logger.info(
                 "native_tools: fact tool %s executed, result=%s",
-                tool_name, _classify_tool_result(result),
+                r["tool_name"], r["error_type"],
             )
 
-        return TurnState.CALL_LLM
+        turn._resume_state = TurnState.CLASSIFY_TOOL_ERROR
+        return TurnState.INTERRUPT_CHECK
 
     async def _do_exec_state_tools(self, turn: TurnScratchpad) -> TurnState:
         """EXEC_STATE_TOOLS: execute state tools (v1.2 strict mode).
