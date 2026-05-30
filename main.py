@@ -1797,7 +1797,6 @@ def _build_chatagent_post_turn_hooks(
     route: str,
     context_policy: str,
     raw_messages: list[str],
-    send_status: str,
     memory_hook: Any,
     memory_store: Any,
 ) -> list:
@@ -1805,6 +1804,7 @@ def _build_chatagent_post_turn_hooks(
 
     Each hook receives (turn: TurnScratchpad, terminal_state: TurnState).
     Individual failures are caught inside each hook and logged.
+    send_status is computed from terminal_state inside _hook_dev_logs.
     """
 
     async def _hook_memory(turn: TurnScratchpad, terminal_state: TurnState) -> None:
@@ -1835,6 +1835,17 @@ def _build_chatagent_post_turn_hooks(
             e.get("type", "") for e in (turn.fallback_events or [])[:3]
         ) if turn.fallback_events else ""
         token_count = turn.token_usage.get("total_tokens", 0)
+
+        # Compute send_status from terminal_state (v1.2: inside hook, not injected)
+        _ss_map = {
+            TurnState.END_SENT: "delivered",
+            TurnState.END_PARTIAL_SENT: "delivered",
+            TurnState.END_SKIPPED: "skipped",
+            TurnState.END_FALLBACK_SENT: "fallback_sent",
+            TurnState.END_FAILED: "failed",
+            TurnState.END_CANCELLED: "cancelled",
+        }
+        send_status = _ss_map.get(terminal_state, "generated")
 
         await memory_store.record_turn_diagnostics(
             turn_id=turn.turn_id,
@@ -2015,7 +2026,7 @@ async def chat(request: Request):
             _hook_cbs = _build_chatagent_post_turn_hooks(
                 user_id=user_id, bot_id=bot_id,
                 route=route, context_policy=context_policy,
-                raw_messages=raw_messages, send_status="",
+                raw_messages=raw_messages,
                 memory_hook=memory_hook, memory_store=memory_store,
             )
             result: TurnResult = await chat_agent.chat(

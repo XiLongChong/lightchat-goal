@@ -892,9 +892,11 @@ class ChatAgent:
     def _do_guard_output(self, turn: TurnScratchpad) -> TurnState:
         """GUARD_OUTPUT: run output guard on every parsed VisibleMessage.
 
-        v1.2: each VisibleMessage gets guarded_text and guard_status populated
-        individually.  Messages blocked by guard get delivery_status =
-        BLOCKED_BY_GUARD.  If all are blocked → HARD_FALLBACK.
+        v1.2: each VisibleMessage gets guarded_text/guard_status via
+        guard_single_message.  Then batch-level limits (max_count, max_total)
+        are applied directly on the VisibleMessage list in original order,
+        preserving stable per-message mapping.  Messages beyond max_count
+        or truncated by max_total get BLOCKED_BY_GUARD.
         Interrupt check before guard.
         """
         if self._is_interrupted():
@@ -903,7 +905,7 @@ class ChatAgent:
 
         from agent.output_guard import guard_single_message, guard_send_message_batch
 
-        # ── Per-message guard (populates VisibleMessage fields) ──
+        # ── Per-message guard ──────────────────────────────────────
         for vm in turn.visible_messages:
             guarded = guard_single_message(vm.original_text)
             if guarded:
@@ -914,24 +916,46 @@ class ChatAgent:
                 vm.guard_status = "BLOCKED"
                 vm.delivery_status = DeliveryStatus.BLOCKED_BY_GUARD
 
-        # ── Batch guard (for count/char limits and backward compat) ──
+        # ── Batch guard (run for its logging + to get limit configs) ──
         guard_result = guard_send_message_batch(
             turn.visible_batch, mode=getattr(turn, "_send_mode", "normal"),
         )
-
         if guard_result.blocked_count > 0:
             turn.add_fallback_event(
                 "guard_blocked",
                 f"blocked {guard_result.blocked_count}/{guard_result.total} messages",
             )
-        if guard_result.truncated_count > 0:
+
+        # ── v1.2: Apply batch limits directly on VisibleMessage list ──
+        # Use constants from output_guard for consistency
+        from agent.output_guard import MAX_MESSAGE_COUNT, MAX_TOTAL_CHARS
+        passed = [vm for vm in turn.visible_messages if vm.guard_status != "BLOCKED"]
+        truncated_count = 0
+
+        # max_count: mark excess messages as BLOCKED_BY_GUARD
+        if len(passed) > MAX_MESSAGE_COUNT:
+            for vm in passed[MAX_MESSAGE_COUNT:]:
+                vm.guard_status = "BLOCKED"
+                vm.guarded_text = ""
+                vm.delivery_status = DeliveryStatus.BLOCKED_BY_GUARD
+            truncated_count = len(passed) - MAX_MESSAGE_COUNT
+            passed = passed[:MAX_MESSAGE_COUNT]
+
+        # max_total: trim the last message's guarded_text if total exceeds limit
+        total_chars = sum(len(vm.guarded_text) for vm in passed)
+        if total_chars > MAX_TOTAL_CHARS and passed:
+            excess = total_chars - MAX_TOTAL_CHARS
+            last = passed[-1]
+            new_len = max(10, len(last.guarded_text) - excess)
+            last.guarded_text = last.guarded_text[:new_len].rstrip() + "…"
+            if last.guard_status == "PASSED":
+                last.guard_status = "SANITIZED"
+
+        if truncated_count > 0:
             turn.add_fallback_event(
                 "guard_truncated",
-                f"truncated {guard_result.truncated_count} messages",
+                f"truncated {truncated_count} messages (max_count={MAX_MESSAGE_COUNT})",
             )
-
-        # ── Build legacy guarded_batch for wechat_sender callback ──
-        passed = [vm for vm in turn.visible_messages if vm.guard_status != "BLOCKED"]
 
         if not passed:
             turn.add_fallback_event(
@@ -940,6 +964,7 @@ class ChatAgent:
             )
             return TurnState.HARD_FALLBACK
 
+        # ── Build legacy guarded_batch for wechat_sender callback ──
         turn.guarded_batch = [
             {"text": vm.guarded_text, "delay": 0.0, "_vm_index": vm.index}
             for vm in passed
@@ -1241,9 +1266,11 @@ class ChatAgent:
                 turn.add_fallback_event("hard_fallback_send_error", str(e)[:200])
                 return TurnState.END_FAILED
         else:
-            turn.sent_results = [{"text": guarded, "delay": 0.0, "send_status": "generated"}]
-            turn.add_fallback_event("hard_fallback_no_sender", "no wechat_sender, message prepared")
-            return TurnState.END_FALLBACK_SENT
+            # v1.2: no sender → cannot deliver → END_FAILED (not END_FALLBACK_SENT)
+            fallback_vm.delivery_status = DeliveryStatus.FAILED_BEFORE_SEND
+            turn.sent_results = [{"text": guarded, "delay": 0.0, "send_status": "failed"}]
+            turn.add_fallback_event("hard_fallback_no_sender", "no wechat_sender, cannot send")
+            return TurnState.END_FAILED
 
     # ================================================================
     # Default system prompt (fallback when none provided)
