@@ -407,16 +407,21 @@ class ChatAgent:
         """OPTIONAL_PREPROCESS: pre-fetch deterministic facts.
 
         v1.2 §7: only pre-fetches current time (no weather auto-fetch).
+        Merges time into the first system message — does NOT append
+        a separate system message at the tail.
         Cannot generate replies, send WeChat, or write assistant history.
         """
-        # Pre-fetch current time
         try:
             from datetime import datetime
             now = datetime.now().strftime("%Y年%m月%d日 %H:%M 周%u")
-            turn.messages.append({
-                "role": "system",
-                "content": f"[系统] 当前时间：{now}",
-            })
+            time_note = f"\n\n[系统] 当前时间：{now}"
+            if turn.messages and turn.messages[0].get("role") == "system":
+                turn.messages[0]["content"] = turn.messages[0]["content"] + time_note
+            else:
+                logger.warning(
+                    "optional_preprocess: messages[0] missing or not system role=%s — skipping",
+                    turn.messages[0].get("role", "?") if turn.messages else "empty",
+                )
         except Exception as e:
             turn.context_warnings.append({
                 "source": "time_prefetch",
@@ -569,7 +574,7 @@ class ChatAgent:
                     len(_tool_names), ",".join(_tool_names),
                 )
 
-        tool_choice = "auto" if request_tools else None
+        tool_choice = "required" if request_tools else None
         # v1.2 diagnostic: log last 3 message roles (no content — privacy)
         _last_roles = [m.get("role", "?") for m in turn.messages[-3:]]
 
@@ -845,14 +850,8 @@ class ChatAgent:
             turn.protocol_retry_count, turn.max_protocol_retries,
         )
 
-        # Inject system reminder — pure instruction, no raw content
-        retry_note = (
-            "你没有调用 send_wechat_messages 或 skip_reply。"
-            "必须调用以下终态工具之一来结束本轮："
-            "send_wechat_messages 发送回复，或 skip_reply 明确跳过。"
-            "不要直接在 assistant content 里写回复。"
-            "不要展示或复述历史记录、对话记录、或上下文标签。"
-        )
+        # Inject system reminder — minimal, tool_choice=required enforces this
+        retry_note = "必须调用 send_wechat_messages 或 skip_reply 结束本轮。"
         turn.messages.append({"role": "system", "content": retry_note})
 
         return TurnState.CALL_LLM
@@ -1534,6 +1533,12 @@ def _build_context_sample(messages: list[dict[str, Any]], last_n: int = 8) -> li
 
 def _dump_llm_payload(messages: list[dict[str, Any]], turn_id: str, iteration: int) -> None:
     """Pre-LLM safety scan — detect call_ leaks before they reach the model."""
+    # v1.2: quick role summary for diagnostics
+    _roles = [m.get("role", "?") for m in messages]
+    role_summary = ",".join(_roles[-6:]) if len(_roles) > 6 else ",".join(_roles)
+    logger.debug("LLM_PAYLOAD: msg_count=%d roles_head=%s roles_tail=%s",
+                 len(messages), ",".join(_roles[:4]), ",".join(_roles[-4:]))
+
     for i, m in enumerate(messages):
         content = str(m.get("content", ""))
         if _re.search(r'\bcall_[A-Za-z0-9_-]{8,}\b', content):

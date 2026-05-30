@@ -1002,9 +1002,22 @@ class TestTurnLifecycle:
         assert result.turn_id, "turn_id must be non-empty"
 
     def test_optional_preprocess_injects_time(self):
-        """OPTIONAL_PREPROCESS adds current time to messages before CALL_LLM."""
-        tc = _make_tc("send_wechat_messages", '{"messages":["ok"]}')
-        gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
+        """OPTIONAL_PREPROCESS merges current time into messages[0] system content."""
+        call_count = [0]
+        responses = [
+            _make_response("", tool_calls=[_make_tc("send_wechat_messages", '{"messages":["ok"]}')]),
+        ]
+
+        class MGW:
+            def __init__(self):
+                self.requests = []
+            async def complete(self, req):
+                self.requests.append(req)
+                idx = call_count[0]
+                call_count[0] += 1
+                return responses[idx]
+
+        gw = MGW()
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=gw,
@@ -1017,6 +1030,110 @@ class TestTurnLifecycle:
             user_message="hello", history=[], trigger="user",
         ))
         assert result.llm_status == "ok"
+        # Verify time was injected into messages[0], not appended as a new tail message
+        req = gw.requests[0]
+        msgs = req.messages
+        assert msgs[0]["role"] == "system"
+        assert "当前时间" in msgs[0]["content"], "time should be in first system message"
+        # No separate system message with "[系统] 当前时间" at the tail
+        tail_roles = [m["role"] for m in msgs]
+        system_count = sum(1 for r in tail_roles if r == "system")
+        assert system_count == 1, f"expected 1 system msg, got {system_count}: roles={tail_roles}"
+
+
+class TestToolChoice:
+    """v1.2: tool_choice='required' enforced in CALL_LLM."""
+
+    def test_tool_choice_required_when_tools_present(self):
+        """Request with tools → tool_choice='required'."""
+        tc = _make_tc("send_wechat_messages", '{"messages":["ok"]}')
+        call_count = [0]
+        responses = [_make_response("", tool_calls=[tc])]
+
+        class MGW:
+            def __init__(self):
+                self.requests = []
+            async def complete(self, req):
+                self.requests.append(req)
+                idx = call_count[0]
+                call_count[0] += 1
+                return responses[idx]
+
+        gw = MGW()
+        agent = ChatAgent(
+            model="test", persona="p", personality="",
+            llm_gateway=gw,
+            native_tool_calls=True,
+            native_allowed_tools=["send_wechat_messages"],
+            test_mode=True,
+        )
+        import asyncio
+        asyncio.run(agent.chat(
+            user_message="hello", history=[], trigger="user",
+        ))
+        assert gw.requests[0].tool_choice == "required"
+
+    def test_tool_choice_none_when_no_tools(self):
+        """No tools → tool_choice is None."""
+        call_count = [0]
+        responses = [_make_response("ok")]  # no tools → content only
+
+        class MGW:
+            def __init__(self):
+                self.requests = []
+            async def complete(self, req):
+                self.requests.append(req)
+                idx = call_count[0]
+                call_count[0] += 1
+                return responses[idx]
+
+        gw = MGW()
+        agent = ChatAgent(
+            model="test", persona="p", personality="",
+            llm_gateway=gw,
+            native_tool_calls=True,
+            native_allowed_tools=[],  # no tools
+            test_mode=True,
+        )
+        import asyncio
+        asyncio.run(agent.chat(
+            user_message="hello", history=[], trigger="user",
+        ))
+        assert gw.requests[0].tool_choice is None
+
+    def test_protocol_retry_keeps_tool_choice_required(self):
+        """PROTOCOL_RETRY → CALL_LLM still uses tool_choice='required'."""
+        call_count = [0]
+        responses = [
+            _make_response("text without tools"),  # violation
+            _make_response("", tool_calls=[_make_tc("send_wechat_messages", '{"messages":["retry ok"]}')]),
+        ]
+
+        class MGW:
+            def __init__(self):
+                self.requests = []
+            async def complete(self, req):
+                self.requests.append(req)
+                idx = call_count[0]
+                call_count[0] += 1
+                return responses[idx]
+
+        gw = MGW()
+        agent = ChatAgent(
+            model="test", persona="p", personality="",
+            llm_gateway=gw,
+            native_tool_calls=True,
+            native_allowed_tools=["send_wechat_messages"],
+            test_mode=True,
+        )
+        import asyncio
+        asyncio.run(agent.chat(
+            user_message="hello", history=[], trigger="user",
+        ))
+        # Both requests should have tool_choice='required'
+        for req in gw.requests:
+            assert req.tool_choice == "required", \
+                f"expected 'required', got {req.tool_choice}"
 
 
 class TestInterruptCheck:
