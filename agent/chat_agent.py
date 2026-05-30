@@ -87,9 +87,6 @@ class ChatAgent:
         self._write_model_history: PostTerminalCallback | None = write_model_history
         self._post_turn_hooks: list[PostTerminalCallback] = list(post_turn_hooks or [])
 
-        # v1.2: active turn's interrupt token
-        self._active_interrupt_token: str = ""
-
     def set_interrupt_checker(self, checker: InterruptChecker | None) -> None:
         """Inject an interrupt checker. Called before each turn.
 
@@ -102,7 +99,7 @@ class ChatAgent:
         """
         self._interrupt_checker = checker
 
-    def _is_interrupted(self) -> bool:
+    def _is_interrupted(self, token: str = "") -> bool:
         """Check whether the current turn should be cancelled.
 
         Production: checker is required. If missing, raises ValueError.
@@ -116,7 +113,7 @@ class ChatAgent:
                 "Inject via chat(interrupt_checker=...) or set_interrupt_checker()."
             )
         try:
-            return self._interrupt_checker(self._active_interrupt_token)
+            return self._interrupt_checker(token)
         except Exception:
             return False
 
@@ -137,6 +134,9 @@ class ChatAgent:
         wechat_sender: WeChatSender | None = None,
         source: str = "user_message",
         input_message_ids: list[str] | None = None,
+        input_first_seq: int = 0,
+        input_latest_seq: int = 0,
+        input_cutoff_time: float = 0.0,
         interrupt_checker: InterruptChecker | None = None,
         # ── v1.2 Phase 5C: per-request post-terminal callbacks ──
         write_model_history: PostTerminalCallback | None = None,
@@ -157,6 +157,9 @@ class ChatAgent:
             trigger=trigger,
             source=source,
             input_message_ids=list(input_message_ids or []),
+            input_first_seq=input_first_seq,
+            input_latest_seq=input_latest_seq,
+            input_cutoff_time=input_cutoff_time,
         )
         state = TurnState.RECEIVE_EVENT
 
@@ -332,9 +335,15 @@ class ChatAgent:
         Then immediately enters INTERRUPT_CHECK before any processing.
         """
         turn.interrupt_token = f"it_{turn.turn_id}_{int(time.time() * 1000)}"
-        self._active_interrupt_token = turn.interrupt_token
         turn.status = "running"
         turn._resume_state = TurnState.BUILD_CONTEXT
+
+        logger.info(
+            "create_turn: turn_id=%s input_latest_seq=%d input_message_ids=%d "
+            "input_cutoff_time=%.3f",
+            turn.turn_id, turn.input_latest_seq,
+            len(turn.input_message_ids), turn.input_cutoff_time,
+        )
         return TurnState.INTERRUPT_CHECK
 
     def _do_interrupt_check(self, turn: TurnScratchpad) -> TurnState:
@@ -342,7 +351,12 @@ class ChatAgent:
 
         Resume to _resume_state if valid, else END_CANCELLED.
         """
-        if self._is_interrupted():
+        interrupted = self._is_interrupted(turn.interrupt_token)
+        logger.info(
+            "interrupt_check: input_latest_seq=%d interrupted=%s",
+            turn.input_latest_seq, interrupted,
+        )
+        if interrupted:
             turn.add_fallback_event(
                 "interrupted_at_check",
                 f"turn {turn.turn_id} superseded by newer event",

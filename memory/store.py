@@ -1449,8 +1449,9 @@ class MemoryStore:
         status: str,
         send_error: str = "",
     ) -> bool:
-        """Mark a turn draft as sending/delivered/failed/retry_pending."""
-        valid = {"generated", "sending", "delivered", "failed", "retry_pending"}
+        """Mark a turn draft as sending/delivered/failed/retry_pending/cancelled/skipped."""
+        valid = {"generated", "sending", "delivered", "failed", "retry_pending",
+                 "cancelled", "skipped"}
         if status not in valid:
             raise ValueError(f"invalid turn draft status: {status}")
         now = time.time()

@@ -8,6 +8,8 @@ Single process, no TypeScript dependency.
 
 import asyncio
 import logging
+import time
+import uuid
 from typing import Any
 
 import httpx
@@ -46,6 +48,7 @@ class WeChatBridge:
         self._buffers: dict[str, list[dict[str, Any]]] = {}
         self._buffer_started: dict[str, float] = {}
         self._buffer_tasks: dict[str, asyncio.Task] = {}
+        self._inbound_seq: dict[str, int] = {}  # v1.2: user_id → next seq
 
     async def start(self):
         """Begin polling in the background."""
@@ -98,6 +101,12 @@ class WeChatBridge:
         from_user = msg.get("from_user_id", "")
         context_token = msg.get("context_token", "")
         items = msg.get("item_list", [])
+        msg_id = (
+            msg.get("msg_id")
+            or msg.get("id")
+            or msg.get("message_id")
+            or f"ilink_{uuid.uuid4().hex[:12]}"
+        )
 
         # Extract text from message items
         text_parts = []
@@ -112,18 +121,28 @@ class WeChatBridge:
         if not text or not from_user:
             return
 
-        logger.info(f"WeChat [{from_user}]: {text[:60]} (buffered)")
-        await self._push_buffer(from_user, text, context_token)
+        logger.info(f"WeChat [{from_user}]: {text[:60]} msg_id={msg_id[:16]} (buffered)")
+        await self._push_buffer(from_user, text, context_token, msg_id)
 
-    async def _push_buffer(self, from_user: str, text: str, context_token: str):
-        now = asyncio.get_running_loop().time()
+    async def _push_buffer(self, from_user: str, text: str, context_token: str,
+                          msg_id: str = ""):
+        now = time.time()
+        # v1.2: per-user inbound seq
+        seq = self._inbound_seq.get(from_user, 0) + 1
+        self._inbound_seq[from_user] = seq
+
         if from_user not in self._buffers:
             self._buffers[from_user] = []
             self._buffer_started[from_user] = now
         self._buffers[from_user].append({
             "text": text,
             "context_token": context_token,
+            "msg_id": msg_id,
+            "seq": seq,
+            "received_at": now,
         })
+
+        logger.info(f"WeChat [{from_user}]: buffered msg_id={msg_id[:16]} seq={seq}")
 
         existing = self._buffer_tasks.get(from_user)
         if existing and not existing.done():
@@ -161,7 +180,18 @@ class WeChatBridge:
         if not messages:
             return
 
-        logger.info(f"WeChat [{from_user}]: flushing {len(messages)} message(s)")
+        # v1.2: input boundary fields
+        input_message_ids = [item["msg_id"] for item in batch if item.get("msg_id")]
+        input_first_seq = batch[0].get("seq", 0) if batch else 0
+        input_latest_seq = batch[-1].get("seq", 0) if batch else 0
+        input_cutoff_time = max(
+            (item.get("received_at", 0) for item in batch), default=0
+        )
+
+        logger.info(
+            f"WeChat [{from_user}]: flushing {len(messages)} message(s) "
+            f"first_seq={input_first_seq} latest_seq={input_latest_seq}"
+        )
 
         # Forward to Goal Chat Agent
         try:
@@ -176,6 +206,10 @@ class WeChatBridge:
                         "messages": messages,
                         "user_id": from_user,
                         "context_token": context_token,
+                        "input_message_ids": input_message_ids,
+                        "input_first_seq": input_first_seq,
+                        "input_latest_seq": input_latest_seq,
+                        "input_cutoff_time": input_cutoff_time,
                     },
                     headers=headers,
                 )

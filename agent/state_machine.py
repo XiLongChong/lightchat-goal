@@ -149,9 +149,12 @@ class TurnScratchpad:
     # ── v1.2: Turn lifecycle metadata ──────────────────────────
     source: str = "user_message"       # TURN_SOURCE: user_message | proactive_trigger | ...
     input_message_ids: list[str] = field(default_factory=list)
+    input_first_seq: int = 0           # seq of first message in this batch
+    input_latest_seq: int = 0          # seq of last message in this batch
+    input_cutoff_time: float = 0.0     # max received_at in this batch
     interrupt_token: str = ""          # set by CREATE_TURN
     status: str = "created"            # created → running → cancelled / ended
-    terminal_state: TurnState | None = None  # set after terminal state reached
+    terminal_state: TurnState | None = None
     context_warnings: list[dict[str, str]] = field(default_factory=list)
     # transient: where to resume after INTERRUPT_CHECK passes
     _resume_state: TurnState | None = field(default=None, repr=False)

@@ -464,40 +464,30 @@ _user_turn_lock_access: dict[str, float] = {}
 _MAX_USER_TURN_LOCKS = 512
 _USER_ID_RE = re.compile(r"^[A-Za-z0-9_.:@-]+$")
 
-# ── v1.2: Interrupt checker — track latest message per user ───
-# Maps user_id → timestamp (seconds) of the most recent inbound message.
-_user_latest_message_ts: dict[str, float] = {}
+# ── v1.2: Interrupt checker — seq-based per user ────────────
+# Maps user_id → latest inbound seq seen globally.
+_user_latest_inbound_seq: dict[str, int] = {}
 
 
-def _record_user_message_arrival(user_id: str) -> None:
-    """Record that a message arrived for user_id right now."""
-    _user_latest_message_ts[user_id] = time.time()
+def _record_user_message_arrival(user_id: str, seq: int = 0) -> None:
+    """Record the latest inbound seq for a user. Called inside the lock."""
+    if seq > 0:
+        current = _user_latest_inbound_seq.get(user_id, 0)
+        if seq > current:
+            _user_latest_inbound_seq[user_id] = seq
 
 
-def _make_interrupt_checker(user_id: str):
+def _make_interrupt_checker(user_id: str, input_latest_seq: int):
     """Return an InterruptChecker for the given user.
 
-    Format of interrupt_token:  it_{turn_id}_{timestamp_ms}
-    The checker extracts the turn's creation timestamp and compares it
-    against the latest message arrival time for this user.
-
-    Returns a callable: (interrupt_token: str) -> bool
+    v1.2 seq-based: interrupt only when a message with seq strictly
+    greater than the current turn's input_latest_seq has arrived.
+    This prevents the current batch from cancelling itself.
     """
-    # Capture the user_id in closure
-    def _check(interrupt_token: str) -> bool:
-        try:
-            # Extract timestamp from token:  it_xxxxxxxxxxxx_1234567890123
-            parts = interrupt_token.rsplit("_", 1)
-            if len(parts) != 2:
-                return False
-            turn_start_ms = int(parts[1])
-            turn_start_s = turn_start_ms / 1000.0
-        except (ValueError, IndexError):
-            return False
-
-        latest = _user_latest_message_ts.get(user_id, 0)
-        # If a message arrived after the turn started, interrupt
-        return latest > turn_start_s
+    def _check(_interrupt_token: str) -> bool:
+        latest_seq = _user_latest_inbound_seq.get(user_id, 0)
+        # Only seq strictly greater than input boundary counts
+        return latest_seq > input_latest_seq
 
     return _check
 
@@ -1974,12 +1964,25 @@ async def chat(request: Request):
     user_id = _validate_chat_user_id(str(body.get("user_id", "default")), api_cfg)
     context_token = str(body.get("context_token", ""))
     inbound_trigger = str(body.get("trigger") or "user")
-
-    # ── v1.2: Record message arrival for interrupt checking ──
-    _record_user_message_arrival(user_id) if inbound_trigger == "user" else None
     inbound_source = str(body.get("source") or "wechat")
 
-    logger.info(f"[{user_id}] Received {len(str(user_message))} chars")
+    # ── v1.2: Input boundary fields from bridge ──────────────────
+    input_message_ids = body.get("input_message_ids")
+    if not isinstance(input_message_ids, list):
+        input_message_ids = []
+    input_first_seq = int(body.get("input_first_seq", 0) or 0)
+    input_latest_seq = int(body.get("input_latest_seq", 0) or 0)
+    input_cutoff_time = float(body.get("input_cutoff_time", 0) or 0)
+    if input_latest_seq == 0 and inbound_trigger == "user":
+        logger.warning(
+            "[%s] missing input_latest_seq in /chat payload — "
+            "interrupt checker will be degraded (seq=0)", user_id,
+        )
+
+    logger.info(
+        f"[{user_id}] Received {len(str(user_message))} chars "
+        f"seq={input_first_seq}-{input_latest_seq} count={len(input_message_ids)}"
+    )
 
     lock = _get_user_lock(user_id)
     turn_id = ""
@@ -2020,8 +2023,11 @@ async def chat(request: Request):
             async def _bound_sender(messages: list[dict]) -> list[dict]:
                 return await wechat_sender(user_id, context_token, messages)
 
+            # ── v1.2: Record arrival & build seq-based checker (inside lock) ──
+            _record_user_message_arrival(user_id, seq=input_latest_seq)
+            interrupt_checker = _make_interrupt_checker(user_id, input_latest_seq)
+
             # Run Chat Agent (v1.2 state machine)
-            interrupt_checker = _make_interrupt_checker(user_id)
             _wmh_cb = _build_chatagent_write_model_history(user_id, bot_id)
             _hook_cbs = _build_chatagent_post_turn_hooks(
                 user_id=user_id, bot_id=bot_id,
@@ -2038,6 +2044,11 @@ async def chat(request: Request):
                 bot_id=bot_id,
                 system_prompt=system_prompt,
                 wechat_sender=_bound_sender,
+                source="user_message",
+                input_message_ids=input_message_ids,
+                input_first_seq=input_first_seq,
+                input_latest_seq=input_latest_seq,
+                input_cutoff_time=input_cutoff_time,
                 interrupt_checker=interrupt_checker,
                 write_model_history=_wmh_cb,
                 post_turn_hooks=_hook_cbs,

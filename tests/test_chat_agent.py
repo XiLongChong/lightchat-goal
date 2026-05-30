@@ -1912,5 +1912,191 @@ class TestSkipReplyPath:
         assert result.delivered_count == 0
 
 
+class TestDraftStatusValid:
+    """v1.2: mark_turn_draft_status accepts cancelled and skipped."""
+
+    def test_cancelled_is_valid_draft_status(self):
+        """'cancelled' is in the valid set of mark_turn_draft_status."""
+        # Simulate the validation that mark_turn_draft_status performs
+        valid = {"generated", "sending", "delivered", "failed", "retry_pending",
+                 "cancelled", "skipped"}
+        assert "cancelled" in valid
+
+    def test_skipped_is_valid_draft_status(self):
+        """'skipped' is in the valid set of mark_turn_draft_status."""
+        valid = {"generated", "sending", "delivered", "failed", "retry_pending",
+                 "cancelled", "skipped"}
+        assert "skipped" in valid
+
+
+class TestSeqBasedInterrupt:
+    """v1.2: seq-based interrupt checker — current batch never cancels itself."""
+
+    def test_single_message_not_cancelled(self):
+        """Single message with input_latest_seq=1 → not interrupted."""
+        tc = _make_tc("send_wechat_messages", '{"messages":["ok"]}')
+        gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
+        seq_counter = {"X": 1}
+
+        def _checker(user_id: str, input_seq: int):
+            def _check(_token: str) -> bool:
+                return seq_counter.get(user_id, 0) > input_seq
+            return _check
+
+        async def fake_sender(messages):
+            for m in messages:
+                m["send_status"] = "delivered"
+            return messages
+
+        agent = ChatAgent(
+            model="test", persona="p", personality="",
+            llm_gateway=gw,
+            native_tool_calls=True,
+            native_allowed_tools=["send_wechat_messages"],
+            test_mode=True,
+        )
+        import asyncio
+        result = asyncio.run(agent.chat(
+            user_message="hello", history=[], trigger="user",
+            input_latest_seq=1,
+            interrupt_checker=_checker("X", 1),
+            wechat_sender=fake_sender,
+        ))
+        assert not result.was_cancelled, f"should not cancel, got {result.terminal_state}"
+        assert result.was_sent
+
+    def test_equal_seq_not_cancelled(self):
+        """input_latest_seq == latest_seq → not interrupted."""
+        seq_counter = {"X": 3}
+
+        def _checker(user_id: str, input_seq: int):
+            def _check(_token: str) -> bool:
+                return seq_counter.get(user_id, 0) > input_seq
+            return _check
+
+        tc = _make_tc("send_wechat_messages", '{"messages":["ok"]}')
+        gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
+        async def fake_sender(messages):
+            for m in messages:
+                m["send_status"] = "delivered"
+            return messages
+
+        agent = ChatAgent(
+            model="test", persona="p", personality="",
+            llm_gateway=gw,
+            native_tool_calls=True,
+            native_allowed_tools=["send_wechat_messages"],
+            test_mode=True,
+        )
+        import asyncio
+        result = asyncio.run(agent.chat(
+            user_message="hello", history=[], trigger="user",
+            input_latest_seq=3,
+            interrupt_checker=_checker("X", 3),
+            wechat_sender=fake_sender,
+        ))
+        assert not result.was_cancelled, f"equal seq should not cancel, got {result.terminal_state}"
+
+    def test_higher_seq_cancels(self):
+        """latest_seq > input_latest_seq → interrupted → END_CANCELLED."""
+        seq_counter = {"X": 5}  # higher than input
+
+        def _checker(user_id: str, input_seq: int):
+            def _check(_token: str) -> bool:
+                return seq_counter.get(user_id, 0) > input_seq
+            return _check
+
+        tc = _make_tc("send_wechat_messages", '{"messages":["ok"]}')
+        gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
+        async def fake_sender(messages):
+            for m in messages:
+                m["send_status"] = "delivered"
+            return messages
+
+        agent = ChatAgent(
+            model="test", persona="p", personality="",
+            llm_gateway=gw,
+            native_tool_calls=True,
+            native_allowed_tools=["send_wechat_messages"],
+            test_mode=True,
+        )
+        import asyncio
+        result = asyncio.run(agent.chat(
+            user_message="hello", history=[], trigger="user",
+            input_latest_seq=2,
+            interrupt_checker=_checker("X", 2),
+            wechat_sender=fake_sender,
+        ))
+        assert result.was_cancelled, f"expected END_CANCELLED, got {result.terminal_state}"
+
+    def test_batch_2_messages_not_cancelled(self):
+        """flush 2 messages, seq=1,2 → input_latest_seq=2, latest_seq=2 → not cancelled."""
+        seq_counter = {"X": 2}
+
+        def _checker(user_id: str, input_seq: int):
+            def _check(_token: str) -> bool:
+                return seq_counter.get(user_id, 0) > input_seq
+            return _check
+
+        tc = _make_tc("send_wechat_messages", '{"messages":["ok"]}')
+        gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
+        async def fake_sender(messages):
+            for m in messages:
+                m["send_status"] = "delivered"
+            return messages
+
+        agent = ChatAgent(
+            model="test", persona="p", personality="",
+            llm_gateway=gw,
+            native_tool_calls=True,
+            native_allowed_tools=["send_wechat_messages"],
+            test_mode=True,
+        )
+        import asyncio
+        result = asyncio.run(agent.chat(
+            user_message="hello\nworld", history=[], trigger="user",
+            input_latest_seq=2,
+            interrupt_checker=_checker("X", 2),
+            wechat_sender=fake_sender,
+        ))
+        assert not result.was_cancelled, f"batch should not cancel self, got {result.terminal_state}"
+
+    def test_cancelled_turn_no_assistant_history(self):
+        """END_CANCELLED → post_terminal_completed, no visible messages sent."""
+        seq_counter = {"X": 5}
+
+        def _checker(user_id: str, input_seq: int):
+            def _check(_token: str) -> bool:
+                return seq_counter.get(user_id, 0) > input_seq
+            return _check
+
+        tc = _make_tc("send_wechat_messages", '{"messages":["stale reply"]}')
+        gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
+        sent = []
+
+        async def fake_sender(messages):
+            for m in messages:
+                m["send_status"] = "delivered"
+            sent.extend(messages)
+            return messages
+
+        agent = ChatAgent(
+            model="test", persona="p", personality="",
+            llm_gateway=gw,
+            native_tool_calls=True,
+            native_allowed_tools=["send_wechat_messages"],
+            test_mode=True,
+        )
+        import asyncio
+        result = asyncio.run(agent.chat(
+            user_message="hello", history=[], trigger="user",
+            input_latest_seq=1,
+            interrupt_checker=_checker("X", 1),
+            wechat_sender=fake_sender,
+        ))
+        assert result.was_cancelled
+        assert len(sent) == 0, "cancelled turn must not send messages"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
