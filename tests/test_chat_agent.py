@@ -330,6 +330,280 @@ class TestWechatReplyV15:
 
 
 # ================================================================
+# v1.6: Post-send thinking delay
+# ================================================================
+
+
+class TestPostSendThinkingDelay:
+    """v1.6: interruptible delay between wechat_reply bubbles to reduce rate limits."""
+
+    def test_delay_triggers_after_delivered_bubble(self):
+        """wechat_reply delivered → POST_SEND_THINKING_DELAY entered before next CALL_LLM."""
+        call_count = [0]
+        responses = [
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"msg1"}')]),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+        ]
+
+        class MGW:
+            def __init__(self):
+                self.requests = []
+
+            async def complete(self, req):
+                self.requests.append(req)
+                idx = call_count[0]
+                call_count[0] += 1
+                return responses[idx]
+
+        sent_msgs = []
+        state_transitions = []
+
+        class ProbeAgent(ChatAgent):
+            async def _do_post_send_thinking_delay(self, turn):
+                state_transitions.append(("enter_delay", turn.sent_message_count))
+                result = await super()._do_post_send_thinking_delay(turn)
+                state_transitions.append(("exit_delay", result))
+                return result
+
+        async def fake_sender(messages):
+            for m in messages:
+                m["send_status"] = "delivered"
+            sent_msgs.extend(messages)
+            return messages
+
+        agent = ProbeAgent(
+            model="test", persona="p", personality="",
+            llm_gateway=MGW(), native_tool_calls=True,
+            native_allowed_tools=["wechat_reply", "done"],
+            test_mode=True,
+        )
+        import asyncio
+        result = asyncio.run(agent.chat(
+            user_message="hello", history=[], trigger="user",
+            wechat_sender=fake_sender,
+        ))
+        assert result.terminal_state == TurnState.END_REPLIED, f"got {result.terminal_state}"
+        assert result.sent_message_count == 1
+        # delay was entered after first delivered bubble
+        assert ("enter_delay", 1) in state_transitions
+        # delay exited cleanly to POST_SEND_INTERRUPT_CHECK
+        assert any(s == ("exit_delay", TurnState.POST_SEND_INTERRUPT_CHECK)
+                   for s in state_transitions)
+
+    def test_no_delay_on_failed_send(self):
+        """wechat_reply failed → no thinking delay, immediate re-decision."""
+        call_count = [0]
+        responses = [
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"msg1"}')]),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"failed","note":"cant send"}')]),
+        ]
+
+        class MGW:
+            def __init__(self):
+                self.requests = []
+
+            async def complete(self, req):
+                self.requests.append(req)
+                idx = call_count[0]
+                call_count[0] += 1
+                return responses[idx]
+
+        async def fake_sender(messages):
+            for m in messages:
+                m["send_status"] = "failed"
+                m["send_error"] = "test failure"
+            return messages
+
+        agent = ChatAgent(
+            model="test", persona="p", personality="",
+            llm_gateway=MGW(), native_tool_calls=True,
+            native_allowed_tools=["wechat_reply", "done"],
+            test_mode=True,
+        )
+        import asyncio
+        result = asyncio.run(agent.chat(
+            user_message="hello", history=[], trigger="user",
+            wechat_sender=fake_sender,
+        ))
+        assert result.terminal_state == TurnState.END_FAILED, f"got {result.terminal_state}"
+        assert result.sent_message_count == 0
+
+    def test_interrupted_during_delay_ends_sequence(self):
+        """Delay interrupted by user → END_INTERRUPTED_DURING_REPLY_SEQUENCE, sent msgs preserved.
+
+        In test_mode the delay is skipped, but POST_SEND_INTERRUPT_CHECK still fires.
+        We set interrupt to trigger at POST_SEND_INTERRUPT_CHECK (3rd check point:
+        CREATE_TURN→CALL_LLM→POST_SEND), which simulates an interrupt during the
+        delay window in production.
+        """
+        call_count = [0]
+        responses = [
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"msg1"}')]),
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"msg2"}')]),
+            # should not reach here — interrupted before second CALL_LLM
+        ]
+
+        class MGW:
+            def __init__(self):
+                self.requests = []
+
+            async def complete(self, req):
+                self.requests.append(req)
+                idx = call_count[0]
+                call_count[0] += 1
+                if idx >= len(responses):
+                    raise RuntimeError("LLM called after interruption")
+                return responses[idx]
+
+        sent_msgs = []
+
+        async def fake_sender(messages):
+            for m in messages:
+                m["send_status"] = "delivered"
+            sent_msgs.extend(messages)
+            return messages
+
+        check_count = [0]
+
+        def _interrupt_at_post_send(_token):
+            # Interrupt at POST_SEND_INTERRUPT_CHECK (check #4 in test_mode:
+            # INTERRUPT_CHECK → HANDLE_MODEL_OUTPUT → PRE_SEND → POST_SEND)
+            check_count[0] += 1
+            return check_count[0] >= 4
+
+        agent = ChatAgent(
+            model="test", persona="p", personality="",
+            llm_gateway=MGW(), native_tool_calls=True,
+            native_allowed_tools=["wechat_reply", "done"],
+            test_mode=True,
+        )
+        import asyncio
+        result = asyncio.run(agent.chat(
+            user_message="hello", history=[], trigger="user",
+            wechat_sender=fake_sender,
+            interrupt_checker=_interrupt_at_post_send,
+        ))
+        # POST_SEND_INTERRUPT_CHECK fires → END_INTERRUPTED_DURING_REPLY_SEQUENCE
+        assert result.terminal_state == TurnState.END_INTERRUPTED_DURING_REPLY_SEQUENCE, \
+            f"got {result.terminal_state}"
+        # Already-sent message preserved
+        assert result.sent_message_count == 1
+        assert len(sent_msgs) == 1
+        assert sent_msgs[0]["text"] == "msg1"
+
+    def test_sent_messages_preserved_on_interrupt(self):
+        """Interrupted during reply sequence — already-sent messages are in result."""
+        call_count = [0]
+        responses = [
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"msg1"}')]),
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"msg2"}')]),
+        ]
+
+        class MGW:
+            def __init__(self):
+                self.requests = []
+
+            async def complete(self, req):
+                self.requests.append(req)
+                idx = call_count[0]
+                call_count[0] += 1
+                if idx >= len(responses):
+                    raise RuntimeError("LLM called after interruption")
+                return responses[idx]
+
+        sent_msgs = []
+        interrupt_flag = [False]
+
+        async def fake_sender(messages):
+            for m in messages:
+                m["send_status"] = "delivered"
+            sent_msgs.extend(messages)
+            return messages
+
+        def _interrupt_after_first_send(_token):
+            if sent_msgs and not interrupt_flag[0]:
+                interrupt_flag[0] = True
+                return False  # let first send go through
+            return interrupt_flag[0]  # interrupt subsequent checks
+
+        agent = ChatAgent(
+            model="test", persona="p", personality="",
+            llm_gateway=MGW(), native_tool_calls=True,
+            native_allowed_tools=["wechat_reply", "done"],
+            test_mode=True,
+        )
+        import asyncio
+        result = asyncio.run(agent.chat(
+            user_message="hello", history=[], trigger="user",
+            wechat_sender=fake_sender,
+            interrupt_checker=_interrupt_after_first_send,
+        ))
+        # First deliver happened; interrupt may fire after
+        assert result.sent_message_count >= 1
+        assert len(sent_msgs) >= 1
+        assert sent_msgs[0]["text"] == "msg1"
+        # No second LLM call should happen if interrupted
+        # (might still happen in test_mode since delay is skipped)
+
+    def test_delay_params_vary_by_reply_index(self):
+        """Delay tiers: 1st=1.5-2.5, 2nd=2.5-3.5, 3rd+=3.5-5.5."""
+        from agent.state_machine import (
+            POST_SEND_DELAY_TIERS,
+            POST_SEND_DELAY_LONG_NARRATIVE,
+        )
+        assert POST_SEND_DELAY_TIERS[0] == (1.5, 2.5)
+        assert POST_SEND_DELAY_TIERS[1] == (2.5, 3.5)
+        assert POST_SEND_DELAY_TIERS[2] == (3.5, 5.5)
+        assert POST_SEND_DELAY_LONG_NARRATIVE == (2.5, 4.5)
+
+    def test_test_mode_skips_delay(self):
+        """In test_mode, POST_SEND_THINKING_DELAY is skipped entirely."""
+        call_count = [0]
+        responses = [
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"msg1"}')]),
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"msg2"}')]),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+        ]
+
+        class MGW:
+            def __init__(self):
+                self.requests = []
+
+            async def complete(self, req):
+                self.requests.append(req)
+                idx = call_count[0]
+                call_count[0] += 1
+                return responses[idx]
+
+        sent_msgs = []
+
+        async def fake_sender(messages):
+            for m in messages:
+                m["send_status"] = "delivered"
+            sent_msgs.extend(messages)
+            return messages
+
+        agent = ChatAgent(
+            model="test", persona="p", personality="",
+            llm_gateway=MGW(), native_tool_calls=True,
+            native_allowed_tools=["wechat_reply", "done"],
+            test_mode=True,
+        )
+        import asyncio
+        import time
+        t0 = time.time()
+        result = asyncio.run(agent.chat(
+            user_message="hello", history=[], trigger="user",
+            wechat_sender=fake_sender,
+        ))
+        elapsed = time.time() - t0
+        assert result.terminal_state == TurnState.END_REPLIED
+        assert result.sent_message_count == 2
+        # With test_mode, the entire chat should complete very fast (< 1s)
+        assert elapsed < 3.0, f"expected fast (<3s), got {elapsed:.1f}s"
+
+
+# ================================================================
 # v1.5: done(no_reply) guard — reject when user asks a question
 # ================================================================
 

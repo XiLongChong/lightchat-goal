@@ -6,8 +6,10 @@ done = only normal terminal tool.  Tool results always fed back to model.
 
 from __future__ import annotations
 
+import asyncio
 import json as _json
 import logging
+import random
 import re as _re
 import time
 from datetime import datetime
@@ -18,6 +20,10 @@ from agent.state_machine import (
     MAX_PROTOCOL_RETRIES_PER_TURN,
     MAX_REPLY_MESSAGES_PER_TURN,
     MAX_SEND_FAILURES_PER_TURN,
+    POST_SEND_DELAY_LONG_NARRATIVE,
+    POST_SEND_DELAY_NARRATIVE_THRESHOLD_CHARS,
+    POST_SEND_DELAY_POLL_INTERVAL_MS,
+    POST_SEND_DELAY_TIERS,
     TERMINAL_STATES,
     ContextBuildResult,
     DeliveryStatus,
@@ -198,10 +204,12 @@ class ChatAgent:
                 )
                 state = TurnState.HARD_FALLBACK
 
-            if turn.elapsed_ms / 1000 > turn.turn_timeout_seconds:
+            effective_elapsed_s = (turn.elapsed_ms - turn._thinking_delay_accumulated_ms) / 1000
+            if effective_elapsed_s > turn.turn_timeout_seconds:
                 logger.warning(
-                    "turn timeout: elapsed=%.1fs turn_id=%s",
-                    turn.elapsed_ms / 1000, turn.turn_id,
+                    "turn timeout: effective_elapsed=%.1fs (raw=%.1fs delay=%.1fs) turn_id=%s",
+                    effective_elapsed_s, turn.elapsed_ms / 1000,
+                    turn._thinking_delay_accumulated_ms / 1000, turn.turn_id,
                 )
                 turn.reply_sequence_status = "max_limit_reached"
                 state = TurnState.END_MAX_LIMIT
@@ -329,6 +337,9 @@ class ChatAgent:
 
         elif state == TurnState.APPEND_SEND_RESULT:
             return self._do_append_send_result(turn)
+
+        elif state == TurnState.POST_SEND_THINKING_DELAY:
+            return await self._do_post_send_thinking_delay(turn)
 
         elif state == TurnState.POST_SEND_INTERRUPT_CHECK:
             return self._do_post_send_interrupt_check(turn)
@@ -1224,6 +1235,7 @@ class ChatAgent:
         send_status = raw_results[0].get("send_status", "unknown") if raw_results else "unknown"
 
         if send_status == "delivered":
+            turn._last_send_delivered = True
             turn.sent_message_count += 1
             turn._sent_idempotency_keys.add(idempotency_key)
             vm = VisibleMessage(
@@ -1283,9 +1295,86 @@ class ChatAgent:
     def _do_append_send_result(self, turn: TurnScratchpad) -> TurnState:
         """APPEND_SEND_RESULT: transition after send result appended.
 
-        v1.5: result already appended to turn.messages by EXEC_SEND_ONE.
-        Route to POST_SEND_INTERRUPT_CHECK.
+        v1.6: if wechat_reply was delivered → POST_SEND_THINKING_DELAY
+        (interruptible delay before next CALL_LLM to avoid rate limits).
+        Otherwise → POST_SEND_INTERRUPT_CHECK (immediate re-decision).
         """
+        if turn._last_send_delivered:
+            turn._last_send_delivered = False
+            return TurnState.POST_SEND_THINKING_DELAY
+        return TurnState.POST_SEND_INTERRUPT_CHECK
+
+    async def _do_post_send_thinking_delay(self, turn: TurnScratchpad) -> TurnState:
+        """POST_SEND_THINKING_DELAY: interruptible delay between wechat_reply bubbles.
+
+        v1.6: after a wechat_reply is delivered, pause before CALL_LLM to:
+          - Reduce WeChat rate-limit risk (spacing out sends)
+          - Give the user a chance to interject (natural chat feel)
+
+        Delay is NOT written to model history or tool results.
+        Interrupt during delay → END_INTERRUPTED_DURING_REPLY_SEQUENCE
+          (already-sent messages are preserved).
+        No interrupt → POST_SEND_INTERRUPT_CHECK → LIMIT_CHECK → CALL_LLM.
+        """
+        if self.test_mode:
+            return TurnState.POST_SEND_INTERRUPT_CHECK
+
+        reply_index = turn.sent_message_count  # 1-based after delivered increment
+        last_text = turn._current_reply_text if turn._current_reply_text else ""
+        is_narrative = len(last_text) >= POST_SEND_DELAY_NARRATIVE_THRESHOLD_CHARS
+
+        # ── Compute delay range ────────────────────────────────────
+        if is_narrative:
+            min_delay, max_delay = POST_SEND_DELAY_LONG_NARRATIVE
+            delay_reason = f"long_narrative ({len(last_text)} chars)"
+        elif reply_index <= len(POST_SEND_DELAY_TIERS):
+            min_delay, max_delay = POST_SEND_DELAY_TIERS[reply_index - 1]
+            delay_reason = f"reply_index={reply_index}"
+        else:
+            min_delay, max_delay = POST_SEND_DELAY_TIERS[-1]
+            delay_reason = f"reply_index={reply_index} (capped)"
+
+        delay_s = min_delay + random.random() * (max_delay - min_delay)
+        poll_interval_s = POST_SEND_DELAY_POLL_INTERVAL_MS / 1000.0
+
+        logger.info(
+            "post_send_thinking_delay: start delay=%.2fs reason=%s reply_index=%d narrative=%s",
+            delay_s, delay_reason, reply_index, is_narrative,
+        )
+
+        # ── Interruptible wait loop ────────────────────────────────
+        waited = 0.0
+        interrupted = False
+        while waited < delay_s:
+            sleep_for = min(poll_interval_s, delay_s - waited)
+            await asyncio.sleep(sleep_for)
+            waited += sleep_for
+
+            if self._is_interrupted():
+                interrupted = True
+                break
+
+        # ── Record accumulated delay (excluded from turn timeout) ──
+        turn._thinking_delay_accumulated_ms += waited * 1000
+
+        if interrupted:
+            turn.reply_sequence_status = "interrupted_by_user"
+            turn.add_fallback_event(
+                "interrupted_during_thinking_delay",
+                f"sent {turn.sent_message_count} messages, waited {waited:.2f}s",
+            )
+            logger.info(
+                "post_send_thinking_delay: interrupted_during_delay=yes "
+                "waited=%.2fs reply_index=%d sent_count=%d → END_INTERRUPTED_DURING_REPLY_SEQUENCE",
+                waited, reply_index, turn.sent_message_count,
+            )
+            return TurnState.END_INTERRUPTED_DURING_REPLY_SEQUENCE
+
+        logger.info(
+            "post_send_thinking_delay: complete waited=%.2fs reply_index=%d "
+            "delay_reason=%s next_call_llm_after_delay=yes",
+            waited, reply_index, delay_reason,
+        )
         return TurnState.POST_SEND_INTERRUPT_CHECK
 
     def _do_post_send_interrupt_check(self, turn: TurnScratchpad) -> TurnState:

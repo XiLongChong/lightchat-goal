@@ -46,6 +46,7 @@ class TurnState(StrEnum):
     PRE_SEND_INTERRUPT_CHECK = "pre_send_interrupt_check"
     EXEC_SEND_ONE = "exec_send_one"                         # single bubble send
     APPEND_SEND_RESULT = "append_send_result"
+    POST_SEND_THINKING_DELAY = "post_send_thinking_delay"    # v1.6: interruptible delay between sends
     POST_SEND_INTERRUPT_CHECK = "post_send_interrupt_check"
     LIMIT_CHECK = "limit_check"
 
@@ -261,6 +262,10 @@ class TurnScratchpad:
     # ── v1.5: Pending wechat_reply (for interrupt differentiation) ──
     _has_pending_wechat_reply: bool = False  # model generated wechat_reply but not yet sent
 
+    # ── v1.6: Post-send thinking delay ────────────────────────────
+    _last_send_delivered: bool = False       # set by EXEC_SEND_ONE, read by APPEND_SEND_RESULT
+    _thinking_delay_accumulated_ms: float = 0.0  # total time spent in POST_SEND_THINKING_DELAY
+
     # legacy compat
     visible_batch: list[str] = field(default_factory=list)
     guarded_batch: list[dict[str, Any]] = field(default_factory=list)
@@ -414,6 +419,17 @@ MAX_FACT_TOOL_CALLS_PER_TURN = 3
 MAX_PROTOCOL_RETRIES_PER_TURN = 2
 MAX_SEND_FAILURES_PER_TURN = 2
 PROACTIVE_SOFT_REPLY_LIMIT = 3
+
+# v1.6: Post-send thinking delay — interruptible pause between wechat_reply bubbles.
+# Each tier covers a reply_index range. Values are (min_s, max_s) tuples.
+POST_SEND_DELAY_TIERS: list[tuple[float, float]] = [
+    (1.5, 2.5),   # after 1st message
+    (2.5, 3.5),   # after 2nd message
+    (3.5, 5.5),   # after 3rd+ message
+]
+POST_SEND_DELAY_LONG_NARRATIVE: tuple[float, float] = (2.5, 4.5)
+POST_SEND_DELAY_NARRATIVE_THRESHOLD_CHARS: int = 120
+POST_SEND_DELAY_POLL_INTERVAL_MS: int = 300  # interrupt check granularity
 
 
 # ================================================================
