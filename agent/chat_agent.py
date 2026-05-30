@@ -36,7 +36,8 @@ logger = logging.getLogger(__name__)
 # Safeguard constants
 MAX_TOOL_LOOP = 5
 MAX_MESSAGE_LEN = 500
-MAX_MESSAGE_COUNT = 8
+MAX_MESSAGES_PER_TURN = 16        # model MUST stay within this; exceeding → PROTOCOL_RETRY
+LEGACY_MAX_MESSAGE_COUNT = 8      # kept for output_guard.py compat; NOT used for truncation
 
 # Route constants (kept for diagnostics)
 ROUTE_SYSTEM_FAST = "SystemFastPath"
@@ -923,6 +924,24 @@ class ChatAgent:
             return TurnState.PROTOCOL_RETRY
 
         raw_texts = [str(m) for m in raw_messages]
+        parsed_count = len(raw_texts)
+
+        # v1.2: enforce max messages per turn — no silent truncation
+        if parsed_count > MAX_MESSAGES_PER_TURN:
+            turn.add_fallback_event(
+                "too_many_messages",
+                f"model requested {parsed_count} messages, limit={MAX_MESSAGES_PER_TURN}",
+            )
+            # Inject retry note so model re-calls send_wechat_messages compressed
+            turn.messages.append({
+                "role": "system",
+                "content": (
+                    f"你一次性请求发送了 {parsed_count} 条消息，超过了上限 {MAX_MESSAGES_PER_TURN} 条。"
+                    f"请压缩到 {MAX_MESSAGES_PER_TURN} 条以内，重新调用 send_wechat_messages。"
+                    '如果内容太多，可以分段讲，或者最后说"我先讲到这里，你想听我继续再说"。'
+                ),
+            })
+            return TurnState.PROTOCOL_RETRY
 
         # v1.2: create VisibleMessage for each parsed message
         turn.visible_messages = [
@@ -934,13 +953,13 @@ class ChatAgent:
             for i, text in enumerate(raw_texts)
         ]
 
-        # Legacy compat: still populate visible_batch for guard_send_message_batch
         turn.visible_batch = raw_texts
         turn._send_mode = str(args.get("mode", "normal") or "normal")
+        turn._parsed_count = parsed_count  # transient diagnostic
 
         logger.info(
             "state_machine: parsed %d visible messages, mode=%s",
-            len(turn.visible_messages), turn._send_mode,
+            parsed_count, turn._send_mode,
         )
         return TurnState.GUARD_OUTPUT
 
@@ -948,19 +967,19 @@ class ChatAgent:
         """GUARD_OUTPUT: run output guard on every parsed VisibleMessage.
 
         v1.2: each VisibleMessage gets guarded_text/guard_status via
-        guard_single_message.  Then batch-level limits (max_count, max_total)
-        are applied directly on the VisibleMessage list in original order,
-        preserving stable per-message mapping.  Messages beyond max_count
-        or truncated by max_total get BLOCKED_BY_GUARD.
+        guard_single_message.  Messages blocked by guard get
+        delivery_status=BLOCKED_BY_GUARD.  If all blocked → HARD_FALLBACK.
+        No silent truncation — parsed_count already enforced at PARSE_VISIBLE_BATCH.
         Interrupt check before guard.
         """
         if self._is_interrupted():
             turn.add_fallback_event("interrupted_before_guard", "turn superseded by newer event")
             return TurnState.END_CANCELLED
 
-        from agent.output_guard import guard_single_message, guard_send_message_batch
+        from agent.output_guard import guard_single_message
 
         # ── Per-message guard ──────────────────────────────────────
+        guard_blocked = 0
         for vm in turn.visible_messages:
             guarded = guard_single_message(vm.original_text)
             if guarded:
@@ -970,47 +989,15 @@ class ChatAgent:
                 vm.guarded_text = ""
                 vm.guard_status = "BLOCKED"
                 vm.delivery_status = DeliveryStatus.BLOCKED_BY_GUARD
+                guard_blocked += 1
 
-        # ── Batch guard (run for its logging + to get limit configs) ──
-        guard_result = guard_send_message_batch(
-            turn.visible_batch, mode=getattr(turn, "_send_mode", "normal"),
-        )
-        if guard_result.blocked_count > 0:
+        if guard_blocked > 0:
             turn.add_fallback_event(
                 "guard_blocked",
-                f"blocked {guard_result.blocked_count}/{guard_result.total} messages",
+                f"blocked {guard_blocked} messages by guard",
             )
 
-        # ── v1.2: Apply batch limits directly on VisibleMessage list ──
-        # Use constants from output_guard for consistency
-        from agent.output_guard import MAX_MESSAGE_COUNT, MAX_TOTAL_CHARS
         passed = [vm for vm in turn.visible_messages if vm.guard_status != "BLOCKED"]
-        truncated_count = 0
-
-        # max_count: mark excess messages as BLOCKED_BY_GUARD
-        if len(passed) > MAX_MESSAGE_COUNT:
-            for vm in passed[MAX_MESSAGE_COUNT:]:
-                vm.guard_status = "BLOCKED"
-                vm.guarded_text = ""
-                vm.delivery_status = DeliveryStatus.BLOCKED_BY_GUARD
-            truncated_count = len(passed) - MAX_MESSAGE_COUNT
-            passed = passed[:MAX_MESSAGE_COUNT]
-
-        # max_total: trim the last message's guarded_text if total exceeds limit
-        total_chars = sum(len(vm.guarded_text) for vm in passed)
-        if total_chars > MAX_TOTAL_CHARS and passed:
-            excess = total_chars - MAX_TOTAL_CHARS
-            last = passed[-1]
-            new_len = max(10, len(last.guarded_text) - excess)
-            last.guarded_text = last.guarded_text[:new_len].rstrip() + "…"
-            if last.guard_status == "PASSED":
-                last.guard_status = "SANITIZED"
-
-        if truncated_count > 0:
-            turn.add_fallback_event(
-                "guard_truncated",
-                f"truncated {truncated_count} messages (max_count={MAX_MESSAGE_COUNT})",
-            )
 
         if not passed:
             turn.add_fallback_event(
@@ -1203,41 +1190,64 @@ class ChatAgent:
     def _do_decide_send_terminal(self, turn: TurnScratchpad) -> TurnState:
         """DECIDE_SEND_TERMINAL: determine END_SENT / END_PARTIAL_SENT / END_FAILED.
 
-        v1.2 §13.5: uses DeliveryStatus.SENT_CONFIRMED on VisibleMessage
-        objects to decide.  SENT_CONFIRMED → successful; anything else → not.
+        v1.2 §13.5: compares parsed_count, guard_passed_count, attempted_count,
+        delivered_count.  No silent message loss — every gap has a reason.
         """
-        if not turn.visible_messages:
-            return TurnState.END_FAILED
-
-        confirmed = [
-            vm for vm in turn.visible_messages
+        parsed_count = len(turn.visible_messages)
+        guard_blocked = sum(
+            1 for vm in turn.visible_messages
+            if vm.delivery_status == DeliveryStatus.BLOCKED_BY_GUARD
+        )
+        guard_passed = parsed_count - guard_blocked
+        sent_confirmed = sum(
+            1 for vm in turn.visible_messages
             if vm.delivery_status == DeliveryStatus.SENT_CONFIRMED
-        ]
-        attempted = [
-            vm for vm in turn.visible_messages
-            if vm.guard_status != "BLOCKED" and vm.delivery_status
-        ]
-        non_confirmed = [vm for vm in attempted if vm.delivery_status != DeliveryStatus.SENT_CONFIRMED]
+        )
+        failed_before = sum(
+            1 for vm in turn.visible_messages
+            if vm.delivery_status == DeliveryStatus.FAILED_BEFORE_SEND
+        )
+        unknown = sum(
+            1 for vm in turn.visible_messages
+            if vm.delivery_status == DeliveryStatus.UNKNOWN_AFTER_ATTEMPT
+        )
+        pending = sum(
+            1 for vm in turn.visible_messages
+            if vm.delivery_status in (DeliveryStatus.PENDING, "")
+        )
+        attempted = sent_confirmed + failed_before + unknown
 
-        if not confirmed and not non_confirmed:
-            return TurnState.END_FAILED
+        terminal = TurnState.END_FAILED
+        if parsed_count == 0:
+            terminal = TurnState.END_FAILED
+        elif sent_confirmed == parsed_count:
+            terminal = TurnState.END_SENT
+        elif sent_confirmed > 0:
+            terminal = TurnState.END_PARTIAL_SENT
+        elif attempted > 0:
+            terminal = TurnState.END_FAILED
+        elif guard_blocked == parsed_count:
+            terminal = TurnState.END_FAILED
+            turn.add_fallback_event("send_all_guard_blocked", f"{parsed_count} blocked by guard")
+        else:
+            terminal = TurnState.END_FAILED
 
-        if confirmed and not non_confirmed:
-            return TurnState.END_SENT
+        logger.info(
+            "decide_send_terminal: parsed=%d guard_passed=%d guard_blocked=%d "
+            "attempted=%d delivered=%d unknown=%d pending=%d -> %s",
+            parsed_count, guard_passed, guard_blocked,
+            attempted, sent_confirmed, unknown, pending,
+            terminal,
+        )
 
-        if confirmed and non_confirmed:
+        if terminal == TurnState.END_PARTIAL_SENT:
             turn.add_fallback_event(
                 "partial_send",
-                f"{len(confirmed)} sent_confirmed, {len(non_confirmed)} not confirmed",
+                f"{sent_confirmed}/{parsed_count} sent_confirmed "
+                f"(guard_blocked={guard_blocked} unknown={unknown})",
             )
-            return TurnState.END_PARTIAL_SENT
 
-        # All non-confirmed
-        turn.add_fallback_event(
-            "send_all_failed",
-            f"{len(non_confirmed)} messages all non-confirmed",
-        )
-        return TurnState.END_FAILED
+        return terminal
 
     # ── Skip path ────────────────────────────────────────────────
 

@@ -1791,15 +1791,12 @@ class TestFatalContextErrors:
         assert result.was_fallback or result.was_failed
 
 
-class TestBatchGuardIntegration:
-    """v1.2 §13: batch-level guard limits effective in ChatAgent send path."""
+class TestMessageLimitProtocolRetry:
+    """v1.2: exceeding MAX_MESSAGES_PER_TURN → PROTOCOL_RETRY, not silent truncation."""
 
-    def test_max_count_enforced_in_send_path(self):
-        """Model returns 20 messages → GUARD_OUTPUT blocks extras → only 8 sent.
-
-        MAX_MESSAGE_COUNT = 8 in output_guard.  20 messages → 12 blocked.
-        """
-        msgs = [f"msg{i}" for i in range(20)]
+    def test_within_limit_all_sent_ends_sent(self):
+        """9 messages, limit=16 → all sent → END_SENT."""
+        msgs = [f"msg{i}" for i in range(9)]
         tc = _make_tc("send_wechat_messages", json.dumps({"messages": msgs}))
         gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
 
@@ -1819,18 +1816,92 @@ class TestBatchGuardIntegration:
         )
         import asyncio
         result = asyncio.run(agent.chat(
-            user_message="spam me", history=[], trigger="user",
+            user_message="story please", history=[], trigger="user",
             wechat_sender=fake_sender,
         ))
-        # Not all 20 were sent — max_count capped them
-        assert len(sent_msgs) <= 8, f"expected <=8 sent, got {len(sent_msgs)}"
-        # The truncated ones have BLOCKED_BY_GUARD status
-        blocked = sum(
-            1 for m in result.visible_messages
-            if m.get("delivery_status") == "blocked_by_guard"
-            or m.get("delivery_status") == ""
+        assert result.was_sent, f"expected END_SENT, got {result.terminal_state}"
+        assert len(sent_msgs) == 9
+
+    def test_exceeds_limit_goes_protocol_retry(self):
+        """21 messages, limit=16 → PROTOCOL_RETRY, model retries with fewer."""
+        call_count = [0]
+        msgs_too_many = [f"msg{i}" for i in range(21)]
+        msgs_compressed = [f"compressed{i}" for i in range(5)]
+        responses = [
+            _make_response("", tool_calls=[
+                _make_tc("send_wechat_messages", json.dumps({"messages": msgs_too_many}))
+            ]),
+            _make_response("", tool_calls=[
+                _make_tc("send_wechat_messages", json.dumps({"messages": msgs_compressed}))
+            ]),
+        ]
+
+        class MGW:
+            def __init__(self):
+                self.requests = []
+            async def complete(self, req):
+                self.requests.append(req)
+                idx = call_count[0]
+                call_count[0] += 1
+                return responses[idx]
+
+        sent_msgs = []
+        async def fake_sender(messages):
+            for m in messages:
+                m["send_status"] = "delivered"
+            sent_msgs.extend(messages)
+            return messages
+
+        agent = ChatAgent(
+            model="test", persona="p", personality="",
+            llm_gateway=MGW(),
+            native_tool_calls=True,
+            native_allowed_tools=["send_wechat_messages"],
+            test_mode=True,
         )
-        assert blocked > 0, f"expected some messages blocked by guard, got {len(result.visible_messages)} visible"
+        import asyncio
+        result = asyncio.run(agent.chat(
+            user_message="story please", history=[], trigger="user",
+            wechat_sender=fake_sender,
+        ))
+        # Second call succeeded with compressed messages
+        assert len(sent_msgs) == 5, f"expected 5 compressed msgs sent, got {len(sent_msgs)}"
+        types = [e.get("type") for e in result.fallback_events]
+        assert "too_many_messages" in types
+
+    def test_partial_send_on_one_failed(self):
+        """9 messages, sender delivers 8 → END_PARTIAL_SENT."""
+        msgs = [f"msg{i}" for i in range(9)]
+        tc = _make_tc("send_wechat_messages", json.dumps({"messages": msgs}))
+        gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
+
+        sent_count = [0]
+        async def fake_sender(messages):
+            for m in messages:
+                sent_count[0] += 1
+                if sent_count[0] <= 8:
+                    m["send_status"] = "delivered"
+                else:
+                    m["send_status"] = "failed"
+                    m["send_error"] = "simulated failure"
+            return messages
+
+        agent = ChatAgent(
+            model="test", persona="p", personality="",
+            llm_gateway=gw,
+            native_tool_calls=True,
+            native_allowed_tools=["send_wechat_messages"],
+            test_mode=True,
+        )
+        import asyncio
+        result = asyncio.run(agent.chat(
+            user_message="story please", history=[], trigger="user",
+            wechat_sender=fake_sender,
+        ))
+        assert result.terminal_state == TurnState.END_PARTIAL_SENT, \
+            f"expected END_PARTIAL_SENT, got {result.terminal_state}"
+        types = [e.get("type") for e in result.fallback_events]
+        assert "partial_send" in types
 
 
 class TestOptionalPreprocessNoWeather:
