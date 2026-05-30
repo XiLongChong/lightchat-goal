@@ -77,28 +77,19 @@ def compact_history(
 def build_chat_system_prompt(
     persona: str,
     personality: str = "",
-    default_city: str = "",
     tool_names: list[str] | None = None,
 ) -> str:
     """Build a minimal chat system prompt.
 
-    Only includes persona, time, and tools.
-    No memory_policy, relationship_context, recap, or multi-bot components.
+    Time and city are appended as separate system messages in chat_agent
+    so the main prompt stays stable across turns for prompt cache hits.
     """
-    now = datetime.now().strftime("%Y年%m月%d日 %H:%M 周%u")
     tool_list = ", ".join(tool_names) if tool_names else "send_wechat_messages, get_time, get_weather, skip_reply"
 
     sections = [
         persona,
         personality if personality else "",
-        f"当前时间：{now}",
     ]
-
-    if default_city:
-        sections.append(
-            f"用户默认天气城市：{default_city}。"
-            "用户只问天气时，直接查这个城市，不要反问。"
-        )
 
     sections.append(f"可用工具：{tool_list}\n")
 

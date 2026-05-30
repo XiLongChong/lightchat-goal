@@ -1,10 +1,7 @@
-"""ChatAgent — v1.2 Level-1 state-machine-driven chat loop.
+"""ChatAgent — v1.5 strict CC causal chain state machine.
 
-All visible WeChat output must go through: native tool calls → guard → wechat_sender.
-assistant.content is never directly sent to WeChat.
-send_wechat_messages tool result is never fed back to the model.
-skip_reply is a formal terminal tool.
-Old JSON actions are NOT recognized.
+One tool call per LLM response.  wechat_reply = one bubble (NOT terminal).
+done = only normal terminal tool.  Tool results always fed back to model.
 """
 
 from __future__ import annotations
@@ -13,9 +10,14 @@ import json as _json
 import logging
 import re as _re
 import time
+from datetime import datetime
 from typing import Any, Callable, Coroutine
 
 from agent.state_machine import (
+    MAX_LLM_STEPS_PER_TURN,
+    MAX_PROTOCOL_RETRIES_PER_TURN,
+    MAX_REPLY_MESSAGES_PER_TURN,
+    MAX_SEND_FAILURES_PER_TURN,
     TERMINAL_STATES,
     ContextBuildResult,
     DeliveryStatus,
@@ -30,16 +32,16 @@ from agent.state_machine import (
     VisibleMessage,
     classify_error,
 )
-from agent.tool_classifier import classify_tool_calls
+from agent.tool_classifier import classify_single_tool_call
 from agent.tool_registry import TOOL_REGISTRY
 
 logger = logging.getLogger(__name__)
 
 # Safeguard constants
-MAX_TOOL_LOOP = 5
+MAX_TOOL_LOOP = 5                 # legacy, replaced by MAX_LLM_STEPS_PER_TURN
 MAX_MESSAGE_LEN = 500
-MAX_MESSAGES_PER_TURN = 16        # model MUST stay within this; exceeding → PROTOCOL_RETRY
-LEGACY_MAX_MESSAGE_COUNT = 8      # kept for output_guard.py compat; NOT used for truncation
+MAX_MESSAGES_PER_TURN = 16        # legacy, kept for output_guard.py compat
+LEGACY_MAX_MESSAGE_COUNT = 8
 
 # Route constants (kept for diagnostics)
 ROUTE_SYSTEM_FAST = "SystemFastPath"
@@ -179,18 +181,22 @@ class ChatAgent:
             input_cutoff_time=input_cutoff_time,
             route=route,
             max_flash_upgrade_attempts=self._max_flash_upgrade_attempts,
+            max_llm_steps_per_turn=MAX_LLM_STEPS_PER_TURN,
+            max_reply_messages_per_turn=MAX_REPLY_MESSAGES_PER_TURN,
+            max_protocol_retries=MAX_PROTOCOL_RETRIES_PER_TURN,
+            max_send_failures_per_turn=MAX_SEND_FAILURES_PER_TURN,
         )
         state = TurnState.RECEIVE_EVENT
 
         # ── State machine loop ──────────────────────────────────
         while state not in TERMINAL_STATES:
-            if turn.llm_call_count >= turn.max_iterations:
+            if turn.llm_call_count >= turn.max_llm_steps_per_turn:
                 logger.warning(
-                    "state_machine: max_iterations=%d exceeded, forcing HARD_FALLBACK",
-                    turn.max_iterations,
+                    "state_machine: max_llm_steps=%d exceeded, forcing HARD_FALLBACK",
+                    turn.max_llm_steps_per_turn,
                 )
                 turn.add_fallback_event(
-                    "max_iterations_exceeded",
+                    "max_llm_steps_exceeded",
                     f"reached {turn.llm_call_count} LLM calls",
                 )
                 state = TurnState.HARD_FALLBACK
@@ -251,6 +257,10 @@ class ChatAgent:
             trigger=trigger_type,
             context_sample=context_sample,
             post_terminal_completed=_has_callbacks,
+            reply_sequence_status=turn.reply_sequence_status,
+            sent_message_count=turn.sent_message_count,
+            done_status=turn.done_status,
+            done_note=turn.done_note,
         )
 
     # ================================================================
@@ -293,47 +303,41 @@ class ChatAgent:
         elif state == TurnState.HANDLE_MODEL_OUTPUT:
             return self._do_handle_model_output(turn)
 
-        elif state == TurnState.CLASSIFY_TOOL_CALLS:
-            return self._do_classify_tool_calls(turn)
+        elif state == TurnState.CLASSIFY_ONE_TOOL_CALL:
+            return self._do_classify_one_tool_call(turn)
 
         elif state == TurnState.EXEC_FACT_TOOLS:
             return await self._do_exec_fact_tools(turn)
 
-        elif state == TurnState.EXEC_STATE_TOOLS:
-            return await self._do_exec_state_tools(turn)
-
-        elif state == TurnState.CLASSIFY_TOOL_ERROR:
-            return self._do_classify_tool_error(turn)
-
-        elif state == TurnState.PROTOCOL_RETRY:
-            return self._do_route_retry_model(turn)
-
-        elif state == TurnState.TERMINAL_ACTION_BRANCH:
-            return self._do_terminal_action_branch(turn)
-
-        elif state == TurnState.PARSE_VISIBLE_BATCH:
-            return self._do_parse_visible_batch(turn)
+        elif state == TurnState.VALIDATE_REPLY_ARGS:
+            return self._do_validate_reply_args(turn)
 
         elif state == TurnState.GUARD_OUTPUT:
             return self._do_guard_output(turn)
 
-        elif state == TurnState.EXEC_SEND_WECHAT:
-            return await self._do_exec_send_wechat(turn, wechat_sender)
+        elif state == TurnState.PRE_SEND_INTERRUPT_CHECK:
+            return self._do_pre_send_interrupt_check(turn)
 
-        elif state == TurnState.SEND_RETRY_UNDELIVERED_ONLY:
-            return await self._do_send_retry(turn, wechat_sender)
+        elif state == TurnState.EXEC_SEND_ONE:
+            return await self._do_exec_send_one(turn, wechat_sender)
 
-        elif state == TurnState.DECIDE_SEND_TERMINAL:
-            return self._do_decide_send_terminal(turn)
+        elif state == TurnState.APPEND_SEND_RESULT:
+            return self._do_append_send_result(turn)
 
-        elif state == TurnState.EXEC_SKIP_REPLY:
-            return self._do_exec_skip_reply(turn)
+        elif state == TurnState.POST_SEND_INTERRUPT_CHECK:
+            return self._do_post_send_interrupt_check(turn)
+
+        elif state == TurnState.LIMIT_CHECK:
+            return self._do_limit_check(turn)
+
+        elif state == TurnState.VALIDATE_DONE_ARGS:
+            return self._do_validate_done_args(turn)
+
+        elif state == TurnState.PROTOCOL_RETRY:
+            return self._do_protocol_retry(turn)
 
         elif state == TurnState.FLASH_TO_PRO_UPGRADE:
             return self._do_flash_to_pro_upgrade(turn)
-
-        elif state == TurnState.ROUTE_RETRY_MODEL:
-            return self._do_route_retry_model(turn)
 
         elif state == TurnState.HARD_FALLBACK:
             return await self._do_hard_fallback(turn, wechat_sender)
@@ -420,10 +424,10 @@ class ChatAgent:
             turn.add_fallback_event("fatal_context_error", "tool_registry_unavailable")
             return TurnState.HARD_FALLBACK
 
-        # At least one terminal tool must be registered and have a schema
+        # At least one native-eligible terminal tool (done) must be registered
         terminal_names = {
             t.name for t in TOOL_REGISTRY.iter_defs()
-            if t.tool_category == "terminal_tool"
+            if t.tool_category == "terminal_tool" and t.native_tool_call_eligible
         }
         if not terminal_names:
             turn.add_fallback_event("fatal_context_error", "no_terminal_tool_registered")
@@ -571,6 +575,16 @@ class ChatAgent:
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": prompt},
         ]
+
+        # Time + city as separate system messages to keep main prompt cache-stable
+        now = datetime.now().strftime("%Y年%m月%d日 %H:%M 周%u")
+        messages.append({"role": "system", "content": f"当前时间：{now}"})
+        default_city = str(self.defaults.get("default_city", "") or "").strip()
+        if default_city:
+            messages.append({
+                "role": "system",
+                "content": f"用户默认天气城市：{default_city}。用户只问天气时，直接查这个城市，不要反问。",
+            })
 
         # Short-term history
         recent = history[-24:] if len(history) > 24 else history
@@ -738,10 +752,17 @@ class ChatAgent:
     def _do_handle_model_output(self, turn: TurnScratchpad) -> TurnState:
         """HANDLE_MODEL_OUTPUT: inspect what the model returned.
 
-        Interrupt check #1: after CALL_LLM returns.
+        v1.5: exactly 1 tool call required.
+        Interrupt after CALL_LLM: differentiates END_CANCELLED /
+        END_SUPERSEDED_BEFORE_SEND / END_INTERRUPTED_DURING_REPLY_SEQUENCE.
         """
         if self._is_interrupted():
             turn.add_fallback_event("interrupted_after_llm", "turn superseded by newer event")
+            if turn._has_pending_wechat_reply:
+                return TurnState.END_SUPERSEDED_BEFORE_SEND
+            if turn.sent_message_count > 0:
+                turn.reply_sequence_status = "interrupted_by_user"
+                return TurnState.END_INTERRUPTED_DURING_REPLY_SEQUENCE
             return TurnState.END_CANCELLED
 
         response = turn._llm_response
@@ -749,119 +770,138 @@ class ChatAgent:
         assistant_content = (response.content or "").strip()
         finish_reason = getattr(response, "finish_reason", "") or ""
 
-        # ── v1.2 diagnostic log: HANDLE_MODEL_OUTPUT ─────────────
         logger.info(
             "handle_model_output: finish_reason=%s has_content=%s content_preview=%s "
-            "raw_tool_calls=%d parsed_tool_calls=%d iter=%d",
+            "raw_tool_calls=%d iter=%d sent_count=%d",
             finish_reason,
             bool(assistant_content),
             assistant_content[:120].replace("\n", "\\n"),
             len(native_tool_calls) if native_tool_calls else 0,
-            len(native_tool_calls),
             turn.iteration,
+            turn.sent_message_count,
         )
 
-        if native_tool_calls:
-            # Serialize and append assistant message with tool_calls
-            assistant_msg: dict[str, Any] = {
-                "role": "assistant",
-                "content": assistant_content or "",
-            }
-            serialized: list[dict[str, Any]] = []
-            for tc in native_tool_calls:
-                fn = getattr(tc, "function", None)
-                serialized.append({
-                    "id": getattr(tc, "id", ""),
-                    "type": "function",
-                    "function": {
-                        "name": str(getattr(fn, "name", "") if fn else ""),
-                        "arguments": str(getattr(fn, "arguments", "") if fn else ""),
-                    },
-                })
-            assistant_msg["tool_calls"] = serialized
-            turn.messages.append(assistant_msg)
-
-            tc_names = [s["function"]["name"] for s in serialized]
-            logger.info(
-                "native_tools: received %d tool_calls iter=%d: %s",
-                len(native_tool_calls), turn.iteration, ",".join(tc_names),
-            )
-
-            turn._tool_calls = native_tool_calls
-            return TurnState.CLASSIFY_TOOL_CALLS
-
-        # No tool calls — diagnose violation reason
-        if assistant_content:
-            if '"actions"' in assistant_content.lower():
-                violation = "old_json_actions"
-                turn.add_fallback_event(
-                    "old_json_actions_detected",
-                    "model output looks like old JSON actions format",
-                )
+        # ── v1.5: exactly 1 tool call required ───────────────────
+        if not native_tool_calls:
+            if assistant_content:
+                if '"actions"' in assistant_content.lower():
+                    violation = "old_json_actions"
+                    turn.add_fallback_event("old_json_actions_detected",
+                        "model output looks like old JSON actions format")
+                else:
+                    violation = "assistant_content_only"
+                turn.add_fallback_event("assistant_content_no_tool_call",
+                    f"model returned {len(assistant_content)} chars without tool calls")
             else:
-                violation = "assistant_content_only"
-            turn.add_fallback_event(
-                "assistant_content_no_tool_call",
-                f"model returned {len(assistant_content)} chars without tool calls",
-            )
-        else:
-            violation = "empty_response"
-            turn.add_fallback_event(
-                "empty_response",
-                "no tool calls and no assistant content",
-            )
-
-        # v1.3: mark current attempt as protocol violation
-        if turn._current_attempt:
-            turn._current_attempt.result_type = "protocol_violation"
-            turn._current_attempt.error_type = violation
-
-        logger.info(
-            "handle_model_output: violation_reason=%s iter=%d",
-            violation, turn.iteration,
-        )
-        return TurnState.PROTOCOL_RETRY
-
-    def _do_classify_tool_calls(self, turn: TurnScratchpad) -> TurnState:
-        """CLASSIFY_TOOL_CALLS: classify tools and check parallel-call legality."""
-        tool_calls = turn._tool_calls
-        classified = classify_tool_calls(tool_calls, TOOL_REGISTRY)
-        turn._classified = classified
-
-        if not classified.is_legal:
-            violation = classified.violation_reason()
-            logger.info(
-                "classify_tool_calls: violation_reason=invalid_tool_combo detail=%s iter=%d",
-                violation, turn.iteration,
-            )
-            turn.add_fallback_event("illegal_tool_combination", violation)
+                violation = "empty_response"
+                turn.add_fallback_event("empty_response",
+                    "no tool calls and no assistant content")
+            if turn._current_attempt:
+                turn._current_attempt.result_type = "protocol_violation"
+                turn._current_attempt.error_type = violation
+            logger.info("handle_model_output: violation=%s iter=%d", violation, turn.iteration)
             return TurnState.PROTOCOL_RETRY
 
-        if classified.has_terminal:
-            return TurnState.TERMINAL_ACTION_BRANCH
+        if len(native_tool_calls) > 1:
+            tc_names = []
+            for tc in native_tool_calls:
+                fn = getattr(tc, "function", None)
+                tc_names.append(str(getattr(fn, "name", "") if fn else ""))
+            turn.add_fallback_event("multiple_tool_calls",
+                f"expected exactly 1 tool call, got {len(native_tool_calls)}: {','.join(tc_names)}")
+            logger.info("handle_model_output: violation=multiple_tool_calls count=%d iter=%d",
+                       len(native_tool_calls), turn.iteration)
+            if turn._current_attempt:
+                turn._current_attempt.result_type = "protocol_violation"
+                turn._current_attempt.error_type = "multiple_tool_calls"
+            return TurnState.PROTOCOL_RETRY
 
-        if classified.has_fact:
-            return TurnState.EXEC_FACT_TOOLS
+        # ── Exactly 1 tool call — serialize and append ───────────
+        tc = native_tool_calls[0]
+        fn = getattr(tc, "function", None)
+        tool_name = str(getattr(fn, "name", "") if fn else "")
+        tool_args = str(getattr(fn, "arguments", "") if fn else "")
+        tool_call_id = str(getattr(tc, "id", ""))
 
-        if classified.has_state:
-            return TurnState.EXEC_STATE_TOOLS
+        serialized = {
+            "id": tool_call_id,
+            "type": "function",
+            "function": {"name": tool_name, "arguments": tool_args},
+        }
 
-        # Shouldn't reach here if tool_calls were present, but safety
+        assistant_msg: dict[str, Any] = {
+            "role": "assistant",
+            "content": assistant_content or "",
+            "tool_calls": [serialized],
+        }
+        turn.messages.append(assistant_msg)
+
+        turn._tool_calls = [tc]
+        turn._current_tool_call_id = tool_call_id
+
         logger.info(
-            "classify_tool_calls: violation_reason=no_tool_calls "
-            "total=%d iter=%d",
-            classified.total, turn.iteration,
+            "native_tools: 1 tool_call iter=%d name=%s call_id=%s",
+            turn.iteration, tool_name, tool_call_id,
         )
-        turn.add_fallback_event("no_actionable_tools", "all tools classified but none actionable")
+
+        # ── Flag pending wechat_reply for interrupt differentiation ──
+        if tool_name == "wechat_reply":
+            turn._has_pending_wechat_reply = True
+
+        return TurnState.CLASSIFY_ONE_TOOL_CALL
+
+    def _do_classify_one_tool_call(self, turn: TurnScratchpad) -> TurnState:
+        """CLASSIFY_ONE_TOOL_CALL: classify single tool call, route by tool_name.
+
+        v1.5: wechat_reply MUST route by name (NOT by tool_category).
+        It is registered as fact_tool but must never enter EXEC_FACT_TOOLS.
+        """
+        tool_calls = turn._tool_calls
+        if not tool_calls:
+            turn.add_fallback_event("no_tool_calls", "empty tool_calls in CLASSIFY_ONE_TOOL_CALL")
+            return TurnState.PROTOCOL_RETRY
+
+        tc = tool_calls[0]
+        classified = classify_single_tool_call(tc, TOOL_REGISTRY)
+        turn._classified_single = classified
+
+        if classified.is_deprecated:
+            logger.info("classify_one_tool_call: deprecated=%s iter=%d", classified.tool_name, turn.iteration)
+            turn.add_fallback_event("deprecated_tool", classified.tool_name)
+            turn.messages.append({"role": "system", "content": classified.deprecated_hint})
+            return TurnState.PROTOCOL_RETRY
+
+        if not classified.is_legal:
+            logger.info("classify_one_tool_call: illegal=%s reason=%s iter=%d",
+                       classified.tool_name, classified.violation_reason, turn.iteration)
+            turn.add_fallback_event("illegal_tool", classified.violation_reason)
+            return TurnState.PROTOCOL_RETRY
+
+        name = classified.tool_name
+
+        # ── Name-based routing (NOT category-based) ─────────────
+        # wechat_reply is registered as fact_tool but MUST NOT enter EXEC_FACT_TOOLS.
+        if name in ("get_time", "get_weather"):
+            return TurnState.EXEC_FACT_TOOLS
+        elif name == "wechat_reply":
+            # Check if already at reply limit
+            if turn.sent_message_count >= turn.max_reply_messages_per_turn:
+                logger.info("classify_one_tool_call: wechat_reply after limit sent_count=%d", turn.sent_message_count)
+                turn.add_fallback_event("wechat_reply_after_limit",
+                    f"sent_count={turn.sent_message_count} >= max={turn.max_reply_messages_per_turn}")
+                return TurnState.END_MAX_LIMIT
+            return TurnState.VALIDATE_REPLY_ARGS
+        elif name == "done":
+            return TurnState.VALIDATE_DONE_ARGS
+
+        turn.add_fallback_event("unroutable_tool", f"tool '{name}' has no route")
         return TurnState.PROTOCOL_RETRY
 
     async def _do_exec_fact_tools(self, turn: TurnScratchpad) -> TurnState:
         """EXEC_FACT_TOOLS: execute fact tools (get_time, get_weather).
 
-        v1.2: multiple FACT_TOOLs execute in parallel via asyncio.gather.
-        Single-tool failures do not abort sibling tools.
-        Results are merged in original tool_call order and appended to messages.
-        After execution → INTERRUPT_CHECK → CLASSIFY_TOOL_ERROR.
+        v1.5: only get_time and get_weather enter here (wechat_reply is name-routed
+        to VALIDATE_REPLY_ARGS). Results feed back to model → CALL_LLM.
         Fact tools can NOT end the turn.
         """
         import asyncio
@@ -921,7 +961,7 @@ class ChatAgent:
                 r["tool_name"], r["error_type"],
             )
 
-        turn._resume_state = TurnState.CLASSIFY_TOOL_ERROR
+        turn._resume_state = TurnState.CALL_LLM
         return TurnState.INTERRUPT_CHECK
 
     async def _do_exec_state_tools(self, turn: TurnScratchpad) -> TurnState:
@@ -1016,415 +1056,446 @@ class ChatAgent:
         )
         return TurnState.CALL_LLM
 
-    def _do_terminal_action_branch(self, turn: TurnScratchpad) -> TurnState:
-        """TERMINAL_ACTION_BRANCH: route to send or skip based on terminal tool name."""
-        terminal_name = turn._classified.terminal_name()
+    # ================================================================
+    # v1.5: wechat_reply pipeline — single bubble send
+    # ================================================================
 
-        if terminal_name == "send_wechat_messages":
-            return TurnState.PARSE_VISIBLE_BATCH
-        elif terminal_name == "skip_reply":
-            return TurnState.EXEC_SKIP_REPLY
-        else:
-            turn.add_fallback_event(
-                "unknown_terminal_tool", f"terminal tool '{terminal_name}' not recognized",
-            )
-            return TurnState.PROTOCOL_RETRY
+    def _do_validate_reply_args(self, turn: TurnScratchpad) -> TurnState:
+        """VALIDATE_REPLY_ARGS: validate wechat_reply(text).
 
-    # ── Send path ───────────────────────────────────────────────
-
-    def _do_parse_visible_batch(self, turn: TurnScratchpad) -> TurnState:
-        """PARSE_VISIBLE_BATCH: extract messages from send_wechat_messages args.
-
-        v1.2: creates VisibleMessage objects with visible_message_id,
-        original_text, and index.  Also populates legacy turn.visible_batch
-        for guard_send_message_batch compatibility.
+        v1.5: text must be string, non-empty, ≤500 chars, no newlines.
+        Returns recoverable error tool result on failure → CALL_LLM.
         """
-        classified = turn._classified
-        tc = classified.terminal_tools[0]
-        fn = tc.get("function", {})
+        from agent.output_guard import validate_reply_text
+
+        classified = turn._classified_single
+        serialized = classified.serialized or {}
+        fn = serialized.get("function", {})
         args_raw = fn.get("arguments", "")
 
         try:
             args = _json.loads(args_raw) if args_raw.strip() else {}
         except _json.JSONDecodeError as e:
-            turn.add_fallback_event(
-                "parse_visible_batch_error",
-                f"JSON parse failed: {e}",
-            )
-            return TurnState.PROTOCOL_RETRY
-
-        if not isinstance(args, dict):
-            turn.add_fallback_event(
-                "parse_visible_batch_error",
-                "args is not a JSON object",
-            )
-            return TurnState.PROTOCOL_RETRY
-
-        raw_messages = args.get("messages")
-        if not isinstance(raw_messages, list) or not raw_messages:
-            turn.add_fallback_event(
-                "parse_visible_batch_error",
-                "messages missing or not a list",
-            )
-            return TurnState.PROTOCOL_RETRY
-
-        raw_texts = [str(m) for m in raw_messages]
-        parsed_count = len(raw_texts)
-
-        # v1.2: enforce max messages per turn — no silent truncation
-        if parsed_count > MAX_MESSAGES_PER_TURN:
-            turn.add_fallback_event(
-                "too_many_messages",
-                f"model requested {parsed_count} messages, limit={MAX_MESSAGES_PER_TURN}",
-            )
-            # Inject retry note so model re-calls send_wechat_messages compressed
+            result = {"status": "error", "recoverable": True,
+                      "reason": "invalid_json", "hint": f"参数 JSON 解析失败：{e}"}
             turn.messages.append({
-                "role": "system",
-                "content": (
-                    f"你一次性请求发送了 {parsed_count} 条消息，超过了上限 {MAX_MESSAGES_PER_TURN} 条。"
-                    f"请压缩到 {MAX_MESSAGES_PER_TURN} 条以内，重新调用 send_wechat_messages。"
-                    '如果内容太多，可以分段讲，或者最后说"我先讲到这里，你想听我继续再说"。'
-                ),
+                "role": "tool", "tool_call_id": turn._current_tool_call_id,
+                "content": _json.dumps(result, ensure_ascii=False),
             })
-            return TurnState.PROTOCOL_RETRY
+            logger.info("validate_reply_args: invalid_json")
+            return TurnState.CALL_LLM
 
-        # v1.2: create VisibleMessage for each parsed message
-        turn.visible_messages = [
-            VisibleMessage(
-                visible_message_id=f"vm_{turn.turn_id}_{i}",
-                index=i,
-                original_text=text,
-            )
-            for i, text in enumerate(raw_texts)
-        ]
+        text = str(args.get("text", "")) if isinstance(args, dict) else ""
 
-        turn.visible_batch = raw_texts
-        turn._send_mode = str(args.get("mode", "normal") or "normal")
-        turn._parsed_count = parsed_count  # transient diagnostic
+        is_valid, error_reason = validate_reply_text(text)
+        if not is_valid:
+            hint_map = {
+                "text_must_be_string": "text 必须是字符串，请重新调用 wechat_reply。",
+                "text_empty": "text 不能为空，请输入要发送的消息内容。",
+                "text_too_long": f"text 超过 500 字符限制（当前 {len(text)} 字符），请缩短后重试。",
+                "text_contains_newline": "text 不能包含换行符。想发多条请多次调用 wechat_reply。",
+            }
+            result = {"status": "error", "recoverable": True,
+                      "reason": error_reason,
+                      "hint": hint_map.get(error_reason, "请修正后重新调用 wechat_reply。")}
+            turn.messages.append({
+                "role": "tool", "tool_call_id": turn._current_tool_call_id,
+                "content": _json.dumps(result, ensure_ascii=False),
+            })
+            logger.info("validate_reply_args: invalid reason=%s len=%d",
+                       error_reason, len(text))
+            return TurnState.CALL_LLM
 
-        logger.info(
-            "state_machine: parsed %d visible messages, mode=%s",
-            parsed_count, turn._send_mode,
-        )
+        turn._current_reply_text = text
+        logger.info("validate_reply_args: valid len=%d preview=%s",
+                   len(text), text[:60].replace("\n", "\\n"))
         return TurnState.GUARD_OUTPUT
 
     def _do_guard_output(self, turn: TurnScratchpad) -> TurnState:
-        """GUARD_OUTPUT: run output guard on every parsed VisibleMessage.
+        """GUARD_OUTPUT: guard single wechat_reply text.
 
-        v1.2: each VisibleMessage gets guarded_text/guard_status via
-        guard_single_message.  Messages blocked by guard get
-        delivery_status=BLOCKED_BY_GUARD.  If all blocked → HARD_FALLBACK.
-        No silent truncation — parsed_count already enforced at PARSE_VISIBLE_BATCH.
-        Interrupt check before guard.
+        v1.5: guards one message at a time (wechat_reply pipeline).
+        Stores guarded_text on turn._guarded_text.
+        If blocked → recoverable error tool result → CALL_LLM.
         """
-        if self._is_interrupted():
-            turn.add_fallback_event("interrupted_before_guard", "turn superseded by newer event")
-            return TurnState.END_CANCELLED
-
         from agent.output_guard import guard_single_message
 
-        # ── Per-message guard ──────────────────────────────────────
-        guard_blocked = 0
-        for vm in turn.visible_messages:
-            guarded = guard_single_message(vm.original_text)
-            if guarded:
-                vm.guarded_text = guarded
-                vm.guard_status = "PASSED" if guarded == vm.original_text else "SANITIZED"
-            else:
-                vm.guarded_text = ""
-                vm.guard_status = "BLOCKED"
-                vm.delivery_status = DeliveryStatus.BLOCKED_BY_GUARD
-                guard_blocked += 1
+        text = turn._current_reply_text
+        guarded = guard_single_message(text)
 
-        if guard_blocked > 0:
-            turn.add_fallback_event(
-                "guard_blocked",
-                f"blocked {guard_blocked} messages by guard",
-            )
+        if not guarded:
+            result = {"status": "error", "recoverable": True,
+                      "reason": "guard_blocked",
+                      "hint": "消息被输出保护拦截（可能包含敏感内容或协议泄露）。请修改后重新调用 wechat_reply。"}
+            turn.messages.append({
+                "role": "tool", "tool_call_id": turn._current_tool_call_id,
+                "content": _json.dumps(result, ensure_ascii=False),
+            })
+            logger.info("guard_output: blocked preview=%s", text[:60])
+            return TurnState.CALL_LLM
 
-        passed = [vm for vm in turn.visible_messages if vm.guard_status != "BLOCKED"]
+        turn._guarded_text = guarded
+        logger.info("guard_output: passed len=%d sanitized=%s",
+                   len(guarded), guarded != text)
+        return TurnState.PRE_SEND_INTERRUPT_CHECK
 
-        if not passed:
-            turn.add_fallback_event(
-                "guard_all_blocked",
-                "all messages blocked by output guard",
-            )
-            return TurnState.HARD_FALLBACK
+    def _do_pre_send_interrupt_check(self, turn: TurnScratchpad) -> TurnState:
+        """PRE_SEND_INTERRUPT_CHECK: check before actually sending.
 
-        # ── Build legacy guarded_batch for wechat_sender callback ──
-        turn.guarded_batch = [
-            {"text": vm.guarded_text, "delay": 0.0, "_vm_index": vm.index}
-            for vm in passed
-        ]
-        return TurnState.EXEC_SEND_WECHAT
-
-    async def _do_exec_send_wechat(
-        self, turn: TurnScratchpad, wechat_sender: WeChatSender | None,
-    ) -> TurnState:
-        """EXEC_SEND_WECHAT: send via wechat_sender, map to five-state delivery.
-
-        v1.2: maps old send_status → DeliveryStatus on each VisibleMessage.
-        Only FAILED_BEFORE_SEND and FAILED_CONFIRMED trigger retry.
-        SENT_CONFIRMED, UNKNOWN_AFTER_ATTEMPT, BLOCKED_BY_GUARD do NOT retry.
-        Interrupt check before sending.
+        v1.5: if interrupted before send → END_SUPERSEDED_BEFORE_SEND.
+        The model's wechat_reply text is discarded, NOT sent to user.
         """
         if self._is_interrupted():
-            turn.add_fallback_event("interrupted_before_send", "turn superseded by newer event")
-            return TurnState.END_CANCELLED
+            turn.add_fallback_event("interrupted_before_send",
+                "turn superseded before wechat_reply could be sent")
+            logger.info("pre_send_interrupt: interrupted=True → END_SUPERSEDED_BEFORE_SEND")
+            return TurnState.END_SUPERSEDED_BEFORE_SEND
+        return TurnState.EXEC_SEND_ONE
 
-        from agent.tools import compute_message_delay
-
-        turn.tool_results.append({
-            "name": "send_wechat_messages",
-            "result": f"prepared {len(turn.guarded_batch)} messages",
-        })
-
-        if not wechat_sender:
-            for vm in turn.visible_messages:
-                if vm.guard_status != "BLOCKED":
-                    vm.delivery_status = DeliveryStatus.PENDING
-            turn.sent_results = list(turn.guarded_batch)
-            turn.add_fallback_event("send_no_sender", "no wechat_sender callback")
-            return TurnState.DECIDE_SEND_TERMINAL
-
-        # Compute delays
-        total = len(turn.guarded_batch)
-        for i, m in enumerate(turn.guarded_batch):
-            m["delay"] = compute_message_delay(
-                i, m["text"], total, test_mode=self.test_mode,
-            )
-
-        # Send via callback
-        try:
-            raw_results = await wechat_sender(turn.guarded_batch)
-            logger.info(
-                "state_machine: sent %d messages via wechat_sender",
-                len(raw_results),
-            )
-        except Exception as e:
-            logger.error("state_machine: wechat_sender failed: %s", e)
-            turn.add_fallback_event("send_error", str(e)[:200])
-            # All attempted messages → UNKNOWN_AFTER_ATTEMPT (don't know if sent)
-            for m in turn.guarded_batch:
-                vm_idx = m.get("_vm_index")
-                if vm_idx is not None and vm_idx < len(turn.visible_messages):
-                    vm = turn.visible_messages[vm_idx]
-                    if vm.delivery_status != DeliveryStatus.BLOCKED_BY_GUARD:
-                        vm.delivery_status = DeliveryStatus.UNKNOWN_AFTER_ATTEMPT
-                        vm.error_code = str(e)[:200]
-            turn.sent_results = list(turn.guarded_batch)
-            return TurnState.DECIDE_SEND_TERMINAL
-
-        # ── Map results back to VisibleMessage (v1.2 five-state) ──
-        turn.sent_results = raw_results
-        for r in raw_results:
-            vm_idx = r.get("_vm_index")
-            if vm_idx is None or vm_idx >= len(turn.visible_messages):
-                continue
-            vm = turn.visible_messages[vm_idx]
-            if vm.delivery_status == DeliveryStatus.BLOCKED_BY_GUARD:
-                continue  # already blocked
-            old_status = r.get("send_status", "")
-            if old_status == "delivered":
-                vm.delivery_status = DeliveryStatus.SENT_CONFIRMED
-                vm.attempt_count += 1
-            elif old_status == "failed":
-                error = r.get("send_error", "")
-                if "no_bridge" in str(error).lower():
-                    vm.delivery_status = DeliveryStatus.FAILED_BEFORE_SEND
-                else:
-                    vm.delivery_status = DeliveryStatus.UNKNOWN_AFTER_ATTEMPT
-                vm.error_code = str(error)[:200]
-            elif old_status == "blocked":
-                vm.delivery_status = DeliveryStatus.FAILED_BEFORE_SEND
-                vm.error_code = r.get("send_error", "empty text")
-            elif old_status == "generated":
-                vm.delivery_status = DeliveryStatus.PENDING
-            else:
-                vm.delivery_status = DeliveryStatus.UNKNOWN_AFTER_ATTEMPT
-            vm.attempt_count += 1
-
-        # ── Retry decision (v1.2: only specific statuses) ──
-        retryable = [
-            vm for vm in turn.visible_messages
-            if vm.delivery_status in (
-                DeliveryStatus.FAILED_BEFORE_SEND,
-                DeliveryStatus.FAILED_CONFIRMED,
-            )
-        ]
-        if retryable and turn.send_attempt < turn.max_send_retries:
-            return TurnState.SEND_RETRY_UNDELIVERED_ONLY
-
-        return TurnState.DECIDE_SEND_TERMINAL
-
-    async def _do_send_retry(
+    async def _do_exec_send_one(
         self, turn: TurnScratchpad, wechat_sender: WeChatSender | None,
     ) -> TurnState:
-        """SEND_RETRY_UNDELIVERED_ONLY: retry only retry-safe messages.
+        """EXEC_SEND_ONE: send a single WeChat bubble.
 
-        v1.2 §13.4: only retries FAILED_BEFORE_SEND and FAILED_CONFIRMED.
-        Never retries SENT_CONFIRMED, UNKNOWN_AFTER_ATTEMPT, BLOCKED_BY_GUARD.
-        Does NOT re-invoke the model.
+        v1.5: sends turn._guarded_text (NOT original_text).
+        Checks wechat_sender return value for delivered/failed/blocked/unknown.
+        Only delivered → sent_message_count += 1.
+        Idempotency: turn_id + tool_call_id.
         """
+        guarded_text = turn._guarded_text
+        original_text = turn._current_reply_text
+        tool_call_id = turn._current_tool_call_id
+        idempotency_key = f"{turn.turn_id}_{tool_call_id}"
+
+        def _append_result(result: dict) -> None:
+            turn.messages.append({
+                "role": "tool", "tool_call_id": tool_call_id,
+                "content": _json.dumps(result, ensure_ascii=False),
+            })
+
+        # ── Idempotency check ────────────────────────────────────
+        if idempotency_key in turn._sent_idempotency_keys:
+            result = {"status": "ok", "delivery": "already_sent",
+                      "message_index": turn.sent_message_count}
+            _append_result(result)
+            logger.info("exec_send_one: idempotent already_sent key=%s", idempotency_key)
+            return TurnState.APPEND_SEND_RESULT
+
+        # ── Clear pending flag (we're about to send) ─────────────
+        turn._has_pending_wechat_reply = False
+
+        # ── No sender → cannot send ──────────────────────────────
         if not wechat_sender:
-            turn.add_fallback_event("send_retry_no_sender", "cannot retry without sender")
-            return TurnState.DECIDE_SEND_TERMINAL
+            result = {"status": "error", "recoverable": False,
+                      "reason": "wechat_sender_unavailable",
+                      "hint": "发送通道不可用。请调用 done(status='failed')。"}
+            _append_result(result)
+            turn.send_failure_count += 1
+            logger.info("exec_send_one: no wechat_sender")
+            return TurnState.APPEND_SEND_RESULT
 
-        # v1.2: only collect retryable messages
-        retryable_vms = [
-            vm for vm in turn.visible_messages
-            if vm.delivery_status in (
-                DeliveryStatus.FAILED_BEFORE_SEND,
-                DeliveryStatus.FAILED_CONFIRMED,
+        # ── Send single bubble (guarded_text) ────────────────────
+        send_batch = [{"text": guarded_text, "delay": 0.0, "_vm_index": 0}]
+        try:
+            raw_results = await wechat_sender(send_batch)
+        except Exception as e:
+            turn.send_failure_count += 1
+            result = {"status": "error", "recoverable": False,
+                      "reason": "send_exception", "hint": str(e)[:200]}
+            _append_result(result)
+            logger.error("exec_send_one: exception=%s", e)
+            return TurnState.APPEND_SEND_RESULT
+
+        # ── Check wechat_sender return value ─────────────────────
+        if not raw_results or not isinstance(raw_results, list) or not raw_results:
+            turn.send_failure_count += 1
+            result = {"status": "error", "recoverable": False,
+                      "reason": "send_no_result", "hint": "wechat_sender returned empty"}
+            _append_result(result)
+            logger.info("exec_send_one: empty result")
+            return TurnState.APPEND_SEND_RESULT
+
+        send_status = raw_results[0].get("send_status", "unknown") if raw_results else "unknown"
+
+        if send_status == "delivered":
+            turn.sent_message_count += 1
+            turn._sent_idempotency_keys.add(idempotency_key)
+            vm = VisibleMessage(
+                visible_message_id=f"vm_{turn.turn_id}_{turn.sent_message_count}",
+                index=turn.sent_message_count,
+                original_text=original_text,
+                guarded_text=guarded_text,
+                guard_status="PASSED" if guarded_text == original_text else "SANITIZED",
+                tool_call_id=tool_call_id,
+                idempotency_key=idempotency_key,
+                delivery_status=DeliveryStatus.SENT_CONFIRMED,
+                sent_at_timestamp=time.time(),
             )
-        ]
-        if not retryable_vms:
-            return TurnState.DECIDE_SEND_TERMINAL
+            turn.visible_messages.append(vm)
+            result = {"status": "ok", "delivery": "sent",
+                      "message_index": turn.sent_message_count}
+            # ── Embed limit_reached in this tool result if at limit ──
+            if turn.sent_message_count >= turn.max_reply_messages_per_turn:
+                result["limit_reached"] = True
+                result["hint"] = "本轮微信消息数量已达上限，请调用 done 结束。"
+            turn._sent_idempotency_keys.discard(idempotency_key)
+            # re-add after result construction for completeness
+            logger.info("exec_send_one: delivered reply_index=%d idempotency_key=%s",
+                       turn.sent_message_count, idempotency_key)
+        elif send_status == "failed":
+            turn.send_failure_count += 1
+            error_detail = raw_results[0].get("send_error", "")
+            if "no_bridge" in str(error_detail).lower():
+                result = {"status": "error", "recoverable": False,
+                          "reason": "wechat_sender_unavailable",
+                          "hint": "发送通道不可用。请调用 done(status='failed')。"}
+            else:
+                result = {"status": "error", "recoverable": True,
+                          "reason": "send_failed",
+                          "hint": f"发送失败：{error_detail[:100]}。可以重试或 done。"}
+            logger.info("exec_send_one: failed error=%s", error_detail[:80])
+        elif send_status == "blocked":
+            result = {"status": "error", "recoverable": True,
+                      "reason": "send_blocked",
+                      "hint": "消息被拦截（可能为空或包含敏感内容）。请修改后重试。"}
+            logger.info("exec_send_one: blocked")
+        else:
+            turn.send_failure_count += 1
+            result = {"status": "error", "recoverable": False,
+                      "reason": "send_unknown_status",
+                      "hint": f"发送状态未知：{send_status}"}
+            logger.info("exec_send_one: unknown status=%s", send_status)
 
-        turn.send_attempt += 1
-        turn.add_fallback_event(
-            "send_retry_attempt",
-            f"retrying {len(retryable_vms)} messages (attempt {turn.send_attempt})",
-        )
-        logger.info(
-            "state_machine: send_retry attempt=%d retryable=%d",
-            turn.send_attempt, len(retryable_vms),
-        )
+        turn.tool_results.append({"name": "wechat_reply", "result": send_status})
+        _append_result(result)
+        return TurnState.APPEND_SEND_RESULT
 
-        # Build retry batch
-        retry_batch: list[dict[str, Any]] = [
-            {"text": vm.guarded_text or vm.original_text,
-             "delay": vm.delay,
-             "_vm_index": vm.index}
-            for vm in retryable_vms
-        ]
+    def _do_append_send_result(self, turn: TurnScratchpad) -> TurnState:
+        """APPEND_SEND_RESULT: transition after send result appended.
+
+        v1.5: result already appended to turn.messages by EXEC_SEND_ONE.
+        Route to POST_SEND_INTERRUPT_CHECK.
+        """
+        return TurnState.POST_SEND_INTERRUPT_CHECK
+
+    def _do_post_send_interrupt_check(self, turn: TurnScratchpad) -> TurnState:
+        """POST_SEND_INTERRUPT_CHECK: check if user interrupted mid-sequence.
+
+        v1.5: if user sent new message after we sent a bubble but before done →
+        END_INTERRUPTED_DURING_REPLY_SEQUENCE.
+        Already-sent messages are preserved.
+        """
+        if self._is_interrupted():
+            turn.reply_sequence_status = "interrupted_by_user"
+            turn.add_fallback_event("interrupted_during_reply_sequence",
+                f"sent {turn.sent_message_count} messages before user interruption")
+            logger.info("post_send_interrupt: interrupted=True sent_count=%d → END_INTERRUPTED_DURING_REPLY_SEQUENCE",
+                       turn.sent_message_count)
+            return TurnState.END_INTERRUPTED_DURING_REPLY_SEQUENCE
+        return TurnState.LIMIT_CHECK
+
+    def _do_limit_check(self, turn: TurnScratchpad) -> TurnState:
+        """LIMIT_CHECK: check turn-level limits after each send.
+
+        v1.5: limit info already embedded in wechat_reply tool result
+        (limit_reached=true). This state checks for exceeded limits that
+        force termination.
+        """
+        if turn.sent_message_count >= turn.max_reply_messages_per_turn:
+            # Already flagged in tool result. Allow model one more turn
+            # to call done. If it calls wechat_reply again → END_MAX_LIMIT
+            # (handled in CLASSIFY_ONE_TOOL_CALL).
+            logger.info("limit_check: at max replies sent_count=%d → CALL_LLM (model should done)",
+                       turn.sent_message_count)
+            return TurnState.CALL_LLM
+        if turn.send_failure_count >= turn.max_send_failures_per_turn:
+            turn.add_fallback_event("max_send_failures",
+                f"{turn.send_failure_count} failures")
+            logger.info("limit_check: max send failures → CALL_LLM")
+            return TurnState.CALL_LLM
+        if turn.llm_call_count >= turn.max_llm_steps_per_turn:
+            turn.add_fallback_event("max_llm_steps",
+                f"{turn.llm_call_count} steps")
+            logger.info("limit_check: max LLM steps → HARD_FALLBACK")
+            return TurnState.HARD_FALLBACK
+        return TurnState.CALL_LLM
+
+    # ================================================================
+    # v1.5: done pipeline — only normal terminal
+    # ================================================================
+
+    def _do_validate_done_args(self, turn: TurnScratchpad) -> TurnState:
+        """VALIDATE_DONE_ARGS: validate done(status, note).
+
+        v1.5: status must be replied/no_reply/failed.
+        replied requires sent_count > 0.
+        no_reply requires sent_count == 0.
+        no_reply/failed require non-empty note.
+        replied note is optional.
+        """
+        classified = turn._classified_single
+        serialized = classified.serialized or {}
+        fn = serialized.get("function", {})
+        args_raw = fn.get("arguments", "")
 
         try:
-            retry_results = await wechat_sender(retry_batch)
-        except Exception as e:
-            logger.error("state_machine: send_retry failed: %s", e)
-            turn.add_fallback_event("send_retry_error", str(e)[:200])
-            for vm in retryable_vms:
-                if vm.delivery_status in (DeliveryStatus.FAILED_BEFORE_SEND, DeliveryStatus.FAILED_CONFIRMED):
-                    vm.delivery_status = DeliveryStatus.UNKNOWN_AFTER_ATTEMPT
-                    vm.error_code = str(e)[:200]
-            return TurnState.DECIDE_SEND_TERMINAL
+            args = _json.loads(args_raw) if args_raw.strip() else {}
+        except _json.JSONDecodeError as e:
+            turn.messages.append({
+                "role": "system",
+                "content": f"done 参数 JSON 解析失败：{e}。请修正后重新调用 done。",
+            })
+            return TurnState.PROTOCOL_RETRY
 
-        # Map retry results back to VisibleMessage
-        for rr in retry_results:
-            vm_idx = rr.get("_vm_index")
-            if vm_idx is None or vm_idx >= len(turn.visible_messages):
-                continue
-            vm = turn.visible_messages[vm_idx]
-            old_status = rr.get("send_status", "")
-            if old_status == "delivered":
-                vm.delivery_status = DeliveryStatus.SENT_CONFIRMED
-            elif old_status in ("failed", "blocked"):
-                vm.delivery_status = DeliveryStatus.UNKNOWN_AFTER_ATTEMPT
-                vm.error_code = rr.get("send_error", "")[:200]
-            vm.attempt_count += 1
+        status = str(args.get("status", "") or "").strip()
+        note = str(args.get("note", "") or "").strip()
+        sent_count = turn.sent_message_count
 
-        # Also update legacy sent_results for diagnostics
-        for rr in retry_results:
-            vm_idx = rr.get("_vm_index")
-            if vm_idx is not None and vm_idx < len(turn.sent_results):
-                turn.sent_results[vm_idx] = rr
+        # ── status must be valid ──
+        if status not in ("replied", "no_reply", "failed"):
+            turn.messages.append({
+                "role": "system",
+                "content": f"done status 必须为 replied/no_reply/failed，收到了 '{status}'。请修正后重新调用。",
+            })
+            return TurnState.PROTOCOL_RETRY
 
-        return TurnState.DECIDE_SEND_TERMINAL
+        # ── status vs sent_count consistency ──
+        if status == "replied" and sent_count == 0:
+            turn.messages.append({
+                "role": "system",
+                "content": "done(status='replied') 要求本轮至少发送过一条消息，但 sent_count=0。请先调用 wechat_reply 或使用 done(status='no_reply')。",
+            })
+            return TurnState.PROTOCOL_RETRY
+        if status == "no_reply" and sent_count > 0:
+            turn.messages.append({
+                "role": "system",
+                "content": f"done(status='no_reply') 要求本轮未发送消息，但已发送 {sent_count} 条。请使用 done(status='replied')。",
+            })
+            return TurnState.PROTOCOL_RETRY
 
-    def _do_decide_send_terminal(self, turn: TurnScratchpad) -> TurnState:
-        """DECIDE_SEND_TERMINAL: determine END_SENT / END_PARTIAL_SENT / END_FAILED.
+        # ── note required for no_reply / failed ──
+        if status in ("no_reply", "failed") and not note:
+            turn.messages.append({
+                "role": "system",
+                "content": f"done(status='{status}') 时 note 不能为空，请说明原因后重新调用 done。",
+            })
+            return TurnState.PROTOCOL_RETRY
 
-        v1.2 §13.5: compares parsed_count, guard_passed_count, attempted_count,
-        delivered_count.  No silent message loss — every gap has a reason.
-        """
-        parsed_count = len(turn.visible_messages)
-        guard_blocked = sum(
-            1 for vm in turn.visible_messages
-            if vm.delivery_status == DeliveryStatus.BLOCKED_BY_GUARD
-        )
-        guard_passed = parsed_count - guard_blocked
-        sent_confirmed = sum(
-            1 for vm in turn.visible_messages
-            if vm.delivery_status == DeliveryStatus.SENT_CONFIRMED
-        )
-        failed_before = sum(
-            1 for vm in turn.visible_messages
-            if vm.delivery_status == DeliveryStatus.FAILED_BEFORE_SEND
-        )
-        unknown = sum(
-            1 for vm in turn.visible_messages
-            if vm.delivery_status == DeliveryStatus.UNKNOWN_AFTER_ATTEMPT
-        )
-        pending = sum(
-            1 for vm in turn.visible_messages
-            if vm.delivery_status in (DeliveryStatus.PENDING, "")
-        )
-        attempted = sent_confirmed + failed_before + unknown
+        # ── v1.5: no_reply guard — reject if user message is a question / follow-up ──
+        if status == "no_reply" and _user_message_is_question(turn.user_message):
+            turn.messages.append({
+                "role": "system",
+                "content": (
+                    "用户当前在问你问题或追问（消息包含疑问词、追问标记或社交邀约）。"
+                    "不能 done(status='no_reply')。"
+                    "请调用 wechat_reply 回答用户的问题，或说明你不知道。"
+                ),
+            })
+            logger.info("validate_done_args: no_reply blocked, user message is question: %s",
+                       turn.user_message[:80])
+            return TurnState.PROTOCOL_RETRY
 
-        terminal = TurnState.END_FAILED
-        if parsed_count == 0:
-            terminal = TurnState.END_FAILED
-        elif sent_confirmed == parsed_count:
-            terminal = TurnState.END_SENT
-        elif sent_confirmed > 0:
-            terminal = TurnState.END_PARTIAL_SENT
-        elif attempted > 0:
-            terminal = TurnState.END_FAILED
-        elif guard_blocked == parsed_count:
-            terminal = TurnState.END_FAILED
-            turn.add_fallback_event("send_all_guard_blocked", f"{parsed_count} blocked by guard")
+        turn.done_status = status
+        turn.done_note = note
+
+        logger.info("validate_done_args: status=%s note=%s sent_count=%d",
+                   status, note[:80] if note else "(none)", sent_count)
+
+        if status == "replied":
+            turn.reply_sequence_status = "completed"
+            return TurnState.END_REPLIED
+        elif status == "no_reply":
+            turn.reply_sequence_status = "no_reply"
+            return TurnState.END_NO_REPLY
         else:
-            terminal = TurnState.END_FAILED
+            turn.reply_sequence_status = "failed"
+            return TurnState.END_FAILED
 
-        logger.info(
-            "decide_send_terminal: parsed=%d guard_passed=%d guard_blocked=%d "
-            "attempted=%d delivered=%d unknown=%d pending=%d -> %s",
-            parsed_count, guard_passed, guard_blocked,
-            attempted, sent_confirmed, unknown, pending,
-            terminal,
-        )
+    # ================================================================
+    # v1.5: Protocol retry
+    # ================================================================
 
-        if terminal == TurnState.END_PARTIAL_SENT:
+    def _do_protocol_retry(self, turn: TurnScratchpad) -> TurnState:
+        """PROTOCOL_RETRY: model violated tool protocol.
+
+        v1.5: if sent_count > 0 when retries exceeded → END_PROTOCOL_ERROR
+        (preserve sent history, don't HARD_FALLBACK).
+        If sent_count == 0 when retries exceeded → HARD_FALLBACK.
+        """
+        turn.protocol_retry_count += 1
+
+        if turn.protocol_retry_count > turn.max_protocol_retries:
             turn.add_fallback_event(
-                "partial_send",
-                f"{sent_confirmed}/{parsed_count} sent_confirmed "
-                f"(guard_blocked={guard_blocked} unknown={unknown})",
+                "protocol_retry_exceeded",
+                f"exceeded max protocol retries ({turn.max_protocol_retries})",
             )
+            logger.info("protocol_retry: exceeded sent_count=%d", turn.sent_message_count)
+            if turn.sent_message_count > 0:
+                # Don't lose already-sent messages → END_PROTOCOL_ERROR
+                turn.reply_sequence_status = "protocol_error"
+                return TurnState.END_PROTOCOL_ERROR
+            return TurnState.HARD_FALLBACK
 
-        return terminal
+        turn.add_fallback_event(
+            "protocol_retry",
+            f"attempt {turn.protocol_retry_count}/{turn.max_protocol_retries}",
+        )
+        logger.info("protocol_retry: attempt=%d/%d",
+                   turn.protocol_retry_count, turn.max_protocol_retries)
 
-    # ── Skip path ────────────────────────────────────────────────
+        # ── v1.5: if any assistant tool_calls message in recent history lacks
+        # a matching tool result, the LLM API will reject the next request
+        # ("insufficient tool messages following tool_calls message").
+        # Search backward from end for unmatched assistant tool_calls.
+        # (The caller may have already appended a system message before PROTOCOL_RETRY,
+        # so we check the last few messages, not just messages[-1].)
+        for _scan_offset in range(min(3, len(turn.messages)), 0, -1):
+            _candidate = turn.messages[-_scan_offset]
+            if _candidate.get("role") == "assistant" and _candidate.get("tool_calls"):
+                # Check if any matching tool message already follows it
+                _tcs = _candidate["tool_calls"]
+                _has_match = False
+                for _j in range(len(turn.messages) - _scan_offset + 1, len(turn.messages)):
+                    if turn.messages[_j].get("role") == "tool":
+                        _has_match = True
+                        break
+                if not _has_match:
+                    for tc in _tcs:
+                        cid = tc.get("id", "") if isinstance(tc, dict) else ""
+                        turn.messages.append({
+                            "role": "tool",
+                            "tool_call_id": cid,
+                            "content": _json.dumps({
+                                "status": "error", "recoverable": True,
+                                "reason": "protocol_retry",
+                                "hint": "上一个工具调用因协议违规被拒绝，请按提示重新调用正确的工具。",
+                            }, ensure_ascii=False),
+                        })
+                    break
 
-    def _do_exec_skip_reply(self, turn: TurnScratchpad) -> TurnState:
-        """EXEC_SKIP_REPLY: model explicitly chose not to reply."""
-        # Log the reason if provided
-        classified = turn._classified
-        if classified.terminal_tools:
-            tc = classified.terminal_tools[0]
-            fn = tc.get("function", {})
-            args_raw = fn.get("arguments", "")
-            try:
-                args = _json.loads(args_raw) if args_raw.strip() else {}
-                reason = str(args.get("reason", ""))[:200]
-            except _json.JSONDecodeError:
-                reason = ""
-            if reason:
-                turn.add_fallback_event("skip_reply_reason", reason)
+        retry_note = "必须调用 wechat_reply 或 done。每次只能调用一个工具。"
+        turn.messages.append({"role": "system", "content": retry_note})
 
-        turn.add_fallback_event("skip_reply", "model explicitly skipped reply")
-        logger.info("state_machine: skip_reply → END_SKIPPED")
-        return TurnState.END_SKIPPED
+        # v1.3: flash → pro upgrade logic
+        last = turn.model_attempts[-1] if turn.model_attempts else None
+        if last and last.selected_model == "flash":
+            if self._routing_mode == "manual_flash" and not self._manual_flash_allow_upgrade:
+                return TurnState.CALL_LLM
+            return TurnState.FLASH_TO_PRO_UPGRADE
 
-    # ── Fallback path ───────────────────────────────────────────
+        return TurnState.CALL_LLM
+
+    # ================================================================
+    # v1.5: Hard fallback
+    # ================================================================
 
     async def _do_hard_fallback(
         self, turn: TurnScratchpad, wechat_sender: WeChatSender | None,
     ) -> TurnState:
         """HARD_FALLBACK: system fixed fallback text.
 
-        v1.2: INTERRUPT_CHECK before sending.  Uses VisibleMessage for
-        fallback tracking.  Does NOT use model content.
+        v1.5: only reached when sent_count == 0 (otherwise END_PROTOCOL_ERROR).
+        Uses VisibleMessage for fallback tracking. Does NOT use model content.
         """
         from agent.output_guard import HARD_FALLBACK_TEXT, guard_single_message
 
@@ -1520,9 +1591,9 @@ class ChatAgent:
         ]
         if default_city:
             parts.append(f"用户默认天气城市：{default_city}")
-        parts.append("可用工具：get_time, get_weather, send_wechat_messages, skip_reply")
+        parts.append("可用工具：get_time, get_weather, wechat_reply, done")
         parts.append(
-            "通过 send_wechat_messages 发送微信回复。不回复时调用 skip_reply。"
+            "通过 wechat_reply 逐条发送微信。最后调用 done 结束本轮。"
         )
 
         return "\n\n".join(p.strip() for p in parts if p.strip())
@@ -1684,6 +1755,36 @@ def _classify_tool_result(result: str) -> str:
     if "工具执行出错" in result:
         return "tool_execution_error"
     return "unknown_error"
+
+
+def _user_message_is_question(text: str) -> bool:
+    """v1.5: detect if user message is a question, follow-up, or social invitation.
+
+    Returns True when the message clearly asks something or invites a reply.
+    Used to block done(status='no_reply') when the user expects a response.
+    """
+    if not text or not text.strip():
+        return False
+    t = text.strip()
+    # Explicit question markers
+    _question_words = (
+        "吗", "呢", "啥", "什么", "哪", "谁", "几", "多少",
+        "为什么", "为啥", "怎么", "怎样", "如何", "干嘛", "咋", "怎么了",
+        "然后", "接着", "之后", "还有", "是不是", "对不对", "行不行",
+        "在哪", "什么时候", "几点", "多久", "多远",
+    )
+    for w in _question_words:
+        if w in t:
+            return True
+    # Question marks
+    if "？" in t or "?" in t:
+        return True
+    # Short follow-ups that clearly invite a reply
+    _followups = ("说呀", "说啊", "讲啊", "继续", "接着说", "然后呢", "后来呢",
+                  "你咋", "你怎么", "你咋看", "你怎么看")
+    if t in _followups:
+        return True
+    return False
 
 
 def _build_context_sample(messages: list[dict[str, Any]], last_n: int = 8) -> list[dict[str, str]]:

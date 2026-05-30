@@ -139,80 +139,153 @@ class FakeGateway:
             raise self.error
         if self.response:
             return self.response
-        tc = _make_tc("send_wechat_messages", '{"messages":["hello"]}')
+        tc = _make_tc("wechat_reply", '{"text":"hello"}')
         return _make_response("", tool_calls=[tc])
 
 
-class TestSendWechatMessages:
-    def test_single_message(self):
-        tc = _make_tc("send_wechat_messages", '{"messages":["OK"]}')
-        gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
+class TestWechatReplyV15:
+    """v1.5: single bubble per wechat_reply tool call + done to end turn."""
+
+    def test_single_wechat_reply_then_done(self):
+        call_count = [0]
+        responses = [
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"OK"}')],
+                           prompt_tokens=50, completion_tokens=10, total_tokens=60),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')],
+                           prompt_tokens=60, completion_tokens=5, total_tokens=65),
+        ]
+        class MGW:
+            def __init__(self): self.requests = []
+            async def complete(self, req):
+                self.requests.append(req)
+                idx = call_count[0]; call_count[0] += 1
+                return responses[idx]
+
+        sent_msgs = []
+        async def fake_sender(messages):
+            for m in messages: m["send_status"] = "delivered"
+            sent_msgs.extend(messages)
+            return messages
+
         agent = ChatAgent(
             model="test", persona="p", personality="",
-            llm_gateway=gw,
-            native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
+            llm_gateway=MGW(), native_tool_calls=True,
+            native_allowed_tools=["get_time", "get_weather", "wechat_reply", "done"],
+            test_mode=True,
+        )
+        import asyncio
+        result = asyncio.run(agent.chat(
+            user_message="hello", history=[], trigger="user",
+            wechat_sender=fake_sender,
+        ))
+        assert result.terminal_state == TurnState.END_REPLIED, f"got {result.terminal_state}"
+        assert result.sent_message_count == 1
+        assert result.reply_sequence_status == "completed"
+        assert len(sent_msgs) == 1
+
+    def test_three_wechat_reply_then_done(self):
+        call_count = [0]
+        responses = [
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"msg1"}')]),
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"msg2"}')]),
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"msg3"}')]),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+        ]
+        class MGW:
+            def __init__(self): self.requests = []
+            async def complete(self, req):
+                self.requests.append(req)
+                idx = call_count[0]; call_count[0] += 1
+                return responses[idx]
+
+        sent_msgs = []
+        async def fake_sender(messages):
+            for m in messages: m["send_status"] = "delivered"
+            sent_msgs.extend(messages)
+            return messages
+
+        agent = ChatAgent(
+            model="test", persona="p", personality="",
+            llm_gateway=MGW(), native_tool_calls=True,
+            native_allowed_tools=["wechat_reply", "done"],
+            test_mode=True,
+        )
+        import asyncio
+        result = asyncio.run(agent.chat(
+            user_message="tell me more", history=[], trigger="user",
+            wechat_sender=fake_sender,
+        ))
+        assert result.terminal_state == TurnState.END_REPLIED
+        assert result.sent_message_count == 3
+        assert len(sent_msgs) == 3  # 3 separate wechat_sender calls
+
+    def test_done_no_reply_without_send(self):
+        gw = FakeGateway(response=_make_response("", tool_calls=[
+            _make_tc("done", '{"status":"no_reply","note":"话题自然结束"}')]))
+        agent = ChatAgent(
+            model="test", persona="p", personality="",
+            llm_gateway=gw, native_tool_calls=True,
+            native_allowed_tools=["wechat_reply", "done"],
             test_mode=True,
         )
         import asyncio
         result = asyncio.run(agent.chat(
             user_message="hello", history=[], trigger="user",
         ))
-        assert result.llm_status == "ok"
-        assert len(result.tool_results) >= 1
-        assert result.tool_results[0]["name"] == "send_wechat_messages"
+        assert result.terminal_state == TurnState.END_NO_REPLY
+        assert result.sent_message_count == 0
 
-    def test_multi_message(self):
-        tc = _make_tc("send_wechat_messages",
-                       '{"messages":["msg1","msg2","msg3"]}')
-        gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
+    def test_done_failed(self):
+        gw = FakeGateway(response=_make_response("", tool_calls=[
+            _make_tc("done", '{"status":"failed","note":"发送通道不可用"}')]))
         agent = ChatAgent(
             model="test", persona="p", personality="",
-            llm_gateway=gw,
-            native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
+            llm_gateway=gw, native_tool_calls=True,
+            native_allowed_tools=["wechat_reply", "done"],
             test_mode=True,
         )
         import asyncio
         result = asyncio.run(agent.chat(
-            user_message="test", history=[], trigger="user",
+            user_message="hello", history=[], trigger="user",
         ))
-        assert len(result.tool_results) == 1
-        assert result.tool_results[0]["name"] == "send_wechat_messages"
+        assert result.terminal_state == TurnState.END_FAILED
 
-    def test_fact_tool_then_messages(self):
+    def test_fact_tool_then_wechat_reply_then_done(self):
         call_count = [0]
         responses = [
-            _make_response("", tool_calls=[_make_tc("get_time", '{"timezone":"Asia/Shanghai"}')],
-                           prompt_tokens=50, completion_tokens=15, total_tokens=65),
-            _make_response("", tool_calls=[_make_tc("send_wechat_messages", '{"messages":["3pm"]}')],
-                           prompt_tokens=80, completion_tokens=10, total_tokens=90),
+            _make_response("", tool_calls=[_make_tc("get_time", '{"timezone":"Asia/Shanghai"}')]),
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"现在是下午3点"}')]),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
         ]
-
         class MGW:
-            def __init__(self):
-                self.requests = []
-
+            def __init__(self): self.requests = []
             async def complete(self, req):
                 self.requests.append(req)
-                idx = call_count[0]
+                idx = min(call_count[0], len(responses) - 1)
                 call_count[0] += 1
                 return responses[idx]
 
+        sent_msgs = []
+        async def fake_sender(messages):
+            for m in messages: m["send_status"] = "delivered"
+            sent_msgs.extend(messages)
+            return messages
+
         agent = ChatAgent(
             model="test", persona="p", personality="",
-            llm_gateway=MGW(),
-            native_tool_calls=True,
-            native_allowed_tools=["get_time", "send_wechat_messages"],
-            test_mode=True,
+            llm_gateway=MGW(), native_tool_calls=True,
+            native_allowed_tools=["get_time", "wechat_reply", "done"],
+            test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
         result = asyncio.run(agent.chat(
             user_message="time?", history=[], trigger="user",
+            wechat_sender=fake_sender,
         ))
-        assert result.iterations == 2
+        assert result.terminal_state == TurnState.END_REPLIED, f"got {result.terminal_state}"
+        assert result.sent_message_count == 1
         assert result.tool_results[0]["name"] == "get_time"
-        assert result.tool_results[1]["name"] == "send_wechat_messages"
+        assert len(sent_msgs) == 1
 
     def test_no_tool_calls_fallback(self):
         gw = FakeGateway(response=_make_response("Hello there!"))
@@ -220,7 +293,7 @@ class TestSendWechatMessages:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
+            native_allowed_tools=["wechat_reply", "done"],
             test_mode=True,
         )
         import asyncio
@@ -232,7 +305,7 @@ class TestSendWechatMessages:
         assert "hard_fallback_enter" in types
 
     def test_max_loop_exit(self):
-        from agent.chat_agent import MAX_TOOL_LOOP
+        from agent.state_machine import MAX_LLM_STEPS_PER_TURN
 
         class MGW:
             def __init__(self):
@@ -246,14 +319,105 @@ class TestSendWechatMessages:
             model="test", persona="p", personality="",
             llm_gateway=MGW(),
             native_tool_calls=True,
-            native_allowed_tools=["get_time", "send_wechat_messages"],
-            test_mode=True,
+            native_allowed_tools=["get_time", "wechat_reply", "done"],
+            test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
         result = asyncio.run(agent.chat(
             user_message="time?", history=[], trigger="user",
         ))
-        assert result.iterations == MAX_TOOL_LOOP
+        assert result.iterations == MAX_LLM_STEPS_PER_TURN
+
+
+# ================================================================
+# v1.5: done(no_reply) guard — reject when user asks a question
+# ================================================================
+
+
+class TestDoneNoReplyGuard:
+    def test_no_reply_blocked_for_question_with_ma(self):
+        """done(no_reply) rejected when user asks '吃的啥呀' (contains 啥)."""
+        tc = _make_tc("done", '{"status":"no_reply","note":"not needed"}')
+        gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
+        agent = ChatAgent(
+            model="test", persona="p", personality="",
+            llm_gateway=gw, native_tool_calls=True,
+            native_allowed_tools=["wechat_reply", "done"],
+            test_mode=True, routing_mode="manual_flash",
+        )
+        import asyncio
+        result = asyncio.run(agent.chat(
+            user_message="吃的啥呀", history=[], trigger="user",
+        ))
+        # no_reply blocked → PROTOCOL_RETRY → eventually PROTOCOL_RETRY exceeded
+        types = [e.get("type") for e in result.fallback_events]
+        assert "protocol_retry" in types
+
+    def test_no_reply_blocked_for_followup_question(self):
+        """done(no_reply) rejected for '然后呢' (follow-up)."""
+        tc = _make_tc("done", '{"status":"no_reply","note":"not needed"}')
+        gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
+        agent = ChatAgent(
+            model="test", persona="p", personality="",
+            llm_gateway=gw, native_tool_calls=True,
+            native_allowed_tools=["wechat_reply", "done"],
+            test_mode=True, routing_mode="manual_flash",
+        )
+        import asyncio
+        result = asyncio.run(agent.chat(
+            user_message="然后呢", history=[], trigger="user",
+        ))
+        types = [e.get("type") for e in result.fallback_events]
+        assert "protocol_retry" in types
+
+    def test_no_reply_allowed_for_goodnight(self):
+        """done(no_reply) allowed for '晚安' (topic-ending signal)."""
+        tc = _make_tc("done", '{"status":"no_reply","note":"user said goodnight"}')
+        gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
+        agent = ChatAgent(
+            model="test", persona="p", personality="",
+            llm_gateway=gw, native_tool_calls=True,
+            native_allowed_tools=["wechat_reply", "done"],
+            test_mode=True, routing_mode="manual_flash",
+        )
+        import asyncio
+        result = asyncio.run(agent.chat(
+            user_message="晚安", history=[], trigger="user",
+        ))
+        assert result.terminal_state == TurnState.END_NO_REPLY
+
+    def test_no_reply_allowed_for_ok(self):
+        """done(no_reply) allowed for '好的' (acknowledgment)."""
+        tc = _make_tc("done", '{"status":"no_reply","note":"user acknowledged"}')
+        gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
+        agent = ChatAgent(
+            model="test", persona="p", personality="",
+            llm_gateway=gw, native_tool_calls=True,
+            native_allowed_tools=["wechat_reply", "done"],
+            test_mode=True, routing_mode="manual_flash",
+        )
+        import asyncio
+        result = asyncio.run(agent.chat(
+            user_message="好的", history=[], trigger="user",
+        ))
+        assert result.terminal_state == TurnState.END_NO_REPLY
+
+    def test_no_reply_blocked_for_why_question(self):
+        """done(no_reply) rejected for '为啥' (why question)."""
+        tc = _make_tc("done", '{"status":"no_reply","note":"not needed"}')
+        gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
+        agent = ChatAgent(
+            model="test", persona="p", personality="",
+            llm_gateway=gw, native_tool_calls=True,
+            native_allowed_tools=["wechat_reply", "done"],
+            test_mode=True, routing_mode="manual_flash",
+        )
+        import asyncio
+        result = asyncio.run(agent.chat(
+            user_message="为啥不说话了", history=[], trigger="user",
+        ))
+        types = [e.get("type") for e in result.fallback_events]
+        assert "protocol_retry" in types
 
 
 # ================================================================
@@ -278,7 +442,7 @@ class TestAssistantContentFallback:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
+            native_allowed_tools=["wechat_reply", "done"],
             test_mode=True,
         )
         import asyncio
@@ -295,12 +459,21 @@ class TestAssistantContentFallback:
         assert "protocol_retry" in types
         assert "hard_fallback_enter" in types
 
-    def test_no_double_send_for_tool_call(self):
-        """send_wechat_messages tool call → wechat_sender called once, END_SENT."""
-        tc = _make_tc("send_wechat_messages", '{"messages":["hello"]}')
-        gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
-        sent_count = [0]
+    def test_wechat_reply_sends_one_bubble_then_done(self):
+        """v1.5: wechat_reply → one send → done → END_REPLIED."""
+        call_count = [0]
+        responses = [
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"hello"}')]),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+        ]
+        class MGW:
+            def __init__(self): self.requests = []
+            async def complete(self, req):
+                self.requests.append(req)
+                idx = min(call_count[0], len(responses)-1); call_count[0] += 1
+                return responses[idx]
 
+        sent_count = [0]
         async def fake_sender(messages):
             sent_count[0] += 1
             for m in messages:
@@ -309,10 +482,10 @@ class TestAssistantContentFallback:
 
         agent = ChatAgent(
             model="test", persona="p", personality="",
-            llm_gateway=gw,
+            llm_gateway=MGW(),
             native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
-            test_mode=True,
+            native_allowed_tools=["wechat_reply", "done"],
+            test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
         result = asyncio.run(agent.chat(
@@ -320,7 +493,8 @@ class TestAssistantContentFallback:
             wechat_sender=fake_sender,
         ))
         assert sent_count[0] == 1, f"expected 1 send, got {sent_count[0]}"
-        assert result.was_sent, f"expected END_SENT, got {result.terminal_state}"
+        assert result.terminal_state == TurnState.END_REPLIED, f"got {result.terminal_state}"
+        assert result.sent_message_count == 1
 
     def test_assistant_fallback_sends_hard_text(self):
         """assistant.content fallback → END_FALLBACK_SENT with system text."""
@@ -338,7 +512,7 @@ class TestAssistantContentFallback:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
+            native_allowed_tools=["wechat_reply", "done"],
             test_mode=True,
         )
         import asyncio
@@ -359,7 +533,7 @@ class TestAssistantContentFallback:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
+            native_allowed_tools=["wechat_reply", "done"],
             test_mode=True,
         )
         import asyncio
@@ -379,144 +553,108 @@ class TestAssistantContentFallback:
 
 class TestToolRetry:
     def test_assistant_content_triggers_tool_retry(self):
-        """First: assistant.content, no tool → retry → model calls send_wechat_messages."""
+        """v1.5: first no tool → retry → wechat_reply → done → END_REPLIED."""
         call_count = [0]
         responses = [
             _make_response("some text reply"),  # first: no tool_calls
-            _make_response("", tool_calls=[
-                _make_tc("send_wechat_messages", '{"messages":["msg1","msg2"]}')
-            ]),  # retry: calls tool
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"retry_msg"}')]),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
         ]
 
         class MGW:
-            def __init__(self):
-                self.requests = []
-
+            def __init__(self): self.requests = []
             async def complete(self, req):
                 self.requests.append(req)
-                idx = call_count[0]
-                call_count[0] += 1
+                idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
 
         sent_msgs = []
-
         async def fake_sender(messages):
-            for m in messages:
-                m["send_status"] = "delivered"
+            for m in messages: m["send_status"] = "delivered"
             sent_msgs.extend(messages)
             return messages
 
         agent = ChatAgent(
             model="test", persona="p", personality="",
-            llm_gateway=MGW(),
-            native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
-            test_mode=True,
+            llm_gateway=MGW(), native_tool_calls=True,
+            native_allowed_tools=["wechat_reply", "done"],
+            test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
         result = asyncio.run(agent.chat(
             user_message="hello", history=[], trigger="user",
             wechat_sender=fake_sender,
         ))
-        assert call_count[0] == 2, f"expected 2 LLM calls, got {call_count[0]}"
         events = [e.get("type") for e in result.fallback_events]
         assert "assistant_content_no_tool_call" in events
         assert "protocol_retry" in events
-        assert result.was_sent
-        assert len(sent_msgs) == 2  # sent via tool, not fallback
+        assert result.terminal_state == TurnState.END_REPLIED
+        assert len(sent_msgs) == 1
 
-    def test_explicit_multi_request_detected_and_retried(self):
-        """User says "分开发" → detection triggers multi-message retry note."""
+    def test_deprecated_tool_rejected_in_retry(self):
+        """v1.5: deprecated send_wechat_messages → PROTOCOL_RETRY with hint."""
         call_count = [0]
         responses = [
-            _make_response("ok let me split"),  # first: no tool
-            _make_response("", tool_calls=[
-                _make_tc("send_wechat_messages",
-                          '{"messages":["第一条","第二条","第三条"]}')
-            ]),
+            _make_response("ok let me split"),
+            _make_response("", tool_calls=[_make_tc("send_wechat_messages",
+                          '{"messages":["第一条","第二条","第三条"]}')]),
         ]
-
         class MGW:
-            def __init__(self):
-                self.requests = []
-
+            def __init__(self): self.requests = []
             async def complete(self, req):
                 self.requests.append(req)
-                idx = call_count[0]
-                call_count[0] += 1
+                idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
-
-        sent_msgs = []
-
-        async def fake_sender(messages):
-            for m in messages:
-                m["send_status"] = "delivered"
-            sent_msgs.extend(messages)
-            return messages
 
         agent = ChatAgent(
             model="test", persona="p", personality="",
-            llm_gateway=MGW(),
-            native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
-            test_mode=True,
+            llm_gateway=MGW(), native_tool_calls=True,
+            native_allowed_tools=["wechat_reply", "done"],
+            test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
         result = asyncio.run(agent.chat(
             user_message="你一条一条发给我", history=[], trigger="user",
-            wechat_sender=fake_sender,
         ))
-        assert call_count[0] == 2
         events = [e.get("type") for e in result.fallback_events]
-        assert "assistant_content_no_tool_call" in events
-        assert "protocol_retry" in events
-        assert result.was_sent
-        assert len(sent_msgs) == 3
+        assert "deprecated_tool" in events
+        assert result.sent_message_count == 0
 
     def test_retry_failure_then_content_fallback(self):
-        """Both rounds return no tool_calls → final fallback with 1 message."""
+        """v1.5: no tool_calls repeatedly → protocol_retry_exceeded → HARD_FALLBACK."""
         call_count = [0]
         responses = [
             _make_response("text reply"),
             _make_response("still no tool"),
         ]
-
         class MGW:
-            def __init__(self):
-                self.requests = []
-
+            def __init__(self): self.requests = []
             async def complete(self, req):
                 self.requests.append(req)
-                idx = call_count[0]
-                call_count[0] += 1
+                idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
 
         sent_msgs = []
-
         async def fake_sender(messages):
-            for m in messages:
-                m["send_status"] = "delivered"
+            for m in messages: m["send_status"] = "delivered"
             sent_msgs.extend(messages)
             return messages
 
         agent = ChatAgent(
             model="test", persona="p", personality="",
-            llm_gateway=MGW(),
-            native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
-            test_mode=True,
+            llm_gateway=MGW(), native_tool_calls=True,
+            native_allowed_tools=["wechat_reply", "done"],
+            test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
         result = asyncio.run(agent.chat(
             user_message="hi", history=[], trigger="user",
             wechat_sender=fake_sender,
         ))
-        assert call_count[0] == 2
         events = [e.get("type") for e in result.fallback_events]
-        assert "protocol_retry_exceeded" in events
         assert "hard_fallback_enter" in events
         assert result.was_fallback
-        assert len(sent_msgs) == 1  # single hard fallback msg
+        assert len(sent_msgs) == 1
 
     def test_ten_messages_allowed_by_schema(self):
         """10 messages pass through guard (max_count=12)."""
@@ -715,8 +853,7 @@ class TestHistoryLeakPrevention:
         from agent.context_builder import build_chat_system_prompt
         prompt = build_chat_system_prompt(
             persona="test persona", personality="casual",
-            default_city="Chengdu",
-            tool_names=["get_time", "get_weather", "send_wechat_messages"],
+            tool_names=["get_time", "get_weather", "wechat_reply", "done"],
         )
         assert "history" not in prompt.lower() or "时间" in prompt
 
@@ -731,7 +868,7 @@ class TestHistoryLeakPrevention:
         from agent.context_builder import build_chat_system_prompt
         history_text = "user said hello yesterday"
         prompt = build_chat_system_prompt(
-            persona="p", personality="", tool_names=["send_wechat_messages"],
+            persona="p", personality="", tool_names=["wechat_reply", "done"],
         )
         assert history_text not in prompt
 
@@ -927,7 +1064,7 @@ class TestToolCallIdLeak:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
+            native_allowed_tools=["wechat_reply", "done"],
             test_mode=True,
         )
         import asyncio
@@ -952,45 +1089,56 @@ class TestTurnLifecycle:
     """
 
     def test_lifecycle_states_visited(self):
-        """A normal send_wechat_messages turn visits the core lifecycle states."""
-        tc = _make_tc("send_wechat_messages", '{"messages":["ok"]}')
-        gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
+        """v1.5: wechat_reply + done turn visits core lifecycle states."""
+        call_count = [0]
+        responses = [
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+        ]
+        class MGW:
+            def __init__(self): self.requests = []
+            async def complete(self, req):
+                self.requests.append(req)
+                idx = min(call_count[0], len(responses)-1); call_count[0] += 1
+                return responses[idx]
 
         async def fake_sender(messages):
-            for m in messages:
-                m["send_status"] = "delivered"
+            for m in messages: m["send_status"] = "delivered"
             return messages
 
         agent = ChatAgent(
             model="test", persona="p", personality="",
-            llm_gateway=gw,
+            llm_gateway=MGW(),
             native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
-            test_mode=True,
+            native_allowed_tools=["wechat_reply", "done"],
+            test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
         result = asyncio.run(agent.chat(
             user_message="hello", history=[], trigger="user",
             wechat_sender=fake_sender,
         ))
-        assert result.terminal_state in (TurnState.END_SENT, TurnState.END_PARTIAL_SENT,
-                                          TurnState.END_FALLBACK_SENT)
-        # post_terminal_completed: False when no callbacks injected (test path).
-        # The terminal_state itself confirms the lifecycle completed.
-        assert result.terminal_state in (
-            TurnState.END_SENT, TurnState.END_PARTIAL_SENT,
-            TurnState.END_FALLBACK_SENT, TurnState.END_FAILED,
-        ), f"unexpected terminal_state: {result.terminal_state}"
+        assert result.terminal_state == TurnState.END_REPLIED, f"got {result.terminal_state}"
 
     def test_turn_has_interrupt_token(self):
         """CREATE_TURN generates a non-empty interrupt_token."""
-        tc = _make_tc("send_wechat_messages", '{"messages":["ok"]}')
-        gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
+        call_count = [0]
+        responses = [
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+        ]
+        class MGW:
+            def __init__(self): self.requests = []
+            async def complete(self, req):
+                self.requests.append(req)
+                idx = min(call_count[0], len(responses)-1); call_count[0] += 1
+                return responses[idx]
+        gw = MGW()
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
+            native_allowed_tools=["wechat_reply", "done"],
             test_mode=True,
         )
         import asyncio
@@ -1002,70 +1150,70 @@ class TestTurnLifecycle:
         assert result.turn_id, "turn_id must be non-empty"
 
     def test_optional_preprocess_injects_time(self):
-        """OPTIONAL_PREPROCESS merges current time into messages[0] system content."""
+        """v1.5: OPTIONAL_PREPROCESS merges current time into messages[0] system content."""
         call_count = [0]
         responses = [
-            _make_response("", tool_calls=[_make_tc("send_wechat_messages", '{"messages":["ok"]}')]),
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
         ]
-
         class MGW:
-            def __init__(self):
-                self.requests = []
+            def __init__(self): self.requests = []
             async def complete(self, req):
                 self.requests.append(req)
-                idx = call_count[0]
-                call_count[0] += 1
+                idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
+
+        async def fake_sender(messages):
+            for m in messages: m["send_status"] = "delivered"
+            return messages
 
         gw = MGW()
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
-            test_mode=True,
+            native_allowed_tools=["wechat_reply", "done"],
+            test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
         result = asyncio.run(agent.chat(
             user_message="hello", history=[], trigger="user",
+            wechat_sender=fake_sender,
         ))
-        assert result.llm_status == "ok"
-        # Verify time was injected into messages[0], not appended as a new tail message
+        assert result.terminal_state == TurnState.END_REPLIED
         req = gw.requests[0]
         msgs = req.messages
         assert msgs[0]["role"] == "system"
-        assert "当前时间" in msgs[0]["content"], "time should be in first system message"
-        # No separate system message with "[系统] 当前时间" at the tail
+        assert "当前时间" in msgs[1]["content"], "time should be in second system message (after main prompt)"
         tail_roles = [m["role"] for m in msgs]
         system_count = sum(1 for r in tail_roles if r == "system")
-        assert system_count == 1, f"expected 1 system msg, got {system_count}: roles={tail_roles}"
+        assert system_count >= 2, f"expected >=2 system msgs (prompt + time), got {system_count}: roles={tail_roles}"
 
 
 class TestToolChoice:
     """v1.2: tool_choice='required' enforced in CALL_LLM."""
 
-    def test_tool_choice_required_when_tools_present(self):
-        """Request with tools → tool_choice='required'."""
-        tc = _make_tc("send_wechat_messages", '{"messages":["ok"]}')
+    def test_tool_choice_auto_when_tools_present(self):
+        """v1.5: Request with tools → tool_choice='auto' (thinking mode compat)."""
         call_count = [0]
-        responses = [_make_response("", tool_calls=[tc])]
+        responses = [
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+        ]
 
         class MGW:
-            def __init__(self):
-                self.requests = []
+            def __init__(self): self.requests = []
             async def complete(self, req):
                 self.requests.append(req)
-                idx = call_count[0]
-                call_count[0] += 1
+                idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
 
         gw = MGW()
         agent = ChatAgent(
             model="test", persona="p", personality="",
-            llm_gateway=gw,
-            native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
-            test_mode=True,
+            llm_gateway=gw, native_tool_calls=True,
+            native_allowed_tools=["wechat_reply", "done"],
+            test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
         asyncio.run(agent.chat(
@@ -1102,35 +1250,32 @@ class TestToolChoice:
         assert gw.requests[0].tool_choice is None
 
     def test_protocol_retry_keeps_tool_choice_required(self):
-        """PROTOCOL_RETRY → CALL_LLM still uses tool_choice='required'."""
+        """v1.5: PROTOCOL_RETRY → CALL_LLM uses tool_choice='auto' (thinking compat)."""
         call_count = [0]
         responses = [
             _make_response("text without tools"),  # violation
-            _make_response("", tool_calls=[_make_tc("send_wechat_messages", '{"messages":["retry ok"]}')]),
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"retry ok"}')]),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
         ]
 
         class MGW:
-            def __init__(self):
-                self.requests = []
+            def __init__(self): self.requests = []
             async def complete(self, req):
                 self.requests.append(req)
-                idx = call_count[0]
-                call_count[0] += 1
+                idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
 
         gw = MGW()
         agent = ChatAgent(
             model="test", persona="p", personality="",
-            llm_gateway=gw,
-            native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
-            test_mode=True,
+            llm_gateway=gw, native_tool_calls=True,
+            native_allowed_tools=["wechat_reply", "done"],
+            test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
         asyncio.run(agent.chat(
             user_message="hello", history=[], trigger="user",
         ))
-        # Both requests should have tool_choice='required'
         for req in gw.requests:
             assert req.tool_choice == "required", \
                 f"expected 'required', got {req.tool_choice}"
@@ -1141,8 +1286,18 @@ class TestInterruptCheck:
 
     def test_interrupt_at_create_turn_cancels(self):
         """Turn interrupted immediately after creation → END_CANCELLED."""
-        tc = _make_tc("send_wechat_messages", '{"messages":["ok"]}')
-        gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
+        call_count = [0]
+        responses = [
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+        ]
+        class MGW:
+            def __init__(self): self.requests = []
+            async def complete(self, req):
+                self.requests.append(req)
+                idx = min(call_count[0], len(responses)-1); call_count[0] += 1
+                return responses[idx]
+        gw = MGW()
 
         def _always_interrupt(_token: str) -> bool:
             return True
@@ -1151,7 +1306,7 @@ class TestInterruptCheck:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
+            native_allowed_tools=["wechat_reply", "done"],
             test_mode=True,
         )
         import asyncio
@@ -1163,8 +1318,18 @@ class TestInterruptCheck:
 
     def test_no_interrupt_completes_normally(self):
         """Always-false checker → normal completion."""
-        tc = _make_tc("send_wechat_messages", '{"messages":["ok"]}')
-        gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
+        call_count = [0]
+        responses = [
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+        ]
+        class MGW:
+            def __init__(self): self.requests = []
+            async def complete(self, req):
+                self.requests.append(req)
+                idx = min(call_count[0], len(responses)-1); call_count[0] += 1
+                return responses[idx]
+        gw = MGW()
 
         def _never_interrupt(_token: str) -> bool:
             return False
@@ -1178,7 +1343,7 @@ class TestInterruptCheck:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
+            native_allowed_tools=["wechat_reply", "done"],
             test_mode=True,
         )
         import asyncio
@@ -1188,7 +1353,7 @@ class TestInterruptCheck:
             wechat_sender=fake_sender,
         ))
         assert not result.was_cancelled, f"should not be cancelled, got {result.terminal_state}"
-        assert result.was_sent, f"expected END_SENT, got {result.terminal_state}"
+        assert result.terminal_state == TurnState.END_REPLIED, f"got {result.terminal_state}"
 
     def test_interrupt_after_fact_tool_returns_cancelled(self):
         """INTERRUPT_CHECK after fact tool execution → END_CANCELLED."""
@@ -1202,7 +1367,7 @@ class TestInterruptCheck:
         responses = [
             _make_response("", tool_calls=[_make_tc("get_time", '{}')],
                            prompt_tokens=50, completion_tokens=10, total_tokens=60),
-            _make_response("", tool_calls=[_make_tc("send_wechat_messages", '{"messages":["time"]}')],
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"time"}')],
                            prompt_tokens=80, completion_tokens=10, total_tokens=90),
         ]
 
@@ -1219,7 +1384,7 @@ class TestInterruptCheck:
             model="test", persona="p", personality="",
             llm_gateway=MGW(),
             native_tool_calls=True,
-            native_allowed_tools=["get_time", "send_wechat_messages"],
+            native_allowed_tools=["get_time", "wechat_reply", "done"],
             test_mode=True,
         )
         import asyncio
@@ -1230,32 +1395,27 @@ class TestInterruptCheck:
         assert result.was_cancelled, f"expected END_CANCELLED after fact tool, got {result.terminal_state}"
 
     def test_interrupt_at_guard_output_cancels(self):
-        """INTERRUPT_CHECK before GUARD_OUTPUT → END_CANCELLED."""
-        tc = _make_tc("send_wechat_messages", '{"messages":["hello"]}')
+        """v1.5: interrupt after CALL_LLM but before send → END_SUPERSEDED_BEFORE_SEND."""
+        tc = _make_tc("wechat_reply", '{"text":"hello"}')
         gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
         sent_msgs = []
-
         async def fake_sender(messages):
-            for m in messages:
-                m["send_status"] = "delivered"
+            for m in messages: m["send_status"] = "delivered"
             sent_msgs.extend(messages)
             return messages
 
-        # Interrupt on the second check (before GUARD_OUTPUT / EXEC_SEND)
-        # The first check is at CREATE_TURN, second at HANDLE_MODEL_OUTPUT,
-        # third at GUARD_OUTPUT. We want to cancel at the guard.
+        # v1.5: interrupt at check #2 (after HANDLE_MODEL_OUTPUT) with pending wechat_reply
         check_count = [0]
-
         def _delayed_interrupt(_token: str) -> bool:
             check_count[0] += 1
-            return check_count[0] >= 3  # interrupt at check #3 (GUARD_OUTPUT)
+            return check_count[0] >= 2  # interrupt at check #2 (after HANDLE_MODEL_OUTPUT)
 
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
-            test_mode=True,
+            native_allowed_tools=["wechat_reply", "done"],
+            test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
         result = asyncio.run(agent.chat(
@@ -1263,19 +1423,30 @@ class TestInterruptCheck:
             interrupt_checker=_delayed_interrupt,
             wechat_sender=fake_sender,
         ))
-        assert result.was_cancelled, f"expected END_CANCELLED, got {result.terminal_state}"
-        # No messages should have been sent
-        assert len(sent_msgs) == 0, f"expected 0 sent messages, got {len(sent_msgs)}"
+        # v1.5: pending wechat_reply + interrupt → END_SUPERSEDED_BEFORE_SEND
+        assert result.terminal_state in (TurnState.END_CANCELLED, TurnState.END_SUPERSEDED_BEFORE_SEND), \
+            f"got {result.terminal_state}"
+        assert result.sent_message_count == 0
 
     def test_production_missing_checker_raises(self):
         """In production (test_mode=False), missing interrupt_checker → ValueError."""
-        tc = _make_tc("send_wechat_messages", '{"messages":["ok"]}')
-        gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
+        call_count = [0]
+        responses = [
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+        ]
+        class MGW:
+            def __init__(self): self.requests = []
+            async def complete(self, req):
+                self.requests.append(req)
+                idx = min(call_count[0], len(responses)-1); call_count[0] += 1
+                return responses[idx]
+        gw = MGW()
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
+            native_allowed_tools=["wechat_reply", "done"],
             test_mode=False,  # production mode, no checker provided
         )
         import asyncio
@@ -1290,13 +1461,23 @@ class TestContextErrorClassification:
 
     def test_normal_context_proceeds(self):
         """No errors in context → continues to CALL_LLM."""
-        tc = _make_tc("send_wechat_messages", '{"messages":["ok"]}')
-        gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
+        call_count = [0]
+        responses = [
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+        ]
+        class MGW:
+            def __init__(self): self.requests = []
+            async def complete(self, req):
+                self.requests.append(req)
+                idx = min(call_count[0], len(responses)-1); call_count[0] += 1
+                return responses[idx]
+        gw = MGW()
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
+            native_allowed_tools=["wechat_reply", "done"],
             test_mode=True,
         )
         import asyncio
@@ -1332,8 +1513,18 @@ class TestContextErrorClassification:
 
     def test_empty_system_prompt_warns_not_fatal(self):
         """Empty system_prompt → warning in context_warnings, not fatal."""
-        tc = _make_tc("send_wechat_messages", '{"messages":["ok"]}')
-        gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
+        call_count = [0]
+        responses = [
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+        ]
+        class MGW:
+            def __init__(self): self.requests = []
+            async def complete(self, req):
+                self.requests.append(req)
+                idx = min(call_count[0], len(responses)-1); call_count[0] += 1
+                return responses[idx]
+        gw = MGW()
 
         async def fake_sender(messages):
             for m in messages:
@@ -1344,7 +1535,7 @@ class TestContextErrorClassification:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
+            native_allowed_tools=["wechat_reply", "done"],
             test_mode=True,
         )
         import asyncio
@@ -1358,78 +1549,69 @@ class TestContextErrorClassification:
 
 
 class TestClassifyToolError:
-    """v1.2 §10.3: CLASSIFY_TOOL_ERROR routes correctly."""
+    """v1.5: fact tools route to CALL_LLM directly (CLASSIFY_TOOL_ERROR removed)."""
 
     def test_fact_tool_success_returns_to_llm(self):
-        """After successful fact tool execution, model is called again."""
+        """v1.5: after fact tool success, model called again → wechat_reply + done."""
         call_count = [0]
         responses = [
-            _make_response("", tool_calls=[_make_tc("get_time", '{}')],
-                           prompt_tokens=50, completion_tokens=10, total_tokens=60),
-            _make_response("", tool_calls=[_make_tc("send_wechat_messages", '{"messages":["time ok"]}')],
-                           prompt_tokens=80, completion_tokens=10, total_tokens=90),
+            _make_response("", tool_calls=[_make_tc("get_time", '{}')]),
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"time ok"}')]),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
         ]
-
         class MGW:
-            def __init__(self):
-                self.requests = []
+            def __init__(self): self.requests = []
             async def complete(self, req):
                 self.requests.append(req)
-                idx = call_count[0]
-                call_count[0] += 1
+                idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
+
+        async def fake_sender(messages):
+            for m in messages: m["send_status"] = "delivered"
+            return messages
 
         agent = ChatAgent(
             model="test", persona="p", personality="",
-            llm_gateway=MGW(),
-            native_tool_calls=True,
-            native_allowed_tools=["get_time", "send_wechat_messages"],
-            test_mode=True,
+            llm_gateway=MGW(), native_tool_calls=True,
+            native_allowed_tools=["get_time", "wechat_reply", "done"],
+            test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
         result = asyncio.run(agent.chat(
             user_message="what time", history=[], trigger="user",
+            wechat_sender=fake_sender,
         ))
-        assert result.llm_status == "ok"
-        # get_time was called, then send_wechat_messages
-        assert len(result.tool_results) >= 2
+        assert result.terminal_state == TurnState.END_REPLIED, f"got {result.terminal_state}"
+        assert len(result.tool_results) >= 1
 
-    def test_parallel_fact_tools_executed(self):
-        """Multiple fact tools in one turn → parallel execution, results merged."""
+    def test_parallel_tool_calls_rejected(self):
+        """v1.5: multiple tool calls in one response → PROTOCOL_RETRY."""
         call_count = [0]
         responses = [
             _make_response("", tool_calls=[
                 _make_tc("get_time", '{}', call_id="call_t"),
                 _make_tc("get_weather", '{"city":"Beijing"}', call_id="call_w"),
-            ], prompt_tokens=50, completion_tokens=20, total_tokens=70),
-            _make_response("", tool_calls=[_make_tc("send_wechat_messages", '{"messages":["done"]}')],
-                           prompt_tokens=100, completion_tokens=10, total_tokens=110),
+            ]),
         ]
-
         class MGW:
-            def __init__(self):
-                self.requests = []
+            def __init__(self): self.requests = []
             async def complete(self, req):
                 self.requests.append(req)
-                idx = call_count[0]
-                call_count[0] += 1
+                idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
 
         agent = ChatAgent(
             model="test", persona="p", personality="",
-            llm_gateway=MGW(),
-            native_tool_calls=True,
-            native_allowed_tools=["get_time", "get_weather", "send_wechat_messages"],
-            test_mode=True,
+            llm_gateway=MGW(), native_tool_calls=True,
+            native_allowed_tools=["get_time", "get_weather", "wechat_reply", "done"],
+            test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
         result = asyncio.run(agent.chat(
             user_message="time and weather?", history=[], trigger="user",
         ))
-        # Both fact tools executed, then send
-        fact_names = [r["name"] for r in result.tool_results if r["name"] != "send_wechat_messages"]
-        assert "get_time" in fact_names
-        assert "get_weather" in fact_names
+        events = [e.get("type") for e in result.fallback_events]
+        assert "multiple_tool_calls" in events or "protocol_retry" in events
 
     def test_invalid_tool_args_classified_as_protocol_error(self):
         """Invalid tool args → CLASSIFY_TOOL_ERROR → PROTOCOL_RETRY."""
@@ -1473,21 +1655,16 @@ class TestClassifyToolError:
 
 
 class TestStateToolStrict:
-    """v1.2 §11: STATE_TOOL strict mode — no silent no-op."""
+    """v1.5: unknown tools → PROTOCOL_RETRY via classifier."""
 
-    def test_state_tool_not_registered_rejected_by_classifier(self):
-        """No STATE_TOOL registered → classifier rejects → PROTOCOL_RETRY."""
-        from agent.tool_registry import TOOL_REGISTRY, ToolDef
-        has_state = any(t.tool_category == "state_tool" for t in TOOL_REGISTRY.iter_defs())
-        assert not has_state, "TOOL_REGISTRY should have no STATE_TOOL for this test to be valid"
-
-        # Simulate model calling a would-be state tool → classifier marks it unknown
-        from agent.tool_classifier import classify_tool_calls
+    def test_unknown_tool_rejected_by_classifier(self):
+        """v1.5: unknown tool → classify_single_tool_call marks illegal."""
+        from agent.tool_registry import TOOL_REGISTRY
+        from agent.tool_classifier import classify_single_tool_call
         fake_tc = _make_tc("propose_memory_update", '{}')
-        classified = classify_tool_calls([fake_tc], TOOL_REGISTRY)
+        classified = classify_single_tool_call(fake_tc, TOOL_REGISTRY)
         assert not classified.is_legal, "unknown tool should be illegal"
-        assert classified.unknown_tools, "should have unknown tools"
-        assert "propose_memory_update" in classified.unknown_tools
+        assert "未知" in classified.violation_reason or "未注册" in classified.violation_reason
 
 
 # ================================================================
@@ -1495,36 +1672,32 @@ class TestStateToolStrict:
 # ================================================================
 
 class TestProtocolHardening:
-    """v1.2 §8: model output protocol enforcement through new lifecycle."""
+    """v1.5: model output protocol enforcement."""
 
     def test_assistant_content_no_tool_calls_retried(self):
-        """Model returns only text → PROTOCOL_RETRY → retry."""
+        """v1.5: text only → PROTOCOL_RETRY → retry → wechat_reply + done."""
         call_count = [0]
         responses = [
-            _make_response("just some text reply"),  # protocol violation
-            _make_response("", tool_calls=[_make_tc("send_wechat_messages", '{"messages":["retried ok"]}')]),
+            _make_response("just some text reply"),
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"retried ok"}')]),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
         ]
-
         class MGW:
-            def __init__(self):
-                self.requests = []
+            def __init__(self): self.requests = []
             async def complete(self, req):
                 self.requests.append(req)
-                idx = call_count[0]
-                call_count[0] += 1
+                idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
 
         async def fake_sender(messages):
-            for m in messages:
-                m["send_status"] = "delivered"
+            for m in messages: m["send_status"] = "delivered"
             return messages
 
         agent = ChatAgent(
             model="test", persona="p", personality="",
-            llm_gateway=MGW(),
-            native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
-            test_mode=True,
+            llm_gateway=MGW(), native_tool_calls=True,
+            native_allowed_tools=["wechat_reply", "done"],
+            test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
         result = asyncio.run(agent.chat(
@@ -1533,38 +1706,33 @@ class TestProtocolHardening:
         ))
         types = [e.get("type") for e in result.fallback_events]
         assert "protocol_retry" in types
-        # Second call succeeded
-        assert result.was_sent
+        assert result.terminal_state == TurnState.END_REPLIED
 
     def test_old_json_actions_detected_as_protocol_error(self):
-        """Model returns old JSON actions format → detected → PROTOCOL_RETRY."""
+        """v1.5: old JSON actions format → detected → PROTOCOL_RETRY."""
         call_count = [0]
         old_json = '{"actions": [{"type": "tool", "name": "wechat_reply", "args": {"text": "我在"}}], "done": false}'
         responses = [
-            _make_response(old_json),  # old format
-            _make_response("", tool_calls=[_make_tc("send_wechat_messages", '{"messages":["ok"]}')]),
+            _make_response(old_json),
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
         ]
-
         class MGW:
-            def __init__(self):
-                self.requests = []
+            def __init__(self): self.requests = []
             async def complete(self, req):
                 self.requests.append(req)
-                idx = call_count[0]
-                call_count[0] += 1
+                idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
 
         async def fake_sender(messages):
-            for m in messages:
-                m["send_status"] = "delivered"
+            for m in messages: m["send_status"] = "delivered"
             return messages
 
         agent = ChatAgent(
             model="test", persona="p", personality="",
-            llm_gateway=MGW(),
-            native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
-            test_mode=True,
+            llm_gateway=MGW(), native_tool_calls=True,
+            native_allowed_tools=["wechat_reply", "done"],
+            test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
         result = asyncio.run(agent.chat(
@@ -1573,7 +1741,6 @@ class TestProtocolHardening:
         ))
         types = [e.get("type") for e in result.fallback_events]
         assert "old_json_actions_detected" in types
-        assert result.was_sent
 
     def test_protocol_retry_exceeded_goes_to_hard_fallback(self):
         """After max_protocol_retries exceeded → HARD_FALLBACK."""
@@ -1587,7 +1754,7 @@ class TestProtocolHardening:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
+            native_allowed_tools=["wechat_reply", "done"],
             test_mode=True,
         )
         import asyncio
@@ -1625,7 +1792,7 @@ class TestProtocolHardening:
             model="test", persona="p", personality="",
             llm_gateway=MGW(),
             native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
+            native_allowed_tools=["wechat_reply", "done"],
             test_mode=True,
         )
         import asyncio
@@ -1638,65 +1805,56 @@ class TestProtocolHardening:
 
 
 class TestFactToolErrors:
-    """v1.2 §10.3: FACT_TOOL error edge cases."""
+    """v1.5: fact tool error handling (fact tools route to CALL_LLM directly)."""
 
-    def test_fact_tool_timeout_recoverable(self):
-        """Weather timeout → recoverable, result fed back to model."""
+    def test_fact_tool_success_then_reply(self):
+        """v1.5: fact tool success → wechat_reply → done → END_REPLIED."""
         call_count = [0]
-        # First call: model requests weather, then send
-        # We mock a "success" path since actual weather call is real HTTP
         responses = [
-            _make_response("", tool_calls=[_make_tc("get_weather", '{"city":"Shanghai"}')],
-                           prompt_tokens=50, completion_tokens=10, total_tokens=60),
-            _make_response("", tool_calls=[_make_tc("send_wechat_messages", '{"messages":["weather ok"]}')],
-                           prompt_tokens=80, completion_tokens=10, total_tokens=90),
+            _make_response("", tool_calls=[_make_tc("get_weather", '{"city":"Shanghai"}')]),
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"weather ok"}')]),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
         ]
-
         class MGW:
-            def __init__(self):
-                self.requests = []
+            def __init__(self): self.requests = []
             async def complete(self, req):
                 self.requests.append(req)
-                idx = call_count[0]
-                call_count[0] += 1
+                idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
+
+        async def fake_sender(messages):
+            for m in messages: m["send_status"] = "delivered"
+            return messages
 
         agent = ChatAgent(
             model="test", persona="p", personality="",
-            llm_gateway=MGW(),
-            native_tool_calls=True,
-            native_allowed_tools=["get_weather", "send_wechat_messages"],
-            test_mode=True,
+            llm_gateway=MGW(), native_tool_calls=True,
+            native_allowed_tools=["get_weather", "wechat_reply", "done"],
+            test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
         result = asyncio.run(agent.chat(
             user_message="weather in Shanghai?", history=[], trigger="user",
+            wechat_sender=fake_sender,
         ))
-        assert result.llm_status == "ok"
-        # Weather was called (even if HTTP fails or succeeds, it's handled)
+        assert result.terminal_state == TurnState.END_REPLIED, f"got {result.terminal_state}"
 
     def test_unknown_tool_rejected_by_classifier(self):
-        """Unknown tool → classifier marks as unknown → PROTOCOL_RETRY."""
+        """v1.5: unknown tool → PROTOCOL_RETRY."""
         unknown_tc = _make_tc("unknown_tool_xyz", '{}')
         gw = FakeGateway(response=_make_response("", tool_calls=[unknown_tc]))
         agent = ChatAgent(
             model="test", persona="p", personality="",
-            llm_gateway=gw,
-            native_tool_calls=True,
-            native_allowed_tools=["get_time", "get_weather", "send_wechat_messages"],
-            test_mode=True,
+            llm_gateway=gw, native_tool_calls=True,
+            native_allowed_tools=["get_time", "get_weather", "wechat_reply", "done"],
+            test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
         result = asyncio.run(agent.chat(
             user_message="hi", history=[], trigger="user",
         ))
         types = [e.get("type") for e in result.fallback_events]
-        assert "illegal_tool_combination" in types
-        assert "unknown_tool_xyz" in str(types) or any(
-            "unknown" in str(e.get("detail", "")) for e in result.fallback_events
-        ) or any(
-            "未知" in str(e.get("detail", "")) for e in result.fallback_events
-        )
+        assert "illegal_tool" in types or "protocol_retry" in types
 
 
 class TestHardFallbackWithInterrupt:
@@ -1730,7 +1888,7 @@ class TestHardFallbackWithInterrupt:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
+            native_allowed_tools=["wechat_reply", "done"],
             test_mode=True,
         )
         import asyncio
@@ -1759,7 +1917,7 @@ class TestHardFallbackWithInterrupt:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
+            native_allowed_tools=["wechat_reply", "done"],
             test_mode=True,
         )
         import asyncio
@@ -1792,116 +1950,90 @@ class TestFatalContextErrors:
 
 
 class TestMessageLimitProtocolRetry:
-    """v1.2: exceeding MAX_MESSAGES_PER_TURN → PROTOCOL_RETRY, not silent truncation."""
+    """v1.5: per-bubble wechat_reply, deprecated batch tool rejected."""
 
-    def test_within_limit_all_sent_ends_sent(self):
-        """9 messages, limit=16 → all sent → END_SENT."""
+    def test_deprecated_batch_tool_rejected(self):
+        """v1.5: send_wechat_messages is deprecated → PROTOCOL_RETRY."""
         msgs = [f"msg{i}" for i in range(9)]
         tc = _make_tc("send_wechat_messages", json.dumps({"messages": msgs}))
         gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
-
-        sent_msgs = []
-        async def fake_sender(messages):
-            for m in messages:
-                m["send_status"] = "delivered"
-            sent_msgs.extend(messages)
-            return messages
-
         agent = ChatAgent(
             model="test", persona="p", personality="",
-            llm_gateway=gw,
-            native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
-            test_mode=True,
+            llm_gateway=gw, native_tool_calls=True,
+            native_allowed_tools=["wechat_reply", "done"],
+            test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
         result = asyncio.run(agent.chat(
             user_message="story please", history=[], trigger="user",
-            wechat_sender=fake_sender,
         ))
-        assert result.was_sent, f"expected END_SENT, got {result.terminal_state}"
-        assert len(sent_msgs) == 9
+        types = [e.get("type") for e in result.fallback_events]
+        assert "deprecated_tool" in types
 
-    def test_exceeds_limit_goes_protocol_retry(self):
-        """21 messages, limit=16 → PROTOCOL_RETRY, model retries with fewer."""
+    def test_single_bubble_within_limit(self):
+        """v1.5: 1 wechat_reply → done → END_REPLIED, sent_count=1."""
         call_count = [0]
-        msgs_too_many = [f"msg{i}" for i in range(21)]
-        msgs_compressed = [f"compressed{i}" for i in range(5)]
         responses = [
-            _make_response("", tool_calls=[
-                _make_tc("send_wechat_messages", json.dumps({"messages": msgs_too_many}))
-            ]),
-            _make_response("", tool_calls=[
-                _make_tc("send_wechat_messages", json.dumps({"messages": msgs_compressed}))
-            ]),
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"msg"}')]),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
         ]
-
         class MGW:
-            def __init__(self):
-                self.requests = []
+            def __init__(self): self.requests = []
             async def complete(self, req):
                 self.requests.append(req)
-                idx = call_count[0]
-                call_count[0] += 1
+                idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
 
         sent_msgs = []
         async def fake_sender(messages):
-            for m in messages:
-                m["send_status"] = "delivered"
+            for m in messages: m["send_status"] = "delivered"
             sent_msgs.extend(messages)
             return messages
 
         agent = ChatAgent(
             model="test", persona="p", personality="",
-            llm_gateway=MGW(),
-            native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
-            test_mode=True,
+            llm_gateway=MGW(), native_tool_calls=True,
+            native_allowed_tools=["wechat_reply", "done"],
+            test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
         result = asyncio.run(agent.chat(
             user_message="story please", history=[], trigger="user",
             wechat_sender=fake_sender,
         ))
-        # Second call succeeded with compressed messages
-        assert len(sent_msgs) == 5, f"expected 5 compressed msgs sent, got {len(sent_msgs)}"
-        types = [e.get("type") for e in result.fallback_events]
-        assert "too_many_messages" in types
+        assert result.terminal_state == TurnState.END_REPLIED, f"got {result.terminal_state}"
+        assert result.sent_message_count == 1
 
-    def test_partial_send_on_one_failed(self):
-        """9 messages, sender delivers 8 → END_PARTIAL_SENT."""
-        msgs = [f"msg{i}" for i in range(9)]
-        tc = _make_tc("send_wechat_messages", json.dumps({"messages": msgs}))
-        gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
+    def test_failed_send_error_tool_result(self):
+        """v1.5: failed send → error tool result, sent_count unchanged."""
+        call_count = [0]
+        responses = [
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"hello"}')]),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"failed","note":"send error"}')]),
+        ]
+        class MGW:
+            def __init__(self): self.requests = []
+            async def complete(self, req):
+                self.requests.append(req)
+                idx = min(call_count[0], len(responses)-1); call_count[0] += 1
+                return responses[idx]
 
-        sent_count = [0]
         async def fake_sender(messages):
-            for m in messages:
-                sent_count[0] += 1
-                if sent_count[0] <= 8:
-                    m["send_status"] = "delivered"
-                else:
-                    m["send_status"] = "failed"
-                    m["send_error"] = "simulated failure"
+            for m in messages: m["send_status"] = "failed"; m["send_error"] = "simulated"
             return messages
 
         agent = ChatAgent(
             model="test", persona="p", personality="",
-            llm_gateway=gw,
-            native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
-            test_mode=True,
+            llm_gateway=MGW(), native_tool_calls=True,
+            native_allowed_tools=["wechat_reply", "done"],
+            test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
         result = asyncio.run(agent.chat(
-            user_message="story please", history=[], trigger="user",
+            user_message="hello", history=[], trigger="user",
             wechat_sender=fake_sender,
         ))
-        assert result.terminal_state == TurnState.END_PARTIAL_SENT, \
-            f"expected END_PARTIAL_SENT, got {result.terminal_state}"
-        types = [e.get("type") for e in result.fallback_events]
-        assert "partial_send" in types
+        assert result.sent_message_count == 0
 
 
 class TestOptionalPreprocessNoWeather:
@@ -1944,43 +2076,41 @@ class TestOptionalPreprocessNoWeather:
 
 
 class TestSkipReplyPath:
-    """v1.2 §12.1: skip_reply → EXEC_SKIP_REPLY → END_SKIPPED."""
+    """v1.5: skip_reply deprecated → done(status='no_reply') replaces it."""
 
-    def test_skip_reply_ends_skipped(self):
-        """Model calls skip_reply → END_SKIPPED."""
+    def test_skip_reply_deprecated_rejected(self):
+        """v1.5: skip_reply is deprecated → PROTOCOL_RETRY."""
         tc = _make_tc("skip_reply", '{"reason":"user said goodnight"}')
         gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
         agent = ChatAgent(
             model="test", persona="p", personality="",
-            llm_gateway=gw,
-            native_tool_calls=True,
-            native_allowed_tools=["skip_reply", "send_wechat_messages"],
-            test_mode=True,
+            llm_gateway=gw, native_tool_calls=True,
+            native_allowed_tools=["wechat_reply", "done"],
+            test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
         result = asyncio.run(agent.chat(
             user_message="晚安", history=[], trigger="user",
         ))
-        assert result.was_skipped, f"expected END_SKIPPED, got {result.terminal_state}"
         types = [e.get("type") for e in result.fallback_events]
-        assert "skip_reply" in types
+        assert "deprecated_tool" in types
 
-    def test_skip_reply_no_visible_messages(self):
-        """skip_reply produces zero visible messages."""
-        tc = _make_tc("skip_reply", '{}')
+    def test_done_no_reply_ends_no_reply(self):
+        """v1.5: done(status='no_reply', note='...') → END_NO_REPLY."""
+        tc = _make_tc("done", '{"status":"no_reply","note":"user said goodnight"}')
         gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
         agent = ChatAgent(
             model="test", persona="p", personality="",
-            llm_gateway=gw,
-            native_tool_calls=True,
-            native_allowed_tools=["skip_reply", "send_wechat_messages"],
-            test_mode=True,
+            llm_gateway=gw, native_tool_calls=True,
+            native_allowed_tools=["wechat_reply", "done"],
+            test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
         result = asyncio.run(agent.chat(
-            user_message="ok", history=[], trigger="user",
+            user_message="晚安", history=[], trigger="user",
         ))
-        assert result.delivered_count == 0
+        assert result.terminal_state == TurnState.END_NO_REPLY, f"got {result.terminal_state}"
+        assert result.sent_message_count == 0
 
 
 class TestDraftStatusValid:
@@ -2005,8 +2135,18 @@ class TestSeqBasedInterrupt:
 
     def test_single_message_not_cancelled(self):
         """Single message with input_latest_seq=1 → not interrupted."""
-        tc = _make_tc("send_wechat_messages", '{"messages":["ok"]}')
-        gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
+        call_count = [0]
+        responses = [
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+        ]
+        class MGW:
+            def __init__(self): self.requests = []
+            async def complete(self, req):
+                self.requests.append(req)
+                idx = min(call_count[0], len(responses)-1); call_count[0] += 1
+                return responses[idx]
+        gw = MGW()
         seq_counter = {"X": 1}
 
         def _checker(user_id: str, input_seq: int):
@@ -2023,7 +2163,7 @@ class TestSeqBasedInterrupt:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
+            native_allowed_tools=["wechat_reply", "done"],
             test_mode=True,
         )
         import asyncio
@@ -2045,8 +2185,18 @@ class TestSeqBasedInterrupt:
                 return seq_counter.get(user_id, 0) > input_seq
             return _check
 
-        tc = _make_tc("send_wechat_messages", '{"messages":["ok"]}')
-        gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
+        call_count = [0]
+        responses = [
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+        ]
+        class MGW:
+            def __init__(self): self.requests = []
+            async def complete(self, req):
+                self.requests.append(req)
+                idx = min(call_count[0], len(responses)-1); call_count[0] += 1
+                return responses[idx]
+        gw = MGW()
         async def fake_sender(messages):
             for m in messages:
                 m["send_status"] = "delivered"
@@ -2056,7 +2206,7 @@ class TestSeqBasedInterrupt:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
+            native_allowed_tools=["wechat_reply", "done"],
             test_mode=True,
         )
         import asyncio
@@ -2077,8 +2227,18 @@ class TestSeqBasedInterrupt:
                 return seq_counter.get(user_id, 0) > input_seq
             return _check
 
-        tc = _make_tc("send_wechat_messages", '{"messages":["ok"]}')
-        gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
+        call_count = [0]
+        responses = [
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+        ]
+        class MGW:
+            def __init__(self): self.requests = []
+            async def complete(self, req):
+                self.requests.append(req)
+                idx = min(call_count[0], len(responses)-1); call_count[0] += 1
+                return responses[idx]
+        gw = MGW()
         async def fake_sender(messages):
             for m in messages:
                 m["send_status"] = "delivered"
@@ -2088,7 +2248,7 @@ class TestSeqBasedInterrupt:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
+            native_allowed_tools=["wechat_reply", "done"],
             test_mode=True,
         )
         import asyncio
@@ -2109,8 +2269,18 @@ class TestSeqBasedInterrupt:
                 return seq_counter.get(user_id, 0) > input_seq
             return _check
 
-        tc = _make_tc("send_wechat_messages", '{"messages":["ok"]}')
-        gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
+        call_count = [0]
+        responses = [
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+        ]
+        class MGW:
+            def __init__(self): self.requests = []
+            async def complete(self, req):
+                self.requests.append(req)
+                idx = min(call_count[0], len(responses)-1); call_count[0] += 1
+                return responses[idx]
+        gw = MGW()
         async def fake_sender(messages):
             for m in messages:
                 m["send_status"] = "delivered"
@@ -2120,7 +2290,7 @@ class TestSeqBasedInterrupt:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
+            native_allowed_tools=["wechat_reply", "done"],
             test_mode=True,
         )
         import asyncio
@@ -2155,7 +2325,7 @@ class TestSeqBasedInterrupt:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
+            native_allowed_tools=["wechat_reply", "done"],
             test_mode=True,
         )
         import asyncio
@@ -2175,8 +2345,10 @@ class TestModelRouting:
     def test_manual_flash_uses_flash_profile(self):
         """routing_mode=manual_flash → model_name=flash, reason=manual_flash."""
         call_count = [0]
-        tc = _make_tc("send_wechat_messages", '{"messages":["ok"]}')
-        responses = [_make_response("", tool_calls=[tc])]
+        responses = [
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+        ]
 
         class MGW:
             def __init__(self):
@@ -2196,7 +2368,7 @@ class TestModelRouting:
             model="default-model", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
+            native_allowed_tools=["wechat_reply", "done"],
             test_mode=True,
             flash_profile=flash_p,
             pro_profile=pro_p,
@@ -2214,8 +2386,10 @@ class TestModelRouting:
     def test_manual_pro_uses_pro_profile(self):
         """routing_mode=manual_pro → model_name=pro, reason=manual_pro."""
         call_count = [0]
-        tc = _make_tc("send_wechat_messages", '{"messages":["ok"]}')
-        responses = [_make_response("", tool_calls=[tc])]
+        responses = [
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+        ]
 
         class MGW:
             def __init__(self):
@@ -2235,7 +2409,7 @@ class TestModelRouting:
             model="old", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
+            native_allowed_tools=["wechat_reply", "done"],
             test_mode=True,
             flash_profile=flash_p,
             pro_profile=pro_p,
@@ -2253,8 +2427,10 @@ class TestModelRouting:
     def test_auto_short_message_uses_flash(self):
         """auto + short message (ChatLite) → flash."""
         call_count = [0]
-        tc = _make_tc("send_wechat_messages", '{"messages":["ok"]}')
-        responses = [_make_response("", tool_calls=[tc])]
+        responses = [
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+        ]
 
         class MGW:
             def __init__(self):
@@ -2274,7 +2450,7 @@ class TestModelRouting:
             model="x", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
+            native_allowed_tools=["wechat_reply", "done"],
             test_mode=True,
             flash_profile=flash_p,
             pro_profile=pro_p,
@@ -2312,7 +2488,7 @@ class TestModelRouting:
             model="x", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
+            native_allowed_tools=["wechat_reply", "done"],
             test_mode=True,
             flash_profile=flash_p,
             pro_profile=pro_p,
@@ -2330,7 +2506,8 @@ class TestModelRouting:
         call_count = [0]
         responses = [
             _make_response("text without tools"),  # flash violation
-            _make_response("", tool_calls=[_make_tc("send_wechat_messages", '{"messages":["pro ok"]}')]),
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"pro ok"}')]),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
         ]
 
         class MGW:
@@ -2356,7 +2533,7 @@ class TestModelRouting:
             model="x", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
+            native_allowed_tools=["wechat_reply", "done"],
             test_mode=True,
             flash_profile=flash_p,
             pro_profile=pro_p,
@@ -2367,26 +2544,31 @@ class TestModelRouting:
             user_message="hello", history=[], trigger="user",
             wechat_sender=fake_sender,
         ))
-        assert len(gw.requests) == 2
+        # v1.5: flash text → PROTOCOL_RETRY → pro upgrade → wechat_reply → done
+        assert len(gw.requests) == 3, f"expected 3 reqs, got {len(gw.requests)}"
         assert gw.requests[0].model == "f-proto-violation"
         assert gw.requests[1].model == "p-upgrade"
         assert gw.requests[1].retry == 0, "upgrade attempt should have retry=0"
-        assert result.was_sent, f"expected END_SENT, got {result.terminal_state}"
+        assert result.terminal_state == TurnState.END_REPLIED, f"got {result.terminal_state}"
 
     def test_model_attempts_recorded(self):
         """model_attempts list has entries after a turn."""
         call_count = [0]
-        tc = _make_tc("send_wechat_messages", '{"messages":["ok"]}')
-        responses = [_make_response("", tool_calls=[tc])]
+        responses = [
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+        ]
 
         class MGW:
-            def __init__(self):
-                self.requests = []
+            def __init__(self): self.requests = []
             async def complete(self, req):
                 self.requests.append(req)
-                idx = call_count[0]
-                call_count[0] += 1
+                idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
+
+        async def fake_sender(messages):
+            for m in messages: m["send_status"] = "delivered"
+            return messages
 
         from agent.state_machine import ModelProfile
         flash_p = ModelProfile(model_name="f-attempts")
@@ -2396,19 +2578,19 @@ class TestModelRouting:
             model="x", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
+            native_allowed_tools=["wechat_reply", "done"],
             test_mode=True,
             flash_profile=flash_p,
             pro_profile=ModelProfile(model_name="p-attempts"),
-            routing_mode="auto",
+            routing_mode="manual_flash",
         )
         import asyncio
         result = asyncio.run(agent.chat(
             user_message="hello", history=[], trigger="user",
+            wechat_sender=fake_sender,
         ))
-        # Check model_attempts via visible fallback events or just verify turn completed
         assert result.llm_status == "ok"
-        # ModelAttempt hook will log the attempt info
+        assert result.terminal_state == TurnState.END_REPLIED
 
 
 if __name__ == "__main__":

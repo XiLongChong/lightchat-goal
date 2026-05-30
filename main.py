@@ -389,12 +389,11 @@ def build_system_prompt_for_turn() -> str:
     personality = _read_personality()
     default_city = cfg.get("weather", {}).get("default_city", "")
     tool_names = cfg.get("model", {}).get("native_tool_calls", {}).get(
-        "allowed_tools", ["get_time", "get_weather", "send_wechat_messages"]
+        "allowed_tools", ["get_time", "get_weather", "wechat_reply", "done"]
     )
     return build_chat_system_prompt(
         persona=persona,
         personality=personality,
-        default_city=default_city,
         tool_names=tool_names,
     )
 
@@ -1561,26 +1560,60 @@ async def _write_model_history(
 ) -> None:
     """Write model-visible history according to terminal state.
 
-    v1.2 §15.1 history matrix:
-    - END_SENT / END_PARTIAL_SENT → user + SENT_CONFIRMED assistant
-    - END_FALLBACK_SENT → user, assistant:fallback if text exists
-    - END_SKIPPED / END_FAILED / END_CANCELLED → user only (no assistant)
+    v1.5 history matrix:
+    - END_REPLIED → user + all sent messages (completed)
+    - END_NO_REPLY → user only (no_reply)
+    - END_FAILED (sent_count>0) → user + sent messages (failed_after_partial_reply)
+    - END_FAILED (sent_count==0) → user only
+    - END_FALLBACK_SENT → user + fallback text (fallback)
+    - END_SUPERSEDED_BEFORE_SEND → user only (don't write unsent messages)
+    - END_INTERRUPTED_DURING_REPLY_SEQUENCE → user + sent messages (interrupted_by_user)
+    - END_MAX_LIMIT → user + sent messages (max_limit_reached)
+    - END_PROTOCOL_ERROR → user + sent messages if any (protocol_error)
+    - END_CANCELLED → user only
     """
     await append_history_async(user_id, "user", user_message, source="wechat", bot_id=bot_id)
 
-    if result.was_sent:
-        delivered_texts = [
-            m["text"] for m in result.visible_messages
-            if (m.get("send_status") in _IS_DELIVERED
-                or m.get("delivery_status") in _IS_DELIVERED)
-            and m.get("text")
-        ]
+    delivered_texts = [
+        m["text"] for m in result.visible_messages
+        if (m.get("send_status") in _IS_DELIVERED
+            or m.get("delivery_status") in _IS_DELIVERED)
+        and m.get("text")
+    ]
+
+    state = result.terminal_state
+
+    if state == TurnState.END_REPLIED:
         if delivered_texts:
             await append_history_async(
                 user_id, "assistant", "\n".join(delivered_texts),
                 source="assistant", bot_id=bot_id,
             )
-    elif result.was_fallback:
+    elif state == TurnState.END_FAILED and result.sent_message_count > 0:
+        if delivered_texts:
+            await append_history_async(
+                user_id, "assistant", "\n".join(delivered_texts),
+                source="assistant:failed_after_partial_reply", bot_id=bot_id,
+            )
+    elif state == TurnState.END_INTERRUPTED_DURING_REPLY_SEQUENCE:
+        if delivered_texts:
+            await append_history_async(
+                user_id, "assistant", "\n".join(delivered_texts),
+                source="assistant:interrupted", bot_id=bot_id,
+            )
+    elif state == TurnState.END_MAX_LIMIT:
+        if delivered_texts:
+            await append_history_async(
+                user_id, "assistant", "\n".join(delivered_texts),
+                source="assistant:max_limit", bot_id=bot_id,
+            )
+    elif state == TurnState.END_PROTOCOL_ERROR:
+        if delivered_texts:
+            await append_history_async(
+                user_id, "assistant", "\n".join(delivered_texts),
+                source="assistant:protocol_error", bot_id=bot_id,
+            )
+    elif state == TurnState.END_FALLBACK_SENT:
         if result.visible_messages:
             fallback_texts = [
                 m["text"] for m in result.visible_messages if m.get("text")
@@ -1590,7 +1623,8 @@ async def _write_model_history(
                     user_id, "assistant", "\n".join(fallback_texts),
                     source="assistant:fallback", bot_id=bot_id,
                 )
-    # END_SKIPPED / END_FAILED / END_CANCELLED: no assistant history
+    # END_NO_REPLY, END_SUPERSEDED_BEFORE_SEND, END_CANCELLED, END_FAILED(sent_count==0):
+    # no assistant history
 
 
 # ================================================================
@@ -1782,30 +1816,52 @@ def _build_chatagent_write_model_history(
     """Return a PostTerminalCallback that writes model history from TurnScratchpad."""
     async def _cb(turn: TurnScratchpad, terminal_state: TurnState) -> None:
         visible = _visible_messages_as_dicts(turn)
-        # Build minimal TurnResult-like wrapper
-        was_sent = terminal_state in (TurnState.END_SENT, TurnState.END_PARTIAL_SENT)
-        was_fallback = terminal_state == TurnState.END_FALLBACK_SENT
+        delivered_texts = [
+            m["text"] for m in visible
+            if (m.get("send_status") in _IS_DELIVERED
+                or m.get("delivery_status") in _IS_DELIVERED)
+            and m.get("text")
+        ]
 
         await append_history_async(
             user_id, "user", turn.user_message, source="wechat", bot_id=bot_id,
         )
-        if was_sent:
-            delivered_texts = [
-                m["text"] for m in visible
-                if (m.get("send_status") in _IS_DELIVERED
-                    or m.get("delivery_status") in _IS_DELIVERED)
-                and m.get("text")
-            ]
-            if delivered_texts:
+
+        if terminal_state == TurnState.END_REPLIED:
+            for text in delivered_texts:
                 await append_history_async(
-                    user_id, "assistant", "\n".join(delivered_texts),
+                    user_id, "assistant", text,
                     source="assistant", bot_id=bot_id,
                 )
-        elif was_fallback:
-            fallback_texts = [m["text"] for m in visible if m.get("text")]
-            if fallback_texts:
+        elif terminal_state == TurnState.END_FAILED and turn.sent_message_count > 0:
+            for text in delivered_texts:
                 await append_history_async(
-                    user_id, "assistant", "\n".join(fallback_texts),
+                    user_id, "assistant", text,
+                    source="assistant:failed_after_partial_reply", bot_id=bot_id,
+                )
+        elif terminal_state == TurnState.END_INTERRUPTED_DURING_REPLY_SEQUENCE:
+            for text in delivered_texts:
+                await append_history_async(
+                    user_id, "assistant", text,
+                    source="assistant:interrupted", bot_id=bot_id,
+                )
+        elif terminal_state == TurnState.END_MAX_LIMIT:
+            for text in delivered_texts:
+                await append_history_async(
+                    user_id, "assistant", text,
+                    source="assistant:max_limit", bot_id=bot_id,
+                )
+        elif terminal_state == TurnState.END_PROTOCOL_ERROR:
+            for text in delivered_texts:
+                await append_history_async(
+                    user_id, "assistant", text,
+                    source="assistant:protocol_error", bot_id=bot_id,
+                )
+        elif terminal_state == TurnState.END_FALLBACK_SENT:
+            fallback_texts = [m["text"] for m in visible if m.get("text")]
+            for text in fallback_texts:
+                await append_history_async(
+                    user_id, "assistant", text,
                     source="assistant:fallback", bot_id=bot_id,
                 )
     return _cb
@@ -1856,14 +1912,17 @@ def _build_chatagent_post_turn_hooks(
         ) if turn.fallback_events else ""
         token_count = turn.token_usage.get("total_tokens", 0)
 
-        # Compute send_status from terminal_state (v1.2: inside hook, not injected)
+        # Compute send_status from terminal_state (v1.5)
         _ss_map = {
-            TurnState.END_SENT: "delivered",
-            TurnState.END_PARTIAL_SENT: "delivered",
-            TurnState.END_SKIPPED: "skipped",
+            TurnState.END_REPLIED: "delivered",
+            TurnState.END_NO_REPLY: "skipped",
             TurnState.END_FALLBACK_SENT: "fallback_sent",
             TurnState.END_FAILED: "failed",
             TurnState.END_CANCELLED: "cancelled",
+            TurnState.END_SUPERSEDED_BEFORE_SEND: "superseded_before_send",
+            TurnState.END_INTERRUPTED_DURING_REPLY_SEQUENCE: "interrupted_during_reply",
+            TurnState.END_MAX_LIMIT: "max_limit",
+            TurnState.END_PROTOCOL_ERROR: "protocol_error",
         }
         send_status = _ss_map.get(terminal_state, "generated")
 
@@ -1906,17 +1965,20 @@ def _build_chatagent_post_turn_hooks(
                 "terminal_state": str(terminal_state),
             },
         )
-        # Mark draft / outbound status
-        was_sent = terminal_state in (TurnState.END_SENT, TurnState.END_PARTIAL_SENT)
+        # Mark draft / outbound status (v1.5)
+        was_replied = terminal_state == TurnState.END_REPLIED
         was_fallback = terminal_state == TurnState.END_FALLBACK_SENT
-        was_skipped = terminal_state == TurnState.END_SKIPPED
+        was_skipped = terminal_state == TurnState.END_NO_REPLY
         was_cancelled = terminal_state == TurnState.END_CANCELLED
-        was_failed = terminal_state == TurnState.END_FAILED
+        was_failed = terminal_state in (TurnState.END_FAILED, TurnState.END_PROTOCOL_ERROR, TurnState.END_MAX_LIMIT)
+        was_interrupted = terminal_state in (TurnState.END_SUPERSEDED_BEFORE_SEND, TurnState.END_INTERRUPTED_DURING_REPLY_SEQUENCE)
         if was_skipped:
             await memory_store.mark_turn_draft_status(turn.turn_id, "skipped")
         elif was_cancelled:
             await memory_store.mark_turn_draft_status(turn.turn_id, "cancelled")
-        elif was_sent or was_fallback:
+        elif was_interrupted:
+            await memory_store.mark_turn_draft_status(turn.turn_id, "interrupted")
+        elif was_replied or was_fallback:
             await memory_store.mark_turn_draft_status(turn.turn_id, "delivered")
             await memory_store.mark_outbound_batch_status(turn.turn_id, "delivered")
         elif was_failed:
@@ -2110,18 +2172,26 @@ async def chat(request: Request):
 
             turn_id = result.turn_id
 
-            # ── Determine send_status from terminal_state ─────────
+            # ── Determine send_status from terminal_state (v1.5) ──
             match result.terminal_state:
-                case TurnState.END_SENT | TurnState.END_PARTIAL_SENT:
+                case TurnState.END_REPLIED:
                     send_status = "delivered"
-                case TurnState.END_SKIPPED:
+                case TurnState.END_NO_REPLY:
                     send_status = "skipped"
                 case TurnState.END_FALLBACK_SENT:
                     send_status = "fallback_sent"
                 case TurnState.END_FAILED:
-                    send_status = "failed"
+                    send_status = "failed" if result.sent_message_count == 0 else "failed_after_partial_reply"
                 case TurnState.END_CANCELLED:
                     send_status = "cancelled"
+                case TurnState.END_SUPERSEDED_BEFORE_SEND:
+                    send_status = "superseded_before_send"
+                case TurnState.END_INTERRUPTED_DURING_REPLY_SEQUENCE:
+                    send_status = "interrupted_during_reply"
+                case TurnState.END_MAX_LIMIT:
+                    send_status = "max_limit"
+                case TurnState.END_PROTOCOL_ERROR:
+                    send_status = "protocol_error"
                 case _:
                     send_status = "generated"
 
