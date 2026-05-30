@@ -26,6 +26,24 @@ model:
       - get_weather
       - send_wechat_messages
       - skip_reply
+
+  # ── v1.3: Model routing ──────────────────────────────
+  routing_mode: auto                      # auto | manual_flash | manual_pro
+  max_flash_upgrade_attempts: 1           # flash → pro 最大升级次数
+  manual_flash_allow_upgrade: false       # manual_flash 下是否允许升级 pro
+
+  flash_profile:
+    model_name: deepseek-v4-flash
+    temperature: 0.8
+    max_tokens: 800
+    timeout_seconds: 20
+
+  pro_profile:
+    model_name: deepseek-v4-pro
+    temperature: 0.7
+    max_tokens: 1200
+    timeout_seconds: 40
+
   streaming:
     chat_agent: false                     # Phase 1: start with non-streaming
 

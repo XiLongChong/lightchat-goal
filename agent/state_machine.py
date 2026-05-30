@@ -57,6 +57,10 @@ class TurnState(StrEnum):
     # --- skip path ---
     EXEC_SKIP_REPLY = "exec_skip_reply"
 
+    # ── v1.3: model routing ──
+    FLASH_TO_PRO_UPGRADE = "flash_to_pro_upgrade"
+    ROUTE_RETRY_MODEL = "route_retry_model"
+
     # --- fallback ---
     HARD_FALLBACK = "hard_fallback"
 
@@ -119,6 +123,39 @@ class VisibleMessage:
 
 
 # ================================================================
+# v1.3: Model profile — per-model params (shared provider)
+# ================================================================
+
+@dataclass(slots=True)
+class ModelProfile:
+    """v1.3: flash 或 pro 的模型级参数。不含 provider/api_key/base_url。"""
+    model_name: str = "deepseek-v4-flash"
+    temperature: float = 0.7
+    max_tokens: int = 800
+    timeout_seconds: float = 20.0
+
+
+# ================================================================
+# v1.3: Model attempt log — one per CALL_LLM
+# ================================================================
+
+@dataclass(slots=True)
+class ModelAttempt:
+    """v1.3 §9: 一次模型调用尝试记录。"""
+    attempt_index: int = 0
+    selected_model: str = ""         # "flash" | "pro"
+    routing_mode: str = ""           # "auto" | "manual_flash" | "manual_pro"
+    routing_reason: str = ""         # "daily_chat" | "flash_failed" | ...
+    model_name: str = ""             # 实际传给 API 的模型名
+    started_at: float = 0.0
+    finished_at: float = 0.0
+    latency_ms: int = 0
+    result_type: str = ""            # "success" | "llm_error" | "protocol_violation"
+    error_type: str = ""             # "timeout" | "empty_response" | ...
+    upgraded_from: str = ""          # "flash"（如果是从 flash 升级来的）
+
+
+# ================================================================
 # ContextBuildResult — internal to _do_build_context (v1.2 §6)
 # ================================================================
 
@@ -164,6 +201,15 @@ class TurnScratchpad:
 
     # Tool results (diagnostic only)
     tool_results: list[dict[str, Any]] = field(default_factory=list)
+
+    # ── v1.3: Model routing ────────────────────────────────────
+    model_attempts: list["ModelAttempt"] = field(default_factory=list)
+    _current_attempt: "ModelAttempt | None" = field(default=None, repr=False)
+    _force_model_label: str = ""          # 强制下一次选模，消费后清空
+    _force_model_upgraded_from: str = ""  # 升级来源，消费后清空
+    max_flash_upgrade_attempts: int = 1
+    flash_upgrade_count: int = 0
+    route: str = ""                       # ChatLite / ChatFull / SystemFastPath
 
     # ── v1.2: Send path — VisibleMessage tracking ─────────────
     visible_messages: list[VisibleMessage] = field(default_factory=list)

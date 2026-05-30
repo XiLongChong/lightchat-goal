@@ -43,7 +43,7 @@ from agent.context_builder import compact_history, build_chat_system_prompt
 from agent.llm_gateway import LLMGateway
 from agent.llm_types import LLMRequest
 from agent.output_guard import guard_messages, guard_single_message
-from agent.state_machine import TurnResult, TurnScratchpad, TurnState
+from agent.state_machine import ModelProfile, TurnResult, TurnScratchpad, TurnState
 from agent.tools import configure_runtime, configure_tools, execute_tool, compute_message_delay
 from bridge.wechat_poller import WeChatBridge, login_qr
 from memory.store import MemoryStore
@@ -312,10 +312,29 @@ _feature_on = lambda name: (
     (cfg.get("features") or {}).get(name, False) is True
 )
 
+# ── v1.3: Model routing profiles ────────────────────────────────
+_flash_cfg = cfg.get("model", {}).get("flash_profile", {})
+_pro_cfg = cfg.get("model", {}).get("pro_profile", {})
+flash_profile = ModelProfile(
+    model_name=_flash_cfg.get("model_name", "deepseek-v4-flash"),
+    temperature=float(_flash_cfg.get("temperature", 0.8) or 0.8),
+    max_tokens=int(_flash_cfg.get("max_tokens", 800) or 800),
+    timeout_seconds=float(_flash_cfg.get("timeout_seconds", 20) or 20),
+)
+pro_profile = ModelProfile(
+    model_name=_pro_cfg.get("model_name", "deepseek-v4-pro"),
+    temperature=float(_pro_cfg.get("temperature", 0.7) or 0.7),
+    max_tokens=int(_pro_cfg.get("max_tokens", 1200) or 1200),
+    timeout_seconds=float(_pro_cfg.get("timeout_seconds", 40) or 40),
+)
+_routing_mode = cfg.get("model", {}).get("routing_mode", "auto")
+_manual_upgrade = cfg.get("model", {}).get("manual_flash_allow_upgrade", False)
+_max_upgrade = int(cfg.get("model", {}).get("max_flash_upgrade_attempts", 1) or 1)
+
 chat_agent = ChatAgent(
     model=model_name,
-    persona=_read_persona(),           # persona.md file content
-    personality=_read_personality(),    # cfg personality extension (usually empty)
+    persona=_read_persona(),
+    personality=_read_personality(),
     temperature=temperature,
     defaults={
         "default_city": cfg.get("weather", {}).get(
@@ -326,8 +345,14 @@ chat_agent = ChatAgent(
     llm_gateway=llm_gateway,
     native_tool_calls=cfg.get("model", {}).get("native_tool_calls", {}).get("chat_agent", True),
     native_allowed_tools=cfg.get("model", {}).get("native_tool_calls", {}).get("allowed_tools", []),
-    json_output_enabled=False,  # Phase 1: JSON actions disabled
+    json_output_enabled=False,
     test_mode=cfg.get("wechat", {}).get("send_delay", {}).get("test_mode_zero_delay", False),
+    # ── v1.3 model routing ──
+    flash_profile=flash_profile,
+    pro_profile=pro_profile,
+    routing_mode=_routing_mode,
+    manual_flash_allow_upgrade=_manual_upgrade,
+    max_flash_upgrade_attempts=_max_upgrade,
 )
 
 # v0.2 Phase 5: Memory hook — wires MemoryStore + MemoryWorker into
@@ -1909,12 +1934,30 @@ def _build_chatagent_post_turn_hooks(
     async def _hook_quality(turn: TurnScratchpad, terminal_state: TurnState) -> None:
         pass  # placeholder
 
+    async def _hook_model_attempt_log(turn: TurnScratchpad, terminal_state: TurnState) -> None:
+        """v1.3 WRITE_MODEL_ATTEMPT_LOG: log all model attempts for this turn."""
+        for attempt in turn.model_attempts:
+            logger.info(
+                "model_attempt: index=%d model=%s/%s mode=%s reason=%s "
+                "latency=%dms result=%s error=%s upgraded_from=%s",
+                attempt.attempt_index,
+                attempt.selected_model,
+                attempt.model_name,
+                attempt.routing_mode,
+                attempt.routing_reason,
+                attempt.latency_ms,
+                attempt.result_type,
+                attempt.error_type,
+                attempt.upgraded_from,
+            )
+
     return [
         _hook_summary,
         _hook_memory,
         _hook_emotion,
         _hook_dev_logs,
         _hook_quality,
+        _hook_model_attempt_log,
     ]
 
 

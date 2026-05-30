@@ -21,6 +21,8 @@ from agent.state_machine import (
     DeliveryStatus,
     ErrorClass,
     InterruptChecker,
+    ModelAttempt,
+    ModelProfile,
     PostTerminalCallback,
     TurnResult,
     TurnScratchpad,
@@ -68,12 +70,18 @@ class ChatAgent:
         native_allowed_tools: list[str] | None = None,
         json_output_enabled: bool = False,
         test_mode: bool = False,
+        # ── v1.3: model routing ──────────────────────────────────
+        flash_profile: ModelProfile | None = None,
+        pro_profile: ModelProfile | None = None,
+        routing_mode: str = "auto",
+        manual_flash_allow_upgrade: bool = False,
+        max_flash_upgrade_attempts: int = 1,
         # ── v1.2: post-terminal callbacks injected by main.py ─────
         write_model_history: PostTerminalCallback | None = None,
         post_turn_hooks: list[PostTerminalCallback] | None = None,
     ):
         self.llm_gateway = llm_gateway
-        self.model = model
+        self.model = model          # legacy default (kept for backward compat)
         self.persona = persona
         self.personality = personality
         self.temperature = temperature
@@ -84,7 +92,15 @@ class ChatAgent:
         self.test_mode = test_mode
         self._last_call_time = 0.0
         self._interrupt_checker: InterruptChecker | None = None
-        # v1.2: post-terminal pipeline callbacks
+
+        # ── v1.3: model routing ──────────────────────────────────
+        self._flash_profile = flash_profile or ModelProfile()
+        self._pro_profile = pro_profile or ModelProfile(model_name="deepseek-v4-pro", max_tokens=1200, timeout_seconds=40)
+        self._routing_mode = routing_mode
+        self._manual_flash_allow_upgrade = manual_flash_allow_upgrade
+        self._max_flash_upgrade_attempts = max_flash_upgrade_attempts
+
+        # ── v1.2: post-terminal pipeline callbacks ───────────────
         self._write_model_history: PostTerminalCallback | None = write_model_history
         self._post_turn_hooks: list[PostTerminalCallback] = list(post_turn_hooks or [])
 
@@ -161,6 +177,8 @@ class ChatAgent:
             input_first_seq=input_first_seq,
             input_latest_seq=input_latest_seq,
             input_cutoff_time=input_cutoff_time,
+            route=route,
+            max_flash_upgrade_attempts=self._max_flash_upgrade_attempts,
         )
         state = TurnState.RECEIVE_EVENT
 
@@ -288,7 +306,7 @@ class ChatAgent:
             return self._do_classify_tool_error(turn)
 
         elif state == TurnState.PROTOCOL_RETRY:
-            return self._do_protocol_retry(turn)
+            return self._do_route_retry_model(turn)
 
         elif state == TurnState.TERMINAL_ACTION_BRANCH:
             return self._do_terminal_action_branch(turn)
@@ -310,6 +328,12 @@ class ChatAgent:
 
         elif state == TurnState.EXEC_SKIP_REPLY:
             return self._do_exec_skip_reply(turn)
+
+        elif state == TurnState.FLASH_TO_PRO_UPGRADE:
+            return self._do_flash_to_pro_upgrade(turn)
+
+        elif state == TurnState.ROUTE_RETRY_MODEL:
+            return self._do_route_retry_model(turn)
 
         elif state == TurnState.HARD_FALLBACK:
             return await self._do_hard_fallback(turn, wechat_sender)
@@ -573,11 +597,63 @@ class ChatAgent:
         turn._context_result = result  # transient, consumed by CLASSIFY_CONTEXT_ERROR
         return TurnState.CLASSIFY_CONTEXT_ERROR
 
+    # ================================================================
+    # v1.3: Model router
+    # ================================================================
+
+    def _select_model(self, turn: TurnScratchpad) -> tuple[str, str, "ModelProfile"]:
+        """Return (model_label, routing_reason, profile).
+
+        Priority: _force_model_label > manual override > auto rules.
+        """
+        # ── 0. 强制选择（FLASH_TO_PRO_UPGRADE 设置）──────────────
+        if turn._force_model_label:
+            label = turn._force_model_label
+            turn._force_model_label = ""
+            reason = "flash_upgraded_to_pro" if label == "pro" else f"force_{label}"
+            profile = self._pro_profile if label == "pro" else self._flash_profile
+            return (label, reason, profile)
+
+        # ── 1. 手动模式 ──────────────────────────────────────────
+        if self._routing_mode == "manual_flash":
+            return ("flash", "manual_flash", self._flash_profile)
+        if self._routing_mode == "manual_pro":
+            return ("pro", "manual_pro", self._pro_profile)
+
+        # ── 2. auto 模式 ─────────────────────────────────────────
+        last = turn.model_attempts[-1] if turn.model_attempts else None
+        if last and last.selected_model == "flash" and last.result_type in (
+            "protocol_violation", "llm_error",
+        ):
+            return ("pro", "flash_failed", self._pro_profile)
+
+        if turn.route == "ChatFull":
+            return ("pro", "complex_chat", self._pro_profile)
+
+        return ("flash", "daily_chat", self._flash_profile)
+
     async def _do_call_llm(self, turn: TurnScratchpad) -> TurnState:
         """CALL_LLM: invoke the LLM via gateway."""
         from agent.llm_types import LLMRequest
 
         turn.llm_call_count += 1
+
+        # ── v1.3: Model routing ──────────────────────────────────
+        model_label, routing_reason, profile = self._select_model(turn)
+        is_upgrade = bool(turn._force_model_upgraded_from)
+
+        attempt = ModelAttempt(
+            attempt_index=len(turn.model_attempts) + 1,
+            selected_model=model_label,
+            routing_mode=self._routing_mode,
+            routing_reason=routing_reason,
+            model_name=profile.model_name,
+            started_at=time.time(),
+        )
+        if is_upgrade:
+            attempt.upgraded_from = turn._force_model_upgraded_from
+            turn._force_model_upgraded_from = ""
+        turn._current_attempt = attempt
 
         request_tools = None
         if self.native_tool_calls and self.native_allowed_tools:
@@ -590,46 +666,73 @@ class ChatAgent:
                 )
 
         tool_choice = "required" if request_tools else None
-        # v1.2 diagnostic: log last 3 message roles (no content — privacy)
         _last_roles = [m.get("role", "?") for m in turn.messages[-3:]]
 
+        # v1.3: upgrade attempts → no gateway-level retry (state machine controls it)
+        _retry = 0 if is_upgrade else None  # None → gateway uses its default
+
         logger.info(
-            "call_llm: iter=%d model=%s tools_count=%d tool_names=%s "
-            "tool_choice=%s last_roles=%s",
+            "call_llm: iter=%d model=%s label=%s reason=%s "
+            "tools_count=%d tool_names=%s tool_choice=%s last_roles=%s "
+            "upgraded=%s retry=%s",
             turn.llm_call_count,
-            self.model,
+            profile.model_name,
+            model_label,
+            routing_reason,
             len(request_tools) if request_tools else 0,
             ",".join(_tool_names) if request_tools else "",
             tool_choice,
             _last_roles,
+            attempt.upgraded_from or "none",
+            _retry if _retry is not None else "default",
         )
 
         try:
             response = await self.llm_gateway.complete(
                 LLMRequest(
                     purpose="chat_turn",
-                    model=self.model,
+                    model=profile.model_name,
                     messages=turn.messages,
-                    temperature=self.temperature,
-                    max_tokens=2048,
+                    temperature=profile.temperature,
+                    max_tokens=profile.max_tokens,
+                    timeout_s=profile.timeout_seconds,
                     response_mode="text",
                     thinking="disabled",
                     tools=request_tools,
                     tool_choice=tool_choice,
+                    retry=_retry,
                     metadata={
                         "turn_id": turn.turn_id,
                         "iteration": turn.iteration,
+                        "model_label": model_label,
                     },
                 )
             )
+            attempt.finished_at = time.time()
+            attempt.latency_ms = int((attempt.finished_at - attempt.started_at) * 1000)
+            attempt.result_type = "success"
             _merge_llm_usage(turn.token_usage, getattr(response, "usage", None))
             turn._llm_response = response
+            turn.model_attempts.append(attempt)
             return TurnState.HANDLE_MODEL_OUTPUT
 
         except Exception as e:
-            logger.error("LLM call failed: %s", e)
+            attempt.finished_at = time.time()
+            attempt.latency_ms = int((attempt.finished_at - attempt.started_at) * 1000)
+            attempt.result_type = "llm_error"
+            attempt.error_type = type(e).__name__
+            turn.model_attempts.append(attempt)
+            logger.error("LLM call failed: %s model=%s", e, profile.model_name)
             turn.llm_status = "error"
             turn.add_fallback_event("llm_error", str(e)[:200])
+
+            # v1.3: flash error → try upgrade; pro error → HARD_FALLBACK
+            if model_label == "flash" and (
+                self._routing_mode == "auto"
+                or (self._routing_mode == "manual_flash" and self._manual_flash_allow_upgrade)
+            ):
+                if turn.flash_upgrade_count < turn.max_flash_upgrade_attempts:
+                    return TurnState.FLASH_TO_PRO_UPGRADE
             return TurnState.HARD_FALLBACK
 
     def _do_handle_model_output(self, turn: TurnScratchpad) -> TurnState:
@@ -707,6 +810,11 @@ class ChatAgent:
                 "empty_response",
                 "no tool calls and no assistant content",
             )
+
+        # v1.3: mark current attempt as protocol violation
+        if turn._current_attempt:
+            turn._current_attempt.result_type = "protocol_violation"
+            turn._current_attempt.error_type = violation
 
         logger.info(
             "handle_model_output: violation_reason=%s iter=%d",
@@ -840,12 +948,16 @@ class ChatAgent:
         turn._resume_state = TurnState.CLASSIFY_TOOL_ERROR
         return TurnState.INTERRUPT_CHECK
 
-    def _do_protocol_retry(self, turn: TurnScratchpad) -> TurnState:
-        """PROTOCOL_RETRY: model didn't follow protocol.
+    # ================================================================
+    # v1.3: Model routing handlers
+    # ================================================================
 
-        Injects a system reminder and goes back to CALL_LLM.
-        Does NOT feed assistant.content back to the model.
-        If retry limit exceeded, goes to HARD_FALLBACK.
+    def _do_route_retry_model(self, turn: TurnScratchpad) -> TurnState:
+        """ROUTE_RETRY_MODEL: inject protocol retry note, then decide model.
+
+        v1.3: same retry note injection as v1.2 _do_protocol_retry.
+        After injection, decides: flash → FLASH_TO_PRO_UPGRADE,
+        pro → same-model retry → CALL_LLM, exceeded → HARD_FALLBACK.
         """
         turn.protocol_retry_count += 1
 
@@ -861,14 +973,47 @@ class ChatAgent:
             f"attempt {turn.protocol_retry_count}/{turn.max_protocol_retries}",
         )
         logger.info(
-            "state_machine: protocol_retry attempt=%d/%d",
+            "route_retry_model: protocol_retry_count=%d/%d",
             turn.protocol_retry_count, turn.max_protocol_retries,
         )
 
-        # Inject system reminder — minimal, tool_choice=required enforces this
+        # Inject retry note (same as v1.2)
         retry_note = "必须调用 send_wechat_messages 或 skip_reply 结束本轮。"
         turn.messages.append({"role": "system", "content": retry_note})
 
+        # Decide model for retry
+        last = turn.model_attempts[-1] if turn.model_attempts else None
+        if last and last.selected_model == "flash":
+            if self._routing_mode == "manual_flash" and not self._manual_flash_allow_upgrade:
+                logger.info("route_retry_model: manual_flash no upgrade → same-model retry")
+                return TurnState.CALL_LLM
+            return TurnState.FLASH_TO_PRO_UPGRADE
+
+        # pro → same-model retry (already enforced by protocol_retry_count check above)
+        return TurnState.CALL_LLM
+
+    def _do_flash_to_pro_upgrade(self, turn: TurnScratchpad) -> TurnState:
+        """FLASH_TO_PRO_UPGRADE: upgrade flash → pro.
+
+        v1.3: sets _force_model_label and _force_model_upgraded_from
+        so the next CALL_LLM uses pro with retry=0.
+        Budget check against max_flash_upgrade_attempts.
+        """
+        if turn.flash_upgrade_count >= turn.max_flash_upgrade_attempts:
+            turn.add_fallback_event(
+                "flash_upgrade_exceeded",
+                f"exceeded max flash upgrades ({turn.max_flash_upgrade_attempts})",
+            )
+            return TurnState.HARD_FALLBACK
+
+        turn.flash_upgrade_count += 1
+        turn._force_model_label = "pro"
+        turn._force_model_upgraded_from = "flash"
+
+        logger.info(
+            "flash_to_pro_upgrade: count=%d/%d upgrading to pro",
+            turn.flash_upgrade_count, turn.max_flash_upgrade_attempts,
+        )
         return TurnState.CALL_LLM
 
     def _do_terminal_action_branch(self, turn: TurnScratchpad) -> TurnState:
