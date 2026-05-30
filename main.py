@@ -1526,6 +1526,219 @@ async def admin_send_message(request: Request):
     return {"status": "sent", "count": len(messages)}
 
 
+# ================================================================
+# v1.2 Phase 5A: Extracted model-history writer
+# ================================================================
+
+_IS_DELIVERED = {"delivered", "sent_confirmed"}
+
+
+async def _write_model_history(
+    result: TurnResult,
+    user_id: str,
+    bot_id: str,
+    user_message: str,
+) -> None:
+    """Write model-visible history according to terminal state.
+
+    v1.2 §15.1 history matrix:
+    - END_SENT / END_PARTIAL_SENT → user + SENT_CONFIRMED assistant
+    - END_FALLBACK_SENT → user, assistant:fallback if text exists
+    - END_SKIPPED / END_FAILED / END_CANCELLED → user only (no assistant)
+    """
+    await append_history_async(user_id, "user", user_message, source="wechat", bot_id=bot_id)
+
+    if result.was_sent:
+        delivered_texts = [
+            m["text"] for m in result.visible_messages
+            if (m.get("send_status") in _IS_DELIVERED
+                or m.get("delivery_status") in _IS_DELIVERED)
+            and m.get("text")
+        ]
+        if delivered_texts:
+            await append_history_async(
+                user_id, "assistant", "\n".join(delivered_texts),
+                source="assistant", bot_id=bot_id,
+            )
+    elif result.was_fallback:
+        if result.visible_messages:
+            fallback_texts = [
+                m["text"] for m in result.visible_messages if m.get("text")
+            ]
+            if fallback_texts:
+                await append_history_async(
+                    user_id, "assistant", "\n".join(fallback_texts),
+                    source="assistant:fallback", bot_id=bot_id,
+                )
+    # END_SKIPPED / END_FAILED / END_CANCELLED: no assistant history
+
+
+# ================================================================
+# v1.2 Phase 5B: Extracted post-turn hooks
+# ================================================================
+
+async def _hook_update_summary(
+    result: TurnResult,
+    user_id: str,
+    bot_id: str,
+    **__: Any,
+) -> None:
+    """UPDATE_SUMMARY — placeholder. Summary is handled by separate recap trigger."""
+    pass
+
+
+async def _hook_update_memory(
+    result: TurnResult,
+    user_id: str,
+    user_message: str,
+    memory_hook: Any,
+    **__: Any,
+) -> None:
+    """UPDATE_MEMORY — fire-and-forget memory extraction."""
+    if not memory_hook:
+        return
+    assistant_text = "\n".join(
+        m["text"] for m in result.visible_messages
+        if m.get("text")
+        and (m.get("send_status") in _IS_DELIVERED
+             or m.get("delivery_status") in _IS_DELIVERED)
+    )
+    if assistant_text:
+        await memory_hook.update(
+            user_message=user_message,
+            assistant_text=assistant_text,
+            user_id=user_id,
+        )
+
+
+async def _hook_update_emotion(
+    result: TurnResult,
+    **__: Any,
+) -> None:
+    """UPDATE_EMOTION — placeholder for future emotion engine."""
+    pass
+
+
+async def _hook_write_dev_logs(
+    result: TurnResult,
+    turn_id: str,
+    user_id: str,
+    bot_id: str,
+    route: str,
+    context_policy: str,
+    user_message: str,
+    raw_messages: list[str],
+    send_status: str,
+    memory_store: Any,
+    **__: Any,
+) -> None:
+    """WRITE_DEV_LOGS — turn diagnostics, usage events, draft/outbound status."""
+    diag_fallback = ",".join(
+        e.get("type", "") for e in (result.fallback_events or [])[:3]
+    ) if result.fallback_events else ""
+    token_count = result.token_usage.get("total_tokens", 0) if result.token_usage else 0
+
+    await memory_store.record_turn_diagnostics(
+        turn_id=turn_id,
+        user_id=user_id,
+        source="wechat",
+        route=route,
+        context_policy=context_policy,
+        llm_status=result.llm_status,
+        token_count=token_count,
+        elapsed_ms=result.elapsed_ms,
+        fallback_type=diag_fallback,
+        send_status=send_status,
+        memory_enqueued=0,
+        input_chars=len(user_message),
+        output_messages=result.delivered_count,
+        tool_calls=len(result.tool_results),
+        metadata={
+            "terminal_state": str(result.terminal_state),
+            "context_sample": result.context_sample,
+        },
+    )
+
+    await memory_store.record_usage_event(
+        event_type="chat_turn",
+        user_id=user_id,
+        source="wechat",
+        message_count=len(raw_messages) + result.delivered_count,
+        token_count=token_count,
+        elapsed_ms=result.elapsed_ms,
+        fallback_type=diag_fallback,
+        metadata={
+            "input_chars": len(user_message),
+            "output_messages": result.delivered_count,
+            "tool_calls": len(result.tool_results),
+            "token_estimated": bool(
+                (result.token_usage or {}).get("estimated")
+            ),
+            "turn_id": turn_id,
+            "route": route,
+            "context_policy": context_policy,
+            "terminal_state": str(result.terminal_state),
+        },
+    )
+
+    # Mark draft / outbound status
+    if result.was_skipped:
+        await memory_store.mark_turn_draft_status(turn_id, "skipped")
+    elif result.was_cancelled:
+        await memory_store.mark_turn_draft_status(turn_id, "cancelled")
+    elif result.was_sent or result.was_fallback:
+        await memory_store.mark_turn_draft_status(turn_id, "delivered")
+        await memory_store.mark_outbound_batch_status(turn_id, "delivered")
+    elif result.was_failed:
+        await memory_store.mark_turn_draft_status(turn_id, "failed")
+    else:
+        await memory_store.mark_turn_draft_status(turn_id, "generated")
+
+    await memory_store.update_turn_send_status(turn_id, send_status)
+
+
+async def _hook_quality_metrics(
+    result: TurnResult,
+    **__: Any,
+) -> None:
+    """QUALITY_METRICS — placeholder for future quality tracking."""
+    pass
+
+
+async def _run_all_post_turn_hooks(
+    result: TurnResult,
+    turn_id: str,
+    user_id: str,
+    bot_id: str,
+    route: str,
+    context_policy: str,
+    user_message: str,
+    raw_messages: list[str],
+    send_status: str,
+    memory_hook: Any,
+    memory_store: Any,
+) -> None:
+    """Execute all post-turn hooks in order. Individual failures do not block others."""
+    hooks = [
+        ("UPDATE_SUMMARY", _hook_update_summary),
+        ("UPDATE_MEMORY", _hook_update_memory),
+        ("UPDATE_EMOTION", _hook_update_emotion),
+        ("WRITE_DEV_LOGS", _hook_write_dev_logs),
+        ("QUALITY_METRICS", _hook_quality_metrics),
+    ]
+    common = dict(
+        result=result, turn_id=turn_id, user_id=user_id, bot_id=bot_id,
+        route=route, context_policy=context_policy, user_message=user_message,
+        raw_messages=raw_messages, send_status=send_status,
+        memory_hook=memory_hook, memory_store=memory_store,
+    )
+    for name, hook in hooks:
+        try:
+            await hook(**common)
+        except Exception:
+            logger.exception("post_turn_hook %s failed", name)
+
+
 @app.post("/chat")
 async def chat(request: Request):
     """Phase 1 chat endpoint — native tool calls primary.
@@ -1698,103 +1911,22 @@ async def chat(request: Request):
 
             scheduled_task_ids: list[str] = []
 
-            # ── Write model history (v0.2: by terminal_state) ─────
-            await append_history_async(user_id, "user", user_message, source="wechat", bot_id=bot_id)
+            # ── v1.2 Phase 5A: Write model history ─────────────────
+            await _write_model_history(result, user_id, bot_id, user_message)
 
-            if result.was_sent:
-                # END_SENT / END_PARTIAL_SENT: write only confirmed deliveries
-                def _is_delivered(st: str) -> bool:
-                    return st in ("delivered", "sent_confirmed")
-
-                delivered_texts = [
-                    m["text"] for m in result.visible_messages
-                    if _is_delivered(m.get("send_status", "") or m.get("delivery_status", ""))
-                    and m.get("text")
-                ]
-                if delivered_texts:
-                    await append_history_async(
-                        user_id, "assistant", "\n".join(delivered_texts),
-                        source="assistant", bot_id=bot_id,
-                    )
-            elif result.was_fallback:
-                # END_FALLBACK_SENT: default no regular assistant history
-                # v1.2: if must write, mark as assistant:fallback via source
-                if result.visible_messages:
-                    fallback_texts = [
-                        m["text"] for m in result.visible_messages if m.get("text")
-                    ]
-                    if fallback_texts:
-                        await append_history_async(
-                            user_id, "assistant", "\n".join(fallback_texts),
-                            source="assistant:fallback", bot_id=bot_id,
-                        )
-            # END_SKIPPED / END_FAILED / END_CANCELLED: no assistant history written
-
-            # ── POST_TURN_HOOKS: memory extraction (fire-and-forget) ─
-            def _is_delivered(st: str) -> bool:
-                return st in ("delivered", "sent_confirmed")
-
-            assistant_text = "\n".join(
-                m["text"] for m in result.visible_messages
-                if m.get("text") and _is_delivered(
-                    m.get("send_status", "") or m.get("delivery_status", "")
-                )
-            )
-            if memory_hook and assistant_text:
-                await memory_hook.update(
-                    user_message=user_message,
-                    assistant_text=assistant_text,
-                    user_id=user_id,
-                )
-
-            # ── Record turn diagnostics ───────────────────────────
-            diag_fallback = ",".join(
-                e.get("type", "") for e in (result.fallback_events or [])[:3]
-            ) if result.fallback_events else ""
-            token_count = result.token_usage.get("total_tokens", 0) if result.token_usage else 0
-
-            await memory_store.record_turn_diagnostics(
+            # ── v1.2 Phase 5B: Post-turn hooks ─────────────────────
+            await _run_all_post_turn_hooks(
+                result=result,
                 turn_id=turn_id,
                 user_id=user_id,
-                source="wechat",
+                bot_id=bot_id,
                 route=route,
                 context_policy=context_policy,
-                llm_status=result.llm_status,
-                token_count=token_count,
-                elapsed_ms=result.elapsed_ms,
-                fallback_type=diag_fallback,
+                user_message=user_message,
+                raw_messages=raw_messages,
                 send_status=send_status,
-                memory_enqueued=0,  # Phase 1: memory disabled
-                input_chars=len(user_message),
-                output_messages=result.delivered_count,
-                tool_calls=len(result.tool_results),
-                metadata={
-                    "terminal_state": str(result.terminal_state),
-                    "context_sample": result.context_sample,
-                },
-            )
-
-            # Also record usage event
-            await memory_store.record_usage_event(
-                event_type="chat_turn",
-                user_id=user_id,
-                source="wechat",
-                message_count=len(raw_messages) + result.delivered_count,
-                token_count=token_count,
-                elapsed_ms=result.elapsed_ms,
-                fallback_type=diag_fallback,
-                metadata={
-                    "input_chars": len(user_message),
-                    "output_messages": result.delivered_count,
-                    "tool_calls": len(result.tool_results),
-                    "token_estimated": bool(
-                        (result.token_usage or {}).get("estimated")
-                    ),
-                    "turn_id": turn_id,
-                    "route": route,
-                    "context_policy": context_policy,
-                    "terminal_state": str(result.terminal_state),
-                },
+                memory_hook=memory_hook,
+                memory_store=memory_store,
             )
 
             logger.info(
@@ -1805,21 +1937,6 @@ async def chat(request: Request):
                 f"elapsed_ms={result.elapsed_ms} "
                 f"route={route}"
             )
-
-            # ── Mark draft / outbound status ──────────────────────
-            if result.was_skipped:
-                await memory_store.mark_turn_draft_status(turn_id, "skipped")
-            elif result.was_cancelled:
-                await memory_store.mark_turn_draft_status(turn_id, "cancelled")
-            elif result.was_sent or result.was_fallback:
-                await memory_store.mark_turn_draft_status(turn_id, "delivered")
-                await memory_store.mark_outbound_batch_status(turn_id, "delivered")
-            elif result.was_failed:
-                await memory_store.mark_turn_draft_status(turn_id, "failed")
-            else:
-                await memory_store.mark_turn_draft_status(turn_id, "generated")
-
-            await memory_store.update_turn_send_status(turn_id, send_status)
 
         # Lock released — return response.
         # Messages were already sent via wechat_sender callback.
