@@ -14,7 +14,11 @@ import asyncio
 import logging
 import time
 from datetime import datetime, time as datetime_time, timezone, timedelta
-from typing import Any
+from typing import Any, Callable
+
+from agent.proactive_settings import (
+    ProactiveSettings, get_intensity_profile, load_proactive_settings,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +47,7 @@ class ProactiveScheduler:
         config: dict[str, Any] | None = None,
         store: Any = None,
         bridge_online_check: Any = None,
+        settings_provider: Any = None,
     ):
         self._lock = asyncio.Lock()
         self._active_proactive_turn_id: str | None = None
@@ -50,6 +55,7 @@ class ProactiveScheduler:
         self._config = config or {}
         self._store = store
         self._bridge_online_check = bridge_online_check  # callable → bool
+        self._settings_provider = settings_provider
         # ── Phase 5 metrics ──
         self.heartbeat_tick_count: int = 0
         self.eligibility_pass_count: int = 0
@@ -59,6 +65,15 @@ class ProactiveScheduler:
     @property
     def is_busy(self) -> bool:
         return self._lock.locked()
+
+    def _get_settings(self) -> ProactiveSettings:
+        """Get current proactive settings. Falls back to config.yaml."""
+        if self._settings_provider:
+            try:
+                return self._settings_provider()
+            except Exception:
+                pass
+        return load_proactive_settings(self._config)
 
     # ── Manual trigger (admin API) ────────────────────────────────
 
@@ -197,7 +212,8 @@ class ProactiveScheduler:
         self.heartbeat_tick_count += 1
 
         # ── Fast pre-checks (no store access) ────────────────────
-        if not self._config.get("features", {}).get("proactive", False):
+        settings = self._get_settings()
+        if not settings.enabled:
             return self._eligibility_fail(ELIGIBILITY_BLOCK_PROACTIVE_DISABLED)
 
         if self._lock.locked():
@@ -210,10 +226,35 @@ class ProactiveScheduler:
 
             self.eligibility_pass_count += 1
 
-            # ── Phase 6: impulse generation (placeholder for now) ──
-            impulse = await self._select_impulse(user_id, bot_id)
-            if not impulse:
-                return {"status": "skipped", "reason": "no_impulse"}
+            # ── v1.6-A: determine trigger mode based on last_visible_message_at ──
+            trigger_mode, block_reason, context_meta = await self._determine_trigger_mode(
+                user_id, bot_id, settings,
+            )
+            if trigger_mode is None:
+                return {"status": "skipped", "reason": block_reason or "too_early"}
+
+            # ── Build impulse ──
+            if trigger_mode == "required":
+                impulse = self._build_required_impulse(user_id, context_meta)
+            else:
+                impulse = await self._select_impulse(user_id, bot_id)
+                if not impulse:
+                    return {"status": "skipped", "reason": "no_impulse"}
+                impulse["trigger_mode"] = "optional"
+                impulse["trigger_kind"] = "autonomous"
+                # Merge context_meta into impulse
+                for k, v in (context_meta or {}).items():
+                    impulse.setdefault(k, v)
+
+            # Add context fields (last_user_message + assistant_messages_after_last_user)
+            if self._store:
+                try:
+                    history = await self._store.get_recent_conversation_history(
+                        user_id, limit=10, bot_id=bot_id,
+                    )
+                    self._enrich_impulse_with_context(impulse, history)
+                except Exception:
+                    pass
 
             turn_id = f"heartbeat_{user_id}_{int(time.time() * 1000)}"
             self._active_proactive_turn_id = turn_id
@@ -243,68 +284,68 @@ class ProactiveScheduler:
     ) -> tuple[bool, str]:
         """Run all eligibility pre-checks (no LLM).
 
-        v3.1 §5.1: System pre-checks that determine whether the bot is
-        allowed to initiate a proactive turn at this moment.
+        v1.6-A: User message quiet window and min_interval removed.
+        Frequency is now controlled by last_visible_message_at + intensity profile.
+        Uses proactive settings (runtime_settings.json or config.yaml fallback).
 
         Returns (eligible: bool, block_reason: str).
         """
-        cfg = self._config.get("proactive", {})
+        settings = self._get_settings()
 
-        # 1. Bridge online
+        # 1. Master switch
+        if not settings.enabled:
+            return False, ELIGIBILITY_BLOCK_PROACTIVE_DISABLED
+
+        # 2. Autonomous sub-switch
+        if not settings.autonomous_enabled:
+            return False, "autonomous_disabled"
+
+        # 3. Bridge online
         if self._bridge_online_check and callable(self._bridge_online_check):
             try:
                 if not self._bridge_online_check():
                     return False, ELIGIBILITY_BLOCK_BRIDGE_OFFLINE
             except Exception:
-                pass  # Degrade gracefully
+                pass
 
-        # 2. Sleep hours
-        sleep_cfg = cfg.get("eligibility", {}).get("sleep_hours", {})
-        if sleep_cfg:
-            if self._in_sleep_hours(sleep_cfg):
+        # 4. Quiet hours
+        if settings.quiet_hours_enabled:
+            quiet_cfg = {"start": settings.quiet_hours_start, "end": settings.quiet_hours_end}
+            if self._in_sleep_hours(quiet_cfg):
                 return False, ELIGIBILITY_BLOCK_SLEEP_HOURS
 
         if self._store is None:
-            return True, ""  # No store → skip store-dependent checks
+            return True, ""
 
-        # 3. User message quiet window
+        # 5. Daily active message cap (counts all proactive delivered messages)
         try:
-            ds = await self._store.get_dialogue_state(user_id, bot_id)
-            last_user_at = float(ds.get("last_user_message_at", 0)) if ds else 0
-            quiet_min = int(cfg.get("eligibility", {}).get("after_user_message_quiet_seconds_min", 60))
-            if last_user_at > 0 and (time.time() - last_user_at) < quiet_min:
-                return False, ELIGIBILITY_BLOCK_USER_QUIET
-        except Exception:
-            pass
-
-        # 4. Daily cap
-        try:
-            daily_cap = int(cfg.get("eligibility", {}).get("daily_cap", 10))
             tz = timezone(timedelta(hours=8))
             now = datetime.now(tz)
             today_start = datetime.combine(now.date(), datetime_time.min, tzinfo=tz).timestamp()
             sent_today = await self._store.count_today_proactive_sent(today_start)
-            if sent_today >= daily_cap:
+            cap = int(settings.daily_active_message_cap)
+            if sent_today >= cap:
                 return False, ELIGIBILITY_BLOCK_DAILY_CAP
         except Exception:
             pass
 
-        # 5. User opt-out (proactive_paused_until)
+        # 6. Daily autonomous trigger cap (counts successful autonomous triggers)
+        try:
+            intensity = settings.autonomous_intensity
+            profile = get_intensity_profile(intensity)
+            trigger_cap = int(profile.get("daily_trigger_cap", 5))
+            count, _ = await self._store.get_autonomous_trigger_count(user_id, bot_id)
+            if count >= trigger_cap:
+                return False, "autonomous_trigger_cap_reached"
+        except Exception:
+            pass
+
+        # 7. User opt-out (proactive_paused_until)
         try:
             ds = await self._store.get_dialogue_state(user_id, bot_id)
             paused_until = float(ds.get("proactive_paused_until", 0)) if ds else 0
             if paused_until > time.time():
                 return False, ELIGIBILITY_BLOCK_USER_OPT_OUT
-        except Exception:
-            pass
-
-        # 6. Min interval since last proactive
-        try:
-            ps = await self._store.get_proactive_schedule_state(user_id, bot_id)
-            last_sent = float(ps.get("last_sent_ts", 0)) if ps else 0
-            min_interval_s = int(cfg.get("eligibility", {}).get("min_interval_minutes", 30)) * 60
-            if last_sent > 0 and (time.time() - last_sent) < min_interval_s:
-                return False, ELIGIBILITY_BLOCK_MIN_INTERVAL
         except Exception:
             pass
 
@@ -334,6 +375,56 @@ class ProactiveScheduler:
                 return now >= start or now <= end
         except Exception:
             return False
+
+    # ══════════════════════════════════════════════════════════════
+    # v1.6-A: trigger mode determination
+    # ══════════════════════════════════════════════════════════════
+
+    async def _determine_trigger_mode(
+        self, user_id: str, bot_id: str, settings: ProactiveSettings,
+    ) -> tuple[str | None, str | None, dict[str, Any] | None]:
+        """Based on last_visible_message_at + intensity profile.
+
+        Returns (trigger_mode, block_reason, context_meta):
+          - ("optional", None, {...})  → trigger allowed, skip_proactive OK
+          - ("required", None, {...})  → trigger required, skip_proactive forbidden
+          - (None, "too_early", None)  → not yet time
+          - (None, "no_visible_message_yet", None) → no visible message recorded
+        """
+        if self._store is None:
+            return (None, "no_store", None)
+
+        try:
+            last_visible = await self._store.get_last_visible_message_at(user_id, bot_id)
+        except Exception:
+            last_visible = 0.0
+
+        if last_visible <= 0:
+            return (None, "no_visible_message_yet", None)
+
+        elapsed = time.time() - last_visible
+        intensity = settings.autonomous_intensity
+        profile = get_intensity_profile(intensity)
+
+        optional_after = int(profile.get("optional_after_minutes", 120)) * 60
+        required_after = int(profile.get("required_after_minutes", 180)) * 60
+
+        # Build context meta used for proactive turn context
+        context_meta = {
+            "last_visible_message_at": last_visible,
+            "elapsed_since_last_visible_message_seconds": int(elapsed),
+            "trigger_kind": "autonomous",
+        }
+
+        if elapsed >= required_after:
+            context_meta["trigger_mode"] = "required"
+            context_meta["trigger_source"] = "REQUIRED_PRESENCE"
+            return ("required", None, context_meta)
+        elif elapsed >= optional_after:
+            context_meta["trigger_mode"] = "optional"
+            return ("optional", None, context_meta)  # trigger_source filled by impulse pipeline
+        else:
+            return (None, "too_early", None)
 
     def _eligibility_fail(self, reason: str) -> dict[str, Any]:
         """Record eligibility failure metric and return skipped result."""
@@ -604,6 +695,78 @@ class ProactiveScheduler:
             ),
             "_source_ts": now_ts,
         }
+
+    # ── v1.6-A: Required impulse + context enrichment ────────────
+
+    def _build_required_impulse(
+        self, user_id: str, context_meta: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Build REQUIRED_PRESENCE impulse when elapsed >= required_after."""
+        now_ts = time.time()
+        return {
+            "impulse_id": f"required_{user_id}_{int(now_ts * 1000)}",
+            "impulse_type": "REQUIRED_PRESENCE",
+            "proactive_chain_id": f"chain_required_{int(now_ts * 1000)}",
+            "trigger_reason_summary": "超过当前强度的最迟触发时间",
+            "trigger_mode": "required",
+            "trigger_kind": "autonomous",
+            "trigger_source": "REQUIRED_PRESENCE",
+            "evidence_pack": {
+                "source_topic_id": "",
+                "source_message_ids": [],
+                "recent_proactive_messages": [],
+                "relationship_temperature": None,
+                "topic_snapshot": "",
+            },
+            "dedupe_key": f"required_{user_id}_{int(now_ts / 3600)}",
+            "reply_window_seconds": 43200,
+            "max_wechat_reply": int(
+                self._config.get("proactive", {})
+                .get("turn", {})
+                .get("default_max_wechat_reply_per_turn", 3)
+            ),
+            "last_visible_message_at": context_meta.get("last_visible_message_at", 0),
+            "elapsed_since_last_visible_message_seconds": context_meta.get(
+                "elapsed_since_last_visible_message_seconds", 0,
+            ),
+            "_source_ts": now_ts,
+        }
+
+    def _enrich_impulse_with_context(
+        self, impulse: dict[str, Any], history: list[dict],
+    ) -> None:
+        """Add last_user_message and assistant_messages_after_last_user to impulse.
+
+        Only uses visible conversation_history messages (role=user or role=assistant
+        with non-fallback source). Dry-run / send failed / guard blocked content
+        is not in conversation_history and therefore not included.
+        """
+        user_msgs = [m for m in history if m.get("role") == "user"]
+        if user_msgs:
+            last_user = user_msgs[-1]
+            impulse["last_user_message"] = str(last_user.get("content", ""))[:500]
+
+            # Find assistant messages after the last user message
+            last_user_ts = float(last_user.get("ts", 0))
+            assistant_after = [
+                m for m in history
+                if m.get("role") == "assistant"
+                and m.get("source") != "assistant:fallback"
+                and float(m.get("ts", 0)) > last_user_ts
+            ]
+            impulse["assistant_messages_after_last_user"] = [
+                str(m.get("content", ""))[:300]
+                for m in assistant_after[-6:]  # max 6 messages, each ≤ 300 chars
+            ]
+
+        # Forbidden claims for the model
+        impulse["forbidden_claims"] = [
+            "不要检测到用户很久没回复",
+            "不要根据设置来找用户",
+            "不要暴露主动消息触发机制",
+            "不要像系统提醒或通知",
+            "不要编造用户正在做什么",
+        ]
 
     # ── Dedup / Expire / Score / Select ──────────────────────────
 

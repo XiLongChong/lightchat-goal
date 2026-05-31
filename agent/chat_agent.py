@@ -2183,6 +2183,40 @@ def _build_proactive_context_system_message(turn: TurnScratchpad) -> str:
     if topic_snapshot:
         parts.append(f"话题快照：{topic_snapshot}")
 
+    # ── v1.6-A: contextual fields for natural-feeling proactive messages ──
+    trigger_mode = str(meta.get("trigger_mode", ""))
+    last_user_msg = str(meta.get("last_user_message", ""))
+    assistant_after = meta.get("assistant_messages_after_last_user", [])
+    forbidden = meta.get("forbidden_claims", [])
+    last_visible_at = meta.get("last_visible_message_at", 0)
+    elapsed_s = meta.get("elapsed_since_last_visible_message_seconds", 0)
+
+    if trigger_mode:
+        parts.append(f"触发模式：{trigger_mode}")
+    if elapsed_s > 0:
+        parts.append(f"距离上一条可见消息：{elapsed_s} 秒")
+
+    if last_user_msg:
+        parts.append("")
+        parts.append(f"[用户最后一条消息] {last_user_msg}")
+    if assistant_after:
+        parts.append("")
+        parts.append("[你随后已发送的消息]")
+        for i, m in enumerate(assistant_after):
+            parts.append(f"  {i + 1}. {m}")
+
+    if forbidden:
+        parts.append("")
+        parts.append("[禁止的表达]")
+        for f in forbidden:
+            parts.append(f"  {f}")
+
+    parts.append("")
+    parts.append("[风格指引]")
+    parts.append("  短一点、轻一点。像微信里等不到回复后又补了一句。")
+    parts.append("  可以顺着上一段话自然延伸，可以轻轻冒泡。")
+    parts.append("  不要像通知，不要像客服，不要像系统提醒。")
+
     parts.append("")
     parts.append("你可以不说，调用 skip_proactive。")
     parts.append("你也可以说一句或几句，但每次只能通过 wechat_reply 发一条。")
