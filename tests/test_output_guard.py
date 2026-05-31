@@ -1,4 +1,10 @@
-"""Tests for the V2 UnifiedOutputGuard module."""
+"""Tests for output guard — v0.2.
+
+Old JSON actions unwrap logic (_unwrap_nested_protocol) deleted.
+_looks_like_protocol_json is kept for protocol leak DETECTION only
+(used by _has_protocol_leak in guard_send_message_batch) — it triggers
+hard reject, never unwrap into sendable text.
+"""
 
 import sys
 from pathlib import Path
@@ -9,11 +15,13 @@ from agent.output_guard import (
     guard_single_message,
     guard_messages,
     _looks_like_protocol_json,
-    _unwrap_nested_protocol,
 )
 
 
+# ── _looks_like_protocol_json: detection only, never unwrap ──────
+
 def test_looks_like_protocol_json_detects_leaked_json():
+    """Used by _has_protocol_leak for detection → hard reject."""
     leaked = '{"actions":[{"type":"tool","name":"wechat_reply","args":{"text":"hi"}}],"done":true}'
     assert _looks_like_protocol_json(leaked) is True
 
@@ -24,41 +32,10 @@ def test_looks_like_protocol_json_rejects_normal_text():
 
 
 def test_looks_like_protocol_json_rejects_text_with_only_actions():
-    # Text contains "actions" but not protocol markers
     assert _looks_like_protocol_json("take actions to improve") is False
 
 
-def test_unwrap_nested_protocol_extracts_text():
-    nested = '{"actions":[{"type":"tool","name":"wechat_reply","args":{"text":"actual reply"}}],"done":true}'
-    result = _unwrap_nested_protocol(nested)
-    assert result == "actual reply"
-
-
-def test_unwrap_nested_protocol_returns_empty_for_plain_text():
-    assert _unwrap_nested_protocol("hello world") == ""
-
-
-def test_unwrap_nested_protocol_skips_recursive_protocol():
-    inner = '{"actions":[{"type":"message","text":"real text"}],"done":true}'
-    outer = f'{{"actions":[{{"type":"tool","name":"wechat_reply","args":{{"text":"{inner}"}}}}],"done":true}}'
-    result = _unwrap_nested_protocol(outer)
-    # Inner text IS protocol JSON, so it gets rejected.
-    # Unwrap extracts no natural-language content from recursive protocol.
-    assert result == ""
-
-
-def test_guard_single_message_hard_fallback_for_recursive_protocol():
-    # When protocol JSON contains nested protocol JSON as text,
-    # unwrap finds nothing and guard returns hard fallback.
-    inner = '{"actions":[{"type":"message","text":"real text"}],"done":true}'
-    outer = (
-        '{"actions":[{"type":"tool","name":"wechat_reply","args":'
-        f'{{"text":"{inner}"}}'
-        '}],"done":true}'
-    )
-    result = guard_single_message(outer)
-    assert result == "我刚刚卡了一下 重新说"
-
+# ── guard_single_message ─────────────────────────────────────────
 
 def test_guard_single_message_passes_normal_text():
     assert guard_single_message("今天天气不错") == "今天天气不错"
@@ -69,7 +46,7 @@ def test_guard_single_message_blocks_empty():
 
 
 def test_guard_single_message_blocks_protocol_json():
-    """v0.2: protocol JSON is hard-blocked, not unwrapped."""
+    """v0.2: protocol JSON is hard-blocked (never unwrapped into sendable text)."""
     leaked = '{"actions":[{"type":"tool","name":"wechat_reply","args":{"text":"nested reply"}}],"done":true}'
     issues = []
     result = guard_single_message(leaked, issues=issues)
@@ -78,9 +55,21 @@ def test_guard_single_message_blocks_protocol_json():
 
 
 def test_guard_single_message_hard_fallback_for_bare_protocol():
-    # Protocol JSON with no extractable natural text — still hard-blocked
+    # Protocol JSON with no extractable natural text — hard-blocked
     bare = '{"actions":[{"type":"tool","name":"get_weather","args":{"city":"beijing"}}],"done":true}'
     result = guard_single_message(bare)
+    assert result == "我刚刚卡了一下 重新说"
+
+
+def test_guard_single_message_hard_fallback_for_nested_protocol():
+    """v0.2: nested protocol JSON is hard-blocked, not recursively unwrapped."""
+    inner = '{"actions":[{"type":"message","text":"real text"}],"done":true}'
+    outer = (
+        '{"actions":[{"type":"tool","name":"wechat_reply","args":'
+        f'{{"text":"{inner}"}}'
+        '}],"done":true}'
+    )
+    result = guard_single_message(outer)
     assert result == "我刚刚卡了一下 重新说"
 
 
@@ -90,18 +79,18 @@ def test_guard_single_message_truncates_long_text():
     assert len(result) <= 500
 
 
+# ── guard_messages ───────────────────────────────────────────────
+
 def test_guard_messages_returns_empty_for_empty_input():
     assert guard_messages([]) == []
 
 
 def test_guard_messages_filters_empty_after_guard():
-    # Non-empty input where all messages have empty text → hard fallback
     result = guard_messages([{"text": "", "delay": 0}])
     assert result == [{"text": "我刚刚卡了一下 重新说", "delay": 0}]
 
 
 def test_guard_messages_empty_input_stays_empty():
-    # Truly empty input (schedule-only turn) stays empty
     assert guard_messages([]) == []
 
 

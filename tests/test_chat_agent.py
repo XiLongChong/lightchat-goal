@@ -12,9 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from utils.json_parser import (
-    safe_parse_json, parse_agent_output, extract_json, validate_agent_output,
-)
+from utils.json_parser import safe_parse_json, extract_json
 
 # ================================================================
 # JSON parser unit tests (safeguard utilities, not protocol-dependent)
@@ -63,31 +61,6 @@ def test_safe_parse_trailing_comma_fix():
     result = safe_parse_json(raw)
     assert result is not None
     assert result["done"] is True
-
-
-def test_parse_agent_output_fallback():
-    text = "不是JSON的输出文本"
-    result = parse_agent_output(text)
-    assert result["done"] is True
-    assert len(result["actions"]) == 1
-    assert result["actions"][0]["type"] == "message"
-    assert text in result["actions"][0]["text"]
-
-
-def test_parse_agent_output_no_actions_field():
-    result = parse_agent_output('{"done": true}')
-    assert result["done"] is True
-    assert len(result["actions"]) == 1
-    assert result["actions"][0]["type"] == "message"
-
-
-def test_parse_agent_output_preserves_valid_json():
-    long_text = "啊" * 600
-    raw = f'{{"actions":[{{"type":"message","text":"{long_text}"}}],"done":true}}'
-    result = parse_agent_output(raw)
-    assert result["done"] is True
-    assert len(result["actions"]) == 1
-    assert result["actions"][0]["text"] == long_text
 
 
 # ================================================================
@@ -964,64 +937,6 @@ class TestToolRetry:
 # ================================================================
 
 
-class TestValidateAgentOutput:
-    def test_valid_simple_actions(self):
-        errors = validate_agent_output({
-            "actions": [{"type": "message", "text": "hello"}], "done": True,
-        })
-        assert errors == []
-
-    def test_valid_tool_action(self):
-        errors = validate_agent_output({
-            "actions": [{"type": "tool", "name": "get_time", "args": {}}], "done": False,
-        })
-        assert errors == []
-
-    def test_valid_skip_action(self):
-        errors = validate_agent_output({
-            "actions": [{"type": "skip", "reason": "no need"}], "done": True,
-        })
-        assert errors == []
-
-    def test_missing_actions_field(self):
-        errors = validate_agent_output({"done": True})
-        assert any("missing_actions" in e for e in errors)
-
-    def test_actions_not_list(self):
-        errors = validate_agent_output({"actions": "not_a_list"})
-        assert any("not_list" in e for e in errors)
-
-    def test_action_not_object(self):
-        errors = validate_agent_output({
-            "actions": ["just a string", {"type": "message", "text": "ok"}],
-            "done": True,
-        })
-        assert any("not_object" in e for e in errors)
-
-    def test_message_empty_text(self):
-        errors = validate_agent_output({
-            "actions": [{"type": "message", "text": ""}], "done": True,
-        })
-        assert any("empty_text" in e for e in errors)
-
-    def test_wechat_reply_empty_text(self):
-        errors = validate_agent_output({
-            "actions": [{"type": "tool", "name": "wechat_reply", "args": {"text": ""}}],
-            "done": True,
-        })
-        assert any("wechat_reply_empty_text" in e for e in errors)
-
-    def test_non_dict_input(self):
-        errors = validate_agent_output([1, 2, 3])
-        assert any("top_level_not_object" in e for e in errors)
-
-    def test_done_not_bool(self):
-        errors = validate_agent_output({
-            "actions": [{"type": "message", "text": "hi"}], "done": "yes",
-        })
-        assert any("done_not_bool" in e for e in errors)
-
-
 # ================================================================
 # History formatting tests
 # ================================================================
@@ -1225,35 +1140,6 @@ class TestSendMessagesGuard:
         ])
         assert len(result.messages) == 0
         assert result.blocked_count == 2
-
-
-# ================================================================
-# compute_message_delay tests
-# ================================================================
-
-
-def test_delay_zero_in_test_mode():
-    from agent.tools import compute_message_delay
-    for i in range(3):
-        assert compute_message_delay(i, "hello", 3, test_mode=True) == 0.0
-
-
-def test_delay_first_message():
-    from agent.tools import compute_message_delay
-    d = compute_message_delay(0, "hello", 3, test_mode=False)
-    assert 0.2 <= d <= 0.8
-
-
-def test_delay_subsequent_short():
-    from agent.tools import compute_message_delay
-    d = compute_message_delay(1, "short", 3, test_mode=False)
-    assert 0.8 <= d <= 1.6
-
-
-def test_delay_subsequent_long():
-    from agent.tools import compute_message_delay
-    d = compute_message_delay(1, "x" * 100, 3, test_mode=False)
-    assert 1.5 <= d <= 3.0
 
 
 # ================================================================

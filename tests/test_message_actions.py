@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from agent.chat_agent import ChatAgent
 from agent.llm_types import LLMResponse, LLMUsage
+from agent.state_machine import TurnState
 
 
 def _make_response(content="", tool_calls=None):
@@ -49,67 +50,86 @@ class FakeGateway:
         return self.response
 
 
-def _run(agent, user_message="test"):
+def _run(agent, user_message="test", wechat_sender=None):
     return asyncio.run(agent.chat(
         user_message=user_message, history=[], trigger="user",
+        wechat_sender=wechat_sender,
     ))
 
 
 class TestSendWechatMessages:
-    def test_single_message(self):
+    def test_old_send_wechat_messages_rejected(self):
+        """v1.5: deprecated send_wechat_messages → PROTOCOL_RETRY."""
         tc = _make_tc("send_wechat_messages", '{"messages":["hello"]}')
         gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
-            test_mode=True,
+            native_allowed_tools=["wechat_reply", "done"],
+            test_mode=True, routing_mode="manual_flash",
         )
         result = _run(agent)
-        assert len(result.tool_results) >= 1
-        assert result.tool_results[0]["name"] == "send_wechat_messages"
+        # Deprecated tool → PROTOCOL_RETRY → END_PROTOCOL_ERROR or END_FAILED
+        assert result.terminal_state in (TurnState.END_FAILED, TurnState.END_PROTOCOL_ERROR, TurnState.END_FALLBACK_SENT)
+        assert result.sent_message_count == 0
 
-    def test_multi_message(self):
-        tc = _make_tc("send_wechat_messages",
-                       '{"messages":["first","second","third"]}')
-        gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
+    def test_wechat_reply_single_bubble(self):
+        """v1.5: wechat_reply sends one bubble, needs done to end."""
+        call_count = [0]
+        responses = [
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"hello"}')]),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+        ]
+        class MGW:
+            def __init__(self): self.requests = []
+            async def complete(self, req):
+                self.requests.append(req)
+                idx = min(call_count[0], len(responses) - 1); call_count[0] += 1
+                return responses[idx]
+
+        sent_msgs = []
+        async def fake_sender(messages):
+            for m in messages: m["send_status"] = "delivered"
+            sent_msgs.extend(messages)
+            return messages
+
         agent = ChatAgent(
             model="test", persona="p", personality="",
-            llm_gateway=gw,
+            llm_gateway=MGW(),
             native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
-            test_mode=True,
+            native_allowed_tools=["wechat_reply", "done"],
+            test_mode=True, routing_mode="manual_flash",
         )
-        result = _run(agent)
-        assert len(result.tool_results) == 1
+        result = _run(agent, wechat_sender=fake_sender)
+        assert result.terminal_state == TurnState.END_REPLIED, f"got {result.terminal_state}"
+        assert result.sent_message_count == 1
+        assert len(sent_msgs) == 1
 
     def test_unknown_tool_triggers_protocol_retry(self):
-        """v0.2: unknown tool → PROTOCOL_RETRY, not executed."""
+        """v1.5: unknown tool → PROTOCOL_RETRY."""
         tc = _make_tc("hack_system", "{}")
         gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["get_time", "send_wechat_messages"],
-            test_mode=True,
+            native_allowed_tools=["wechat_reply", "done"],
+            test_mode=True, routing_mode="manual_flash",
         )
         result = _run(agent)
-        # Unknown tool → PROTOCOL_RETRY → eventually HARD_FALLBACK
         types = [e.get("type") for e in result.fallback_events]
-        assert "illegal_tool_combination" in types
         assert "protocol_retry" in types
 
     def test_no_tool_calls_fallback(self):
-        """v0.2: no tool_calls → PROTOCOL_RETRY → HARD_FALLBACK."""
+        """v1.5: no tool_calls → PROTOCOL_RETRY → HARD_FALLBACK."""
         gw = FakeGateway(response=_make_response("plain text reply"))
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["send_wechat_messages"],
-            test_mode=True,
+            native_allowed_tools=["wechat_reply", "done"],
+            test_mode=True, routing_mode="manual_flash",
         )
         result = _run(agent)
         assert len(result.visible_messages) >= 1

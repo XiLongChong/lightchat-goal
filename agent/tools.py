@@ -16,12 +16,7 @@ from typing import Any
 import httpx
 import pytz
 
-from agent.tool_registry import (
-    TOOL_REGISTRY,
-    get_all_tool_names,
-    is_action,
-    is_external_tool,
-)
+from agent.tool_registry import get_all_tool_names, is_action, is_external_tool
 
 
 # ================================================================
@@ -30,14 +25,6 @@ from agent.tool_registry import (
 
 TOOL_WHITELIST = get_all_tool_names()
 
-# Backward-compat: rebuild TOOL_DEFINITIONS from registries
-def _build_legacy_definitions() -> dict[str, dict[str, Any]]:
-    result: dict[str, dict[str, Any]] = {}
-    for t in TOOL_REGISTRY.iter_defs():
-        result[t.name] = {"description": t.description, "args": list(t.args_schema)}
-    return result
-
-TOOL_DEFINITIONS = _build_legacy_definitions()
 TOOL_RUNTIME_CONFIG: dict[str, Any] = {}
 TOOL_RUNTIME_CONFIG["_current_bot_id"] = ""
 _WEATHER_CACHE: dict[str, tuple[float, str]] = {}
@@ -53,14 +40,6 @@ def configure_tools(config: dict[str, Any]):
 def configure_runtime(memory_store: Any = None):
     """Inject runtime objects that tools may use without importing main.py."""
     TOOL_RUNTIME_CONFIG["_memory_store"] = memory_store
-
-
-def _as_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on"}
-    return bool(value)
 
 
 # ================================================================
@@ -119,42 +98,6 @@ async def _get_weather(city: str = "") -> str:
             return f"查询{city}天气失败"
     except Exception as e:
         return f"天气查询出错：{e}"
-
-
-# ================================================================
-# send_wechat_messages -- delay computation
-# ================================================================
-
-def compute_message_delay(index: int, text: str, total: int, test_mode: bool = False) -> float:
-    """Compute natural-feeling delay between WeChat messages.
-
-    Args:
-        index: 0-based position in the message batch
-        text: the message content
-        total: total number of messages in the batch
-        test_mode: if True, return 0 delay for fast tests
-
-    Rules:
-        - First message (index 0): 0.3-0.7s
-        - Subsequent short messages (<60 chars): 0.8-1.6s
-        - Subsequent longer messages: 1.5-3.0s
-        - Light jitter applied in production mode
-    """
-    import random as _random
-
-    if test_mode:
-        return 0.0
-
-    text_len = len(str(text or ""))
-
-    if index == 0:
-        base = 0.3 + _random.random() * 0.4
-    elif text_len < 60:
-        base = 0.8 + _random.random() * 0.8
-    else:
-        base = 1.5 + _random.random() * 1.5
-
-    return round(base, 2)
 
 
 # ================================================================

@@ -1,7 +1,6 @@
 """Memory hook — v0.2 Phase 5.
 
-Bridges the ContextBuilder extension points and POST_TURN_HOOKS to the
-existing MemoryStore and MemoryWorker.
+Bridges ChatAgent post-turn hooks to the existing MemoryStore and MemoryWorker.
 
 LOAD_MEMORY_CONTEXT:  searches recent memories relevant to the current message.
 UPDATE_MEMORY:        triggers background memory extraction after the turn ends.

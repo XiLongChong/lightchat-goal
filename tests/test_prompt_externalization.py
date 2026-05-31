@@ -49,8 +49,8 @@ def test_context_builder_produces_reasonable_prompt():
     prompt = build_chat_system_prompt(
         persona="test persona",
         personality="",
-        tool_names=["send_wechat_messages", "get_time", "get_weather", "skip_reply"],
+        tool_names=["wechat_reply", "done", "get_time", "get_weather"],
     )
 
     assert "test persona" in prompt
-    assert len(prompt) < 5000  # includes base_protocol + tool_policy from prompts/
+    assert len(prompt) < 6000  # v1.5: base_protocol + tool_policy with wechat_reply/done

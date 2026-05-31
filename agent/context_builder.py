@@ -1,7 +1,7 @@
 """Context utilities — v0.2 Phase 3.
 
-Token estimation, history compaction, and system prompt construction.
-Full context assembly is handled by turn_context.ContextBuilder.
+History compaction and system prompt construction.
+Full context assembly is handled by chat_agent.ChatAgent.
 Dead features (relationship, memory_policy, recap, multi-bot) removed.
 """
 
@@ -10,14 +10,6 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-
-
-def estimate_tokens(text: str) -> int:
-    """Rough token estimation: ~1.5 chars per token for Chinese.
-
-    Conservative: triggers compaction earlier.
-    """
-    return int(len(text) / 1.5)
 
 
 def compact_history(

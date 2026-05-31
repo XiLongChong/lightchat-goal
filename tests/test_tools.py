@@ -3,6 +3,7 @@
 import asyncio
 import sys
 from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
@@ -87,37 +88,26 @@ def test_get_weather_uses_default_city(monkeypatch):
 
 def test_tool_definitions_are_valid():
     """All whitelisted tools have descriptions and args."""
-    from agent.tools import TOOL_DEFINITIONS, TOOL_WHITELIST
+    from agent.tool_registry import TOOL_REGISTRY
+    from agent.tools import TOOL_WHITELIST
 
     for name in TOOL_WHITELIST:
-        assert name in TOOL_DEFINITIONS
-        assert "description" in TOOL_DEFINITIONS[name]
-        assert "args" in TOOL_DEFINITIONS[name]
+        tool = TOOL_REGISTRY.get(name)
+        assert tool is not None
+        assert tool.description
+        assert isinstance(tool.args_schema, dict)
 
 
-def test_persona_change_tool_creates_pending_state(tmp_path, monkeypatch):
-    from agent.tools import configure_runtime, configure_tools, execute_tool
-    from memory.store import MemoryStore
+def test_propose_persona_change_is_removed():
+    """v0.2: propose_persona_change tool removed from registry.
+    Calling it returns a not-available error."""
+    from agent.tools import execute_tool
 
-    async def run():
-        monkeypatch.chdir(tmp_path)
-        (tmp_path / "prompts").mkdir()
-        (tmp_path / "prompts" / "persona.md").write_text("旧人设", encoding="utf-8")
-        store = MemoryStore(str(tmp_path / "memory.db"))
-        configure_tools({"agent": {"persona_file": "./prompts/persona.md"}})
-        configure_runtime(memory_store=store)
-
-        result = await execute_tool(
-            "propose_persona_change",
-            {"content": "新人设", "reason": "测试"},
-        )
-        pending = await store.get_pending_persona_change()
-        await store.close()
-        return result, pending
-
-    result, pending = asyncio.run(run())
-    assert "等待用户" in result
-    assert pending["content"] == "新人设"
+    result = asyncio.run(execute_tool(
+        "propose_persona_change",
+        {"content": "新人设", "reason": "测试"},
+    ))
+    assert "不在可用列表中" in result
 
 
 if __name__ == "__main__":
@@ -126,4 +116,5 @@ if __name__ == "__main__":
     test_get_time_unknown_timezone_falls_back()
     test_get_weather_without_city()
     test_tool_definitions_are_valid()
+    test_propose_persona_change_is_removed()
     print("[OK] All tools tests passed")
