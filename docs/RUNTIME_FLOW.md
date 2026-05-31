@@ -1,7 +1,7 @@
 # Runtime Flow — 运行入口和主链路分析
 
-> 生成日期: 2026-05-31
-> 基于实际代码追踪
+> 最后更新: 2026-05-31
+> 基于实际代码追踪 (v3.1 proactive pipeline)
 
 ---
 
@@ -11,80 +11,56 @@
 
 启动链路:
 
-```
-main.py 模块加载
-  ├─ load_dotenv()                           # 加载 .env
-  ├─ load_config("config.yaml")              # 加载配置, 支持 ${ENV_VAR} 替换
-  ├─ load_runtime_settings()                 # 加载 data/runtime_settings.json
-  ├─ _deep_update(cfg, runtime_settings)     # 合并运行时设置
-  ├─ logging.basicConfig(...)                # 初始化日志 (stdout + data/agent.log)
-  ├─ configure_tools(cfg)                    # 注入工具运行时配置
-  ├─ LLMGateway.from_model_config(cfg)       # 创建 LLM 网关 (DeepSeek adapter)
-  ├─ MemoryStore(db_path=...)                # 创建记忆存储 (SQLite WAL)
-  ├─ configure_runtime(memory_store=...)     # 注入 memory_store 到 tools
-  ├─ ChatAgent(...)                          # 创建聊天 agent 实例
-  ├─ MemoryWorker(...) / MemoryHook(...)     # 条件创建 (features.memory=true)
-  ├─ WeChatBridge(...)                       # 条件创建 (wechat.enabled=true)
-  └─ FastAPI(lifespan=lifespan)              # 创建 FastAPI app
-```
-
-**lifespan 启动** (`main.py:1314-1333`):
-
-```python
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    _startup_validate()           # 启动自检 (API key, persona, data dir)
-    if _bridge is not None:
-        await _bridge.start()     # 启动微信轮询后台任务
-    yield
-    # shutdown:
-    if _bridge is not None:
-        await _bridge.stop()
-    await memory_store.close()
+```mermaid
+flowchart TD
+    A["main.py 模块加载"] --> B["load_dotenv()"]
+    B --> C["load_config('config.yaml')<br/>v3.1: +proactive section"]
+    C --> D["load_runtime_settings()"]
+    D --> E["_deep_update(cfg, runtime_settings)"]
+    E --> F["logging.basicConfig(stdout + data/agent.log)"]
+    F --> G["configure_tools(cfg)"]
+    G --> H["LLMGateway.from_model_config(cfg)"]
+    H --> I["MemoryStore(db_path=...)"]
+    I --> J["configure_runtime(memory_store=...)"]
+    J --> K["ChatAgent(...)"]
+    K --> L["ProactiveScheduler(chat_agent, config, store, bridge_check)<br/>v3.1"]
+    L --> M["MemoryWorker/MemoryHook (条件)"]
+    M --> N["WeChatBridge (条件)"]
+    N --> O["FastAPI(lifespan=lifespan)"]
 ```
 
-**uvicorn 启动** (由 `run.bat` 或命令行):
+**lifespan 启动**:
 
-```
-python main.py  →  uvicorn main:app --host 0.0.0.0 --port 8899
+```mermaid
+flowchart TD
+    A["lifespan startup"] --> B["_startup_validate()<br/>API key / persona / data dir"]
+    B --> C{"bridge configured?"}
+    C -->|yes| D["await _bridge.start()<br/>启动微信轮询"]
+    C -->|no| E{"features.proactive?"}
+    D --> E
+    E -->|yes| F["asyncio.create_task(_proactive_heartbeat_loop())<br/>v3.1: 后台主动消息心跳"]
+    E -->|no| G["yield (service running)"]
+    F --> G
+    G --> H["shutdown: cancel heartbeat + stop bridge + close store"]
 ```
 
 ---
 
 ## 2. 微信消息接收入口
 
-### 2.1 内部桥接模式 (WeChatBridge 长轮询)
+### 内部桥接模式 (WeChatBridge 长轮询)
 
-**文件**: `bridge/wechat_poller.py` → `WeChatBridge._poll_loop()`
-
-```
-WeChatBridge.start()
-  └─ asyncio.create_task(self._poll_loop())   # 后台轮询
-
-_poll_loop():
-  while self.running:
-    updates = await get_updates(token, timeout_ms)  # 调用 iLink API
-    for update in updates:
-      user_id = extract_user_id(update)
-      self._buffers[user_id].append(update)         # 缓冲去抖
-      self._schedule_flush(user_id)                  # 延迟后 flush
-
-_schedule_flush(user_id):
-  await asyncio.sleep(buffer_debounce_seconds)
-  await _flush_buffer(user_id)
-
-_flush_buffer(user_id):
-  messages = [extract_text(u) for u in self._buffers[user_id]]
-  await httpx.post(f"{goal_url}/chat", json={
-      "messages": messages,
-      "user_id": user_id,
-      "input_message_ids": [...],
-      "input_latest_seq": seq,
-      ...
-  })
+```mermaid
+flowchart TD
+    A["WeChatBridge.start()"] --> B["asyncio.create_task(_poll_loop())"]
+    B --> C["while running: get_updates(token, timeout_ms)"]
+    C --> D["for update in updates: buffer[user_id].append(update)"]
+    D --> E["_schedule_flush(user_id)<br/>延迟 buffer_debounce_seconds"]
+    E --> F["_flush_buffer(user_id)<br/>合并多条消息"]
+    F --> G["POST /chat {messages, user_id, input_latest_seq, ...}"]
 ```
 
-### 2.2 外部调用模式
+### 外部调用模式
 
 外部服务直接 POST `/chat` 端点, 格式同上。
 
@@ -92,32 +68,31 @@ _flush_buffer(user_id):
 
 ## 3. 消息进入处理链路
 
-**文件**: `main.py:2030` → `async def chat(request: Request)`
+**文件**: `main.py` → `async def chat(request: Request)`
 
-```
-POST /chat
-  ├─ _require_chat_auth(request)              # API key 验证
-  ├─ body = await request.json()              # 解析 JSON
-  ├─ _normalize_chat_messages(body)           # 标准化消息列表
-  ├─ user_id = _validate_chat_user_id(...)    # 验证 user_id
-  ├─ _record_user_message_arrival(user_id, seq)  # 记录 inbound seq (中断检查基础)
-  ├─ lock = _get_user_lock(user_id)           # per-user 异步锁
-  │
-  └─ async with lock:
-      ├─ handle_pending_persona_confirmation()  # 人设变更确认 (快速路径)
-      ├─ _select_route(user_message)            # 路由选择 (SystemFast/ChatLite/ChatFull)
-      ├─ history = get_history_async(user_id)   # 获取对话历史
-      ├─ system_prompt = build_enriched_system_prompt(user_id, msg)
-      ├─ interrupt_checker = _make_interrupt_checker(user_id, seq)
-      ├─ _wmh_cb = _build_chatagent_write_model_history(user_id, bot_id)
-      ├─ _hook_cbs = _build_chatagent_post_turn_hooks(...)
-      │
-      ├─ result = await chat_agent.chat(...)    # ← 进入状态机
-      │
-      ├─ 记录 turn (L2) → memory_store.create_turn(...)
-      ├─ 记录 outbound → memory_store.record_outbound_messages(...)
-      ├─ 记录诊断 → memory_store.record_turn_diagnostics(...)
-      └─ 返回 JSONResponse
+```mermaid
+flowchart TD
+    A["POST /chat"] --> B["_require_chat_auth(request)"]
+    B --> C["body = await request.json()"]
+    C --> D["_normalize_chat_messages(body)"]
+    D --> E["_validate_chat_user_id()"]
+    E --> F["_record_user_message_arrival(user_id, seq)<br/>中断检查基础"]
+    F --> G["lock = _get_user_lock(user_id)"]
+
+    G --> H["async with lock:"]
+    H --> I{"handle_pending_persona_confirmation()?"}
+    I -->|yes| J["快速路径返回"]
+    I -->|no| K["_select_route(user_message)"]
+    K --> L["history = get_history_async()"]
+    L --> M["system_prompt = build_enriched_system_prompt()"]
+    M --> N["interrupt_checker = _make_interrupt_checker()"]
+    N --> O["构造 _wmh_cb + _hook_cbs"]
+    O --> P["result = await chat_agent.chat(...)"]
+
+    P --> Q["记录 L2 turn → create_turn()"]
+    Q --> R["记录 outbound → record_outbound_messages()"]
+    R --> S["记录 contact state"]
+    S --> T["返回 JSONResponse"]
 ```
 
 ---
@@ -126,371 +101,201 @@ POST /chat
 
 **文件**: `agent/chat_agent.py` → `ChatAgent.chat()`
 
+```mermaid
+flowchart TD
+    A["chat(user_message, history, proactive_meta, ...)"] --> B{"source == PROACTIVE_IMPULSE?"}
+    B -->|yes| C["验证 user_message is None"]
+    B -->|no| D["turn = TurnScratchpad(...)"]
+    C --> D
+    D --> E["state = RECEIVE_EVENT"]
+
+    E --> F["while state not in TERMINAL_STATES:"]
+    F --> G{"llm_call_count ≥ max?"}
+    G -->|yes| H{"source == PROACTIVE?"}
+    H -->|yes| I["END_PROACTIVE_MAX_LLM_STEPS"]
+    H -->|no| J["HARD_FALLBACK"]
+    G -->|no| K{"turn timeout?"}
+    K -->|yes| L["END_MAX_LIMIT"]
+    K -->|no| M["state = _dispatch(state, turn, ...)"]
+    M --> N["turn.iteration += 1"]
+    N --> F
+
+    M --> O["Post-terminal Pipeline"]
+    O --> P["WRITE_MODEL_HISTORY callback<br/>v3.1: proactive → assistant:proactive (delivered-only)"]
+    P --> Q["POST_TURN_HOOKS callbacks<br/>v3.1: proactive dev logs + turn record"]
+    Q --> R["TurnResult 组装返回"]
 ```
-chat(user_message, history, ...)
-  ├─ turn = TurnScratchpad(...)               # 创建 turn 本地状态
-  ├─ state = TurnState.RECEIVE_EVENT
-  │
-  └─ while state not in TERMINAL_STATES:
-      ├─ 检查 max_llm_steps 超限 → HARD_FALLBACK
-      ├─ 检查 turn timeout → END_MAX_LIMIT
-      ├─ state = await self._dispatch(state, turn, ...)
-      └─ turn.iteration += 1
-```
 
-### 状态流转图
+### 完整状态流转 (v3.1)
 
-```
-RECEIVE_EVENT
-  → CREATE_TURN
-    → INTERRUPT_CHECK ──(被中断)──→ END_CANCELLED
-      → BUILD_CONTEXT
-        → CLASSIFY_CONTEXT_ERROR ──(FATAL)──→ HARD_FALLBACK
-          → OPTIONAL_PREPROCESS (预取时间)
-            → CALL_LLM ──────────────────────────────────────┐
-              ← HANDLE_MODEL_OUTPUT                          │
-                ├─ 有 content 无 tool_calls → PROTOCOL_RETRY ─┤
-                └─ 有 tool_calls                             │
-                  → CLASSIFY_ONE_TOOL_CALL                   │
-                    ├─ 未知/废弃工具 → PROTOCOL_RETRY ────────┤
-                    ├─ FACT_TOOL (get_time/get_weather)      │
-                    │   → EXEC_FACT_TOOLS                    │
-                    │     → INTERRUPT_CHECK                  │
-                    │       → CALL_LLM ──────────────────────┘
-                    │
-                    ├─ ACTION_TOOL (wechat_reply)
-                    │   → VALIDATE_REPLY_ARGS
-                    │     → GUARD_OUTPUT
-                    │       → PRE_SEND_INTERRUPT_CHECK
-                    │         → EXEC_SEND_ONE (发送单条)
-                    │           → APPEND_SEND_RESULT
-                    │             → POST_SEND_THINKING_DELAY
-                    │               → POST_SEND_INTERRUPT_CHECK
-                    │                 → LIMIT_CHECK
-                    │                   → CALL_LLM ──────────┘
-                    │
-                    └─ TERMINAL_TOOL (done)
-                        → VALIDATE_DONE_ARGS
-                          → END_REPLIED / END_NO_REPLY
+```mermaid
+flowchart TD
+    RECEIVE_EVENT --> CREATE_TURN
+    CREATE_TURN --> INTERRUPT_CHECK
+    INTERRUPT_CHECK -->|被中断| END_CANCELLED
+    INTERRUPT_CHECK -->|通过| BUILD_CONTEXT
 
-HARD_FALLBACK
-  → INTERRUPT_CHECK
-    → guard_single_message (固定文案 "我刚刚卡了一下 重新说")
-      → EXEC_SEND_ONE
-        → END_FALLBACK_SENT / END_FAILED
+    BUILD_CONTEXT -->|v3.1: proactive → inject proactive context| CLASSIFY_CONTEXT_ERROR
+    CLASSIFY_CONTEXT_ERROR -->|FATAL| HARD_FALLBACK
+    CLASSIFY_CONTEXT_ERROR -->|OK| OPTIONAL_PREPROCESS
 
-[terminal state]
-  → WRITE_MODEL_HISTORY (callback)
-    → POST_TURN_HOOKS (callbacks)
-      → TurnResult 组装
+    OPTIONAL_PREPROCESS -->|预取时间| CALL_LLM
+
+    CALL_LLM -->|v3.1: proactive → dynamic allowed_tools| HANDLE_MODEL_OUTPUT
+    HANDLE_MODEL_OUTPUT -->|无 tool_calls| PROTOCOL_RETRY
+    HANDLE_MODEL_OUTPUT -->|有 tool_calls| CLASSIFY_ONE_TOOL_CALL
+
+    CLASSIFY_ONE_TOOL_CALL -->|"FACT_TOOL (get_time/get_weather)"| EXEC_FACT_TOOLS
+    CLASSIFY_ONE_TOOL_CALL -->|"wechat_reply"| VALIDATE_REPLY_ARGS
+    CLASSIFY_ONE_TOOL_CALL -->|"done"| VALIDATE_DONE_ARGS
+    CLASSIFY_ONE_TOOL_CALL -->|"skip_proactive (v3.1)"| VALIDATE_SKIP_PROACTIVE_ARGS
+
+    EXEC_FACT_TOOLS -->|结果回灌| CALL_LLM
+
+    VALIDATE_REPLY_ARGS --> GUARD_OUTPUT
+    GUARD_OUTPUT -->|v3.1: proactive → END_PROACTIVE_GUARD_BLOCKED| END_PROACTIVE_GUARD_BLOCKED
+    GUARD_OUTPUT -->|通过| PRE_SEND_INTERRUPT_CHECK
+    PRE_SEND_INTERRUPT_CHECK -->|被中断| END_SUPERSEDED_BEFORE_SEND
+    PRE_SEND_INTERRUPT_CHECK -->|通过| EXEC_SEND_ONE
+    EXEC_SEND_ONE -->|v3.1: proactive counter 更新| APPEND_SEND_RESULT
+    APPEND_SEND_RESULT --> POST_SEND_THINKING_DELAY
+    POST_SEND_THINKING_DELAY --> POST_SEND_INTERRUPT_CHECK
+    POST_SEND_INTERRUPT_CHECK -->|被中断| END_INTERRUPTED_DURING_REPLY_SEQUENCE
+    POST_SEND_INTERRUPT_CHECK -->|通过| LIMIT_CHECK
+    LIMIT_CHECK -->|"v3.1: proactive hard_max → END_PROACTIVE_MAX_REPLY_LIMIT"| END_PROACTIVE_MAX_REPLY_LIMIT
+    LIMIT_CHECK -->|通过| CALL_LLM
+
+    VALIDATE_DONE_ARGS --> END_REPLIED
+    VALIDATE_DONE_ARGS --> END_NO_REPLY
+
+    VALIDATE_SKIP_PROACTIVE_ARGS --> EXEC_SKIP_PROACTIVE
+    EXEC_SKIP_PROACTIVE -->|"v3.1: send_attempt>0→SKIPPED_AFTER_SEND_FAILURE"| END_SKIPPED_PROACTIVE
+
+    HARD_FALLBACK -->|v3.1: proactive → END_FAILED_NO_FALLBACK| END_FAILED_NO_FALLBACK
+    HARD_FALLBACK -->|非 proactive| FALLBACK_SEND
+    FALLBACK_SEND --> END_FALLBACK_SENT
+
+    PROTOCOL_RETRY -->|max 2 次| CALL_LLM
+    PROTOCOL_RETRY -->|超限 + proactive| END_FAILED_NO_FALLBACK
+    PROTOCOL_RETRY -->|超限| HARD_FALLBACK
 ```
 
 ---
 
 ## 5. LLM 调用位置
 
-**文件**: `agent/chat_agent.py:666` → `_do_call_llm()`
-
-```python
-async def _do_call_llm(self, turn: TurnScratchpad) -> TurnState:
-    # 1. 模型路由 (v1.3)
-    model_label, routing_reason, profile = self._select_model(turn)
-
-    # 2. 构建 LLMRequest
-    request = LLMRequest(
-        purpose="chat",
-        messages=turn.messages,
-        model=profile.model_name,
-        temperature=profile.temperature,
-        max_tokens=profile.max_tokens,
-        tools=tool_specs,              # native tool calls
-        tool_choice="auto",
-        timeout_s=profile.timeout_seconds,
-    )
-
-    # 3. 调用 LLM Gateway
-    response: LLMResponse = await self.llm_gateway.complete(request)
-```
-
-**文件**: `agent/llm_gateway.py` → `LLMGateway.complete()`
-
-```python
-async def complete(self, request: LLMRequest) -> LLMResponse:
-    return await self.adapter.complete(request)
-```
-
-**文件**: `agent/providers/deepseek.py` → `DeepSeekAdapter.complete()`
-
-```python
-async def complete(self, request: LLMRequest) -> LLMResponse:
-    payload = self._build_payload(request)
-    response = await self.client.chat.completions.create(**payload)
-    return self._parse_response(response, request)
-```
+**文件**: `agent/chat_agent.py` → `_do_call_llm()`
 
 调用链: `chat_agent._do_call_llm()` → `LLMGateway.complete()` → `DeepSeekAdapter.complete()` → `openai.AsyncOpenAI.chat.completions.create()`
+
+v3.1 新增:
+- proactive 回合动态 allowed_tools (Phase A/B/C, 基于 delivered_count)
+- proactive_llm_step_count 追踪和上限检查
+- tool_choice="required" (主动回合强制工具调用)
 
 ---
 
 ## 6. Tool Call 执行位置
 
-### 6.1 工具分类
+### 工具分类
 
 **文件**: `agent/tool_classifier.py` → `classify_single_tool_call()`
 
-分类结果:
-- `FACT_TOOL`: get_time, get_weather → 执行后回灌 LLM
-- `ACTION_TOOL`: wechat_reply → 发送单条消息, 继续 LLM 循环
-- `TERMINAL_TOOL`: done → 结束 turn
-- `STATE_TOOL`: 未注册, 严格拒绝
+| 类型 | 工具 | 执行后流向 |
+|------|------|-----------|
+| FACT_TOOL | get_time, get_weather | execute_tool() → 结果回灌 → CALL_LLM |
+| ACTION_TOOL | wechat_reply | 发送链路 → 继续 LLM 循环 |
+| TERMINAL_TOOL | done, skip_proactive | 结束 turn |
 
-### 6.2 FACT_TOOL 执行
+### FACT_TOOL 执行
 
-**文件**: `agent/chat_agent.py` → `_do_exec_fact_tools()`
+**文件**: `agent/chat_agent.py` → `_do_exec_fact_tools()`, `agent/tools.py` → `execute_tool()`
 
-```python
-async def _do_exec_fact_tools(self, turn: TurnScratchpad) -> TurnState:
-    results = await asyncio.gather(*[
-        execute_tool(name, args) for name, args in fact_calls
-    ])
-    # 结果写入 turn.tool_results, 然后 → CALL_LLM (回灌模型)
-```
+### ACTION_TOOL (wechat_reply) 执行
 
-**文件**: `agent/tools.py` → `execute_tool()`
+状态链: VALIDATE_REPLY_ARGS → GUARD_OUTPUT → PRE_SEND_INTERRUPT_CHECK → EXEC_SEND_ONE
 
-```python
-async def execute_tool(name: str, args: dict) -> str:
-    if name == "get_time":
-        return await _get_time(**args)
-    elif name == "get_weather":
-        return await _get_weather(**args)
-    ...
-```
+v3.1: GUARD_OUTPUT 先过 `guard_proactive_output()` (主动回合) 再过 `guard_single_message()` (通用)
 
-### 6.3 ACTION_TOOL (wechat_reply) 执行
+### skip_proactive 执行 (v3.1)
 
-**文件**: `agent/chat_agent.py` → 状态链:
+状态链: VALIDATE_SKIP_PROACTIVE_ARGS → EXEC_SKIP_PROACTIVE → END_SKIPPED_PROACTIVE
 
-```
-VALIDATE_REPLY_ARGS → GUARD_OUTPUT → PRE_SEND_INTERRUPT_CHECK → EXEC_SEND_ONE
-```
-
-`EXEC_SEND_ONE` 调用注入的 `wechat_sender` 回调。
-
-### 6.4 TERMINAL_TOOL (done) 执行
-
-**文件**: `agent/chat_agent.py` → `_do_validate_done_args()`
-
-done 工具不执行实际操作, 仅验证参数并设置终态:
-- `status="replied"` → `END_REPLIED`
-- `status="no_reply"` → `END_NO_REPLY`
+仅主动回合 Phase A (delivered_count == 0) 可用。send_attempt_count > 0 时状态为 SKIPPED_AFTER_SEND_FAILURE。
 
 ---
 
 ## 7. 微信发送位置
 
-### 7.1 wechat_sender 回调
-
-**文件**: `main.py:417` → `wechat_sender()`
-
-```python
-async def wechat_sender(user_id, context_token, messages):
-    for i, m in enumerate(messages):
-        await asyncio.sleep(delay)
-        await _bridge.send_text(user_id, text, context_token)
-        m["send_status"] = "delivered"
+```mermaid
+flowchart TD
+    A["chat_agent._do_exec_send_one()"] --> B["wechat_sender(messages)<br/>main.py 注入的回调"]
+    B --> C["_bridge.send_text(user_id, text, context_token)"]
+    C --> D["ilink_client.send_message(token, to_user, content)"]
+    D --> E["httpx.post('https://ilinkai.weixin.qq.com/bot/send_message')"]
 ```
 
-### 7.2 iLink API 调用
+v3.1: EXEC_SEND_ONE 中主动回合递增 `proactive_send_attempt_count` 和 `proactive_delivered_count`。
 
-**文件**: `bridge/ilink_client.py` → `send_message()`
+---
 
-```python
-async def send_message(token, to_user, content, base_url=""):
-    body = json.dumps({"to_user": to_user, "content": content})
-    return await _api_fetch("bot/send_message", token=token, body=body, ...)
+## 8. 主动消息链路 (v3.1)
+
+### 8.1 心跳触发
+
+```mermaid
+flowchart TD
+    A["lifespan: asyncio.create_task(_proactive_heartbeat_loop())"] --> B["while True: sleep(interval)"]
+    B --> C["proactive_scheduler.run_heartbeat(user_id, bot_id, providers...)"]
+    C --> D{"_check_eligibility()<br/>8 项前置判定"}
+    D -->|不通过| E["skipped (记录原因)"]
+    D -->|通过| F{"_select_impulse()<br/>生成→去重→过期→评分→选择"}
+    F -->|无候选| E
+    F -->|有候选| G["_execute_proactive_turn()<br/>→ chat_agent.chat(source=PROACTIVE_IMPULSE)"]
+    G --> H["TurnResult"]
 ```
 
-### 7.3 发送链路总览
+### 8.2 管理界面手动触发
+
+```mermaid
+flowchart TD
+    A["POST /admin/proactive/trigger"] --> B["_build_test_impulse_meta(body)"]
+    B --> C["构造 providers (history, system_prompt, wechat_sender, interrupt_checker)"]
+    C --> D["_build_proactive_write_model_history()"]
+    D --> E["_build_proactive_post_turn_hooks()"]
+    E --> F["proactive_scheduler.run_manual_trigger(user_id, impulse_meta, ...)"]
+    F --> G{"lock.locked()?"}
+    G -->|yes| H["skipped: active_proactive_turn_running"]
+    G -->|no| I["_execute_proactive_turn()"]
+    I --> J["返回 result"]
+```
+
+### 8.3 可见上下文一致性
 
 ```
-chat_agent._do_exec_send_one()
-  └─ wechat_sender(messages)           # main.py 注入的回调
-      └─ _bridge.send_text(user_id, text, context_token)
-          └─ ilink_client.send_message(token, to_user, content)
-              └─ httpx.post("https://ilinkai.weixin.qq.com/bot/send_message")
+发送层: EXEC_SEND_ONE → delivery_status
+  ↓
+历史写入层: WRITE_MODEL_HISTORY → 只写 proactive_delivered_texts
+  ↓
+上下文构造器: BUILD_CONTEXT → 只从 confirmed visible history 构造
+  ↓
+日志层: dev log → 记录全量 attempts (与对话历史隔离)
 ```
 
 ---
 
-## 8. 日志/历史记录位置
+## 9. 日志/历史记录位置
 
-### 8.1 应用日志
-
-**文件**: `main.py:210-220`
-
-```python
-logging.basicConfig(
-    handlers=[
-        logging.StreamHandler(),                    # stdout
-        logging.FileHandler("./data/agent.log"),    # 文件
-    ]
-)
-```
-
-输出: `data/agent.log`
-
-### 8.2 对话历史 (L1)
-
-**内存**: `main.py` → `conversation_histories: dict[str, list[dict]]`
-
-**持久化**: `memory/store.py` → `MemoryStore.append_conversation_history()`
-
-表: `conversation_history`
-
-### 8.3 Turn 记录 (L2)
-
-**文件**: `main.py:2208` (chat endpoint 内)
-
-```python
-asyncio.create_task(
-    memory_store.create_turn(
-        turn_id=turn_id,
-        user_id=user_id,
-        bot_id=bot_id,
-        user_messages=user_message,
-        assistant_actions=...,
-        tool_calls=...,
-        send_status=send_status,
-    )
-)
-```
-
-表: `turns`
-
-### 8.4 出站消息追踪
-
-**文件**: `main.py:2222`
-
-```python
-await memory_store.record_outbound_messages(
-    turn_id=turn_id,
-    messages=result.visible_messages,
-    ...
-)
-```
-
-表: `outbound_messages`
-
-### 8.5 Turn 诊断
-
-**文件**: `main.py` → `_build_chatagent_post_turn_hooks()` → `_hook_dev_logs()`
-
-```python
-await memory_store.record_turn_diagnostics(
-    turn_id=turn_id,
-    route=route,
-    llm_status=turn.llm_status,
-    token_count=token_count,
-    elapsed_ms=turn.elapsed_ms,
-    ...
-)
-```
-
-表: `turn_diagnostics`
-
-### 8.6 LLM Trace
-
-**文件**: `main.py:293-297`
-
-```python
-async def _on_llm_trace(trace: dict):
-    await memory_store.save_llm_trace(trace)
-```
-
-表: `llm_traces`
-
-### 8.7 记忆提取 (异步)
-
-**文件**: `agent/memory_worker.py` → `MemoryWorker.extract()`
-
-```python
-async def extract(self, user_msg, assistant_reply):
-    # LLM 提取 → dedup → memory_store.add_memory()
-```
-
-表: `memories`
-
-触发时机: POST_TURN_HOOKS 中的 `_hook_memory` (features.memory=true 时)
-
----
-
-## 9. 完整请求生命周期 (单条微信消息)
-
-```
-[微信用户发送消息]
-  │
-  ▼
-[WeChatBridge._poll_loop() — bridge/wechat_poller.py]
-  │ get_updates() → iLink API 长轮询
-  │ 缓冲去抖 → flush_buffer
-  ▼
-[POST /chat — main.py:2030]
-  │ 认证 → 解析 → 记录 seq → 获取锁
-  ▼
-[chat_agent.chat() — agent/chat_agent.py:146]
-  │
-  ├─ RECEIVE_EVENT → CREATE_TURN → INTERRUPT_CHECK
-  │
-  ├─ BUILD_CONTEXT — 组装 system_prompt + history + user_message
-  │   └─ system_prompt 来自 build_enriched_system_prompt()
-  │       └─ persona.md + 可选 memory context
-  │
-  ├─ CLASSIFY_CONTEXT_ERROR — 检查 fatal/recoverable
-  │
-  ├─ OPTIONAL_PREPROCESS — 预取当前时间, 合入 system message
-  │
-  ├─ CALL_LLM — agent/llm_gateway.py → agent/providers/deepseek.py
-  │   └─ DeepSeek API (native tool calls)
-  │
-  ├─ HANDLE_MODEL_OUTPUT — 检查 assistant.content / tool_calls
-  │
-  ├─ CLASSIFY_ONE_TOOL_CALL — agent/tool_classifier.py
-  │   │
-  │   ├─ [FACT_TOOL: get_time/get_weather]
-  │   │   └─ EXEC_FACT_TOOLS → agent/tools.py → execute_tool()
-  │   │       └─ 结果回灌 → CALL_LLM (循环)
-  │   │
-  │   ├─ [ACTION_TOOL: wechat_reply]
-  │   │   └─ VALIDATE_REPLY_ARGS → GUARD_OUTPUT (agent/output_guard.py)
-  │   │       → EXEC_SEND_ONE → wechat_sender() (main.py)
-  │   │           → _bridge.send_text() → ilink_client.send_message()
-  │   │               → POST_SEND_THINKING_DELAY → CALL_LLM (循环)
-  │   │
-  │   └─ [TERMINAL_TOOL: done]
-  │       └─ VALIDATE_DONE_ARGS → END_REPLIED / END_NO_REPLY
-  │
-  ├─ [异常路径] HARD_FALLBACK
-  │   └─ 固定文案 "我刚刚卡了一下 重新说" → GUARD_OUTPUT → EXEC_SEND_ONE
-  │
-  └─ [终态确定]
-      ├─ WRITE_MODEL_HISTORY — 写入 conversation_history
-      ├─ POST_TURN_HOOKS
-      │   ├─ _hook_memory — 异步记忆提取 (features.memory=true)
-      │   └─ _hook_dev_logs — 写入 turn_diagnostics + usage_events
-      └─ TurnResult 组装返还
-  │
-  ▼
-[POST /chat 续]
-  │ 记录 L2 turn → memory_store.create_turn()
-  │ 记录 outbound → memory_store.record_outbound_messages()
-  │ 返回 JSONResponse 给调用方
-  ▼
-[WeChatBridge._flush_buffer() 收到响应]
-  │ (响应被丢弃, bridge 不处理 /chat 返回值)
-  ▼
-[用户收到微信消息]
-```
+| 数据类型 | 写入位置 | 触发时机 |
+|----------|----------|----------|
+| 应用日志 | `data/agent.log` | 全局 logging |
+| 对话历史 (L1) | `conversation_history` 表 | WRITE_MODEL_HISTORY callback |
+| Turn 记录 (L2) | `turns` 表 | POST_TURN_HOOKS → create_turn() |
+| 出站消息 | `outbound_messages` 表 | POST_TURN_HOOKS → record_outbound_messages() |
+| Turn 诊断 | `turn_diagnostics` 表 | POST_TURN_HOOKS → _hook_dev_logs() |
+| LLM Trace | `llm_traces` 表 | llm_gateway.on_trace callback |
+| 主动消息事件 | `usage_events` 表 | proactive post_turn_hooks |
+| 记忆提取 | `memories` 表 | POST_TURN_HOOKS → _hook_memory (条件) |
 
 ---
 
@@ -499,24 +304,29 @@ async def extract(self, user_msg, assistant_reply):
 | 步骤 | 文件 | 函数 |
 |------|------|------|
 | 启动入口 | `main.py` | 模块级代码 + `lifespan()` |
+| 主动心跳 (v3.1) | `main.py` | `_proactive_heartbeat_loop()` |
 | 微信轮询 | `bridge/wechat_poller.py` | `WeChatBridge._poll_loop()` |
-| 消息接收 | `main.py` | `chat()` (line 2030) |
+| 消息接收 | `main.py` | `chat()` |
+| 主动触发 (v3.1) | `main.py` | `admin_trigger_proactive()` |
 | 中断检查 | `main.py` | `_make_interrupt_checker()` |
 | 路由选择 | `main.py` | `_select_route()` |
-| 系统提示词 | `main.py` | `build_enriched_system_prompt()` |
 | 状态机入口 | `agent/chat_agent.py` | `ChatAgent.chat()` |
 | 状态分发 | `agent/chat_agent.py` | `ChatAgent._dispatch()` |
 | 上下文构建 | `agent/chat_agent.py` | `_do_build_context()` |
+| 主动上下文 (v3.1) | `agent/chat_agent.py` | `_build_proactive_context_system_message()` |
 | LLM 调用 | `agent/chat_agent.py` | `_do_call_llm()` |
-| LLM 网关 | `agent/llm_gateway.py` | `LLMGateway.complete()` |
-| DeepSeek 适配 | `agent/providers/deepseek.py` | `DeepSeekAdapter.complete()` |
+| 主动 allowed_tools (v3.1) | `agent/chat_agent.py` | `_get_proactive_allowed_tools()` |
 | 工具分类 | `agent/tool_classifier.py` | `classify_single_tool_call()` |
+| skip_proactive 验证 (v3.1) | `agent/chat_agent.py` | `_do_validate_skip_proactive_args()` |
+| skip_proactive 执行 (v3.1) | `agent/chat_agent.py` | `_do_exec_skip_proactive()` |
+| 输出守卫 | `agent/output_guard.py` | `guard_single_message()`, `guard_proactive_output()` |
 | 工具执行 | `agent/tools.py` | `execute_tool()` |
-| 输出守卫 | `agent/output_guard.py` | `guard_messages()`, `guard_single_message()` |
 | 微信发送 | `main.py` | `wechat_sender()` |
 | iLink API | `bridge/ilink_client.py` | `send_message()` |
-| 历史写入 | `main.py` | `append_history_async()` |
-| Turn 记录 | `main.py` | `_build_chatagent_write_model_history()` |
-| 诊断记录 | `main.py` | `_build_chatagent_post_turn_hooks()` → `_hook_dev_logs()` |
+| 调度编排 (v3.1) | `agent/scheduler.py` | `ProactiveScheduler.run_heartbeat()`, `run_manual_trigger()` |
+| 资格检查 (v3.1) | `agent/scheduler.py` | `ProactiveScheduler._check_eligibility()` |
+| 冲动生成 (v3.1) | `agent/scheduler.py` | `ProactiveScheduler._select_impulse()` |
+| 关系热度 (v3.1) | `agent/scheduler.py` | `ProactiveScheduler.update_relationship_temperature()` |
+| 历史写入 | `main.py` | `_build_chatagent_write_model_history()`, `_build_proactive_write_model_history()` |
+| 诊断记录 | `main.py` | `_build_chatagent_post_turn_hooks()`, `_build_proactive_post_turn_hooks()` |
 | 记忆提取 | `agent/memory_worker.py` | `MemoryWorker.extract()` |
-| 记忆存储 | `memory/store.py` | `MemoryStore` |
