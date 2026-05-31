@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Goal Proactive Test Console</title>
+<link rel="stylesheet" href="/static/proactive_test_console.css">
+</head>
+<body>
+
+<!-- Login view -->
+<div id="loginView" class="login-container">
+  <div class="login-card">
+    <h1>主动消息测试台</h1>
+    <p class="login-hint">输入后台密码</p>
+    <input type="password" id="passwordInput" placeholder="密码" autofocus>
+    <button id="loginBtn" class="btn btn-primary">进入测试台</button>
+    <div id="loginError" class="error-msg" style="display:none"></div>
+  </div>
+</div>
+
+<!-- App view (hidden until login) -->
+<div id="appView" style="display:none">
+
+  <!-- Top bar -->
+  <header class="top-bar">
+    <div class="bar-left">
+      <span class="bar-title">Proactive Test Console</span>
+      <span id="barUser" class="bar-tag">—</span>
+      <span id="barBot" class="bar-tag">—</span>
+    </div>
+    <div class="bar-right">
+      <span id="barBridge" class="bar-tag">bridge —</span>
+      <span id="barProactive" class="bar-tag">proactive —</span>
+      <span id="barTodaySent" class="bar-tag">today 0</span>
+      <button id="logoutBtn" class="btn btn-sm">退出</button>
+    </div>
+  </header>
+
+  <!-- Main content -->
+  <main class="content">
+
+    <!-- Lab panel -->
+    <section class="panel">
+      <h2>主动消息实验室</h2>
+      <div class="form-grid">
+        <div class="form-group">
+          <label>执行模式</label>
+          <select id="runMode">
+            <option value="dry_run">Dry-run (不发送微信)</option>
+            <option value="real_send">Real-send (真实发送微信)</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Impulse 类型</label>
+          <select id="impulseType">
+            <option value="AUTO">AUTO (完整 pipeline)</option>
+            <option value="ECHO">ECHO</option>
+            <option value="TOPIC_CONTINUE">TOPIC_CONTINUE</option>
+            <option value="PRESENCE">PRESENCE</option>
+            <option value="SCHEDULED_RITUAL">SCHEDULED_RITUAL</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>模拟时间 (debug_now, 可选)</label>
+          <input type="datetime-local" id="debugNow">
+        </div>
+        <div class="form-group">
+          <label>模拟用户静默秒数 (可选)</label>
+          <input type="number" id="simSilent" placeholder="如 28800">
+        </div>
+        <div class="form-group">
+          <label>模拟上次主动秒数 (可选)</label>
+          <input type="number" id="simLastProactive" placeholder="如 43200">
+        </div>
+        <div class="form-group">
+          <label>user_id</label>
+          <input type="text" id="userId" placeholder="自动检测">
+        </div>
+      </div>
+      <div class="btn-row">
+        <button id="btnCheck" class="btn">检查资格</button>
+        <button id="btnImpulses" class="btn">生成候选</button>
+        <button id="btnDryRun" class="btn btn-primary">Dry-run 执行</button>
+        <button id="btnRealSend" class="btn btn-danger">Real-send 执行</button>
+        <button id="btnCopyReport" class="btn" style="display:none">复制调试报告</button>
+      </div>
+      <div id="labSummary" class="summary" style="display:none"></div>
+    </section>
+
+    <!-- Eligibility panel -->
+    <section class="panel" id="eligPanel" style="display:none">
+      <h2>前置判定</h2>
+      <div id="eligResult"></div>
+    </section>
+
+    <!-- Impulse panel -->
+    <section class="panel" id="impulsePanel" style="display:none">
+      <h2>Impulse 候选</h2>
+      <div id="impulseResult"></div>
+    </section>
+
+    <!-- Execution chain panel -->
+    <section class="panel" id="chainPanel" style="display:none">
+      <h2>主动回合执行链</h2>
+      <div id="chainResult"></div>
+    </section>
+
+    <!-- History consistency panel -->
+    <section class="panel" id="historyPanel" style="display:none">
+      <h2>历史一致性检查</h2>
+      <div id="historyResult"></div>
+    </section>
+
+    <!-- Recent runs -->
+    <section class="panel" id="runsPanel">
+      <h2>最近主动测试记录</h2>
+      <div id="runsResult">点击上方按钮执行测试后，记录会出现在这里。</div>
+    </section>
+
+  </main>
+</div>
+
+<script src="/static/proactive_test_console.js"></script>
+</body>
+</html>

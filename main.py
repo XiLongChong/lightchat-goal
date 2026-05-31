@@ -1399,10 +1399,19 @@ async def landing_page():
 
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_page():
-    """Mobile-first local admin UI."""
-    html_path = STATIC_DIR / "admin.html"
+    """v3.1: Proactive test console — main entry point."""
+    html_path = STATIC_DIR / "proactive_test_console.html"
     if not html_path.exists():
-        raise HTTPException(status_code=404, detail="admin UI not found")
+        raise HTTPException(status_code=404, detail="test console not found")
+    return HTMLResponse(html_path.read_text(encoding="utf-8"))
+
+
+@app.get("/admin/proactive-test-console", response_class=HTMLResponse)
+async def proactive_test_console_page():
+    """v3.1: Proactive test console — explicit path."""
+    html_path = STATIC_DIR / "proactive_test_console.html"
+    if not html_path.exists():
+        raise HTTPException(status_code=404, detail="test console not found")
     return HTMLResponse(html_path.read_text(encoding="utf-8"))
 
 
