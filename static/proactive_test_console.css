@@ -125,3 +125,54 @@ body { font-family: -apple-system, "Microsoft YaHei", sans-serif; font-size: 14p
 .overlay-card { background: #fff; padding: 24px; border-radius: 8px; max-width: 360px; text-align: center; }
 .overlay-card p { margin-bottom: 16px; font-size: 14px; }
 .overlay-card .btn-row { justify-content: center; }
+
+/* ── V1.6-A: Settings panel ─────────────────────────────── */
+
+.settings-grid { display: flex; flex-direction: column; gap: 12px; }
+
+.settings-card { background: #f9f9f9; border-radius: 6px; padding: 14px; }
+
+.settings-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+
+.settings-label { font-weight: 600; font-size: 14px; }
+
+.settings-hint { color: #999; font-size: 12px; margin-top: 4px; }
+
+/* Toggle switch */
+.toggle { position: relative; display: inline-block; width: 44px; height: 24px; cursor: pointer; }
+.toggle input { display: none; }
+.toggle i { position: absolute; top: 0; left: 0; width: 44px; height: 24px; border-radius: 12px; background: #ccc; transition: background .2s; }
+.toggle i::after { content: ''; position: absolute; top: 2px; left: 2px; width: 20px; height: 20px; border-radius: 50%; background: #fff; transition: transform .2s; }
+.toggle input:checked + i { background: #07c160; }
+.toggle input:checked + i::after { transform: translateX(20px); }
+
+/* Intensity selector */
+.intensity-select { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin-top: 10px; }
+
+.intensity-btn { display: flex; flex-direction: column; align-items: center; padding: 10px 8px; border: 1px solid #ddd; border-radius: 6px; cursor: pointer; background: #fff; text-align: center; transition: border-color .2s, background .2s; }
+.intensity-btn:hover { border-color: #07c160; }
+.intensity-btn input { display: none; }
+.intensity-btn input:checked ~ .intensity-name { color: #07c160; }
+.intensity-btn input:checked ~ .intensity-desc { color: #07c160; }
+.intensity-btn:has(input:checked) { border-color: #07c160; background: #f0fdf4; }
+
+.intensity-name { font-size: 15px; font-weight: 600; }
+
+.intensity-desc { font-size: 11px; color: #888; margin-top: 2px; }
+
+/* Quiet hours */
+.quiet-hours-row { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+
+.time-input { padding: 6px 8px; border: 1px solid #ddd; border-radius: 4px; font-size: 13px; }
+
+.quiet-sep { color: #888; font-size: 13px; }
+
+.num-input { padding: 6px 8px; border: 1px solid #ddd; border-radius: 4px; font-size: 13px; width: 80px; text-align: center; }
+
+.save-status { font-size: 13px; padding: 6px 12px; border-radius: 4px; }
+.save-status.ok { color: #2e7d32; background: #e8f5e9; }
+.save-status.err { color: #c62828; background: #ffebee; }
+
+@media (max-width: 480px) {
+  .intensity-select { grid-template-columns: 1fr; }
+}

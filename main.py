@@ -2489,6 +2489,18 @@ def _build_proactive_post_turn_hooks(
     ]
 
 
+# ── v1.6: Proactive settings routes ────────────────────────────
+from agent.proactive_settings import set_runtime_settings_path
+set_runtime_settings_path(RUNTIME_SETTINGS_PATH)
+
+from admin_proactive_settings_routes import create_proactive_settings_router
+
+_proactive_settings_router = create_proactive_settings_router(
+    require_admin=require_admin,
+    config=cfg,
+)
+app.include_router(_proactive_settings_router)
+
 # ── v3.1 Phase 2: Proactive test console routes ──────────────────
 from admin_proactive_test_routes import create_proactive_test_router
 

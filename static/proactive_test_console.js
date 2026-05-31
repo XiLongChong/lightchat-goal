@@ -154,6 +154,74 @@
       }
     }).catch(function () {});
   }
+    loadSettings();
+
+  // ══════════════════════════════════════════════════════════════
+  // V1.6-A: Settings panel
+  // ══════════════════════════════════════════════════════════════
+
+  var settingMasterEnabled = $('#settingMasterEnabled');
+  var settingAutonomousEnabled = $('#settingAutonomousEnabled');
+  var settingQuietEnabled = $('#settingQuietEnabled');
+  var settingQuietStart = $('#settingQuietStart');
+  var settingQuietEnd = $('#settingQuietEnd');
+  var settingDailyCap = $('#settingDailyCap');
+  var btnSaveSettings = $('#btnSaveSettings');
+  var settingsSaveStatus = $('#settingsSaveStatus');
+
+  function loadSettings() {
+    apiGet('/admin/proactive/settings').then(function (r) {
+      if (!r || typeof r !== 'object') return;
+      settingMasterEnabled.checked = !!r.enabled;
+      settingAutonomousEnabled.checked = !!r.autonomous_enabled;
+      settingQuietEnabled.checked = !!r.quiet_hours_enabled;
+      settingQuietStart.value = r.quiet_hours_start || '00:00';
+      settingQuietEnd.value = r.quiet_hours_end || '08:00';
+      settingDailyCap.value = r.daily_active_message_cap || 50;
+      var intensity = r.autonomous_intensity || 'daily';
+      var radio = document.querySelector('input[name="intensity"][value="' + intensity + '"]');
+      if (radio) radio.checked = true;
+    }).catch(function () {});
+  }
+
+  function saveSettings() {
+    btnSaveSettings.disabled = true;
+    btnSaveSettings.textContent = '保存中…';
+    var intensityRadio = document.querySelector('input[name="intensity"]:checked');
+    var body = {
+      enabled: settingMasterEnabled.checked,
+      autonomous_enabled: settingAutonomousEnabled.checked,
+      autonomous_intensity: intensityRadio ? intensityRadio.value : 'daily',
+      quiet_hours_enabled: settingQuietEnabled.checked,
+      quiet_hours_start: settingQuietStart.value,
+      quiet_hours_end: settingQuietEnd.value,
+      daily_active_message_cap: parseInt(settingDailyCap.value, 10) || 50,
+    };
+    apiPost('/admin/proactive/settings', body).then(function (r) {
+      if (r && r.status === 'ok') {
+        settingsSaveStatus.style.display = 'inline-block';
+        settingsSaveStatus.textContent = '已保存';
+        settingsSaveStatus.className = 'save-status ok';
+        barProactive.textContent = 'proactive ' + (body.enabled ? 'on' : 'off');
+        barProactive.className = 'bar-tag ' + (body.enabled ? 'green' : 'red');
+      } else {
+        showSaveError(r && r.detail ? r.detail : '保存失败');
+      }
+    }).catch(function (e) {
+      showSaveError('网络错误');
+    }).finally(function () {
+      btnSaveSettings.disabled = false;
+      btnSaveSettings.textContent = '保存设置';
+    });
+  }
+
+  function showSaveError(msg) {
+    settingsSaveStatus.style.display = 'inline-block';
+    settingsSaveStatus.textContent = String(msg).substring(0, 120);
+    settingsSaveStatus.className = 'save-status err';
+  }
+
+  btnSaveSettings.addEventListener('click', saveSettings);
 
   // ══════════════════════════════════════════════════════════════
   // v2.3 readability: translation tables
