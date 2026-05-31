@@ -360,8 +360,9 @@ proactive_scheduler = ProactiveScheduler(
     chat_agent=chat_agent,
     config=cfg,
     store=memory_store,
+    bridge_online_check=lambda: _bridge is not None and _bridge.running,
 )
-logger.info("ProactiveScheduler: initialized (Phase 4 skeleton)")
+logger.info("ProactiveScheduler: initialized (Phase 5 heartbeat + eligibility)")
 
 # v0.2 Phase 5: Memory hook — wires MemoryStore + MemoryWorker into
 # LOAD_MEMORY_CONTEXT and UPDATE_MEMORY positions.
@@ -1307,10 +1308,59 @@ async def lifespan(app: FastAPI):
     if _bridge is not None and _bridge.token:
         await _bridge.start()
 
+    # ── v3.1 Phase 5: Proactive heartbeat loop ──────────────────
+    _proactive_heartbeat_task: asyncio.Task | None = None
+    _proactive_enabled = (cfg.get("features") or {}).get("proactive", False)
+    if _proactive_enabled:
+        async def _proactive_heartbeat_loop():
+            interval = int(cfg.get("proactive", {}).get("heartbeat_interval_seconds", 60))
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    contact = await memory_store.get_contact_state()
+                    uid = contact.get("user_id", "")
+                    if not uid:
+                        continue
+                    ctx_token = contact.get("context_token", "")
+                    bot_id = BOT_ID
+
+                    async def _hb_history_provider(uid: str, bid: str) -> list:
+                        return await get_history_async(uid, bot_id=bid)
+
+                    async def _hb_system_prompt_provider(uid: str) -> str:
+                        return await build_enriched_system_prompt(uid, "")
+
+                    async def _hb_wechat_sender(messages: list) -> list:
+                        return await wechat_sender(uid, ctx_token, messages)
+
+                    _hb_int_checker = _make_interrupt_checker(uid, input_latest_seq=0)
+                    _hb_wmh = _build_proactive_write_model_history(uid, bot_id)
+                    _hb_hooks = _build_proactive_post_turn_hooks(uid, bot_id, {})
+
+                    result = await proactive_scheduler.run_heartbeat(
+                        user_id=uid,
+                        bot_id=bot_id,
+                        history_provider=_hb_history_provider,
+                        system_prompt_provider=_hb_system_prompt_provider,
+                        wechat_sender_provider=_hb_wechat_sender,
+                        interrupt_checker_provider=_hb_int_checker,
+                        write_model_history=_hb_wmh,
+                        post_turn_hooks=_hb_hooks,
+                    )
+                    if result.get("status") != "skipped":
+                        logger.info("proactive_heartbeat: %s", result.get("status"))
+                except Exception as e:
+                    logger.warning("proactive_heartbeat: error: %s", e)
+
+        _proactive_heartbeat_task = asyncio.create_task(_proactive_heartbeat_loop())
+        logger.info("Proactive heartbeat loop started (interval=%ds)", int(cfg.get("proactive", {}).get("heartbeat_interval_seconds", 60)))
+
     yield
 
     # Shutdown
     logger.info("Shutting down...")
+    if _proactive_heartbeat_task:
+        _proactive_heartbeat_task.cancel()
     if _bridge is not None:
         await _bridge.stop()
     await memory_store.close()
@@ -2483,6 +2533,55 @@ async def admin_trigger_proactive(request: Request):
     )
 
     return result
+
+
+@app.get("/admin/proactive/state")
+async def admin_proactive_state(request: Request):
+    """v3.1 Phase 7: View proactive scheduler state."""
+    require_admin(request)
+    contact = await memory_store.get_contact_state()
+    user_id = contact.get("user_id", "")
+    bot_id = BOT_ID
+
+    ds = await memory_store.get_dialogue_state(user_id, bot_id) if user_id else {}
+    ps = await memory_store.get_proactive_schedule_state(user_id, bot_id) if user_id else {}
+
+    return {
+        "scheduler": proactive_scheduler.get_metrics(),
+        "dialogue_state": {
+            "last_user_message_at": ds.get("last_user_message_at", 0),
+            "last_assistant_message_at": ds.get("last_assistant_message_at", 0),
+            "proactive_paused_until": ds.get("proactive_paused_until", 0),
+            "last_proactive_id": ds.get("last_proactive_id", ""),
+        } if ds else {},
+        "schedule_state": {
+            "last_sent_ts": ps.get("last_sent_ts", 0),
+            "next_due_ts": ps.get("next_due_ts", 0),
+        } if ps else {},
+        "today_sent": await memory_store.count_today_proactive_sent(
+            time.time() - (time.time() % 86400)
+        ) if user_id else 0,
+    }
+
+
+@app.get("/admin/proactive/metrics")
+async def admin_proactive_metrics(request: Request):
+    """v3.1 Phase 7: Proactive pipeline metrics."""
+    require_admin(request)
+    contact = await memory_store.get_contact_state()
+    user_id = contact.get("user_id", "")
+    bot_id = BOT_ID
+
+    rel = await memory_store.get_relationship() if user_id else {}
+    candidates = await memory_store.get_recent_proactive_candidates(limit=20) if user_id else []
+
+    return {
+        "scheduler_metrics": proactive_scheduler.get_metrics(),
+        "relationship": {
+            "temperature": rel.get("relationship_temperature", 0),
+        } if rel else {},
+        "recent_candidates": candidates[:10],
+    }
 
 
 # ================================================================

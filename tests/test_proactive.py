@@ -1054,3 +1054,211 @@ class TestProactiveTurnResultFields:
         assert hasattr(result, "proactive_attempt_count")
         assert hasattr(result, "proactive_send_attempt_count")
         assert result.proactive_delivered_count == 0
+
+
+# ══════════════════════════════════════════════════════════════════
+# Phase 5: Heartbeat + eligibility
+# ══════════════════════════════════════════════════════════════════
+
+class TestEligibilityChecks:
+    """Phase 5.1: System pre-checks (no LLM)."""
+
+    def test_eligibility_proactive_disabled(self):
+        """features.proactive=false → skipped."""
+        scheduler = ProactiveScheduler(config={"features": {"proactive": False}})
+
+        async def _test():
+            result = await scheduler.run_heartbeat("u1", "b1")
+            assert result["status"] == "skipped"
+            assert "proactive_disabled" in result["reason"]
+
+        asyncio.run(_test())
+
+    def test_eligibility_scheduler_busy(self):
+        """Lock held → skipped."""
+        scheduler = ProactiveScheduler(config={"features": {"proactive": True}})
+
+        async def _test():
+            async with scheduler._lock:
+                result = await scheduler.run_heartbeat("u1", "b1")
+                assert result["status"] == "skipped"
+                assert "scheduler_busy" in result["reason"]
+
+        asyncio.run(_test())
+
+    def test_eligibility_sleep_hours(self):
+        """Sleep hours block when current time is in range."""
+        import datetime
+
+        # Mock _in_sleep_hours to always return True
+        class SchedulerWithSleep(ProactiveScheduler):
+            def _in_sleep_hours(self, sleep_cfg):
+                return True
+
+        scheduler = SchedulerWithSleep(
+            config={
+                "features": {"proactive": True},
+                "proactive": {"eligibility": {"sleep_hours": {"start": "23:00", "end": "08:00"}}},
+            },
+        )
+
+        async def _test():
+            result = await scheduler.run_heartbeat("u1", "b1")
+            assert result["status"] == "skipped"
+            assert "sleep_hours" in result["reason"]
+
+        asyncio.run(_test())
+
+    def test_eligibility_metrics_tracking(self):
+        """Eligibility failures are tracked in fail_reasons."""
+        scheduler = ProactiveScheduler(config={"features": {"proactive": False}})
+
+        async def _test():
+            await scheduler.run_heartbeat("u1", "b1")
+            metrics = scheduler.get_metrics()
+            assert metrics["eligibility_fail_count"] >= 1
+            assert "proactive_disabled" in metrics["eligibility_fail_reasons"]
+
+        asyncio.run(_test())
+
+    def test_heartbeat_tick_count(self):
+        """Heartbeat increments tick count."""
+        scheduler = ProactiveScheduler(config={"features": {"proactive": False}})
+
+        async def _test():
+            await scheduler.run_heartbeat("u1", "b1")
+            assert scheduler.heartbeat_tick_count >= 1
+
+        asyncio.run(_test())
+
+
+# ══════════════════════════════════════════════════════════════════
+# Phase 6: Impulse generation / dedup / score
+# ══════════════════════════════════════════════════════════════════
+
+class TestImpulseGeneration:
+    """Phase 6.1: Rule-based impulse candidate generation."""
+
+    def test_dedup_removes_duplicate_keys(self):
+        scheduler = ProactiveScheduler()
+        candidates = [
+            {"dedupe_key": "a", "impulse_type": "ECHO", "_source_ts": time.time()},
+            {"dedupe_key": "a", "impulse_type": "ECHO", "_source_ts": time.time()},
+            {"dedupe_key": "b", "impulse_type": "PRESENCE", "_source_ts": time.time()},
+        ]
+        result = scheduler._dedup_candidates(candidates)
+        assert len(result) == 2
+        keys = {c["dedupe_key"] for c in result}
+        assert keys == {"a", "b"}
+
+    def test_expire_removes_old_candidates(self):
+        scheduler = ProactiveScheduler()
+        now = time.time()
+        candidates = [
+            {"dedupe_key": "fresh", "impulse_type": "ECHO", "_source_ts": now},
+            {"dedupe_key": "old", "impulse_type": "ECHO", "_source_ts": now - 10 * 3600},  # 10h ago
+        ]
+        # ECHO TTL is 4h → old should be expired
+        result = scheduler._expire_candidates(candidates)
+        assert len(result) == 1
+        assert result[0]["dedupe_key"] == "fresh"
+
+    def test_score_ranks_by_type(self):
+        """SCHEDULED_RITUAL (80) > TOPIC_CONTINUE (70) > ECHO (60) > PRESENCE (50)."""
+        scheduler = ProactiveScheduler()
+        now = time.time()
+        candidates = [
+            {"dedupe_key": "e", "impulse_type": "ECHO", "_source_ts": now,
+             "evidence_pack": {"topic_snapshot": ""}},
+            {"dedupe_key": "p", "impulse_type": "PRESENCE", "_source_ts": now},
+            {"dedupe_key": "r", "impulse_type": "SCHEDULED_RITUAL", "_source_ts": now},
+        ]
+        scored = scheduler._score_candidates(candidates)
+        # SCHEDULED_RITUAL should be highest
+        assert scored[0]["impulse_type"] == "SCHEDULED_RITUAL"
+
+    def test_select_best_returns_top_scored(self):
+        scheduler = ProactiveScheduler()
+        candidates = [
+            {"impulse_type": "ECHO", "_score": 60, "dedupe_key": "e"},
+            {"impulse_type": "SCHEDULED_RITUAL", "_score": 80, "dedupe_key": "r"},
+            {"impulse_type": "PRESENCE", "_score": 50, "dedupe_key": "p"},
+        ]
+        best = scheduler._select_best(candidates)
+        assert best["impulse_type"] == "SCHEDULED_RITUAL"
+        assert "_score" not in best  # internal field cleaned
+
+    def test_echo_impulse_from_emotional_message(self):
+        scheduler = ProactiveScheduler()
+        history = [
+            {"role": "user", "content": "今天好累啊", "ts": time.time()},
+        ]
+        candidates = scheduler._generate_echo_impulses(history, "u1", time.time(), 1)
+        assert len(candidates) == 1
+        assert candidates[0]["impulse_type"] == "ECHO"
+
+    def test_echo_impulse_no_emotion_no_candidate(self):
+        scheduler = ProactiveScheduler()
+        history = [
+            {"role": "user", "content": "今天天气不错", "ts": time.time()},
+        ]
+        candidates = scheduler._generate_echo_impulses(history, "u1", time.time(), 1)
+        assert len(candidates) == 0
+
+    def test_presence_impulse_builds_correctly(self):
+        scheduler = ProactiveScheduler()
+        now = time.time()
+        impulse = scheduler._build_presence_impulse("u1", now, now - 7200)  # 2h ago
+        assert impulse["impulse_type"] == "PRESENCE"
+        assert "分钟" in impulse["trigger_reason_summary"] or "小时" in impulse["trigger_reason_summary"]
+
+    def test_ritual_impulse_builds_correctly(self):
+        scheduler = ProactiveScheduler()
+        impulse = scheduler._build_ritual_impulse("u1", time.time(), {"intent_hint": "morning"})
+        assert impulse["impulse_type"] == "SCHEDULED_RITUAL"
+        assert impulse["reply_window_seconds"] == 86400
+
+    def test_select_best_returns_none_for_empty(self):
+        scheduler = ProactiveScheduler()
+        assert scheduler._select_best([]) is None
+
+
+# ══════════════════════════════════════════════════════════════════
+# Phase 7: Relationship temperature
+# ══════════════════════════════════════════════════════════════════
+
+class TestRelationshipTemperature:
+    """Phase 7.4: Relationship temperature updates based on events."""
+
+    def test_update_relationship_without_store_succeeds(self):
+        """Without store, returns 0 gracefully."""
+        scheduler = ProactiveScheduler()
+
+        async def _test():
+            temp = await scheduler.update_relationship_temperature("u1", "b1", "user_reply", delta=2)
+            assert temp == 0
+
+        asyncio.run(_test())
+
+    def test_attribute_reply_without_store_returns_none(self):
+        """Without store, attribution returns None."""
+        scheduler = ProactiveScheduler()
+
+        async def _test():
+            result = await scheduler.attribute_user_reply_to_proactive("u1", "b1", time.time())
+            assert result is None
+
+        asyncio.run(_test())
+
+
+class TestMetricsSnapshot:
+    """Phase 7: get_metrics returns correct snapshot."""
+
+    def test_initial_metrics(self):
+        scheduler = ProactiveScheduler()
+        m = scheduler.get_metrics()
+        assert m["heartbeat_tick_count"] == 0
+        assert m["eligibility_pass_count"] == 0
+        assert m["eligibility_fail_count"] == 0
+        assert m["is_busy"] is False
+        assert "eligibility_fail_reasons" in m

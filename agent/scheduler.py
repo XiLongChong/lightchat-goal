@@ -1,7 +1,8 @@
-"""ProactiveScheduler — v3.1 Phase 4 minimal skeleton.
+"""ProactiveScheduler — v3.1 proactive message orchestration.
 
 Orchestrates proactive message turns. Phase 4: manual trigger + delivered-only
-history. Phase 5+: heartbeat + eligibility + impulse generation.
+history. Phase 5: heartbeat + eligibility pre-checks.
+Phase 6: impulse generation/dedup/score/select.
 
 Lock ownership: ProactiveScheduler owns the lock. main.py delegates through
 run_manual_trigger() / run_heartbeat() — never acquires the lock directly.
@@ -12,17 +13,28 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import datetime, time as datetime_time, timezone, timedelta
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# v3.1 §5.1: Known eligibility block reasons (for metrics).
+ELIGIBILITY_BLOCK_PROACTIVE_DISABLED = "proactive_disabled"
+ELIGIBILITY_BLOCK_BRIDGE_OFFLINE = "bridge_offline"
+ELIGIBILITY_BLOCK_USER_QUIET = "user_message_quiet_window"
+ELIGIBILITY_BLOCK_DAILY_CAP = "daily_cap_exceeded"
+ELIGIBILITY_BLOCK_USER_OPT_OUT = "user_opt_out"
+ELIGIBILITY_BLOCK_SCHEDULER_BUSY = "scheduler_busy"
+ELIGIBILITY_BLOCK_MIN_INTERVAL = "min_interval_not_met"
+ELIGIBILITY_BLOCK_SLEEP_HOURS = "sleep_hours"
+
 
 class ProactiveScheduler:
-    """主动消息调度器。Phase 4 最小骨架，Phase 5 扩展心跳/eligibility。
+    """主动消息调度器。
 
     Lock ownership rule: ProactiveScheduler internally manages the lock.
     External callers (main.py) must NOT acquire `_lock` directly.
-    admin trigger and future heartbeat share the same lock and are mutually exclusive.
+    admin trigger and heartbeat share the same lock and are mutually exclusive.
     """
 
     def __init__(
@@ -30,12 +42,19 @@ class ProactiveScheduler:
         chat_agent: Any = None,
         config: dict[str, Any] | None = None,
         store: Any = None,
+        bridge_online_check: Any = None,
     ):
         self._lock = asyncio.Lock()
         self._active_proactive_turn_id: str | None = None
         self._chat_agent = chat_agent
         self._config = config or {}
         self._store = store
+        self._bridge_online_check = bridge_online_check  # callable → bool
+        # ── Phase 5 metrics ──
+        self.heartbeat_tick_count: int = 0
+        self.eligibility_pass_count: int = 0
+        self.eligibility_fail_count: int = 0
+        self.eligibility_fail_reasons: dict[str, int] = {}
 
     @property
     def is_busy(self) -> bool:
@@ -153,3 +172,649 @@ class ProactiveScheduler:
             post_turn_hooks=post_turn_hooks or [],
         )
         return result
+
+    # ══════════════════════════════════════════════════════════════
+    # Phase 5: Heartbeat + eligibility
+    # ══════════════════════════════════════════════════════════════
+
+    async def run_heartbeat(
+        self,
+        user_id: str,
+        bot_id: str,
+        *,
+        history_provider: Any = None,
+        system_prompt_provider: Any = None,
+        wechat_sender_provider: Any = None,
+        interrupt_checker_provider: Any = None,
+        write_model_history: Any = None,
+        post_turn_hooks: list[Any] | None = None,
+    ) -> dict[str, Any]:
+        """Heartbeat entry point. Runs eligibility pre-checks, then executes if eligible.
+
+        v3.1 §5.1-5.2: System pre-checks run BEFORE any LLM call.
+        Internal lock ensures mutual exclusion with manual triggers.
+        """
+        self.heartbeat_tick_count += 1
+
+        # ── Fast pre-checks (no store access) ────────────────────
+        if not self._config.get("features", {}).get("proactive", False):
+            return self._eligibility_fail(ELIGIBILITY_BLOCK_PROACTIVE_DISABLED)
+
+        if self._lock.locked():
+            return self._eligibility_fail(ELIGIBILITY_BLOCK_SCHEDULER_BUSY)
+
+        async with self._lock:
+            eligible, reason = await self._check_eligibility(user_id, bot_id)
+            if not eligible:
+                return self._eligibility_fail(reason)
+
+            self.eligibility_pass_count += 1
+
+            # ── Phase 6: impulse generation (placeholder for now) ──
+            impulse = await self._select_impulse(user_id, bot_id)
+            if not impulse:
+                return {"status": "skipped", "reason": "no_impulse"}
+
+            turn_id = f"heartbeat_{user_id}_{int(time.time() * 1000)}"
+            self._active_proactive_turn_id = turn_id
+            logger.info("proactive_scheduler: heartbeat start turn_id=%s", turn_id)
+            try:
+                result = await self._execute_proactive_turn(
+                    user_id=user_id,
+                    impulse_meta=impulse,
+                    bot_id=bot_id,
+                    turn_id=turn_id,
+                    history_provider=history_provider,
+                    system_prompt_provider=system_prompt_provider,
+                    wechat_sender_provider=wechat_sender_provider,
+                    interrupt_checker_provider=interrupt_checker_provider,
+                    write_model_history=write_model_history,
+                    post_turn_hooks=post_turn_hooks,
+                )
+                return {"status": "ok", "result": result}
+            except Exception as e:
+                logger.error("proactive_scheduler: heartbeat turn failed: %s", e)
+                return {"status": "error", "reason": str(e)[:500]}
+            finally:
+                self._active_proactive_turn_id = None
+
+    async def _check_eligibility(
+        self, user_id: str, bot_id: str,
+    ) -> tuple[bool, str]:
+        """Run all eligibility pre-checks (no LLM).
+
+        v3.1 §5.1: System pre-checks that determine whether the bot is
+        allowed to initiate a proactive turn at this moment.
+
+        Returns (eligible: bool, block_reason: str).
+        """
+        cfg = self._config.get("proactive", {})
+
+        # 1. Bridge online
+        if self._bridge_online_check and callable(self._bridge_online_check):
+            try:
+                if not self._bridge_online_check():
+                    return False, ELIGIBILITY_BLOCK_BRIDGE_OFFLINE
+            except Exception:
+                pass  # Degrade gracefully
+
+        # 2. Sleep hours
+        sleep_cfg = cfg.get("eligibility", {}).get("sleep_hours", {})
+        if sleep_cfg:
+            if self._in_sleep_hours(sleep_cfg):
+                return False, ELIGIBILITY_BLOCK_SLEEP_HOURS
+
+        if self._store is None:
+            return True, ""  # No store → skip store-dependent checks
+
+        # 3. User message quiet window
+        try:
+            ds = await self._store.get_dialogue_state(user_id, bot_id)
+            last_user_at = float(ds.get("last_user_message_at", 0)) if ds else 0
+            quiet_min = int(cfg.get("eligibility", {}).get("after_user_message_quiet_seconds_min", 60))
+            if last_user_at > 0 and (time.time() - last_user_at) < quiet_min:
+                return False, ELIGIBILITY_BLOCK_USER_QUIET
+        except Exception:
+            pass
+
+        # 4. Daily cap
+        try:
+            daily_cap = int(cfg.get("eligibility", {}).get("daily_cap", 10))
+            tz = timezone(timedelta(hours=8))
+            now = datetime.now(tz)
+            today_start = datetime.combine(now.date(), datetime_time.min, tzinfo=tz).timestamp()
+            sent_today = await self._store.count_today_proactive_sent(today_start)
+            if sent_today >= daily_cap:
+                return False, ELIGIBILITY_BLOCK_DAILY_CAP
+        except Exception:
+            pass
+
+        # 5. User opt-out (proactive_paused_until)
+        try:
+            ds = await self._store.get_dialogue_state(user_id, bot_id)
+            paused_until = float(ds.get("proactive_paused_until", 0)) if ds else 0
+            if paused_until > time.time():
+                return False, ELIGIBILITY_BLOCK_USER_OPT_OUT
+        except Exception:
+            pass
+
+        # 6. Min interval since last proactive
+        try:
+            ps = await self._store.get_proactive_schedule_state(user_id, bot_id)
+            last_sent = float(ps.get("last_sent_ts", 0)) if ps else 0
+            min_interval_s = int(cfg.get("eligibility", {}).get("min_interval_minutes", 30)) * 60
+            if last_sent > 0 and (time.time() - last_sent) < min_interval_s:
+                return False, ELIGIBILITY_BLOCK_MIN_INTERVAL
+        except Exception:
+            pass
+
+        return True, ""
+
+    def _in_sleep_hours(self, sleep_cfg: dict) -> bool:
+        """Check if current time is within configured sleep hours."""
+        try:
+            tz = timezone(timedelta(hours=8))
+            now = datetime.now(tz).time()
+            start_str = str(sleep_cfg.get("start", "23:00"))
+            end_str = str(sleep_cfg.get("end", "08:00"))
+            start = datetime_time.fromisoformat(start_str)
+            end = datetime_time.fromisoformat(end_str)
+            if start <= end:
+                return start <= now <= end
+            else:
+                # Spans midnight (e.g. 23:00-08:00)
+                return now >= start or now <= end
+        except Exception:
+            return False
+
+    def _eligibility_fail(self, reason: str) -> dict[str, Any]:
+        """Record eligibility failure metric and return skipped result."""
+        self.eligibility_fail_count += 1
+        self.eligibility_fail_reasons[reason] = self.eligibility_fail_reasons.get(reason, 0) + 1
+        return {"status": "skipped", "reason": reason}
+
+    # ══════════════════════════════════════════════════════════════
+    # Phase 6: Impulse generation / dedup / expire / score / select
+    # ══════════════════════════════════════════════════════════════
+
+    async def _select_impulse(
+        self, user_id: str, bot_id: str,
+    ) -> dict[str, Any] | None:
+        """Select the best impulse candidate via rule-based pipeline.
+
+        v3.1 §6: No LLM calls — pure rule-based generation.
+        Steps: generate → dedup → expire → score → select best.
+        """
+        candidates = await self._generate_impulse_candidates(user_id, bot_id)
+        if not candidates:
+            return None
+
+        # Deduplicate by dedupe_key
+        candidates = self._dedup_candidates(candidates)
+        if not candidates:
+            return None
+
+        # Expire old candidates
+        candidates = self._expire_candidates(candidates)
+        if not candidates:
+            return None
+
+        # Score and select best
+        scored = self._score_candidates(candidates)
+        best = self._select_best(scored)
+        if not best:
+            return None
+
+        logger.info(
+            "proactive_scheduler: selected impulse type=%s score=%.1f candidates=%d",
+            best.get("impulse_type"), best.get("_score", 0), len(candidates),
+        )
+        return best
+
+    async def _generate_impulse_candidates(
+        self, user_id: str, bot_id: str,
+    ) -> list[dict[str, Any]]:
+        """Generate impulse candidates from rule-based sources.
+
+        v3.1 §6.1: Four impulse types, no LLM:
+          ECHO — recent user messages contain emotional keywords
+          TOPIC_CONTINUE — active_topics has unclosed topics
+          PRESENCE — time since last interaction > threshold
+          SCHEDULED_RITUAL — scheduled time reached
+
+        Max 1 per type, max 3 total per check.
+        """
+        cfg = self._config.get("proactive", {})
+        max_total = int(cfg.get("impulse", {}).get("max_candidates_per_check", 3))
+        max_per_type = int(cfg.get("impulse", {}).get("max_per_type", 1))
+        now_ts = time.time()
+        tz = timezone(timedelta(hours=8))
+        now_dt = datetime.now(tz)
+
+        candidates: list[dict[str, Any]] = []
+
+        # ── ECHO: recent user messages with emotional keywords ──
+        if self._store and len(candidates) < max_total:
+            try:
+                history = await self._store.get_recent_conversation_history(
+                    user_id, limit=6, bot_id=bot_id,
+                )
+                echo_candidates = self._generate_echo_impulses(
+                    history, user_id, now_ts, max_per_type,
+                )
+                candidates.extend(echo_candidates[:max_per_type])
+            except Exception as e:
+                logger.warning("proactive_scheduler: ECHO generation failed: %s", e)
+
+        # ── TOPIC_CONTINUE: unclosed active topics ──
+        # Phase 6: topics are looked up individually since store has get_active_topic(id).
+        # Phase 7+ can add a list-active-topics query.
+        if self._store and len(candidates) < max_total:
+            try:
+                # Try to get dialogue_state's last_active_topic_id
+                ds = await self._store.get_dialogue_state(user_id, bot_id)
+                topic_id = str(ds.get("active_topic_id", "")) if ds else ""
+                if topic_id:
+                    topic = await self._store.get_active_topic(topic_id)
+                    if topic and not topic.get("closed_at"):
+                        topic_candidates = self._generate_topic_impulses(
+                            [topic], user_id, now_ts, max_per_type,
+                        )
+                        candidates.extend(topic_candidates[:max_per_type])
+            except Exception as e:
+                logger.warning("proactive_scheduler: TOPIC_CONTINUE generation failed: %s", e)
+
+        # ── PRESENCE: time since last interaction ──
+        if len(candidates) < max_total:
+            try:
+                contact = await self._store.get_contact_state() if self._store else {}
+                # Check last interaction time from dialogue state
+                if self._store:
+                    ds = await self._store.get_dialogue_state(user_id, bot_id)
+                    last_interaction = max(
+                        float(ds.get("last_user_message_at", 0)),
+                        float(ds.get("last_assistant_message_at", 0)),
+                    ) if ds else 0
+                else:
+                    last_interaction = 0
+
+                presence_threshold_s = 3600  # 1 hour default
+                if last_interaction > 0 and (now_ts - last_interaction) > presence_threshold_s:
+                    candidates.append(self._build_presence_impulse(
+                        user_id, now_ts, last_interaction,
+                    ))
+            except Exception as e:
+                logger.warning("proactive_scheduler: PRESENCE generation failed: %s", e)
+
+        # ── SCHEDULED_RITUAL: due-time check ──
+        if self._store and len(candidates) < max_total:
+            try:
+                ps = await self._store.get_proactive_schedule_state(user_id, bot_id)
+                next_due = float(ps.get("next_due_ts", 0)) if ps else 0
+                if next_due > 0 and now_ts >= next_due:
+                    candidates.append(self._build_ritual_impulse(
+                        user_id, now_ts, ps,
+                    ))
+            except Exception as e:
+                logger.warning("proactive_scheduler: SCHEDULED_RITUAL generation failed: %s", e)
+
+        return candidates[:max_total]
+
+    # ── ECHO generation ─────────────────────────────────────────
+
+    _EMOTION_KEYWORDS = [
+        "开心", "难过", "烦", "累", "困", "无聊", "生气", "焦虑",
+        "紧张", "兴奋", "期待", "失望", "孤独", "想", "好想",
+        "哈哈", "唉", "哎", "嗯", "……",
+    ]
+
+    def _generate_echo_impulses(
+        self, history: list[dict], user_id: str, now_ts: float, max_count: int,
+    ) -> list[dict[str, Any]]:
+        """Generate ECHO impulses from recent user messages containing emotional keywords."""
+        candidates = []
+        recent_user_msgs = [
+            m for m in history[-6:]
+            if m.get("role") == "user"
+        ]
+        for msg in recent_user_msgs[-3:]:  # last 3 user messages
+            content = str(msg.get("content", ""))[:200]
+            ts = float(msg.get("ts", 0))
+            if any(kw in content for kw in self._EMOTION_KEYWORDS):
+                candidates.append({
+                    "impulse_id": f"echo_{user_id}_{int(ts * 1000) if ts else int(now_ts * 1000)}",
+                    "impulse_type": "ECHO",
+                    "proactive_chain_id": f"chain_echo_{int(now_ts * 1000)}",
+                    "trigger_reason_summary": f"用户最近消息包含情绪表达：{content[:60]}",
+                    "evidence_pack": {
+                        "source_topic_id": "",
+                        "source_message_ids": [str(msg.get("id", ""))],
+                        "recent_proactive_messages": [],
+                        "relationship_temperature": None,
+                        "topic_snapshot": f"最近用户消息：{content[:80]}",
+                    },
+                    "dedupe_key": f"echo_{user_id}_{ts}",
+                    "reply_window_seconds": 14400,
+                    "max_wechat_reply": int(
+                        self._config.get("proactive", {})
+                        .get("turn", {})
+                        .get("default_max_wechat_reply_per_turn", 3)
+                    ),
+                    "_source_ts": ts,
+                })
+                if len(candidates) >= max_count:
+                    break
+        return candidates
+
+    # ── TOPIC_CONTINUE generation ────────────────────────────────
+
+    def _generate_topic_impulses(
+        self, topics: list[dict], user_id: str, now_ts: float, max_count: int,
+    ) -> list[dict[str, Any]]:
+        """Generate TOPIC_CONTINUE impulses from unclosed active topics."""
+        candidates = []
+        for topic in topics[:max_count]:
+            topic_id = str(topic.get("id", ""))
+            topic_name = str(topic.get("topic_name", ""))
+            topic_snapshot = str(topic.get("snapshot", ""))
+            candidates.append({
+                "impulse_id": f"topic_{topic_id}_{int(now_ts * 1000)}",
+                "impulse_type": "TOPIC_CONTINUE",
+                "proactive_chain_id": f"chain_topic_{topic_id}",
+                "trigger_reason_summary": f"未关闭的话题：{topic_name}",
+                "evidence_pack": {
+                    "source_topic_id": topic_id,
+                    "source_message_ids": [],
+                    "recent_proactive_messages": [],
+                    "relationship_temperature": None,
+                    "topic_snapshot": topic_snapshot[:200] if topic_snapshot else topic_name,
+                },
+                "dedupe_key": f"topic_{user_id}_{topic_id}",
+                "reply_window_seconds": 28800,
+                "max_wechat_reply": int(
+                    self._config.get("proactive", {})
+                    .get("turn", {})
+                    .get("default_max_wechat_reply_per_turn", 3)
+                ),
+                "_source_ts": now_ts,
+            })
+        return candidates
+
+    # ── PRESENCE impulse ─────────────────────────────────────────
+
+    def _build_presence_impulse(
+        self, user_id: str, now_ts: float, last_interaction: float,
+    ) -> dict[str, Any]:
+        """Build a PRESENCE impulse when user has been away for a while."""
+        gap_minutes = int((now_ts - last_interaction) / 60)
+        return {
+            "impulse_id": f"presence_{user_id}_{int(now_ts * 1000)}",
+            "impulse_type": "PRESENCE",
+            "proactive_chain_id": f"chain_presence_{int(now_ts * 1000)}",
+            "trigger_reason_summary": f"距上次互动已过 {gap_minutes} 分钟，检查是否适合联系",
+            "evidence_pack": {
+                "source_topic_id": "",
+                "source_message_ids": [],
+                "recent_proactive_messages": [],
+                "relationship_temperature": None,
+                "topic_snapshot": "",
+            },
+            "dedupe_key": f"presence_{user_id}_{int(now_ts / 3600)}",  # hourly dedup
+            "reply_window_seconds": 43200,
+            "max_wechat_reply": int(
+                self._config.get("proactive", {})
+                .get("turn", {})
+                .get("default_max_wechat_reply_per_turn", 3)
+            ),
+            "_source_ts": now_ts,
+        }
+
+    # ── SCHEDULED_RITUAL impulse ─────────────────────────────────
+
+    def _build_ritual_impulse(
+        self, user_id: str, now_ts: float, schedule_state: dict,
+    ) -> dict[str, Any]:
+        """Build a SCHEDULED_RITUAL impulse from due-time schedule."""
+        return {
+            "impulse_id": f"ritual_{user_id}_{int(now_ts * 1000)}",
+            "impulse_type": "SCHEDULED_RITUAL",
+            "proactive_chain_id": f"chain_ritual_{int(now_ts * 1000)}",
+            "trigger_reason_summary": "定时触发的主动消息",
+            "evidence_pack": {
+                "source_topic_id": "",
+                "source_message_ids": [],
+                "recent_proactive_messages": [],
+                "relationship_temperature": None,
+                "topic_snapshot": str(schedule_state.get("intent_hint", "")),
+            },
+            "dedupe_key": f"ritual_{user_id}_{int(now_ts / 3600)}",
+            "reply_window_seconds": 86400,
+            "max_wechat_reply": int(
+                self._config.get("proactive", {})
+                .get("turn", {})
+                .get("default_max_wechat_reply_per_turn", 3)
+            ),
+            "_source_ts": now_ts,
+        }
+
+    # ── Dedup / Expire / Score / Select ──────────────────────────
+
+    def _dedup_candidates(
+        self, candidates: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Remove duplicate candidates by dedupe_key."""
+        seen: set[str] = set()
+        unique = []
+        for c in candidates:
+            key = str(c.get("dedupe_key", ""))
+            if key and key not in seen:
+                seen.add(key)
+                unique.append(c)
+        dedup_count = len(candidates) - len(unique)
+        if dedup_count > 0:
+            logger.info("proactive_scheduler: dedup removed %d candidates", dedup_count)
+        return unique
+
+    def _expire_candidates(
+        self, candidates: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Expire candidates past their TTL."""
+        cfg = self._config.get("proactive", {})
+        ttl_map = cfg.get("impulse", {}).get("default_ttl_hours", {
+            "ECHO": 4, "TOPIC_CONTINUE": 8, "PRESENCE": 12, "SCHEDULED_RITUAL": 24,
+        })
+        now_ts = time.time()
+        valid = []
+        for c in candidates:
+            impulse_type = str(c.get("impulse_type", ""))
+            source_ts = float(c.get("_source_ts", now_ts))
+            ttl_hours = float(ttl_map.get(impulse_type, 24))
+            if (now_ts - source_ts) < (ttl_hours * 3600):
+                valid.append(c)
+        expired = len(candidates) - len(valid)
+        if expired > 0:
+            logger.info("proactive_scheduler: expired %d candidates", expired)
+        return valid
+
+    def _score_candidates(
+        self, candidates: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Score candidates with fixed base + adjustments.
+
+        v3.1 §6.2: Simplified scoring:
+          ECHO: base 60 + content length bonus (up to 20)
+          TOPIC_CONTINUE: base 70 + topic freshness (up to 15)
+          PRESENCE: base 50 + gap duration bonus (up to 30)
+          SCHEDULED_RITUAL: base 80
+        """
+        now_ts = time.time()
+        for c in candidates:
+            impulse_type = str(c.get("impulse_type", ""))
+            base = 50
+
+            if impulse_type == "ECHO":
+                base = 60
+                content = str(c.get("evidence_pack", {}).get("topic_snapshot", ""))
+                base += min(20, len(content) // 5)
+            elif impulse_type == "TOPIC_CONTINUE":
+                base = 70
+                source_ts = float(c.get("_source_ts", now_ts))
+                freshness_hours = (now_ts - source_ts) / 3600
+                base += max(0, 15 - int(freshness_hours))
+            elif impulse_type == "PRESENCE":
+                base = 50
+                source_ts = float(c.get("_source_ts", now_ts))
+                gap_hours = (now_ts - source_ts) / 3600
+                base += min(30, int(gap_hours * 2))
+            elif impulse_type == "SCHEDULED_RITUAL":
+                base = 80
+
+            c["_score"] = float(base)
+
+        return sorted(candidates, key=lambda c: c.get("_score", 0), reverse=True)
+
+    def _select_best(
+        self, scored: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Select the highest-scoring candidate. Removes _score and _source_ts."""
+        if not scored:
+            return None
+        # Sort by score descending (defensive — caller may have already sorted)
+        best = max(scored, key=lambda c: c.get("_score", 0))
+        # Return a copy with internal fields cleaned
+        result = {k: v for k, v in best.items() if k not in ("_score", "_source_ts")}
+        return result
+
+    # ══════════════════════════════════════════════════════════════
+    # Phase 7: Relationship temperature
+    # ══════════════════════════════════════════════════════════════
+
+    async def update_relationship_temperature(
+        self, user_id: str, bot_id: str,
+        event: str,
+        delta: int = 0,
+    ) -> float:
+        """Update relationship temperature based on events.
+
+        v3.1 §7.4:
+          User replies to proactive message: +2
+          User replies quickly: +3
+          User cold reply: -1
+          User long silence: -2
+          User explicit rejection: -5 (enter quiet period)
+          Normal chat sustained: +1
+          Every 6h no interaction: decay 1 toward 0
+
+        Returns new temperature value. Range [-10, +10].
+        """
+        if self._store is None:
+            return 0.0
+
+        cfg = self._config.get("proactive", {}).get("relationship", {})
+        temp_max = int(cfg.get("temperature_max", 10))
+        temp_min = int(cfg.get("temperature_min", -10))
+
+        try:
+            current = await self._store.get_relationship()
+            current_temp = float(current.get("relationship_temperature", 0)) if current else 0
+        except Exception:
+            current_temp = 0
+
+        # Apply decay (every 6h without interaction)
+        decay_hours = int(cfg.get("temperature_decay_hours", 6))
+        try:
+            ds = await self._store.get_dialogue_state(user_id, bot_id)
+            last_interaction = max(
+                float(ds.get("last_user_message_at", 0)),
+                float(ds.get("last_assistant_message_at", 0)),
+            ) if ds else 0
+            if last_interaction > 0:
+                hours_since = (time.time() - last_interaction) / 3600
+                decay_steps = int(hours_since / decay_hours)
+                if decay_steps > 0:
+                    # Decay toward 0
+                    if current_temp > 0:
+                        current_temp = max(0, current_temp - decay_steps)
+                    elif current_temp < 0:
+                        current_temp = min(0, current_temp + decay_steps)
+        except Exception:
+            pass
+
+        # Apply event delta
+        new_temp = current_temp + delta
+        new_temp = max(temp_min, min(temp_max, new_temp))
+
+        try:
+            await self._store.update_relationship({
+                "relationship_temperature": new_temp,
+            })
+        except Exception:
+            pass
+
+        logger.info(
+            "proactive_scheduler: relationship_temp %s: %.1f → %.1f (event=%s delta=%d)",
+            user_id, current_temp, new_temp, event, delta,
+        )
+        return new_temp
+
+    async def attribute_user_reply_to_proactive(
+        self, user_id: str, bot_id: str, user_message_ts: float,
+    ) -> dict[str, Any] | None:
+        """Check if a user message is a reply to a previous proactive message.
+
+        v3.1 §7.5: Multi-condition check:
+          1. last_proactive_id exists
+          2. last proactive delivery_state is SENT_CONFIRMED or PARTIAL_SENT
+          3. User message time within reply_window
+          4. active_proactive_chain state is OPEN or COOLING
+
+        Returns attribution info dict or None.
+        """
+        if self._store is None:
+            return None
+
+        try:
+            ds = await self._store.get_dialogue_state(user_id, bot_id)
+            if not ds:
+                return None
+
+            last_proactive_id = str(ds.get("last_proactive_id", ""))
+            if not last_proactive_id:
+                return None
+
+            # Check reply window (default 4h)
+            last_proactive_ts = float(ds.get("last_proactive_at", 0))
+            if last_proactive_ts <= 0:
+                return None
+
+            reply_window = int(
+                self._config.get("proactive", {})
+                .get("attribution", {})
+                .get("reply_window_seconds", {}).get("ECHO", 14400)
+            )
+            if (user_message_ts - last_proactive_ts) > reply_window:
+                return None
+
+            return {
+                "is_reply_to_proactive": True,
+                "proactive_origin_id": last_proactive_id,
+                "proactive_chain_id": str(ds.get("active_proactive_chain", "")),
+                "reply_delay_seconds": user_message_ts - last_proactive_ts,
+            }
+        except Exception:
+            return None
+
+    # ══════════════════════════════════════════════════════════════
+    # Phase 7: Metrics snapshot (for admin API)
+    # ══════════════════════════════════════════════════════════════
+
+    def get_metrics(self) -> dict[str, Any]:
+        """Return current scheduler metrics snapshot for admin API."""
+        return {
+            "heartbeat_tick_count": self.heartbeat_tick_count,
+            "eligibility_pass_count": self.eligibility_pass_count,
+            "eligibility_fail_count": self.eligibility_fail_count,
+            "eligibility_fail_reasons": dict(self.eligibility_fail_reasons),
+            "is_busy": self.is_busy,
+            "active_turn_id": self._active_proactive_turn_id,
+        }
