@@ -2480,6 +2480,26 @@ def _build_proactive_post_turn_hooks(
     ]
 
 
+# ── v3.1 Phase 2: Proactive test console routes ──────────────────
+from admin_proactive_test_routes import create_proactive_test_router
+
+_proactive_test_router = create_proactive_test_router(
+    require_admin=require_admin,
+    proactive_scheduler=proactive_scheduler,
+    chat_agent=chat_agent,
+    memory_store=memory_store,
+    get_history_async=get_history_async,
+    build_enriched_system_prompt=build_enriched_system_prompt,
+    wechat_sender=wechat_sender,
+    make_interrupt_checker=_make_interrupt_checker,
+    bot_id=BOT_ID,
+    build_proactive_write_model_history=_build_proactive_write_model_history,
+    build_proactive_post_turn_hooks=_build_proactive_post_turn_hooks,
+)
+app.include_router(_proactive_test_router)
+logger.info("Proactive test routes mounted: /admin/proactive-test/*")
+
+
 @app.post("/admin/proactive/trigger")
 async def admin_trigger_proactive(request: Request):
     """v3.1 Phase 4: Manual proactive turn trigger (admin UI).
