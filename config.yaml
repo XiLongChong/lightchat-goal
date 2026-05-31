@@ -77,7 +77,7 @@ features:
   relationship: false   # relationship state tracking
   multi_bot: false      # multiple bot profiles
   emotion: false        # bot emotion state machine
-  proactive: false      # v3.1: proactive / scheduled messages
+  proactive: true        # v3.1: proactive / scheduled messages
   email: false          # send_email tool in chat
 
 # ---- v3.1: Proactive messages -------------------------------------------
