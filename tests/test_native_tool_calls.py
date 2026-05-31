@@ -160,7 +160,7 @@ class TestChatAgentPhase1:
             def __init__(self):
                 self.requests = []
 
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = min(call_count[0], len(responses) - 1)
                 call_count[0] += 1
@@ -535,7 +535,7 @@ class _FakeGateway:
         self.response = response
         self.requests = []
 
-    async def complete(self, request):
+    async def complete(self, request, **kwargs):
         self.requests.append(request)
         return self.response
 

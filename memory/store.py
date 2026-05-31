@@ -557,6 +557,50 @@ class MemoryStore:
             CREATE INDEX IF NOT EXISTS idx_llm_traces_created
             ON llm_traces(created_at DESC)
         """)
+        # v3.1: Proactive debug runs — test console records
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS proactive_debug_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT UNIQUE NOT NULL,
+                created_at REAL NOT NULL,
+                source TEXT NOT NULL DEFAULT 'admin_proactive_test',
+                mode TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                bot_id TEXT NOT NULL,
+                turn_id TEXT,
+                forced_impulse_type TEXT NOT NULL,
+                actual_impulse_type TEXT,
+                terminal_state TEXT,
+                send_status TEXT,
+                real_send_attempted INTEGER NOT NULL DEFAULT 0,
+                send_simulated INTEGER NOT NULL DEFAULT 0,
+                real_delivered_count INTEGER NOT NULL DEFAULT 0,
+                simulated_delivered_count INTEGER NOT NULL DEFAULT 0,
+                history_written_count INTEGER NOT NULL DEFAULT 0,
+                error_code TEXT,
+                error_message TEXT,
+                summary TEXT,
+                input_overrides_json TEXT DEFAULT '{}',
+                eligibility_json TEXT DEFAULT '{}',
+                candidates_json TEXT DEFAULT '[]',
+                selected_impulse_json TEXT DEFAULT '{}',
+                proactive_context_json TEXT DEFAULT '{}',
+                llm_steps_json TEXT DEFAULT '[]',
+                tool_calls_json TEXT DEFAULT '[]',
+                guard_json TEXT DEFAULT '{}',
+                send_json TEXT DEFAULT '{}',
+                history_write_json TEXT DEFAULT '{}',
+                decision_chain_json TEXT DEFAULT '[]'
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_debug_runs_user_bot
+            ON proactive_debug_runs(user_id, bot_id, created_at DESC)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_debug_runs_mode
+            ON proactive_debug_runs(mode, created_at DESC)
+        """)
         await db.commit()
 
     async def close(self):
@@ -1991,6 +2035,133 @@ class MemoryStore:
             (today_start_ts,),
         )
         return int(rows[0]["cnt"]) if rows else 0
+
+    # ================================================================
+    # v3.1: Proactive debug runs (test console)
+    # ================================================================
+
+    async def insert_debug_run(self, report_dict: dict[str, Any]) -> str:
+        """Insert a proactive debug run record. Returns run_id."""
+        import json as _json
+
+        run_id = str(report_dict.get("run_id", ""))
+        if not run_id:
+            import uuid
+            run_id = f"pro-debug-{uuid.uuid4().hex[:12]}"
+
+        now = time.time()
+        db = await self._get_db()
+
+        def _safe_json(val: Any) -> str:
+            if val is None:
+                return "{}"
+            if isinstance(val, str):
+                return val
+            return _json.dumps(val, ensure_ascii=False, default=str)
+
+        async with self._lock:
+            await db.execute(
+                """INSERT OR REPLACE INTO proactive_debug_runs
+                   (run_id, created_at, source, mode, user_id, bot_id, turn_id,
+                    forced_impulse_type, actual_impulse_type, terminal_state, send_status,
+                    real_send_attempted, send_simulated, real_delivered_count,
+                    simulated_delivered_count, history_written_count,
+                    error_code, error_message, summary,
+                    input_overrides_json, eligibility_json, candidates_json,
+                    selected_impulse_json, proactive_context_json, llm_steps_json,
+                    tool_calls_json, guard_json, send_json, history_write_json,
+                    decision_chain_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    run_id, now,
+                    str(report_dict.get("source", "admin_proactive_test")),
+                    str(report_dict.get("mode", "")),
+                    str(report_dict.get("user_id", "")),
+                    str(report_dict.get("bot_id", "")),
+                    str(report_dict.get("turn_id") or ""),
+                    str(report_dict.get("forced_impulse_type", "")),
+                    str(report_dict.get("actual_impulse_type") or ""),
+                    str(report_dict.get("terminal_state") or ""),
+                    str(report_dict.get("send_status") or ""),
+                    int(bool(report_dict.get("real_send_attempted"))),
+                    int(bool(report_dict.get("send_simulated"))),
+                    int(report_dict.get("real_delivered_count", 0)),
+                    int(report_dict.get("simulated_delivered_count", 0)),
+                    int(report_dict.get("history_written_count", 0)),
+                    str(report_dict.get("error_code") or ""),
+                    str(report_dict.get("error_message") or ""),
+                    str(report_dict.get("summary") or ""),
+                    _safe_json(report_dict.get("input_overrides")),
+                    _safe_json(report_dict.get("eligibility")),
+                    _safe_json(report_dict.get("candidates")),
+                    _safe_json(report_dict.get("selected_impulse")),
+                    _safe_json(report_dict.get("proactive_context_summary")),
+                    _safe_json(report_dict.get("llm_steps")),
+                    _safe_json(report_dict.get("tool_calls")),
+                    _safe_json(report_dict.get("guard")),
+                    _safe_json(report_dict.get("send")),
+                    _safe_json(report_dict.get("history_write")),
+                    _safe_json(report_dict.get("decision_chain")),
+                ),
+            )
+            await db.commit()
+        return run_id
+
+    async def get_debug_run(self, run_id: str) -> dict[str, Any] | None:
+        """Get a single debug run by run_id."""
+        db = await self._get_db()
+        rows = await db.execute_fetchall(
+            "SELECT * FROM proactive_debug_runs WHERE run_id = ?",
+            (run_id,),
+        )
+        return dict(rows[0]) if rows else None
+
+    async def list_debug_runs(
+        self,
+        user_id: str = "",
+        bot_id: str = "",
+        limit: int = 20,
+        mode: str = "all",
+        terminal_state: str = "",
+        send_simulated: bool | None = None,
+        real_send_attempted: bool | None = None,
+        impulse_type: str = "",
+    ) -> list[dict[str, Any]]:
+        """List recent debug runs with optional filters."""
+        db = await self._get_db()
+        where: list[str] = []
+        params: list[Any] = []
+
+        if user_id:
+            where.append("user_id = ?")
+            params.append(user_id)
+        if bot_id:
+            where.append("bot_id = ?")
+            params.append(bot_id)
+        if mode and mode != "all":
+            where.append("mode = ?")
+            params.append(mode)
+        if terminal_state:
+            where.append("terminal_state = ?")
+            params.append(terminal_state)
+        if send_simulated is not None:
+            where.append("send_simulated = ?")
+            params.append(1 if send_simulated else 0)
+        if real_send_attempted is not None:
+            where.append("real_send_attempted = ?")
+            params.append(1 if real_send_attempted else 0)
+        if impulse_type:
+            where.append("forced_impulse_type = ?")
+            params.append(impulse_type)
+
+        where_clause = "WHERE " + " AND ".join(where) if where else ""
+        params.append(max(1, min(limit, 100)))
+
+        rows = await db.execute_fetchall(
+            f"SELECT * FROM proactive_debug_runs {where_clause} ORDER BY created_at DESC LIMIT ?",
+            tuple(params),
+        )
+        return [dict(r) for r in rows]
 
     # ================================================================
     # V2.1: Shared user facts (independent of bot)

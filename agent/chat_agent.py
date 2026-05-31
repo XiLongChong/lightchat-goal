@@ -745,6 +745,8 @@ class ChatAgent:
         )
 
         try:
+            # v3.1: request-scoped trace handler for proactive debug dry-run
+            _trace_handler = _resolve_turn_trace_handler(turn)
             response = await self.llm_gateway.complete(
                 LLMRequest(
                     purpose="chat_turn",
@@ -763,7 +765,8 @@ class ChatAgent:
                         "iteration": turn.iteration,
                         "model_label": model_label,
                     },
-                )
+                ),
+                trace_handler=_trace_handler,
             )
             attempt.finished_at = time.time()
             attempt.latency_ms = int((attempt.finished_at - attempt.started_at) * 1000)
@@ -2186,6 +2189,16 @@ def _build_proactive_context_system_message(turn: TurnScratchpad) -> str:
     parts.append("如果已经说完，请调用 done 结束。")
 
     return "\n".join(parts)
+
+
+def _resolve_turn_trace_handler(turn: TurnScratchpad) -> Any:
+    """Return the request-scoped trace handler for this turn, if any.
+
+    v3.1: proactive_debug sets turn._debug_trace_handler on dry-run turns.
+    When set, LLM traces are routed to the handler instead of the global
+    llm_traces table. Returns None for normal turns (no overhead).
+    """
+    return getattr(turn, "_debug_trace_handler", None)
 
 
 def _dump_llm_payload(messages: list[dict[str, Any]], turn_id: str, iteration: int) -> None:

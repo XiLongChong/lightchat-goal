@@ -77,7 +77,7 @@ def _make_mgw(responses: list):
         def __init__(self):
             self.requests = []
 
-        async def complete(self, req):
+        async def complete(self, req, **kwargs):
             self.requests.append(req)
             idx = call_count[0]
             call_count[0] += 1

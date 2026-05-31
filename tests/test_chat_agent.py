@@ -106,7 +106,7 @@ class FakeGateway:
         self.error = error
         self.requests: list = []
 
-    async def complete(self, request):
+    async def complete(self, request, **kwargs):
         self.requests.append(request)
         if self.error:
             raise self.error
@@ -129,7 +129,7 @@ class TestWechatReplyV15:
         ]
         class MGW:
             def __init__(self): self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = call_count[0]; call_count[0] += 1
                 return responses[idx]
@@ -166,7 +166,7 @@ class TestWechatReplyV15:
         ]
         class MGW:
             def __init__(self): self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = call_count[0]; call_count[0] += 1
                 return responses[idx]
@@ -232,7 +232,7 @@ class TestWechatReplyV15:
         ]
         class MGW:
             def __init__(self): self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = min(call_count[0], len(responses) - 1)
                 call_count[0] += 1
@@ -284,7 +284,7 @@ class TestWechatReplyV15:
             def __init__(self):
                 self.requests = []
 
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 return _make_response("", tool_calls=[_make_tc("get_time", '{}')])
 
@@ -322,7 +322,7 @@ class TestPostSendThinkingDelay:
             def __init__(self):
                 self.requests = []
 
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = call_count[0]
                 call_count[0] += 1
@@ -375,7 +375,7 @@ class TestPostSendThinkingDelay:
             def __init__(self):
                 self.requests = []
 
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = call_count[0]
                 call_count[0] += 1
@@ -420,7 +420,7 @@ class TestPostSendThinkingDelay:
             def __init__(self):
                 self.requests = []
 
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = call_count[0]
                 call_count[0] += 1
@@ -476,7 +476,7 @@ class TestPostSendThinkingDelay:
             def __init__(self):
                 self.requests = []
 
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = call_count[0]
                 call_count[0] += 1
@@ -542,7 +542,7 @@ class TestPostSendThinkingDelay:
             def __init__(self):
                 self.requests = []
 
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = call_count[0]
                 call_count[0] += 1
@@ -715,7 +715,7 @@ class TestAssistantContentFallback:
         ]
         class MGW:
             def __init__(self): self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
@@ -810,7 +810,7 @@ class TestToolRetry:
 
         class MGW:
             def __init__(self): self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
@@ -848,7 +848,7 @@ class TestToolRetry:
         ]
         class MGW:
             def __init__(self): self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
@@ -876,7 +876,7 @@ class TestToolRetry:
         ]
         class MGW:
             def __init__(self): self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
@@ -1257,7 +1257,7 @@ class TestTurnLifecycle:
         ]
         class MGW:
             def __init__(self): self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
@@ -1289,7 +1289,7 @@ class TestTurnLifecycle:
         ]
         class MGW:
             def __init__(self): self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
@@ -1318,7 +1318,7 @@ class TestTurnLifecycle:
         ]
         class MGW:
             def __init__(self): self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
@@ -1363,7 +1363,7 @@ class TestToolChoice:
 
         class MGW:
             def __init__(self): self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
@@ -1389,7 +1389,7 @@ class TestToolChoice:
         class MGW:
             def __init__(self):
                 self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = call_count[0]
                 call_count[0] += 1
@@ -1420,7 +1420,7 @@ class TestToolChoice:
 
         class MGW:
             def __init__(self): self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
@@ -1453,7 +1453,7 @@ class TestInterruptCheck:
         ]
         class MGW:
             def __init__(self): self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
@@ -1485,7 +1485,7 @@ class TestInterruptCheck:
         ]
         class MGW:
             def __init__(self): self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
@@ -1534,7 +1534,7 @@ class TestInterruptCheck:
         class MGW:
             def __init__(self):
                 self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = call_count[0]
                 call_count[0] += 1
@@ -1597,7 +1597,7 @@ class TestInterruptCheck:
         ]
         class MGW:
             def __init__(self): self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
@@ -1628,7 +1628,7 @@ class TestContextErrorClassification:
         ]
         class MGW:
             def __init__(self): self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
@@ -1680,7 +1680,7 @@ class TestContextErrorClassification:
         ]
         class MGW:
             def __init__(self): self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
@@ -1721,7 +1721,7 @@ class TestClassifyToolError:
         ]
         class MGW:
             def __init__(self): self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
@@ -1755,7 +1755,7 @@ class TestClassifyToolError:
         ]
         class MGW:
             def __init__(self): self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
@@ -1791,7 +1791,7 @@ class TestClassifyToolError:
         class MGW:
             def __init__(self):
                 self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = call_count[0]
                 call_count[0] += 1
@@ -1844,7 +1844,7 @@ class TestProtocolHardening:
         ]
         class MGW:
             def __init__(self): self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
@@ -1879,7 +1879,7 @@ class TestProtocolHardening:
         ]
         class MGW:
             def __init__(self): self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
@@ -1937,7 +1937,7 @@ class TestProtocolHardening:
         class MGW:
             def __init__(self):
                 self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = call_count[0]
                 call_count[0] += 1
@@ -1977,7 +1977,7 @@ class TestFactToolErrors:
         ]
         class MGW:
             def __init__(self): self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
@@ -2139,7 +2139,7 @@ class TestMessageLimitProtocolRetry:
         ]
         class MGW:
             def __init__(self): self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
@@ -2173,7 +2173,7 @@ class TestMessageLimitProtocolRetry:
         ]
         class MGW:
             def __init__(self): self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
@@ -2213,7 +2213,7 @@ class TestOptionalPreprocessNoWeather:
         class MGW:
             def __init__(self):
                 self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = call_count[0]
                 call_count[0] += 1
@@ -2302,7 +2302,7 @@ class TestSeqBasedInterrupt:
         ]
         class MGW:
             def __init__(self): self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
@@ -2352,7 +2352,7 @@ class TestSeqBasedInterrupt:
         ]
         class MGW:
             def __init__(self): self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
@@ -2394,7 +2394,7 @@ class TestSeqBasedInterrupt:
         ]
         class MGW:
             def __init__(self): self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
@@ -2436,7 +2436,7 @@ class TestSeqBasedInterrupt:
         ]
         class MGW:
             def __init__(self): self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
@@ -2513,7 +2513,7 @@ class TestModelRouting:
         class MGW:
             def __init__(self):
                 self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = call_count[0]
                 call_count[0] += 1
@@ -2554,7 +2554,7 @@ class TestModelRouting:
         class MGW:
             def __init__(self):
                 self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = call_count[0]
                 call_count[0] += 1
@@ -2595,7 +2595,7 @@ class TestModelRouting:
         class MGW:
             def __init__(self):
                 self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = call_count[0]
                 call_count[0] += 1
@@ -2633,7 +2633,7 @@ class TestModelRouting:
         class MGW:
             def __init__(self):
                 self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = call_count[0]
                 call_count[0] += 1
@@ -2673,7 +2673,7 @@ class TestModelRouting:
         class MGW:
             def __init__(self):
                 self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = call_count[0]
                 call_count[0] += 1
@@ -2721,7 +2721,7 @@ class TestModelRouting:
 
         class MGW:
             def __init__(self): self.requests = []
-            async def complete(self, req):
+            async def complete(self, req, **kwargs):
                 self.requests.append(req)
                 idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]

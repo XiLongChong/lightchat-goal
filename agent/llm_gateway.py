@@ -63,7 +63,15 @@ class LLMGateway:
         adapter = _build_adapter(config)
         return cls(adapter=adapter, config=config)
 
-    async def complete(self, request: LLMRequest) -> LLMResponse:
+    async def complete(self, request: LLMRequest, *,
+                       trace_handler: Any | None = None) -> LLMResponse:
+        """Execute an LLM request.
+
+        v3.1: trace_handler (optional) overrides global trace callbacks for
+        this request only.  Used by proactive debug dry-run to intercept
+        LLM traces without mutating global state.  When None, global
+        _on_trace_callbacks are used as before.
+        """
         if request.model is None:
             request.model = self.config.default_model
         if request.timeout_s is None:
@@ -83,21 +91,29 @@ class LLMGateway:
             try:
                 response = await self.adapter.complete(request)
                 last_latency_ms = int((time.perf_counter() - started) * 1000)
-                await self._emit_trace(self._build_trace(
+                trace = self._build_trace(
                     request, req_id, True, attempt=attempt + 1,
                     latency_ms=last_latency_ms, usage=response.usage,
                     model_used=response.model, response=response,
-                ))
+                )
+                if trace_handler is not None:
+                    await trace_handler(trace)
+                else:
+                    await self._emit_trace(trace)
                 return response
             except LLMError as exc:
                 last_error = exc
                 if not exc.retryable or attempt >= attempts - 1:
                     last_latency_ms = int((time.perf_counter() - started) * 1000)
-                    await self._emit_trace(self._build_trace(
+                    trace = self._build_trace(
                         request, req_id, False, attempt=attempt + 1,
                         latency_ms=last_latency_ms,
                         error=exc,
-                    ))
+                    )
+                    if trace_handler is not None:
+                        await trace_handler(trace)
+                    else:
+                        await self._emit_trace(trace)
                     raise
                 await asyncio.sleep(min(0.5 * (2 ** attempt), 4.0))
         raise last_error or LLMError(

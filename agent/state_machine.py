@@ -284,6 +284,9 @@ class TurnScratchpad:
     proactive_llm_step_count: int = 0      # LLM call count for proactive (max_llm_steps_per_proactive_turn limits this)
     proactive_delivered_texts: list[str] = field(default_factory=list)  # confirmed delivered text content (only this writes to history)
 
+    # ── v3.1: Debug / test console ───────────────────────────────
+    _debug_trace_handler: Any | None = None  # request-scoped LLM trace override (dry-run)
+
     # ── v1.5 limits ────────────────────────────────────────────
     max_llm_steps_per_turn: int = 20        # v1.5
     max_reply_messages_per_turn: int = 15   # v1.5

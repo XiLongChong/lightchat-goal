@@ -310,11 +310,19 @@ class ProactiveScheduler:
 
         return True, ""
 
-    def _in_sleep_hours(self, sleep_cfg: dict) -> bool:
-        """Check if current time is within configured sleep hours."""
+    def _in_sleep_hours(self, sleep_cfg: dict, *, debug_now: Any = None) -> bool:
+        """Check if current time is within configured sleep hours.
+
+        v3.1: debug_now (datetime|None) overrides real time for testing.
+        """
         try:
             tz = timezone(timedelta(hours=8))
-            now = datetime.now(tz).time()
+            if debug_now is not None:
+                if not debug_now.tzinfo:
+                    debug_now = debug_now.replace(tzinfo=tz)
+                now = debug_now.time()
+            else:
+                now = datetime.now(tz).time()
             start_str = str(sleep_cfg.get("start", "23:00"))
             end_str = str(sleep_cfg.get("end", "08:00"))
             start = datetime_time.fromisoformat(start_str)
@@ -806,6 +814,410 @@ class ProactiveScheduler:
 
     # ══════════════════════════════════════════════════════════════
     # Phase 7: Metrics snapshot (for admin API)
+    # ══════════════════════════════════════════════════════════════
+
+    # ══════════════════════════════════════════════════════════════
+    # v3.1: Debug-only methods (proactive test console)
+    # ══════════════════════════════════════════════════════════════
+
+    async def run_debug_eligibility(
+        self,
+        user_id: str,
+        bot_id: str,
+        *,
+        debug_now: Any = None,                      # datetime | None
+        simulate_user_silent_seconds: int | None = None,
+        simulate_last_proactive_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        """Run eligibility check for debug console. Does NOT call LLM.
+
+        Returns {"eligible": bool, "checks": [...], "final_reason": str}.
+        Each check: {"name": str, "passed": bool, "actual": ..., "required": ..., "reason": str|None}.
+        """
+        checks: list[dict[str, Any]] = []
+        cfg = self._config.get("proactive", {})
+
+        # 1. features.proactive
+        proactive_on = bool(
+            (self._config.get("features") or {}).get("proactive", False)
+        )
+        checks.append({
+            "name": "features.proactive",
+            "passed": proactive_on,
+            "actual": proactive_on,
+            "required": True,
+            "reason": None if proactive_on else "proactive feature is disabled",
+        })
+
+        # 2. bridge online
+        bridge_ok = True
+        if self._bridge_online_check and callable(self._bridge_online_check):
+            try:
+                bridge_ok = self._bridge_online_check()
+            except Exception:
+                bridge_ok = False
+        checks.append({
+            "name": "bridge_online",
+            "passed": bridge_ok,
+            "actual": bridge_ok,
+            "required": True,
+            "reason": None if bridge_ok else "WeChat bridge is offline",
+        })
+
+        # 3. sleep hours
+        sleep_cfg = cfg.get("eligibility", {}).get("sleep_hours", {})
+        in_sleep = False
+        if sleep_cfg:
+            in_sleep = self._in_sleep_hours(sleep_cfg, debug_now=debug_now)
+        checks.append({
+            "name": "sleep_hours",
+            "passed": not in_sleep,
+            "actual": in_sleep,
+            "required": False,
+            "reason": "current time is in sleep window" if in_sleep else None,
+        })
+
+        # 4. User message quiet window
+        quiet_passed = True
+        quiet_actual = "N/A"
+        quiet_required = "N/A"
+        if self._store:
+            try:
+                ds = await self._store.get_dialogue_state(user_id, bot_id)
+                last_user_at = float(ds.get("last_user_message_at", 0)) if ds else 0
+                effective_now = debug_now.timestamp() if debug_now else time.time()
+                if simulate_user_silent_seconds is not None:
+                    # Simulate: pretend user last message was N seconds ago
+                    simulated_last = effective_now - simulate_user_silent_seconds
+                    gap = effective_now - simulated_last
+                elif last_user_at > 0:
+                    gap = effective_now - last_user_at
+                else:
+                    gap = 999999  # no user message ever → quiet enough
+
+                quiet_min = int(cfg.get("eligibility", {}).get(
+                    "after_user_message_quiet_seconds_min", 60))
+                quiet_passed = gap >= quiet_min
+                quiet_actual = f"{int(gap)} seconds"
+                quiet_required = f"{quiet_min} seconds"
+            except Exception:
+                pass
+        checks.append({
+            "name": "user_silent_window",
+            "passed": quiet_passed,
+            "actual": quiet_actual,
+            "required": quiet_required,
+            "reason": None if quiet_passed else "user_silent_window_not_met",
+        })
+
+        # 5. Daily cap
+        daily_passed = True
+        daily_actual = "N/A"
+        daily_required = "N/A"
+        if self._store:
+            try:
+                daily_cap = int(cfg.get("eligibility", {}).get("daily_cap", 10))
+                tz = timezone(timedelta(hours=8))
+                effective_dt = debug_now if debug_now else datetime.now(tz)
+                if not effective_dt.tzinfo:
+                    effective_dt = effective_dt.replace(tzinfo=tz)
+                today_start = datetime.combine(
+                    effective_dt.date(),
+                    datetime_time.min,
+                    tzinfo=tz,
+                ).timestamp()
+                sent_today = await self._store.count_today_proactive_sent(today_start)
+                daily_passed = sent_today < daily_cap
+                daily_actual = f"{sent_today} sent"
+                daily_required = f"< {daily_cap}"
+            except Exception:
+                pass
+        checks.append({
+            "name": "daily_limit",
+            "passed": daily_passed,
+            "actual": daily_actual,
+            "required": daily_required,
+            "reason": None if daily_passed else "daily limit reached",
+        })
+
+        # 6. User opt-out
+        optout_passed = True
+        if self._store:
+            try:
+                ds = await self._store.get_dialogue_state(user_id, bot_id)
+                paused_until = float(ds.get("proactive_paused_until", 0)) if ds else 0
+                effective_now = debug_now.timestamp() if debug_now else time.time()
+                optout_passed = paused_until <= effective_now
+            except Exception:
+                pass
+        checks.append({
+            "name": "user_opt_out",
+            "passed": optout_passed,
+            "actual": "paused" if not optout_passed else "not paused",
+            "required": "not paused",
+            "reason": None if optout_passed else "user has opted out of proactive messages",
+        })
+
+        # 7. Min interval since last proactive
+        interval_passed = True
+        interval_actual = "N/A"
+        interval_required = "N/A"
+        if self._store:
+            try:
+                ps = await self._store.get_proactive_schedule_state(user_id, bot_id)
+                last_sent = float(ps.get("last_sent_ts", 0)) if ps else 0
+                effective_now = debug_now.timestamp() if debug_now else time.time()
+                if simulate_last_proactive_seconds is not None:
+                    simulated_last = effective_now - simulate_last_proactive_seconds
+                    gap = effective_now - simulated_last
+                elif last_sent > 0:
+                    gap = effective_now - last_sent
+                else:
+                    gap = 999999
+                min_interval_s = int(cfg.get("eligibility", {}).get("min_interval_minutes", 30)) * 60
+                interval_passed = gap >= min_interval_s
+                interval_actual = f"{int(gap)} seconds"
+                interval_required = f"{min_interval_s} seconds"
+            except Exception:
+                pass
+        checks.append({
+            "name": "min_interval",
+            "passed": interval_passed,
+            "actual": interval_actual,
+            "required": interval_required,
+            "reason": None if interval_passed else "min_interval_not_met",
+        })
+
+        # 8. Scheduler busy
+        busy = self._lock.locked()
+        checks.append({
+            "name": "scheduler_busy",
+            "passed": not busy,
+            "actual": busy,
+            "required": False,
+            "reason": "another proactive turn is running" if busy else None,
+        })
+
+        all_passed = all(c["passed"] for c in checks)
+        failed = [c for c in checks if not c["passed"]]
+        final_reason = failed[0]["reason"] if failed else ""
+
+        return {
+            "eligible": all_passed,
+            "checks": checks,
+            "final_reason": final_reason,
+        }
+
+    async def run_debug_impulse_pipeline(
+        self,
+        user_id: str,
+        bot_id: str,
+        *,
+        forced_impulse_type: str = "AUTO",
+        debug_now: Any = None,
+    ) -> dict[str, Any]:
+        """Run impulse generation pipeline for debug console. Does NOT call LLM.
+
+        forced_impulse_type:
+          "AUTO" → full pipeline (generate all types → dedup → expire → score → select)
+          "ECHO" / "TOPIC_CONTINUE" / "PRESENCE" / "SCHEDULED_RITUAL" →
+            only generate that type, still go through dedup/expire/score/select.
+
+        Returns {"eligible": bool, "candidates": [...], "selected": {...}|None,
+                 "filtering_dedup": {...}, "filtering_expire": {...},
+                 "filtering_score": {...}, "filtering_threshold": {...},
+                 "selection_reason": str}.
+        """
+        # Eligibility must pass first
+        eligibility = await self.run_debug_eligibility(
+            user_id, bot_id, debug_now=debug_now,
+        )
+        if not eligibility["eligible"]:
+            return {
+                "eligible": False,
+                "candidates": [],
+                "selected": None,
+                "filtering_dedup": {},
+                "filtering_expire": {},
+                "filtering_score": {},
+                "filtering_threshold": {},
+                "selection_reason": eligibility["final_reason"],
+            }
+
+        # Generate candidates — if forced, only generate that type
+        if forced_impulse_type == "AUTO":
+            candidates = await self._generate_impulse_candidates(user_id, bot_id)
+        else:
+            candidates = await self._generate_forced_impulse_candidates(
+                user_id, bot_id, forced_impulse_type,
+            )
+
+        if not candidates:
+            return {
+                "eligible": True,
+                "candidates": [],
+                "selected": None,
+                "filtering_dedup": {"input": 0, "output": 0, "removed": []},
+                "filtering_expire": {"input": 0, "output": 0, "removed": []},
+                "filtering_score": {"input": 0, "scored": []},
+                "filtering_threshold": {"min_score": 0, "passed": False},
+                "selection_reason": "no candidates generated",
+            }
+
+        # Dedup
+        before_dedup = len(candidates)
+        candidates = self._dedup_candidates(candidates)
+        dedup_info = {
+            "input": before_dedup,
+            "output": len(candidates),
+            "removed": before_dedup - len(candidates),
+        }
+
+        # Expire
+        before_expire = len(candidates)
+        candidates = self._expire_candidates(candidates)
+        expire_info = {
+            "input": before_expire,
+            "output": len(candidates),
+            "removed": before_expire - len(candidates),
+        }
+
+        # Score
+        scored = self._score_candidates(candidates)
+        score_info = {
+            "input": len(candidates),
+            "scored": [
+                {"type": c.get("impulse_type", "?"), "score": c.get("_score", 0)}
+                for c in scored
+            ],
+        }
+
+        # Threshold (min score = 0 for now, always pass)
+        threshold_info = {"min_score": 0, "passed": len(scored) > 0}
+
+        # Select best
+        selected = self._select_best(scored)
+
+        return {
+            "eligible": True,
+            "candidates": [
+                {
+                    "type": c.get("impulse_type", ""),
+                    "score": c.get("_score", 0) if "_score" in c else None,
+                    "reason": c.get("trigger_reason_summary", ""),
+                    "selected": selected is not None and c is selected,
+                }
+                for c in candidates
+            ],
+            "selected": selected,
+            "filtering_dedup": dedup_info,
+            "filtering_expire": expire_info,
+            "filtering_score": score_info,
+            "filtering_threshold": threshold_info,
+            "selection_reason": "" if selected else "no candidate passed score threshold",
+        }
+
+    async def _generate_forced_impulse_candidates(
+        self, user_id: str, bot_id: str, impulse_type: str,
+    ) -> list[dict[str, Any]]:
+        """Generate candidates for a single forced impulse type.
+
+        v2.1: Only limits the source type. The result still goes through
+        dedup/expire/score/select in run_debug_impulse_pipeline().
+        """
+        now_ts = time.time()
+        if impulse_type == "ECHO":
+            if self._store:
+                try:
+                    history = await self._store.get_recent_conversation_history(
+                        user_id, limit=6, bot_id=bot_id,
+                    )
+                    return self._generate_echo_impulses(history, user_id, now_ts, 3)
+                except Exception:
+                    pass
+            return []
+        elif impulse_type == "TOPIC_CONTINUE":
+            if self._store:
+                try:
+                    ds = await self._store.get_dialogue_state(user_id, bot_id)
+                    topic_id = str(ds.get("active_topic_id", "")) if ds else ""
+                    if topic_id:
+                        topic = await self._store.get_active_topic(topic_id)
+                        if topic and not topic.get("closed_at"):
+                            return self._generate_topic_impulses([topic], user_id, now_ts, 1)
+                except Exception:
+                    pass
+            return []
+        elif impulse_type == "PRESENCE":
+            last_interaction = 0.0
+            if self._store:
+                try:
+                    ds = await self._store.get_dialogue_state(user_id, bot_id)
+                    last_interaction = max(
+                        float(ds.get("last_user_message_at", 0)),
+                        float(ds.get("last_assistant_message_at", 0)),
+                    ) if ds else 0
+                except Exception:
+                    pass
+            return [self._build_presence_impulse(user_id, now_ts, last_interaction)]
+        elif impulse_type == "SCHEDULED_RITUAL":
+            ps = {}
+            if self._store:
+                try:
+                    ps = await self._store.get_proactive_schedule_state(user_id, bot_id) or {}
+                except Exception:
+                    pass
+            return [self._build_ritual_impulse(user_id, now_ts, ps)]
+        return []
+
+    async def run_debug_turn(
+        self,
+        user_id: str,
+        bot_id: str,
+        *,
+        impulse_meta: dict[str, Any],
+        chat_agent_kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Execute a proactive turn under the scheduler lock (debug-only).
+
+        v2.1: shares _lock with run_manual_trigger / run_heartbeat.
+        Dry-run and real-send both use the scheduler lock to prevent
+        concurrent proactive turns for the same user.
+
+        chat_agent_kwargs contains: history, system_prompt, wechat_sender,
+        write_model_history, post_turn_hooks, trigger, interrupt_checker.
+        """
+        if self._lock.locked():
+            return {"status": "skipped", "reason": "active_proactive_turn_running"}
+
+        async with self._lock:
+            turn_id = f"debug_{user_id}_{int(time.time() * 1000)}"
+            self._active_proactive_turn_id = turn_id
+            logger.info("proactive_scheduler: debug turn start turn_id=%s", turn_id)
+            try:
+                from agent.state_machine import SOURCE_PROACTIVE_IMPULSE
+
+                result = await self._chat_agent.chat(
+                    user_message=None,
+                    source=SOURCE_PROACTIVE_IMPULSE,
+                    proactive_meta=impulse_meta,
+                    **chat_agent_kwargs,
+                )
+                return {
+                    "status": "ok",
+                    "result": result,
+                    "turn_id": turn_id,
+                }
+            except Exception as e:
+                logger.error("proactive_scheduler: debug turn failed: %s", e)
+                return {
+                    "status": "error",
+                    "reason": str(e)[:500],
+                    "turn_id": turn_id,
+                }
+            finally:
+                self._active_proactive_turn_id = None
+
     # ══════════════════════════════════════════════════════════════
 
     def get_metrics(self) -> dict[str, Any]:
