@@ -291,6 +291,36 @@ def _build_default_registries() -> None:
         tool_category="terminal_tool",
     ))
 
+    # ── v3.1: skip_proactive — proactive-only terminal tool ──────
+    TOOL_REGISTRY.register(ToolDef(
+        name="skip_proactive",
+        description=(
+            "主动冲动不适合说出口时调用，跳过本次主动回合。"
+            "只能在尚未发送任何消息时调用（proactive_delivered_count == 0）。"
+            "已发送过消息后请用 done 结束。"
+        ),
+        args_schema={
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "enum": [
+                        "insufficient_evidence", "too_soon", "too_intrusive",
+                        "low_value", "repeated", "unsafe", "user_might_be_busy",
+                    ],
+                    "description": "跳过原因",
+                },
+                "note": {
+                    "type": "string",
+                    "description": "简短补充说明",
+                },
+            },
+            "required": ["reason"],
+        },
+        side_effect_level="none",
+        native_tool_call_eligible=True,
+        tool_category="terminal_tool",
+    ))
+
     # ── v1.5 deprecated: NOT exposed to model ───────────────────
     # Kept registered for backward-compat diagnostics and old data readability.
     # Models calling these → PROTOCOL_RETRY with migration hint.

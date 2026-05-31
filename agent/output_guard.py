@@ -54,39 +54,6 @@ def _looks_like_protocol_json(text: str) -> bool:
     return isinstance(parsed, dict) and "actions" in parsed
 
 
-def _unwrap_nested_protocol(text: str) -> str:
-    """Recover natural-language replies when the model double-wraps protocol JSON.
-
-    If the model put a full {"actions": [...], "done": true} payload inside
-    a message text field, extract the inner message texts.
-
-    Returns empty string if no natural-language content was found.
-    """
-    from utils.json_parser import safe_parse_json
-
-    parsed = safe_parse_json(text)
-    if not isinstance(parsed, dict):
-        return ""
-
-    replies: list[str] = []
-    for action in parsed.get("actions", [])[:MAX_MESSAGE_COUNT]:
-        if not isinstance(action, dict):
-            continue
-        action_type = action.get("type")
-        if action_type == "message":
-            candidate = str(action.get("text", "")).strip()
-        elif action_type == "tool" and str(action.get("name", "")).strip() == "wechat_reply":
-            args = action.get("args", {})
-            candidate = str(args.get("text", "")).strip() if isinstance(args, dict) else ""
-        else:
-            candidate = ""
-
-        if candidate and not _looks_like_protocol_json(candidate):
-            replies.append(candidate)
-
-    return "\n".join(replies).strip()
-
-
 def _filter_sensitive(text: str) -> str:
     """Remove concrete internal secrets from text.
 
@@ -287,12 +254,6 @@ def _strip_mild_profanity(text: str) -> str:
     return text
 
 
-# Keep module-level aliases for backward compatibility
-_sanitize_outbound_text = guard_single_message
-_looks_like_protocol_json = _looks_like_protocol_json
-_extract_nested_protocol_reply = _unwrap_nested_protocol
-
-
 # ================================================================
 # Phase 1: send_wechat_messages batch guard
 # ================================================================
@@ -448,3 +409,86 @@ def guard_send_message_batch(
             result.messages[-1] = last[:new_len].rstrip() + "…"
 
     return result
+
+
+# ================================================================
+# v1.5: wechat_reply text validation
+# ================================================================
+
+# ================================================================
+# v3.1: Proactive output guard
+# ================================================================
+
+# Patterns that indicate fabricated reality observations — proactive messages
+# must NOT claim sensory inputs the system doesn't have.
+_PROACTIVE_GUARD_PATTERNS: list[tuple[re.Pattern, str, str]] = [
+    # (pattern, result, label)
+    (re.compile(r'我看到你|我发现你|我注意到你'), "RETRY", "fabricated_observation"),
+    (re.compile(r'检测到你|监测到你|系统检测|根据数据'), "RETRY", "exposed_mechanism"),
+    (re.compile(r'提醒你完成|记得要|别忘了|你应该'), "RETRY", "task_flavor"),
+    (re.compile(r'你现在还没睡|你今天还没吃饭|你还没有|你还没'), "RETRY", "fabricated_observation"),
+    (re.compile(r'请(注意|记住|务必|一定)'), "RETRY", "notification_flavor"),
+    (re.compile(r'请注意休息|早点休息|注意身体'), "RETRY", "notification_flavor"),
+    (re.compile(r'请(问|问一下|你)'), "SANITIZE", "customer_service_flavor"),
+]
+
+
+def guard_proactive_output(text: str) -> tuple[str, str]:
+    """Guard proactive message text before general guard pipeline.
+
+    v3.1: Returns (result, cleaned_text) where result is one of:
+      PASS — text passes all proactive guards
+      SANITIZE — text was cleaned (minor adjustments)
+      RETRY — model must regenerate (fabricated observation, system flavor)
+      BLOCK — hard block, cannot send
+
+    Only RETRY and BLOCK are terminal decisions. SANITIZE lets text through
+    after cleanup, then it still goes through guard_single_message.
+    """
+    if not text or not str(text).strip():
+        return ("BLOCK", "")
+
+    text = str(text).strip()
+
+    for pattern, result, label in _PROACTIVE_GUARD_PATTERNS:
+        if pattern.search(text):
+            if result == "BLOCK":
+                logger.warning("proactive_guard: BLOCK [%s] in: %s", label, text[:80])
+                return ("BLOCK", text)
+            elif result == "RETRY":
+                logger.warning("proactive_guard: RETRY [%s] in: %s", label, text[:80])
+                return ("RETRY", text)
+            elif result == "SANITIZE":
+                logger.info("proactive_guard: SANITIZE [%s] in: %s", label, text[:80])
+                # For SANITIZE, remove the matched pattern and continue checking
+                text = pattern.sub("", text).strip()
+                # Re-check after sanitization
+                return _recheck_proactive_guard(text)
+
+    return ("PASS", text)
+
+
+def _recheck_proactive_guard(text: str) -> tuple[str, str]:
+    """Re-check after SANITIZE to ensure no remaining RETRY/BLOCK patterns."""
+    for pattern, result, label in _PROACTIVE_GUARD_PATTERNS:
+        if result in ("RETRY", "BLOCK") and pattern.search(text):
+            logger.warning("proactive_guard: post-sanitize %s [%s] in: %s", result, label, text[:80])
+            return (result, text)
+    return ("PASS", text)
+
+
+def validate_reply_text(text: str) -> tuple[bool, str]:
+    """Validate wechat_reply(text) before guard pipeline.
+
+    v1.5 first version: rejects any newline character.
+    Returns (is_valid, error_reason).
+    """
+    if not isinstance(text, str):
+        return False, "text_must_be_string"
+    if not text.strip():
+        return False, "text_empty"
+    if len(text) > 500:
+        return False, "text_too_long"
+    if "\n" in text:
+        return False, "text_contains_newline"
+    return True, ""

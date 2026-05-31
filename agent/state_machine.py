@@ -53,6 +53,10 @@ class TurnState(StrEnum):
     # --- done pipeline (v1.5: only normal terminal) ---
     VALIDATE_DONE_ARGS = "validate_done_args"
 
+    # --- v3.1: skip_proactive pipeline ---
+    VALIDATE_SKIP_PROACTIVE_ARGS = "validate_skip_proactive_args"
+    EXEC_SKIP_PROACTIVE = "exec_skip_proactive"
+
     # --- protocol ---
     PROTOCOL_RETRY = "protocol_retry"
 
@@ -78,20 +82,12 @@ class TurnState(StrEnum):
     END_PROTOCOL_ERROR = "end_protocol_error"
     END_ABORTED_BY_SYSTEM = "end_aborted_by_system"
 
-    # === v1.2 legacy (kept for TurnResult compat; not produced by v1.5 state machine) ===
-    END_SENT = "end_sent"
-    END_PARTIAL_SENT = "end_partial_sent"
-    END_SKIPPED = "end_skipped"
-    CLASSIFY_TOOL_CALLS = "classify_tool_calls"
-    CLASSIFY_TOOL_ERROR = "classify_tool_error"
-    TERMINAL_ACTION_BRANCH = "terminal_action_branch"
-    PARSE_VISIBLE_BATCH = "parse_visible_batch"
-    EXEC_SEND_WECHAT = "exec_send_wechat"
-    SEND_RETRY_UNDELIVERED_ONLY = "send_retry_undelivered_only"
-    DECIDE_SEND_TERMINAL = "decide_send_terminal"
-    EXEC_SKIP_REPLY = "exec_skip_reply"
-    ROUTE_RETRY_MODEL = "route_retry_model"
-    EXEC_STATE_TOOLS = "exec_state_tools"
+    # === v3.1 Proactive-specific terminal states ===
+    END_SKIPPED_PROACTIVE = "end_skipped_proactive"
+    END_FAILED_NO_FALLBACK = "end_failed_no_fallback"
+    END_PROACTIVE_GUARD_BLOCKED = "end_proactive_guard_blocked"
+    END_PROACTIVE_MAX_REPLY_LIMIT = "end_proactive_max_reply_limit"
+    END_PROACTIVE_MAX_LLM_STEPS = "end_proactive_max_llm_steps"
 
 
 # v1.5 terminal states
@@ -106,7 +102,17 @@ TERMINAL_STATES: frozenset[TurnState] = frozenset({
     TurnState.END_MAX_LIMIT,
     TurnState.END_PROTOCOL_ERROR,
     TurnState.END_ABORTED_BY_SYSTEM,
+    # v3.1 proactive-specific terminal states
+    TurnState.END_SKIPPED_PROACTIVE,
+    TurnState.END_FAILED_NO_FALLBACK,
+    TurnState.END_PROACTIVE_GUARD_BLOCKED,
+    TurnState.END_PROACTIVE_MAX_REPLY_LIMIT,
+    TurnState.END_PROACTIVE_MAX_LLM_STEPS,
 })
+
+# v3.1: Unified turn source constants
+SOURCE_USER_MESSAGE = "user_message"
+SOURCE_PROACTIVE_IMPULSE = "PROACTIVE_IMPULSE"
 
 
 # ================================================================
@@ -216,8 +222,8 @@ class TurnScratchpad:
     trigger: str = "user"  # user | admin | proactive
 
     # ── v1.5: Turn lifecycle metadata ──────────────────────────
-    source: str = "user_message"       # TURN_SOURCE: user_message | proactive_trigger | ...
-    proactive_meta: dict[str, Any] | None = None  # v1.5: proactive trigger metadata
+    source: str = "user_message"       # SOURCE_USER_MESSAGE | SOURCE_PROACTIVE_IMPULSE
+    proactive_meta: dict[str, Any] | None = None  # v3.1: proactive turn impulse metadata (see §0.3 contract)
     input_message_ids: list[str] = field(default_factory=list)
     input_first_seq: int = 0
     input_latest_seq: int = 0
@@ -255,7 +261,6 @@ class TurnScratchpad:
     reply_sequence_status: str = "in_progress"  # in_progress | completed | no_reply | failed | interrupted_by_user | max_limit_reached | protocol_error
     sent_message_count: int = 0          # successfully delivered this turn
     send_failure_count: int = 0          # failed delivery attempts this turn
-    fact_tool_call_count: int = 0        # fact tool calls this turn
     done_status: str = ""                # done(status=...)
     done_note: str = ""                  # done(note=...)
 
@@ -266,23 +271,24 @@ class TurnScratchpad:
     _last_send_delivered: bool = False       # set by EXEC_SEND_ONE, read by APPEND_SEND_RESULT
     _thinking_delay_accumulated_ms: float = 0.0  # total time spent in POST_SEND_THINKING_DELAY
 
-    # legacy compat
-    visible_batch: list[str] = field(default_factory=list)
-    guarded_batch: list[dict[str, Any]] = field(default_factory=list)
-
     # Counters
     iteration: int = 0
     llm_call_count: int = 0
     protocol_retry_count: int = 0
     send_attempt: int = 0
 
+    # ── v3.1: Proactive turn counters ──────────────────────────
+    proactive_attempt_count: int = 0       # model attempted wechat_reply count (LLM behavior audit)
+    proactive_send_attempt_count: int = 0  # actual wechat send API calls (hard_max_wechat_reply_per_turn limits this)
+    proactive_delivered_count: int = 0     # confirmed delivered count (allowed_tools phase judgment basis)
+    proactive_llm_step_count: int = 0      # LLM call count for proactive (max_llm_steps_per_proactive_turn limits this)
+    proactive_delivered_texts: list[str] = field(default_factory=list)  # confirmed delivered text content (only this writes to history)
+
     # ── v1.5 limits ────────────────────────────────────────────
-    max_iterations: int = 5                 # kept for compatibility
     max_llm_steps_per_turn: int = 20        # v1.5
     max_reply_messages_per_turn: int = 15   # v1.5
     max_protocol_retries: int = 2           # v1.5
     max_send_failures_per_turn: int = 2     # v1.5
-    max_send_retries: int = 2               # kept
     proactive_soft_reply_limit: int = 0     # v1.5: set for proactive turns (0 = n/a)
 
     # Diagnostics
@@ -351,13 +357,19 @@ class TurnResult:
     done_status: str = ""                    # v1.5
     done_note: str = ""                      # v1.5
 
+    # ── v3.1: Proactive turn fields (for main.py callbacks) ──
+    proactive_delivered_count: int = 0
+    proactive_delivered_texts: list[str] = field(default_factory=list)
+    proactive_attempt_count: int = 0
+    proactive_send_attempt_count: int = 0
+
     @property
     def was_sent(self) -> bool:
-        return self.terminal_state in (TurnState.END_REPLIED, TurnState.END_SENT, TurnState.END_PARTIAL_SENT)
+        return self.terminal_state == TurnState.END_REPLIED
 
     @property
     def was_skipped(self) -> bool:
-        return self.terminal_state in (TurnState.END_NO_REPLY, TurnState.END_SKIPPED)
+        return self.terminal_state == TurnState.END_NO_REPLY
 
     @property
     def was_fallback(self) -> bool:
@@ -415,10 +427,8 @@ PostTerminalCallback = Callable[["TurnScratchpad", TurnState], Awaitable[None]]
 
 MAX_REPLY_MESSAGES_PER_TURN = 15
 MAX_LLM_STEPS_PER_TURN = 20
-MAX_FACT_TOOL_CALLS_PER_TURN = 3
 MAX_PROTOCOL_RETRIES_PER_TURN = 2
 MAX_SEND_FAILURES_PER_TURN = 2
-PROACTIVE_SOFT_REPLY_LIMIT = 3
 
 # v1.6: Post-send thinking delay — interruptible pause between wechat_reply bubbles.
 # Each tier covers a reply_index range. Values are (min_s, max_s) tuples.
@@ -432,46 +442,3 @@ POST_SEND_DELAY_NARRATIVE_THRESHOLD_CHARS: int = 120
 POST_SEND_DELAY_POLL_INTERVAL_MS: int = 300  # interrupt check granularity
 
 
-# ================================================================
-# Error classification (v1.2: kept from v0.2 Phase 4)
-# ================================================================
-
-class ErrorClass(StrEnum):
-    RECOVERABLE = "recoverable"
-    FATAL = "fatal"
-
-
-def classify_error(error_source: str, detail: str = "") -> ErrorClass:
-    """Classify an error as recoverable or fatal.
-
-    Recoverable errors allow the turn to continue with degraded context.
-    Fatal errors force HARD_FALLBACK or END_FAILED.
-    """
-    _recoverable_sources = {
-        "memory_loader",
-        "emotion_loader",
-        "summary_loader",
-        "weather_prefetch",
-        "time_prefetch",
-    }
-    _fatal_sources = {
-        "user_message_lost",
-        "system_prompt_build",
-        "tool_registry_unavailable",
-        "wechat_sender_unavailable",
-        "llm_api_consecutive_failures",
-        "state_machine_internal",
-    }
-
-    source = error_source.strip().lower()
-    if source in _recoverable_sources:
-        return ErrorClass.RECOVERABLE
-    if source in _fatal_sources:
-        return ErrorClass.FATAL
-
-    # Heuristic: errors containing "fatal"/"致命" are fatal
-    if "fatal" in source or "致命" in detail:
-        return ErrorClass.FATAL
-
-    # Default: treat unknown errors as fatal (fail-safe)
-    return ErrorClass.FATAL

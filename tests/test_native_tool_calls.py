@@ -390,12 +390,12 @@ class TestDeepSeekAdapterPayload:
 # 6. ToolRegistry native specs tests
 class TestToolRegistryNativeSpecs:
     def test_registry_has_native_eligible_tools(self):
-        """v1.5: 4 tools are native-eligible (get_time, get_weather, wechat_reply, done)."""
+        """v3.1: 5 tools are native-eligible (get_time, get_weather, wechat_reply, done, skip_proactive)."""
         native_names = {
             t.name for t in TOOL_REGISTRY.iter_defs()
             if t.native_tool_call_eligible
         }
-        assert native_names == {"get_time", "get_weather", "wechat_reply", "done"}
+        assert native_names == {"get_time", "get_weather", "wechat_reply", "done", "skip_proactive"}
 
     def test_send_email_not_registered(self):
         """v0.2: send_email is removed from the registry entirely."""

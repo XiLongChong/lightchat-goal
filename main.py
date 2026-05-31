@@ -12,7 +12,6 @@ Single process, single SQLite file, zero cloud dependencies.
 
 import asyncio
 import io
-import random
 import secrets
 import uuid
 import zipfile
@@ -31,7 +30,7 @@ from zoneinfo import ZoneInfo
 import yaml
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 # Add project root to path
@@ -43,9 +42,10 @@ from agent.context_builder import compact_history, build_chat_system_prompt
 from agent.llm_gateway import LLMGateway
 from agent.llm_types import LLMRequest
 from agent.output_guard import guard_messages, guard_single_message
-from agent.state_machine import ModelProfile, TurnResult, TurnScratchpad, TurnState
-from agent.tools import configure_runtime, configure_tools, execute_tool, compute_message_delay
-from bridge.wechat_poller import WeChatBridge, login_qr
+from agent.scheduler import ProactiveScheduler
+from agent.state_machine import ModelProfile, TurnResult, TurnScratchpad, TurnState, SOURCE_PROACTIVE_IMPULSE
+from agent.tools import configure_runtime, configure_tools
+from bridge.wechat_poller import WeChatBridge
 from memory.store import MemoryStore
 
 # ================================================================
@@ -354,6 +354,14 @@ chat_agent = ChatAgent(
     manual_flash_allow_upgrade=_manual_upgrade,
     max_flash_upgrade_attempts=_max_upgrade,
 )
+
+# ── v3.1: ProactiveScheduler ─────────────────────────────────────
+proactive_scheduler = ProactiveScheduler(
+    chat_agent=chat_agent,
+    config=cfg,
+    store=memory_store,
+)
+logger.info("ProactiveScheduler: initialized (Phase 4 skeleton)")
 
 # v0.2 Phase 5: Memory hook — wires MemoryStore + MemoryWorker into
 # LOAD_MEMORY_CONTEXT and UPDATE_MEMORY positions.
@@ -837,30 +845,6 @@ async def append_history_async(user_id: str, role: str, content: str, source: st
         if merged:
             await memory_store.save_history_summary(user_id, merged[-4000:], bot_id=bot_id)
         conversation_histories[key] = compacted
-
-
-def result_token_count(result: dict) -> int:
-    usage = result.get("token_usage") or {}
-    try:
-        return max(0, int(usage.get("total_tokens", 0) or 0))
-    except (TypeError, ValueError):
-        return 0
-
-
-def result_fallback_type(result: dict) -> str:
-    events = result.get("fallback_events") or []
-    types = []
-    for item in events:
-        if isinstance(item, dict) and item.get("type"):
-            types.append(str(item["type"]))
-    return ",".join(types[:3])
-
-
-def result_fallback_detail(result: dict) -> str:
-    events = result.get("fallback_events") or []
-    if not events or not isinstance(events[0], dict):
-        return ""
-    return str(events[0].get("detail", ""))[:200]
 
 
 def public_settings() -> dict:
@@ -1556,247 +1540,6 @@ async def admin_send_message(request: Request):
 _IS_DELIVERED = {"delivered", "sent_confirmed"}
 
 
-async def _write_model_history(
-    result: TurnResult,
-    user_id: str,
-    bot_id: str,
-    user_message: str,
-) -> None:
-    """Write model-visible history according to terminal state.
-
-    v1.5 history matrix:
-    - END_REPLIED → user + all sent messages (completed)
-    - END_NO_REPLY → user only (no_reply)
-    - END_FAILED (sent_count>0) → user + sent messages (failed_after_partial_reply)
-    - END_FAILED (sent_count==0) → user only
-    - END_FALLBACK_SENT → user + fallback text (fallback)
-    - END_SUPERSEDED_BEFORE_SEND → user only (don't write unsent messages)
-    - END_INTERRUPTED_DURING_REPLY_SEQUENCE → user + sent messages (interrupted_by_user)
-    - END_MAX_LIMIT → user + sent messages (max_limit_reached)
-    - END_PROTOCOL_ERROR → user + sent messages if any (protocol_error)
-    - END_CANCELLED → user only
-    """
-    await append_history_async(user_id, "user", user_message, source="wechat", bot_id=bot_id)
-
-    delivered_texts = [
-        m["text"] for m in result.visible_messages
-        if (m.get("send_status") in _IS_DELIVERED
-            or m.get("delivery_status") in _IS_DELIVERED)
-        and m.get("text")
-    ]
-
-    state = result.terminal_state
-
-    if state == TurnState.END_REPLIED:
-        if delivered_texts:
-            await append_history_async(
-                user_id, "assistant", "\n".join(delivered_texts),
-                source="assistant", bot_id=bot_id,
-            )
-    elif state == TurnState.END_FAILED and result.sent_message_count > 0:
-        if delivered_texts:
-            await append_history_async(
-                user_id, "assistant", "\n".join(delivered_texts),
-                source="assistant:failed_after_partial_reply", bot_id=bot_id,
-            )
-    elif state == TurnState.END_INTERRUPTED_DURING_REPLY_SEQUENCE:
-        if delivered_texts:
-            await append_history_async(
-                user_id, "assistant", "\n".join(delivered_texts),
-                source="assistant:interrupted", bot_id=bot_id,
-            )
-    elif state == TurnState.END_MAX_LIMIT:
-        if delivered_texts:
-            await append_history_async(
-                user_id, "assistant", "\n".join(delivered_texts),
-                source="assistant:max_limit", bot_id=bot_id,
-            )
-    elif state == TurnState.END_PROTOCOL_ERROR:
-        if delivered_texts:
-            await append_history_async(
-                user_id, "assistant", "\n".join(delivered_texts),
-                source="assistant:protocol_error", bot_id=bot_id,
-            )
-    elif state == TurnState.END_FALLBACK_SENT:
-        if result.visible_messages:
-            fallback_texts = [
-                m["text"] for m in result.visible_messages if m.get("text")
-            ]
-            if fallback_texts:
-                await append_history_async(
-                    user_id, "assistant", "\n".join(fallback_texts),
-                    source="assistant:fallback", bot_id=bot_id,
-                )
-    # END_NO_REPLY, END_SUPERSEDED_BEFORE_SEND, END_CANCELLED, END_FAILED(sent_count==0):
-    # no assistant history
-
-
-# ================================================================
-# v1.2 Phase 5B: Extracted post-turn hooks
-# ================================================================
-
-async def _hook_update_summary(
-    result: TurnResult,
-    user_id: str,
-    bot_id: str,
-    **__: Any,
-) -> None:
-    """UPDATE_SUMMARY — placeholder. Summary is handled by separate recap trigger."""
-    pass
-
-
-async def _hook_update_memory(
-    result: TurnResult,
-    user_id: str,
-    user_message: str,
-    memory_hook: Any,
-    **__: Any,
-) -> None:
-    """UPDATE_MEMORY — fire-and-forget memory extraction."""
-    if not memory_hook:
-        return
-    assistant_text = "\n".join(
-        m["text"] for m in result.visible_messages
-        if m.get("text")
-        and (m.get("send_status") in _IS_DELIVERED
-             or m.get("delivery_status") in _IS_DELIVERED)
-    )
-    if assistant_text:
-        await memory_hook.update(
-            user_message=user_message,
-            assistant_text=assistant_text,
-            user_id=user_id,
-        )
-
-
-async def _hook_update_emotion(
-    result: TurnResult,
-    **__: Any,
-) -> None:
-    """UPDATE_EMOTION — placeholder for future emotion engine."""
-    pass
-
-
-async def _hook_write_dev_logs(
-    result: TurnResult,
-    turn_id: str,
-    user_id: str,
-    bot_id: str,
-    route: str,
-    context_policy: str,
-    user_message: str,
-    raw_messages: list[str],
-    send_status: str,
-    memory_store: Any,
-    **__: Any,
-) -> None:
-    """WRITE_DEV_LOGS — turn diagnostics, usage events, draft/outbound status."""
-    diag_fallback = ",".join(
-        e.get("type", "") for e in (result.fallback_events or [])[:3]
-    ) if result.fallback_events else ""
-    token_count = result.token_usage.get("total_tokens", 0) if result.token_usage else 0
-
-    await memory_store.record_turn_diagnostics(
-        turn_id=turn_id,
-        user_id=user_id,
-        source="wechat",
-        route=route,
-        context_policy=context_policy,
-        llm_status=result.llm_status,
-        token_count=token_count,
-        elapsed_ms=result.elapsed_ms,
-        fallback_type=diag_fallback,
-        send_status=send_status,
-        memory_enqueued=0,
-        input_chars=len(user_message),
-        output_messages=result.delivered_count,
-        tool_calls=len(result.tool_results),
-        metadata={
-            "terminal_state": str(result.terminal_state),
-            "context_sample": result.context_sample,
-        },
-    )
-
-    await memory_store.record_usage_event(
-        event_type="chat_turn",
-        user_id=user_id,
-        source="wechat",
-        message_count=len(raw_messages) + result.delivered_count,
-        token_count=token_count,
-        elapsed_ms=result.elapsed_ms,
-        fallback_type=diag_fallback,
-        metadata={
-            "input_chars": len(user_message),
-            "output_messages": result.delivered_count,
-            "tool_calls": len(result.tool_results),
-            "token_estimated": bool(
-                (result.token_usage or {}).get("estimated")
-            ),
-            "turn_id": turn_id,
-            "route": route,
-            "context_policy": context_policy,
-            "terminal_state": str(result.terminal_state),
-        },
-    )
-
-    # Mark draft / outbound status
-    if result.was_skipped:
-        await memory_store.mark_turn_draft_status(turn_id, "skipped")
-    elif result.was_cancelled:
-        await memory_store.mark_turn_draft_status(turn_id, "cancelled")
-    elif result.was_sent or result.was_fallback:
-        await memory_store.mark_turn_draft_status(turn_id, "delivered")
-        await memory_store.mark_outbound_batch_status(turn_id, "delivered")
-    elif result.was_failed:
-        await memory_store.mark_turn_draft_status(turn_id, "failed")
-    else:
-        await memory_store.mark_turn_draft_status(turn_id, "generated")
-
-    await memory_store.update_turn_send_status(turn_id, send_status)
-
-
-async def _hook_quality_metrics(
-    result: TurnResult,
-    **__: Any,
-) -> None:
-    """QUALITY_METRICS — placeholder for future quality tracking."""
-    pass
-
-
-async def _run_all_post_turn_hooks(
-    result: TurnResult,
-    turn_id: str,
-    user_id: str,
-    bot_id: str,
-    route: str,
-    context_policy: str,
-    user_message: str,
-    raw_messages: list[str],
-    send_status: str,
-    memory_hook: Any,
-    memory_store: Any,
-) -> None:
-    """Execute all post-turn hooks in order. Individual failures do not block others."""
-    hooks = [
-        ("UPDATE_SUMMARY", _hook_update_summary),
-        ("UPDATE_MEMORY", _hook_update_memory),
-        ("UPDATE_EMOTION", _hook_update_emotion),
-        ("WRITE_DEV_LOGS", _hook_write_dev_logs),
-        ("QUALITY_METRICS", _hook_quality_metrics),
-    ]
-    common = dict(
-        result=result, turn_id=turn_id, user_id=user_id, bot_id=bot_id,
-        route=route, context_policy=context_policy, user_message=user_message,
-        raw_messages=raw_messages, send_status=send_status,
-        memory_hook=memory_hook, memory_store=memory_store,
-    )
-    for name, hook in hooks:
-        try:
-            await hook(**common)
-        except Exception:
-            logger.exception("post_turn_hook %s failed", name)
-
-
 # ================================================================
 # v1.2 Phase 5C: Build ChatAgent-compatible callbacks
 # ================================================================
@@ -1991,15 +1734,6 @@ def _build_chatagent_post_turn_hooks(
             await memory_store.mark_turn_draft_status(turn.turn_id, "generated")
         await memory_store.update_turn_send_status(turn.turn_id, send_status)
 
-    async def _hook_summary(turn: TurnScratchpad, terminal_state: TurnState) -> None:
-        pass  # placeholder
-
-    async def _hook_emotion(turn: TurnScratchpad, terminal_state: TurnState) -> None:
-        pass  # placeholder
-
-    async def _hook_quality(turn: TurnScratchpad, terminal_state: TurnState) -> None:
-        pass  # placeholder
-
     async def _hook_model_attempt_log(turn: TurnScratchpad, terminal_state: TurnState) -> None:
         """v1.3 WRITE_MODEL_ATTEMPT_LOG: log all model attempts for this turn."""
         for attempt in turn.model_attempts:
@@ -2018,11 +1752,8 @@ def _build_chatagent_post_turn_hooks(
             )
 
     return [
-        _hook_summary,
         _hook_memory,
-        _hook_emotion,
         _hook_dev_logs,
-        _hook_quality,
         _hook_model_attempt_log,
     ]
 
@@ -2540,6 +2271,218 @@ async def admin_events(request: Request, limit: int = 30):
     """Aggregated Chinese admin dashboard events for the browser UI."""
     require_admin(request)
     return await build_admin_event_dashboard(limit=limit)
+
+
+# ================================================================
+# v3.1: Proactive callbacks + admin trigger
+# ================================================================
+
+def _build_test_impulse_meta(body: dict[str, Any]) -> dict[str, Any]:
+    """Build a minimal impulse_meta from admin trigger request body.
+
+    v3.1 §4.2: Provides defaults for all required proactive_meta fields.
+    """
+    return {
+        "impulse_id": str(body.get("impulse_id") or f"admin_{int(time.time() * 1000)}"),
+        "impulse_type": str(body.get("impulse_type") or "ADMIN_MANUAL"),
+        "proactive_chain_id": str(body.get("proactive_chain_id") or f"chain_{int(time.time() * 1000)}"),
+        "trigger_reason_summary": str(body.get("trigger_reason_summary") or "管理员手动触发"),
+        "evidence_pack": {
+            "source_topic_id": str(body.get("topic_id") or ""),
+            "source_message_ids": [],
+            "recent_proactive_messages": [],  # only confirmed delivered
+            "relationship_temperature": None,
+            "topic_snapshot": str(body.get("topic_snapshot") or ""),
+        },
+        "dedupe_key": str(body.get("dedupe_key") or f"admin_dedup_{int(time.time())}"),
+        "reply_window_seconds": int(body.get("reply_window_seconds", 14400)),
+        "max_wechat_reply": int(body.get("max_wechat_reply", 3)),
+    }
+
+
+def _build_proactive_write_model_history(
+    user_id: str, bot_id: str,
+):
+    """Return a PostTerminalCallback for proactive turns.
+
+    v3.1 §4.5: Only writes confirmed delivered texts to conversation history.
+    Delivered-only rule — guard RETRY, BLOCK, send failure, and interrupt
+    texts are NEVER written to visible history.
+
+    Source = "assistant:proactive" so context builders can distinguish.
+    """
+    async def _cb(turn: TurnScratchpad, terminal_state: TurnState) -> None:
+        delivered_texts = turn.proactive_delivered_texts
+        if not delivered_texts:
+            # delivered empty → no assistant:proactive written
+            return
+
+        content = "\n".join(delivered_texts)
+        await append_history_async(
+            user_id, "assistant", content,
+            source="assistant:proactive", bot_id=bot_id,
+        )
+        _logger = logging.getLogger("goal")
+        _logger.info(
+            "proactive_write_history: wrote %d delivered texts turn_id=%s terminal=%s",
+            len(delivered_texts), turn.turn_id, str(terminal_state),
+        )
+    return _cb
+
+
+def _build_proactive_post_turn_hooks(
+    user_id: str, bot_id: str, impulse_meta: dict[str, Any],
+) -> list:
+    """Return post_turn_hooks for proactive turns.
+
+    v3.1 §4.5: Hooks record diagnostics, update impulse status, and write
+    recent_proactive_messages.delivered_texts (Phase 4 minimum).
+    Phase 7 will complete full four-state tracking.
+    """
+
+    async def _hook_proactive_dev_logs(turn: TurnScratchpad, terminal_state: TurnState) -> None:
+        _logger = logging.getLogger("goal")
+        _logger.info(
+            "proactive_turn_complete: turn_id=%s terminal=%s "
+            "attempts=%d send_attempts=%d delivered=%d "
+            "delivered_texts=%s",
+            turn.turn_id, str(terminal_state),
+            turn.proactive_attempt_count,
+            turn.proactive_send_attempt_count,
+            turn.proactive_delivered_count,
+            [t[:60] for t in turn.proactive_delivered_texts],
+        )
+
+        # Record usage event
+        await memory_store.record_usage_event(
+            event_type="proactive_turn",
+            user_id=user_id,
+            source="proactive",
+            message_count=turn.proactive_delivered_count,
+            elapsed_ms=turn.elapsed_ms,
+            metadata={
+                "turn_id": turn.turn_id,
+                "terminal_state": str(terminal_state),
+                "impulse_id": str(impulse_meta.get("impulse_id", "")),
+                "impulse_type": str(impulse_meta.get("impulse_type", "")),
+                "proactive_attempt_count": turn.proactive_attempt_count,
+                "proactive_send_attempt_count": turn.proactive_send_attempt_count,
+                "proactive_delivered_count": turn.proactive_delivered_count,
+                "proactive_delivered_texts": [
+                    t[:120] for t in turn.proactive_delivered_texts
+                ],
+                "skip_status": getattr(turn, "_skip_status", ""),
+            },
+        )
+
+    async def _hook_proactive_turn_record(turn: TurnScratchpad, terminal_state: TurnState) -> None:
+        """Record the proactive turn in L2 turns table."""
+        try:
+            import json as _json
+            assistant_actions_json = _json.dumps(
+                [{"text": vm.guarded_text or vm.original_text, "delay": vm.delay}
+                 for vm in turn.visible_messages],
+                ensure_ascii=False,
+            )
+            # Determine send_status from terminal state
+            _ss_map = {
+                TurnState.END_REPLIED: "delivered",
+                TurnState.END_SKIPPED_PROACTIVE: "skipped_proactive",
+                TurnState.END_FAILED_NO_FALLBACK: "failed",
+                TurnState.END_PROACTIVE_GUARD_BLOCKED: "guard_blocked",
+                TurnState.END_PROACTIVE_MAX_REPLY_LIMIT: "max_reply_limit",
+                TurnState.END_PROACTIVE_MAX_LLM_STEPS: "max_llm_steps",
+            }
+            send_status = _ss_map.get(terminal_state, "generated")
+
+            await memory_store.create_turn(
+                turn_id=turn.turn_id,
+                user_id=user_id,
+                bot_id=bot_id,
+                user_messages="",
+                assistant_actions=assistant_actions_json,
+                tool_calls=_json.dumps(turn.tool_results, ensure_ascii=False),
+                source="proactive",
+                trigger="proactive",
+                send_status=send_status,
+            )
+            if turn.visible_messages:
+                await memory_store.record_outbound_messages(
+                    turn_id=turn.turn_id,
+                    messages=[{
+                        "text": vm.guarded_text or vm.original_text,
+                        "delay": vm.delay,
+                        "send_status": vm.delivery_status,
+                        "delivery_status": vm.delivery_status,
+                    } for vm in turn.visible_messages],
+                    user_id=user_id,
+                    bot_id=bot_id,
+                    source="proactive",
+                    author="assistant",
+                    trigger="proactive",
+                )
+        except Exception as e:
+            logging.getLogger("goal").warning("proactive: turn record failed: %s", e)
+
+    return [
+        _hook_proactive_dev_logs,
+        _hook_proactive_turn_record,
+    ]
+
+
+@app.post("/admin/proactive/trigger")
+async def admin_trigger_proactive(request: Request):
+    """v3.1 Phase 4: Manual proactive turn trigger (admin UI).
+
+    Accepts optional impulse_meta overrides. Delegates to ProactiveScheduler.
+    main.py does NOT acquire the scheduler lock directly.
+    """
+    require_admin(request)
+
+    contact = await memory_store.get_contact_state()
+    user_id = contact.get("user_id", "")
+    if not user_id:
+        raise HTTPException(status_code=400, detail="还没有记录到微信联系人")
+
+    bot_id = BOT_ID
+    context_token = contact.get("context_token", "")
+
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    if not isinstance(body, dict):
+        body = {}
+
+    impulse_meta = _build_test_impulse_meta(body)
+
+    # ── Build wechat_sender bound to this user/context ──
+    async def _bound_wechat_sender(messages: list[dict]) -> list[dict]:
+        return await wechat_sender(user_id, context_token, messages)
+
+    # ── Providers ──
+    async def _history_provider(uid: str, bid: str) -> list[dict]:
+        return await get_history_async(uid, bot_id=bid)
+
+    async def _system_prompt_provider(uid: str) -> str:
+        return await build_enriched_system_prompt(uid, "")
+
+    interrupt_checker = _make_interrupt_checker(user_id, input_latest_seq=0)
+
+    # ── Proactive callbacks ──
+    wmh_cb = _build_proactive_write_model_history(user_id, bot_id)
+    hook_cbs = _build_proactive_post_turn_hooks(user_id, bot_id, impulse_meta)
+
+    result = await proactive_scheduler.run_manual_trigger(
+        user_id=user_id,
+        impulse_meta=impulse_meta,
+        bot_id=bot_id,
+        history_provider=_history_provider,
+        system_prompt_provider=_system_prompt_provider,
+        wechat_sender_provider=_bound_wechat_sender,
+        interrupt_checker_provider=interrupt_checker,
+        write_model_history=wmh_cb,
+        post_turn_hooks=hook_cbs,
+    )
+
+    return result
 
 
 # ================================================================

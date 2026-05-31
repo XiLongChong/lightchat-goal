@@ -24,6 +24,8 @@ from agent.state_machine import (
     POST_SEND_DELAY_NARRATIVE_THRESHOLD_CHARS,
     POST_SEND_DELAY_POLL_INTERVAL_MS,
     POST_SEND_DELAY_TIERS,
+    SOURCE_PROACTIVE_IMPULSE,
+    SOURCE_USER_MESSAGE,
     TERMINAL_STATES,
     ContextBuildResult,
     DeliveryStatus,
@@ -139,7 +141,7 @@ class ChatAgent:
 
     async def chat(
         self,
-        user_message: str,
+        user_message: str | None,
         history: list[dict[str, Any]],
         *,
         trigger: str = "user",
@@ -149,6 +151,7 @@ class ChatAgent:
         system_prompt: str = "",
         wechat_sender: WeChatSender | None = None,
         source: str = "user_message",
+        proactive_meta: dict[str, Any] | None = None,
         input_message_ids: list[str] | None = None,
         input_first_seq: int = 0,
         input_latest_seq: int = 0,
@@ -163,15 +166,27 @@ class ChatAgent:
         Returns TurnResult with terminal_state, visible_messages, and diagnostics.
         WRITE_MODEL_HISTORY and POST_TURN_HOOKS execute inside this method
         before TurnResult is assembled.
+
+        v3.1: user_message can be None for proactive turns (source=PROACTIVE_IMPULSE).
+        proactive_meta carries impulse metadata for proactive context injection.
         """
+        # ── v3.1: Proactive turn validation ──────────────────────
+        if source == SOURCE_PROACTIVE_IMPULSE:
+            if user_message is not None:
+                raise ValueError(
+                    f"user_message must be None for proactive turns (source={SOURCE_PROACTIVE_IMPULSE}), "
+                    f"got {len(str(user_message))} chars"
+                )
+
         # ── Inject interrupt checker for this turn ──────────────
         if interrupt_checker is not None:
             self._interrupt_checker = interrupt_checker
 
         turn = TurnScratchpad(
-            user_message=user_message,
+            user_message=user_message or "",
             trigger=trigger,
             source=source,
+            proactive_meta=proactive_meta,
             input_message_ids=list(input_message_ids or []),
             input_first_seq=input_first_seq,
             input_latest_seq=input_latest_seq,
@@ -189,14 +204,17 @@ class ChatAgent:
         while state not in TERMINAL_STATES:
             if turn.llm_call_count >= turn.max_llm_steps_per_turn:
                 logger.warning(
-                    "state_machine: max_llm_steps=%d exceeded, forcing HARD_FALLBACK",
+                    "state_machine: max_llm_steps=%d exceeded",
                     turn.max_llm_steps_per_turn,
                 )
                 turn.add_fallback_event(
                     "max_llm_steps_exceeded",
                     f"reached {turn.llm_call_count} LLM calls",
                 )
-                state = TurnState.HARD_FALLBACK
+                if turn.source == SOURCE_PROACTIVE_IMPULSE:
+                    state = TurnState.END_PROACTIVE_MAX_LLM_STEPS
+                else:
+                    state = TurnState.HARD_FALLBACK
 
             effective_elapsed_s = (turn.elapsed_ms - turn._thinking_delay_accumulated_ms) / 1000
             if effective_elapsed_s > turn.turn_timeout_seconds:
@@ -234,7 +252,7 @@ class ChatAgent:
 
         # ── Build result (after pipeline completes) ─────────────
         self._last_call_time = time.time()
-        source_out, author, trigger_type = _resolve_outbound_semantics(trigger)
+        source_out, author, trigger_type = _resolve_outbound_semantics(trigger, source=turn.source)
         context_sample = _build_context_sample(turn.messages)
 
         # v1.2: build backward-compat dict from VisibleMessage objects
@@ -269,6 +287,11 @@ class ChatAgent:
             sent_message_count=turn.sent_message_count,
             done_status=turn.done_status,
             done_note=turn.done_note,
+            # ── v3.1: Proactive fields for callbacks ──
+            proactive_delivered_count=turn.proactive_delivered_count,
+            proactive_delivered_texts=list(turn.proactive_delivered_texts),
+            proactive_attempt_count=turn.proactive_attempt_count,
+            proactive_send_attempt_count=turn.proactive_send_attempt_count,
         )
 
     # ================================================================
@@ -343,6 +366,12 @@ class ChatAgent:
 
         elif state == TurnState.VALIDATE_DONE_ARGS:
             return self._do_validate_done_args(turn)
+
+        elif state == TurnState.VALIDATE_SKIP_PROACTIVE_ARGS:
+            return self._do_validate_skip_proactive_args(turn)
+
+        elif state == TurnState.EXEC_SKIP_PROACTIVE:
+            return self._do_exec_skip_proactive(turn)
 
         elif state == TurnState.PROTOCOL_RETRY:
             return self._do_protocol_retry(turn)
@@ -580,11 +609,19 @@ class ChatAgent:
             if content.strip():
                 messages.append({"role": role, "content": content})
 
-        # Current user message
-        if trigger == "user":
+        # Current user message (v3.1: skipped for proactive turns)
+        if turn.source == SOURCE_PROACTIVE_IMPULSE:
+            # Proactive turns: no user message. Context is injected below.
+            pass
+        elif trigger == "user":
             messages.append({"role": "user", "content": turn.user_message})
         else:
             messages.append({"role": "system", "content": turn.user_message})
+
+        # ── v3.1: Proactive context as independent system message ──
+        if turn.source == SOURCE_PROACTIVE_IMPULSE:
+            proactive_ctx = _build_proactive_context_system_message(turn)
+            messages.append({"role": "system", "content": proactive_ctx})
 
         # Store result on scratchpad
         result = ContextBuildResult(
@@ -631,10 +668,26 @@ class ChatAgent:
         return ("flash", "daily_chat", self._flash_profile)
 
     async def _do_call_llm(self, turn: TurnScratchpad) -> TurnState:
-        """CALL_LLM: invoke the LLM via gateway."""
+        """CALL_LLM: invoke the LLM via gateway.
+
+        v3.1: proactive turns use dynamic allowed_tools based on
+        proactive_delivered_count, and enforce max_llm_steps check.
+        """
         from agent.llm_types import LLMRequest
 
         turn.llm_call_count += 1
+
+        # ── v3.1: Proactive max_llm_steps check ──────────────────
+        if turn.source == SOURCE_PROACTIVE_IMPULSE:
+            turn.proactive_llm_step_count += 1
+            max_steps = _get_proactive_config(self.defaults).get("max_llm_steps_per_proactive_turn", 8)
+            if turn.proactive_llm_step_count > max_steps:
+                turn.add_fallback_event(
+                    "proactive_max_llm_steps",
+                    f"count={turn.proactive_llm_step_count} > max={max_steps}",
+                )
+                logger.info("call_llm: proactive max_llm_steps exceeded → END_PROACTIVE_MAX_LLM_STEPS")
+                return TurnState.END_PROACTIVE_MAX_LLM_STEPS
 
         # ── v1.3: Model routing ──────────────────────────────────
         model_label, routing_reason, profile = self._select_model(turn)
@@ -654,8 +707,14 @@ class ChatAgent:
         turn._current_attempt = attempt
 
         request_tools = None
-        if self.native_tool_calls and self.native_allowed_tools:
-            request_tools = _build_native_tool_specs(self.native_allowed_tools)
+        # ── v3.1: Proactive dynamic allowed_tools based on delivered_count ──
+        if self.native_tool_calls:
+            if turn.source == SOURCE_PROACTIVE_IMPULSE:
+                allowed = _get_proactive_allowed_tools(turn)
+                request_tools = _build_native_tool_specs(allowed)
+            elif self.native_allowed_tools:
+                request_tools = _build_native_tool_specs(self.native_allowed_tools)
+
             if request_tools:
                 _tool_names = [t["function"]["name"] for t in request_tools]
                 logger.info(
@@ -839,6 +898,8 @@ class ChatAgent:
 
         v1.5: wechat_reply MUST route by name (NOT by tool_category).
         It is registered as fact_tool but must never enter EXEC_FACT_TOOLS.
+
+        v3.1: proactive phase validation added — allowed_tools checked per-phase.
         """
         tool_calls = turn._tool_calls
         if not tool_calls:
@@ -863,13 +924,78 @@ class ChatAgent:
 
         name = classified.tool_name
 
+        # ── v3.1: Proactive allowed_tools phase validation (backend layer) ──
+        if turn.source == SOURCE_PROACTIVE_IMPULSE:
+            meta = turn.proactive_meta or {}
+            max_reply = int(meta.get("max_wechat_reply", 3))
+            delivered = turn.proactive_delivered_count
+
+            # Phase A: delivered_count == 0 → [wechat_reply, skip_proactive]
+            if delivered == 0:
+                if name == "done":
+                    turn.add_fallback_event("proactive_disallowed_tool",
+                        "phase A: cannot call done before any delivery; use skip_proactive")
+                    turn.messages.append({
+                        "role": "system",
+                        "content": "尚未发送任何消息，不能调用 done。如果不想说，请调用 skip_proactive。",
+                    })
+                    return TurnState.PROTOCOL_RETRY
+                if name in ("get_time", "get_weather"):
+                    turn.add_fallback_event("proactive_disallowed_tool",
+                        f"proactive turns cannot use {name}")
+                    turn.messages.append({
+                        "role": "system",
+                        "content": f"主动回合不能使用 {name}。只能使用 wechat_reply 或 skip_proactive。",
+                    })
+                    return TurnState.PROTOCOL_RETRY
+            # Phase B: 0 < delivered < max_reply → [wechat_reply, done]
+            elif delivered < max_reply:
+                if name == "skip_proactive":
+                    turn.add_fallback_event("proactive_disallowed_tool",
+                        "phase B: cannot skip after delivery; use done")
+                    turn.messages.append({
+                        "role": "system",
+                        "content": "已发送过消息，不能调用 skip_proactive。如果说完请调用 done。",
+                    })
+                    return TurnState.PROTOCOL_RETRY
+                if name in ("get_time", "get_weather"):
+                    turn.add_fallback_event("proactive_disallowed_tool",
+                        f"proactive turns cannot use {name}")
+                    return TurnState.PROTOCOL_RETRY
+            # Phase C: delivered >= max_reply → [done]
+            else:
+                if name == "wechat_reply":
+                    turn.add_fallback_event("proactive_max_reply_limit",
+                        f"delivered={delivered} >= max_reply={max_reply}")
+                    logger.info("classify_one_tool_call: proactive max reply limit hit")
+                    return TurnState.END_PROACTIVE_MAX_REPLY_LIMIT
+                if name == "skip_proactive":
+                    turn.add_fallback_event("proactive_disallowed_tool",
+                        "phase C: cannot skip after reaching limit")
+                    return TurnState.PROTOCOL_RETRY
+                if name not in ("done",):
+                    turn.add_fallback_event("proactive_disallowed_tool",
+                        f"phase C: only done allowed, got {name}")
+                    return TurnState.PROTOCOL_RETRY
+
         # ── Name-based routing (NOT category-based) ─────────────
         # wechat_reply is registered as fact_tool but MUST NOT enter EXEC_FACT_TOOLS.
         if name in ("get_time", "get_weather"):
             return TurnState.EXEC_FACT_TOOLS
         elif name == "wechat_reply":
+            # ── v3.1: Proactive attempt counter (LLM behavior audit) ──
+            if turn.source == SOURCE_PROACTIVE_IMPULSE:
+                turn.proactive_attempt_count += 1
             # Check if already at reply limit
-            if turn.sent_message_count >= turn.max_reply_messages_per_turn:
+            if turn.source == SOURCE_PROACTIVE_IMPULSE:
+                meta = turn.proactive_meta or {}
+                max_reply = int(meta.get("max_wechat_reply", 3))
+                if turn.sent_message_count >= max_reply:
+                    logger.info("classify_one_tool_call: proactive wechat_reply after limit sent=%d", turn.sent_message_count)
+                    turn.add_fallback_event("wechat_reply_after_limit",
+                        f"sent_count={turn.sent_message_count} >= max={max_reply}")
+                    return TurnState.END_PROACTIVE_MAX_REPLY_LIMIT
+            elif turn.sent_message_count >= turn.max_reply_messages_per_turn:
                 logger.info("classify_one_tool_call: wechat_reply after limit sent_count=%d", turn.sent_message_count)
                 turn.add_fallback_event("wechat_reply_after_limit",
                     f"sent_count={turn.sent_message_count} >= max={turn.max_reply_messages_per_turn}")
@@ -877,6 +1003,25 @@ class ChatAgent:
             return TurnState.VALIDATE_REPLY_ARGS
         elif name == "done":
             return TurnState.VALIDATE_DONE_ARGS
+        elif name == "skip_proactive":
+            # Only valid in proactive phase A (delivered_count == 0)
+            if turn.source != SOURCE_PROACTIVE_IMPULSE:
+                turn.add_fallback_event("skip_proactive_in_non_proactive",
+                    f"source={turn.source}")
+                turn.messages.append({
+                    "role": "system",
+                    "content": "skip_proactive 只能在主动回合中使用。当前是普通回合，请用 done 或 wechat_reply。",
+                })
+                return TurnState.PROTOCOL_RETRY
+            if turn.proactive_delivered_count > 0:
+                turn.add_fallback_event("skip_proactive_after_delivery",
+                    f"delivered_count={turn.proactive_delivered_count}")
+                turn.messages.append({
+                    "role": "system",
+                    "content": "已发送过消息后不能调用 skip_proactive。如果说完请调用 done。",
+                })
+                return TurnState.PROTOCOL_RETRY
+            return TurnState.VALIDATE_SKIP_PROACTIVE_ARGS
 
         turn.add_fallback_event("unroutable_tool", f"tool '{name}' has no route")
         return TurnState.PROTOCOL_RETRY
@@ -1030,13 +1175,39 @@ class ChatAgent:
     def _do_guard_output(self, turn: TurnScratchpad) -> TurnState:
         """GUARD_OUTPUT: guard single wechat_reply text.
 
-        v1.5: guards one message at a time (wechat_reply pipeline).
-        Stores guarded_text on turn._guarded_text.
-        If blocked → recoverable error tool result → CALL_LLM.
+        v3.1: proactive turns run guard_proactive_output before general guard.
+        RETRY → feedback to model. BLOCK → END_PROACTIVE_GUARD_BLOCKED.
+        SANITIZE → use cleaned text, then continue to general guard.
         """
-        from agent.output_guard import guard_single_message
+        from agent.output_guard import guard_single_message, guard_proactive_output
 
         text = turn._current_reply_text
+
+        # ── v3.1: Proactive guard (runs before general guard) ─────
+        if turn.source == SOURCE_PROACTIVE_IMPULSE:
+            pro_result, pro_text = guard_proactive_output(text)
+            if pro_result == "RETRY":
+                result = {"status": "error", "recoverable": True,
+                          "reason": "proactive_guard_retry",
+                          "hint": (
+                              "你的主动消息包含未经证实的现实观察（如'我看到你'、'检测到'）"
+                              "或系统味/通知味/任务味表达。请改成自然微信短句，像真人聊天一样。"
+                              "不要假装你有视觉或传感器。"
+                          )}
+                turn.messages.append({
+                    "role": "tool", "tool_call_id": turn._current_tool_call_id,
+                    "content": _json.dumps(result, ensure_ascii=False),
+                })
+                logger.info("guard_output: proactive RETRY preview=%s", text[:60])
+                return TurnState.CALL_LLM
+            if pro_result == "BLOCK":
+                turn.add_fallback_event("proactive_guard_block", text[:200])
+                logger.info("guard_output: proactive BLOCK → END_PROACTIVE_GUARD_BLOCKED")
+                return TurnState.END_PROACTIVE_GUARD_BLOCKED
+            if pro_result == "SANITIZE":
+                text = pro_text
+                logger.info("guard_output: proactive SANITIZE len=%d", len(text))
+
         guarded = guard_single_message(text)
 
         if not guarded:
@@ -1110,6 +1281,10 @@ class ChatAgent:
             logger.info("exec_send_one: no wechat_sender")
             return TurnState.APPEND_SEND_RESULT
 
+        # ── v3.1: Proactive send attempt counter ──────────────────
+        if turn.source == SOURCE_PROACTIVE_IMPULSE:
+            turn.proactive_send_attempt_count += 1
+
         # ── Send single bubble (guarded_text) ────────────────────
         send_batch = [{"text": guarded_text, "delay": 0.0, "_vm_index": 0}]
         try:
@@ -1137,6 +1312,12 @@ class ChatAgent:
             turn._last_send_delivered = True
             turn.sent_message_count += 1
             turn._sent_idempotency_keys.add(idempotency_key)
+
+            # ── v3.1: Proactive turn counters ────────────────────
+            if turn.source == SOURCE_PROACTIVE_IMPULSE:
+                turn.proactive_delivered_count += 1
+                turn.proactive_delivered_texts.append(guarded_text)
+
             vm = VisibleMessage(
                 visible_message_id=f"vm_{turn.turn_id}_{turn.sent_message_count}",
                 index=turn.sent_message_count,
@@ -1152,11 +1333,17 @@ class ChatAgent:
             result = {"status": "ok", "delivery": "sent",
                       "message_index": turn.sent_message_count}
             # ── Embed limit_reached in this tool result if at limit ──
-            if turn.sent_message_count >= turn.max_reply_messages_per_turn:
+            if turn.source == SOURCE_PROACTIVE_IMPULSE:
+                meta = turn.proactive_meta or {}
+                max_reply = int(meta.get("max_wechat_reply", 3))
+                if turn.proactive_delivered_count >= max_reply:
+                    result["limit_reached"] = True
+                    result["hint"] = "本轮主动消息已达上限，请调用 done 结束。"
+            elif turn.sent_message_count >= turn.max_reply_messages_per_turn:
                 result["limit_reached"] = True
                 result["hint"] = "本轮微信消息数量已达上限，请调用 done 结束。"
+            # v1.5: discard idempotency key so subsequent same-tool_call_id calls work (test compat)
             turn._sent_idempotency_keys.discard(idempotency_key)
-            # re-add after result construction for completeness
             logger.info("exec_send_one: delivered reply_index=%d idempotency_key=%s",
                        turn.sent_message_count, idempotency_key)
         elif send_status == "failed":
@@ -1295,14 +1482,21 @@ class ChatAgent:
     def _do_limit_check(self, turn: TurnScratchpad) -> TurnState:
         """LIMIT_CHECK: check turn-level limits after each send.
 
-        v1.5: limit info already embedded in wechat_reply tool result
-        (limit_reached=true). This state checks for exceeded limits that
-        force termination.
+        v3.1: proactive turns use hard_max_wechat_reply_per_turn which limits
+        send_attempt_count (prevents infinite retry loop on send failures).
+        Proactive delivered_count caps are handled in CLASSIFY_ONE_TOOL_CALL.
         """
+        # ── v3.1: Proactive hard_max on send_attempt_count ────────
+        if turn.source == SOURCE_PROACTIVE_IMPULSE:
+            hard_max = _get_proactive_config(self.defaults).get("hard_max_wechat_reply_per_turn", 5)
+            if turn.proactive_send_attempt_count >= hard_max:
+                turn.add_fallback_event("proactive_hard_max_send",
+                    f"send_attempt_count={turn.proactive_send_attempt_count} >= hard_max={hard_max}")
+                logger.info("limit_check: proactive hard_max send → END_PROACTIVE_MAX_REPLY_LIMIT")
+                return TurnState.END_PROACTIVE_MAX_REPLY_LIMIT
+            return TurnState.CALL_LLM
+
         if turn.sent_message_count >= turn.max_reply_messages_per_turn:
-            # Already flagged in tool result. Allow model one more turn
-            # to call done. If it calls wechat_reply again → END_MAX_LIMIT
-            # (handled in CLASSIFY_ONE_TOOL_CALL).
             logger.info("limit_check: at max replies sent_count=%d → CALL_LLM (model should done)",
                        turn.sent_message_count)
             return TurnState.CALL_LLM
@@ -1410,6 +1604,72 @@ class ChatAgent:
             return TurnState.END_FAILED
 
     # ================================================================
+    # v3.1: skip_proactive pipeline
+    # ================================================================
+
+    def _do_validate_skip_proactive_args(self, turn: TurnScratchpad) -> TurnState:
+        """VALIDATE_SKIP_PROACTIVE_ARGS: validate skip_proactive(reason, note).
+
+        v3.1: reason must be a valid enum value. Writes skip metadata to turn.
+        """
+        classified = turn._classified_single
+        serialized = classified.serialized or {}
+        fn = serialized.get("function", {})
+        args_raw = fn.get("arguments", "")
+
+        try:
+            args = _json.loads(args_raw) if args_raw.strip() else {}
+        except _json.JSONDecodeError as e:
+            turn.messages.append({
+                "role": "system",
+                "content": f"skip_proactive 参数 JSON 解析失败：{e}。请修正后重新调用。",
+            })
+            return TurnState.PROTOCOL_RETRY
+
+        reason = str(args.get("reason", "") or "").strip()
+        valid_reasons = {
+            "insufficient_evidence", "too_soon", "too_intrusive",
+            "low_value", "repeated", "unsafe", "user_might_be_busy",
+        }
+        if reason not in valid_reasons:
+            turn.messages.append({
+                "role": "system",
+                "content": f"skip_proactive reason 必须为以下之一：{', '.join(sorted(valid_reasons))}。收到了 '{reason}'。请修正后重新调用。",
+            })
+            return TurnState.PROTOCOL_RETRY
+
+        note = str(args.get("note", "") or "").strip()
+        turn._skip_reason = reason
+        turn._skip_note = note
+        logger.info("validate_skip_proactive: reason=%s note=%s", reason, note[:80] if note else "(none)")
+        return TurnState.EXEC_SKIP_PROACTIVE
+
+    def _do_exec_skip_proactive(self, turn: TurnScratchpad) -> TurnState:
+        """EXEC_SKIP_PROACTIVE: execute skip — no visible history, update impulse.
+
+        v3.1 §1.5: Does NOT write assistant visible history.
+        Impulse status is updated via post_turn_hooks.
+        v3.1 §note: if send_attempt_count > 0 and delivered_count == 0,
+        the status is NOT SKIPPED_BY_MODEL (model tried but failed to send).
+        """
+        reason = getattr(turn, "_skip_reason", "unknown")
+        note = getattr(turn, "_skip_note", "")
+
+        # Determine skip status based on send attempts
+        if turn.proactive_send_attempt_count > 0 and turn.proactive_delivered_count == 0:
+            # Model tried to send but all attempts failed — not a clean skip
+            skip_status = "SKIPPED_AFTER_SEND_FAILURE"
+        else:
+            skip_status = "SKIPPED_BY_MODEL"
+
+        turn.add_fallback_event("skip_proactive", f"reason={reason} status={skip_status} note={note}")
+        turn.reply_sequence_status = "skipped_proactive"
+        turn._skip_status = skip_status
+        logger.info("exec_skip_proactive: reason=%s status=%s sent_attempts=%d delivered=%d",
+                   reason, skip_status, turn.proactive_send_attempt_count, turn.proactive_delivered_count)
+        return TurnState.END_SKIPPED_PROACTIVE
+
+    # ================================================================
     # v1.5: Protocol retry
     # ================================================================
 
@@ -1427,11 +1687,14 @@ class ChatAgent:
                 "protocol_retry_exceeded",
                 f"exceeded max protocol retries ({turn.max_protocol_retries})",
             )
-            logger.info("protocol_retry: exceeded sent_count=%d", turn.sent_message_count)
+            logger.info("protocol_retry: exceeded sent_count=%d source=%s", turn.sent_message_count, turn.source)
             if turn.sent_message_count > 0:
                 # Don't lose already-sent messages → END_PROTOCOL_ERROR
                 turn.reply_sequence_status = "protocol_error"
                 return TurnState.END_PROTOCOL_ERROR
+            # v3.1: proactive → no fallback
+            if turn.source == SOURCE_PROACTIVE_IMPULSE:
+                return TurnState.END_FAILED_NO_FALLBACK
             return TurnState.HARD_FALLBACK
 
         turn.add_fallback_event(
@@ -1492,9 +1755,18 @@ class ChatAgent:
     ) -> TurnState:
         """HARD_FALLBACK: system fixed fallback text.
 
-        v1.5: only reached when sent_count == 0 (otherwise END_PROTOCOL_ERROR).
-        Uses VisibleMessage for fallback tracking. Does NOT use model content.
+        v3.1: proactive turns suppress hard fallback → END_FAILED_NO_FALLBACK.
+        No fallback text is sent to user for failed proactive turns.
+        If delivered_messages non-empty, they were already written to history
+        by write_model_history callback.
         """
+        # ── v3.1: Proactive fallback suppression ──────────────────
+        if turn.source == SOURCE_PROACTIVE_IMPULSE:
+            turn.add_fallback_event("proactive_fallback_suppressed",
+                "no fallback for proactive turn")
+            logger.info("hard_fallback: proactive suppressed → END_FAILED_NO_FALLBACK")
+            return TurnState.END_FAILED_NO_FALLBACK
+
         from agent.output_guard import HARD_FALLBACK_TEXT, guard_single_message
 
         # ── v1.2 diagnostic: why we reached HARD_FALLBACK ─────────
@@ -1731,9 +2003,11 @@ def _merge_llm_usage(total: dict[str, Any], usage: Any) -> None:
     total["reasoning_tokens"] = total.get("reasoning_tokens", 0) + int(getattr(usage, "reasoning_tokens", 0) or 0)
 
 
-def _resolve_outbound_semantics(trigger: str) -> tuple[str, str, str]:
+def _resolve_outbound_semantics(trigger: str, source: str = "") -> tuple[str, str, str]:
     if trigger == "admin":
         return ("admin", "system", "manual_admin")
+    if source == SOURCE_PROACTIVE_IMPULSE:
+        return ("proactive", "assistant", "proactive")
     return ("user_reply", "assistant", "user_message")
 
 
@@ -1797,6 +2071,121 @@ def _build_context_sample(messages: list[dict[str, Any]], last_n: int = 8) -> li
             "preview": content[:120].replace("\n", "\\n"),
         })
     return sample
+
+
+def _get_proactive_config(defaults: dict[str, Any]) -> dict[str, Any]:
+    """Return proactive turn config with defaults.
+
+    v3.1: hard_max_wechat_reply_per_turn limits send_attempt_count (not delivered_count).
+    max_llm_steps_per_proactive_turn limits proactive_llm_step_count.
+    """
+    return {
+        "hard_max_wechat_reply_per_turn": 5,   # hard cap on send_attempt_count (prevents infinite retry loop)
+        "max_llm_steps_per_proactive_turn": 8, # hard cap on LLM call count per proactive turn
+    }
+
+
+def _get_proactive_allowed_tools(turn: TurnScratchpad) -> list[str]:
+    """Compute allowed_tools for proactive turn based on delivered_count phase.
+
+    v3.1 §2.3: allowed_tools based on proactive_delivered_count:
+      Phase A (delivered == 0): [wechat_reply, skip_proactive]
+      Phase B (0 < delivered < max): [wechat_reply, done]
+      Phase C (delivered >= max): [done]
+
+    The judgment basis is delivered_count because users haven't received
+    messages that failed to send.
+    """
+    meta = turn.proactive_meta or {}
+    max_reply = int(meta.get("max_wechat_reply", 3))
+    delivered = turn.proactive_delivered_count
+
+    if delivered == 0:
+        return ["wechat_reply", "skip_proactive"]
+    elif delivered < max_reply:
+        return ["wechat_reply", "done"]
+    else:
+        return ["done"]
+
+
+def _build_proactive_context_system_message(turn: TurnScratchpad) -> str:
+    """Build the proactive context system message injected for proactive turns.
+
+    v3.1: This is an independent system message, NOT modifying the main system prompt.
+    It tells the model this is a proactive impulse, not a user reply.
+    """
+    from datetime import datetime, timezone, timedelta
+
+    meta = turn.proactive_meta or {}
+    impulse_id = str(meta.get("impulse_id", ""))
+    impulse_type = str(meta.get("impulse_type", "UNKNOWN"))
+    chain_id = str(meta.get("proactive_chain_id", impulse_id))
+    trigger_reason = str(meta.get("trigger_reason_summary", "主动触发"))
+    max_reply = int(meta.get("max_wechat_reply", 3))
+    delivered = turn.proactive_delivered_count
+
+    # recent_proactive_messages (only confirmed delivered)
+    evidence = meta.get("evidence_pack", {}) if isinstance(meta.get("evidence_pack"), dict) else {}
+    recent_proactive = evidence.get("recent_proactive_messages", [])
+    recent_proactive_texts = [
+        m.get("text", "") for m in recent_proactive
+        if isinstance(m, dict) and m.get("text")
+    ]
+
+    relationship_temp = evidence.get("relationship_temperature", None)
+    topic_snapshot = str(evidence.get("topic_snapshot", ""))
+    reply_window_s = int(meta.get("reply_window_seconds", 14400))
+
+    now = datetime.now(tz=timezone(timedelta(hours=8)))
+    current_time = now.strftime("%Y年%m月%d日 %H:%M")
+
+    # allowed_tools stage info
+    if delivered == 0:
+        stage_desc = "阶段A：尚未发送任何消息。可用工具：wechat_reply（发送消息）、skip_proactive（跳过本轮）"
+    elif delivered < max_reply:
+        stage_desc = f"阶段B：已发送 {delivered} 条，最多可再发 {max_reply - delivered} 条。可用工具：wechat_reply、done"
+    else:
+        stage_desc = "阶段C：已达发送上限。只能调用 done 结束。"
+
+    parts = [
+        "=== 主动消息回合 ===",
+        "这是一次你主动发起的微信聊天。",
+        "当前没有新的用户消息。",
+        "你不是在回答用户。",
+        "你正在判断这个主动冲动是否适合说出口。",
+        "",
+        f"turn_source = PROACTIVE_IMPULSE",
+        f"initiator = assistant",
+        f"has_new_user_message = false",
+        f"impulse_id = {impulse_id}",
+        f"impulse_type = {impulse_type}",
+        f"proactive_chain_id = {chain_id}",
+        f"触发原因：{trigger_reason}",
+        f"当前时间：{current_time}",
+        f"回复窗口：{reply_window_s} 秒",
+        f"本轮发送上限：{max_reply} 条",
+        f"当前已送达：{delivered} 条",
+        f"当前阶段：{stage_desc}",
+    ]
+
+    if recent_proactive_texts:
+        parts.append("")
+        parts.append("近期已发送的主动消息（用户已收到）：")
+        for t in recent_proactive_texts[-5:]:
+            parts.append(f"  - {t[:120]}")
+
+    if relationship_temp is not None:
+        parts.append(f"关系热度：{relationship_temp}")
+
+    if topic_snapshot:
+        parts.append(f"话题快照：{topic_snapshot}")
+
+    parts.append("")
+    parts.append("你可以不说，调用 skip_proactive。")
+    parts.append("你也可以说一句或几句，但每次只能通过 wechat_reply 发一条。")
+    parts.append("如果已经说完，请调用 done 结束。")
+
+    return "\n".join(parts)
 
 
 def _dump_llm_payload(messages: list[dict[str, Any]], turn_id: str, iteration: int) -> None:
