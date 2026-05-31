@@ -2517,10 +2517,37 @@ def _build_proactive_post_turn_hooks(
         except Exception:
             logging.getLogger("goal").warning("last_visible hook failed for turn %s", turn.turn_id, exc_info=True)
 
+    async def _hook_bump_autonomous_trigger_count(turn: TurnScratchpad, terminal_state: TurnState) -> None:
+        """v1.6-A: Bump daily autonomous trigger count on successful completion.
+
+        Only increments when: source=PROACTIVE_IMPULSE, trigger_kind=autonomous,
+        terminal_state=END_REPLIED, proactive_delivered_count > 0.
+        """
+        try:
+            meta = turn.proactive_meta or {}
+            if turn.source != SOURCE_PROACTIVE_IMPULSE:
+                return
+            if str(meta.get("trigger_kind", "")) != "autonomous":
+                return
+            if terminal_state != TurnState.END_REPLIED:
+                return
+            if turn.proactive_delivered_count == 0:
+                return
+            await memory_store.bump_autonomous_trigger_count(user_id, bot_id)
+            logging.getLogger("goal").info(
+                "autonomous_trigger_count: bumped for %s/%s turn=%s",
+                user_id, bot_id, turn.turn_id,
+            )
+        except Exception:
+            logging.getLogger("goal").warning(
+                "bump_autonomous_trigger_count failed for turn %s", turn.turn_id, exc_info=True,
+            )
+
     return [
         _hook_proactive_dev_logs,
         _hook_proactive_turn_record,
         _hook_update_last_visible,
+        _hook_bump_autonomous_trigger_count,
     ]
 
 

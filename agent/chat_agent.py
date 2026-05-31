@@ -927,59 +927,16 @@ class ChatAgent:
 
         name = classified.tool_name
 
-        # ── v3.1: Proactive allowed_tools phase validation (backend layer) ──
+        # ── v1.6-A: Proactive tool constraint validation ──
         if turn.source == SOURCE_PROACTIVE_IMPULSE:
-            meta = turn.proactive_meta or {}
-            max_reply = int(meta.get("max_wechat_reply", 3))
-            delivered = turn.proactive_delivered_count
-
-            # Phase A: delivered_count == 0 → [wechat_reply, skip_proactive]
-            if delivered == 0:
-                if name == "done":
-                    turn.add_fallback_event("proactive_disallowed_tool",
-                        "phase A: cannot call done before any delivery; use skip_proactive")
-                    turn.messages.append({
-                        "role": "system",
-                        "content": "尚未发送任何消息，不能调用 done。如果不想说，请调用 skip_proactive。",
-                    })
-                    return TurnState.PROTOCOL_RETRY
-                if name in ("get_time", "get_weather"):
-                    turn.add_fallback_event("proactive_disallowed_tool",
-                        f"proactive turns cannot use {name}")
-                    turn.messages.append({
-                        "role": "system",
-                        "content": f"主动回合不能使用 {name}。只能使用 wechat_reply 或 skip_proactive。",
-                    })
-                    return TurnState.PROTOCOL_RETRY
-            # Phase B: 0 < delivered < max_reply → [wechat_reply, done]
-            elif delivered < max_reply:
-                if name == "skip_proactive":
-                    turn.add_fallback_event("proactive_disallowed_tool",
-                        "phase B: cannot skip after delivery; use done")
-                    turn.messages.append({
-                        "role": "system",
-                        "content": "已发送过消息，不能调用 skip_proactive。如果说完请调用 done。",
-                    })
-                    return TurnState.PROTOCOL_RETRY
-                if name in ("get_time", "get_weather"):
-                    turn.add_fallback_event("proactive_disallowed_tool",
-                        f"proactive turns cannot use {name}")
-                    return TurnState.PROTOCOL_RETRY
-            # Phase C: delivered >= max_reply → [done]
-            else:
-                if name == "wechat_reply":
-                    turn.add_fallback_event("proactive_max_reply_limit",
-                        f"delivered={delivered} >= max_reply={max_reply}")
-                    logger.info("classify_one_tool_call: proactive max reply limit hit")
-                    return TurnState.END_PROACTIVE_MAX_REPLY_LIMIT
-                if name == "skip_proactive":
-                    turn.add_fallback_event("proactive_disallowed_tool",
-                        "phase C: cannot skip after reaching limit")
-                    return TurnState.PROTOCOL_RETRY
-                if name not in ("done",):
-                    turn.add_fallback_event("proactive_disallowed_tool",
-                        f"phase C: only done allowed, got {name}")
-                    return TurnState.PROTOCOL_RETRY
+            constraint_err = _validate_proactive_tool_constraints(name, turn)
+            if constraint_err is not None:
+                turn.add_fallback_event("proactive_disallowed_tool", constraint_err)
+                turn.messages.append({
+                    "role": "system",
+                    "content": constraint_err,
+                })
+                return TurnState.PROTOCOL_RETRY
 
         # ── Name-based routing (NOT category-based) ─────────────
         # wechat_reply is registered as fact_tool but MUST NOT enter EXEC_FACT_TOOLS.
@@ -1092,6 +1049,12 @@ class ChatAgent:
                 "native_tools: fact tool %s executed, result=%s",
                 r["tool_name"], r["error_type"],
             )
+
+        # v1.6-A: increment fact tool counter for required trigger constraint
+        if turn.source == SOURCE_PROACTIVE_IMPULSE:
+            for r in results:
+                if r["success"]:
+                    turn._proactive_fact_tool_count_since_last_reply += 1
 
         turn._resume_state = TurnState.CALL_LLM
         return TurnState.INTERRUPT_CHECK
@@ -1320,6 +1283,7 @@ class ChatAgent:
             if turn.source == SOURCE_PROACTIVE_IMPULSE:
                 turn.proactive_delivered_count += 1
                 turn.proactive_delivered_texts.append(guarded_text)
+                turn._proactive_fact_tool_count_since_last_reply = 0  # reset after delivery
 
             vm = VisibleMessage(
                 visible_message_id=f"vm_{turn.turn_id}_{turn.sent_message_count}",
@@ -2088,27 +2052,79 @@ def _get_proactive_config(defaults: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+FACT_TOOL_NAMES = frozenset({"get_time", "get_weather"})
+
+
 def _get_proactive_allowed_tools(turn: TurnScratchpad) -> list[str]:
-    """Compute allowed_tools for proactive turn based on delivered_count phase.
+    """Compute allowed_tools for proactive turn based on trigger_mode + delivered_count.
 
-    v3.1 §2.3: allowed_tools based on proactive_delivered_count:
-      Phase A (delivered == 0): [wechat_reply, skip_proactive]
-      Phase B (0 < delivered < max): [wechat_reply, done]
-      Phase C (delivered >= max): [done]
+    v1.6-A: Rules per the plan §8.1 constraint matrix.
 
-    The judgment basis is delivered_count because users haven't received
-    messages that failed to send.
+    delivered_count == 0:
+      optional: wechat_reply + skip_proactive + fact tools (done forbidden)
+      required: wechat_reply + fact tools (skip_proactive + done forbidden)
+
+    delivered_count > 0:
+      any: wechat_reply + done + fact tools (skip_proactive forbidden)
     """
     meta = turn.proactive_meta or {}
-    max_reply = int(meta.get("max_wechat_reply", 3))
+    trigger_mode = str(meta.get("trigger_mode", ""))
     delivered = turn.proactive_delivered_count
+    max_reply = int(meta.get("max_wechat_reply", 3))
+
+    if delivered >= max_reply:
+        return ["done"]
+
+    fact_tools = list(FACT_TOOL_NAMES)
 
     if delivered == 0:
-        return ["wechat_reply", "skip_proactive"]
-    elif delivered < max_reply:
-        return ["wechat_reply", "done"]
+        if trigger_mode == "required":
+            return ["wechat_reply"] + fact_tools
+        else:
+            return ["wechat_reply", "skip_proactive"] + fact_tools
     else:
-        return ["done"]
+        return ["wechat_reply", "done"] + fact_tools
+
+
+def _validate_proactive_tool_constraints(
+    tool_name: str, turn: TurnScratchpad,
+) -> str | None:
+    """v1.6-A: Hard backend validation of proactive tool constraints.
+
+    Returns None if valid, or an error message string for system message injection.
+
+    Rules:
+      - delivered_count == 0: done is forbidden (any trigger_mode)
+      - delivered_count == 0 + required: skip_proactive forbidden
+      - delivered_count == 0 + required: fact tools max 1 call, then must wechat_reply
+      - delivered_count > 0: skip_proactive forbidden
+    """
+    meta = turn.proactive_meta or {}
+    trigger_mode = str(meta.get("trigger_mode", ""))
+    delivered = turn.proactive_delivered_count
+
+    # done: forbidden before first delivery
+    if tool_name == "done" and delivered == 0:
+        if trigger_mode == "required":
+            return "尚未发送任何消息，不能调用 done。必须先调用 wechat_reply 发送一条消息。"
+        else:
+            return "尚未发送任何消息，不能调用 done。如果不想说，请调用 skip_proactive。"
+
+    # skip_proactive: forbidden after first delivery
+    if tool_name == "skip_proactive" and delivered > 0:
+        return "已发送过消息，不能调用 skip_proactive。如果说完请调用 done。"
+
+    # skip_proactive: forbidden in required trigger (any time)
+    if tool_name == "skip_proactive" and trigger_mode == "required":
+        return "当前是最迟触发模式，不能调用 skip_proactive。必须调用 wechat_reply 发送一条消息。"
+
+    # fact tools: max 1 in required + delivered == 0
+    if tool_name in FACT_TOOL_NAMES and trigger_mode == "required" and delivered == 0:
+        count = turn._proactive_fact_tool_count_since_last_reply
+        if count >= 1:
+            return "最迟触发模式下，只能调用 1 次 fact tool，之后必须先调用 wechat_reply。"
+
+    return None
 
 
 def _build_proactive_context_system_message(turn: TurnScratchpad) -> str:
