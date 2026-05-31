@@ -43,7 +43,7 @@ from agent.llm_gateway import LLMGateway
 from agent.llm_types import LLMRequest
 from agent.output_guard import guard_messages, guard_single_message
 from agent.scheduler import ProactiveScheduler
-from agent.state_machine import ModelProfile, TurnResult, TurnScratchpad, TurnState, SOURCE_PROACTIVE_IMPULSE
+from agent.state_machine import ModelProfile, TurnResult, TurnScratchpad, TurnState, DeliveryStatus, SOURCE_PROACTIVE_IMPULSE
 from agent.tools import configure_runtime, configure_tools
 from bridge.wechat_poller import WeChatBridge
 from memory.store import MemoryStore
@@ -838,6 +838,15 @@ async def append_history_async(user_id: str, role: str, content: str, source: st
         ts=ts,
         bot_id=bot_id,
     )
+
+    # v1.6-A: user messages update last_visible_message_at
+    if role == "user":
+        try:
+            await memory_store.update_last_visible_message_at(
+                user_id, bot_id, ts, source="user_message",
+            )
+        except Exception:
+            pass  # non-critical
 
     if len(history) > COMPACT_AT_TURNS * 2:
         compacted, summary = compact_history(history, MAX_HISTORY_TURNS, COMPACT_AT_TURNS)
@@ -1810,10 +1819,23 @@ def _build_chatagent_post_turn_hooks(
                 attempt.upgraded_from,
             )
 
+    async def _hook_update_last_visible(turn: TurnScratchpad, terminal_state: TurnState) -> None:
+        """v1.6-A: Update last_visible_message_at for confirmed-delivered messages."""
+        try:
+            for vm in turn.visible_messages:
+                if vm.delivery_status == DeliveryStatus.SENT_CONFIRMED:
+                    await memory_store.update_last_visible_message_at(
+                        user_id, bot_id, vm.sent_at_timestamp or time.time(),
+                        source="assistant_sent_confirmed",
+                    )
+        except Exception:
+            logger.warning("last_visible hook failed for turn %s", turn.turn_id, exc_info=True)
+
     return [
         _hook_memory,
         _hook_dev_logs,
         _hook_model_attempt_log,
+        _hook_update_last_visible,
     ]
 
 
@@ -2483,9 +2505,22 @@ def _build_proactive_post_turn_hooks(
         except Exception as e:
             logging.getLogger("goal").warning("proactive: turn record failed: %s", e)
 
+    async def _hook_update_last_visible(turn: TurnScratchpad, terminal_state: TurnState) -> None:
+        """v1.6-A: Update last_visible_message_at for confirmed-delivered messages."""
+        try:
+            for vm in turn.visible_messages:
+                if vm.delivery_status == DeliveryStatus.SENT_CONFIRMED:
+                    await memory_store.update_last_visible_message_at(
+                        user_id, bot_id, vm.sent_at_timestamp or time.time(),
+                        source="assistant_sent_confirmed",
+                    )
+        except Exception:
+            logging.getLogger("goal").warning("last_visible hook failed for turn %s", turn.turn_id, exc_info=True)
+
     return [
         _hook_proactive_dev_logs,
         _hook_proactive_turn_record,
+        _hook_update_last_visible,
     ]
 
 

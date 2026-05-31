@@ -601,6 +601,41 @@ class MemoryStore:
             CREATE INDEX IF NOT EXISTS idx_debug_runs_mode
             ON proactive_debug_runs(mode, created_at DESC)
         """)
+        # ── v1.6-A: dialogue_state new columns ─────────────────────
+        for col_sql in [
+            "ALTER TABLE dialogue_state ADD COLUMN last_visible_message_at REAL NOT NULL DEFAULT 0",
+            "ALTER TABLE dialogue_state ADD COLUMN daily_autonomous_trigger_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE dialogue_state ADD COLUMN daily_autonomous_trigger_date TEXT NOT NULL DEFAULT ''",
+        ]:
+            try:
+                await db.execute(col_sql)
+            except Exception:
+                pass  # column already exists
+        # Backfill last_visible_message_at from conversation_history
+        # Default 0 is unsafe — immediate required trigger after upgrade.
+        # Priority: last visible conversation_history message. Fallback: now.
+        cur = await db.execute("SELECT user_id, bot_id FROM dialogue_state")
+        dialogue_rows = await cur.fetchall()
+        fallback_ts = time.time()
+        for dr in dialogue_rows:
+            uid = dr["user_id"]
+            bid = dr["bot_id"]
+            try:
+                cur2 = await db.execute(
+                    """SELECT MAX(ts) as last_ts FROM conversation_history
+                       WHERE user_id = ? AND bot_id = ?
+                         AND (role = 'user'
+                              OR (role = 'assistant' AND source != 'assistant:fallback'))""",
+                    (uid, bid),
+                )
+                row2 = await cur2.fetchone()
+                backfill_ts = row2["last_ts"] if row2 and row2["last_ts"] else fallback_ts
+            except Exception:
+                backfill_ts = fallback_ts
+            await db.execute(
+                "UPDATE dialogue_state SET last_visible_message_at = ? WHERE user_id = ? AND bot_id = ?",
+                (backfill_ts, uid, bid),
+            )
         await db.commit()
 
     async def close(self):
@@ -2988,3 +3023,116 @@ class MemoryStore:
             )
             await db.commit()
         return True
+
+    # ══════════════════════════════════════════════════════════════
+    # V1.6-A: last_visible_message_at + autonomous trigger count
+    # ══════════════════════════════════════════════════════════════
+
+    async def update_last_visible_message_at(
+        self, user_id: str, bot_id: str, ts: float,
+        source: str,
+    ) -> bool:
+        """Update last_visible_message_at. Only accepts two valid sources."""
+        if source not in ("user_message", "assistant_sent_confirmed"):
+            raise ValueError(
+                f"last_visible_message_at only accepts "
+                f"user_message or assistant_sent_confirmed, got {source!r}"
+            )
+        now = time.time()
+        async with self._lock:
+            db = await self._get_db()
+            await db.execute(
+                """INSERT OR IGNORE INTO dialogue_state
+                   (user_id, bot_id, updated_at, version)
+                   VALUES (?, ?, ?, 1)""",
+                (user_id, bot_id, now),
+            )
+            await db.execute(
+                """UPDATE dialogue_state
+                   SET last_visible_message_at = ?, updated_at = ?
+                   WHERE user_id = ? AND bot_id = ?""",
+                (ts, now, user_id, bot_id),
+            )
+            await db.commit()
+        return True
+
+    async def get_last_visible_message_at(
+        self, user_id: str, bot_id: str,
+    ) -> float:
+        """Get last_visible_message_at. Returns 0.0 if not set."""
+        db = await self._get_db()
+        rows = await db.execute_fetchall(
+            """SELECT last_visible_message_at FROM dialogue_state
+               WHERE user_id = ? AND bot_id = ?""",
+            (user_id, bot_id),
+        )
+        if rows and rows[0]["last_visible_message_at"]:
+            return float(rows[0]["last_visible_message_at"])
+        return 0.0
+
+    async def get_autonomous_trigger_count(
+        self, user_id: str, bot_id: str,
+    ) -> tuple[int, str]:
+        """Get (count, date_str) for today. Resets if date changed."""
+        from datetime import datetime, timezone, timedelta
+        tz = timezone(timedelta(hours=8))
+        today_str = datetime.now(tz).strftime("%Y-%m-%d")
+
+        db = await self._get_db()
+        rows = await db.execute_fetchall(
+            """SELECT daily_autonomous_trigger_count, daily_autonomous_trigger_date
+               FROM dialogue_state WHERE user_id = ? AND bot_id = ?""",
+            (user_id, bot_id),
+        )
+        if rows:
+            count = int(rows[0]["daily_autonomous_trigger_count"] or 0)
+            date_str = str(rows[0]["daily_autonomous_trigger_date"] or "")
+            if date_str != today_str:
+                return (0, today_str)
+            return (count, date_str)
+        return (0, today_str)
+
+    async def bump_autonomous_trigger_count(
+        self, user_id: str, bot_id: str,
+    ) -> int:
+        """Increment today's autonomous trigger count. Returns new count."""
+        from datetime import datetime, timezone, timedelta
+        tz = timezone(timedelta(hours=8))
+        today_str = datetime.now(tz).strftime("%Y-%m-%d")
+        now = time.time()
+
+        async with self._lock:
+            db = await self._get_db()
+            await db.execute(
+                """INSERT OR IGNORE INTO dialogue_state
+                   (user_id, bot_id, updated_at, version)
+                   VALUES (?, ?, ?, 1)""",
+                (user_id, bot_id, now),
+            )
+            rows = await db.execute_fetchall(
+                """SELECT daily_autonomous_trigger_count, daily_autonomous_trigger_date
+                   FROM dialogue_state WHERE user_id = ? AND bot_id = ?""",
+                (user_id, bot_id),
+            )
+            if rows:
+                count = int(rows[0]["daily_autonomous_trigger_count"] or 0)
+                date_str = str(rows[0]["daily_autonomous_trigger_date"] or "")
+            else:
+                count = 0
+                date_str = ""
+
+            if date_str != today_str:
+                count = 1
+            else:
+                count += 1
+
+            await db.execute(
+                """UPDATE dialogue_state
+                   SET daily_autonomous_trigger_count = ?,
+                       daily_autonomous_trigger_date = ?,
+                       updated_at = ?
+                   WHERE user_id = ? AND bot_id = ?""",
+                (count, today_str, now, user_id, bot_id),
+            )
+            await db.commit()
+        return count
