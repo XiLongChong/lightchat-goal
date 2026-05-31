@@ -117,6 +117,11 @@ class ProactiveDebugReport:
     execution_result: dict[str, Any] | None = None
     execution_skip_reason: str = ""
 
+    # ── v2.3 readability: generated messages + suggestions ──
+    generated_messages: list[str] = field(default_factory=list)
+    next_step_suggestions: list[str] = field(default_factory=list)
+    guard_summary: dict[str, Any] = field(default_factory=dict)
+
     # ── Detail payloads (JSON-serialisable) ──
     input_overrides: dict[str, Any] = field(default_factory=dict)
     eligibility: dict[str, Any] = field(default_factory=dict)
@@ -161,6 +166,9 @@ class ProactiveDebugReport:
             "candidates": self.candidates,
             "selected_impulse": self.selected_impulse,
             "proactive_context_summary": self.proactive_context_summary,
+            "generated_messages": self.generated_messages,
+            "next_step_suggestions": self.next_step_suggestions,
+            "guard_summary": self.guard_summary,
             "llm_steps": self.llm_steps,
             "tool_calls": self.tool_calls,
             "guard": self.guard,
@@ -420,7 +428,8 @@ def generate_report(
 ) -> ProactiveDebugReport:
     """Assemble a ProactiveDebugReport from collected data.
 
-    v2.1: precheck vs execution separation.
+    v2.3: fixed guard=send_json bug, added generated_messages extraction,
+    guard_summary, next_step_suggestions, improved summary.
     """
     t_state = ""
     delivered = 0
@@ -429,6 +438,7 @@ def generate_report(
     history_count = 0
     send_json: dict[str, Any] = {}
     history_write_json: dict[str, Any] = {}
+    guard_json: dict[str, Any] = {}
 
     if turn_result is not None:
         t_state = str(getattr(turn_result, "terminal_state", ""))
@@ -436,8 +446,10 @@ def generate_report(
         turn_id = str(getattr(turn_result, "turn_id", ""))
         send_json = {
             "real_send_attempted": ctx.mode == "real_send",
-            "send_simulated": ctx.mode == "dry_run",
-            "real_delivery_status": "NOT_SENT_DRY_RUN" if ctx.mode == "dry_run" else send_status,
+            "send_step_executed": ctx.mode == "real_send",
+            "dry_run_mode": ctx.mode == "dry_run",
+            "delivered_count": delivered,
+            "real_delivery_status": "NOT_SENT_DRY_RUN" if ctx.mode == "dry_run" else "",
         }
         history_count = delivered if ctx.mode == "real_send" else 0
         history_write_json = {
@@ -449,15 +461,74 @@ def generate_report(
     is_real = ctx.mode == "real_send"
     is_dry = ctx.mode == "dry_run"
 
-    # Build summary
+    # ── Extract generated messages ───────────────────────────────
+    generated_messages: list[str] = []
+    if turn_result is not None:
+        # Primary source: proactive_delivered_texts from TurnResult
+        gen = getattr(turn_result, "proactive_delivered_texts", None)
+        if gen:
+            generated_messages = list(gen)
+        # Fallback: extract wechat_reply texts from visible_messages
+        if not generated_messages:
+            vm = getattr(turn_result, "visible_messages", None) or []
+            for v in vm:
+                if isinstance(v, dict):
+                    txt = v.get("guarded_text") or v.get("original_text") or v.get("text", "")
+                else:
+                    txt = getattr(v, "guarded_text", "") or getattr(v, "original_text", "")
+                if txt and str(txt).strip():
+                    generated_messages.append(str(txt))
+        # Last fallback: from tool_results
+        if not generated_messages:
+            tr = getattr(turn_result, "tool_results", []) or []
+            for t in tr:
+                if isinstance(t, dict) and t.get("name") == "wechat_reply":
+                    r = t.get("result", "")
+                    if r and "delivered" in str(r).lower():
+                        generated_messages.append("[wechat_reply text not captured]")
+
+    # ── Build guard summary from chain ───────────────────────────
+    guard_blocked = False
+    guard_ok = True
+    guard_stages = [s for s in decision_chain if s.get("stage") == "guard"]
+    if guard_stages:
+        gs = guard_stages[0].get("status", "")
+        guard_blocked = gs in ("block", "fail")
+        guard_ok = not guard_blocked
+    else:
+        # No guard stage = guard was not executed (e.g. skip before LLM)
+        guard_ok = True
+
+    guard_json = {
+        "executed": len(guard_stages) > 0,
+        "passed": guard_ok,
+        "blocked": guard_blocked,
+        "proactive_guard": "block" if guard_blocked else "pass",
+        "general_guard": "pass" if guard_ok else "not_executed",
+    }
+
+    # ── Build summary ────────────────────────────────────────────
     if execution_skip_reason:
-        summary = f"跳过：{execution_skip_reason}"
+        summary = f"已跳过：{execution_skip_reason}"
     elif is_dry:
-        summary = f"Dry-run：生成 {delivered} 条主动消息，guard 通过，未发送微信，未写入可见历史。"
+        guard_note = "guard 拦截" if guard_blocked else "guard 通过"
+        summary = f"Dry-run 成功：生成 {len(generated_messages)} 条主动消息，{guard_note}，未真实发送微信，未写入可见历史。"
     elif is_real and t_state:
-        summary = f"Real-send：终端 {t_state}，送达 {delivered} 条"
+        if "REPLIED" in t_state.upper():
+            summary = f"Real-send 成功：真实发送 {delivered} 条，写入历史 {history_count} 条。"
+        elif delivered > 0:
+            summary = f"Real-send 部分成功：送达 {delivered} 条，写入历史 {history_count} 条，终端 {_ts_label(t_state)}。"
+        else:
+            summary = f"Real-send 未送达：终端 {_ts_label(t_state)}，送达 0 条。"
     else:
         summary = "未执行"
+
+    # ── Build suggestions ────────────────────────────────────────
+    suggestions = _build_suggestions(
+        ctx, eligibility_result, impulse_result, decision_chain,
+        guard_blocked, execution_skip_reason, is_dry, is_real,
+        delivered, history_count, generated_messages,
+    )
 
     return ProactiveDebugReport(
         run_id=run_id,
@@ -505,13 +576,105 @@ def generate_report(
         candidates=impulse_result.get("candidates", []) if impulse_result else [],
         selected_impulse=impulse_result.get("selected") if impulse_result else None,
         proactive_context_summary={},
+        generated_messages=generated_messages,
+        next_step_suggestions=suggestions,
+        guard_summary=guard_json,
         llm_steps=llm_steps or [],
         tool_calls=getattr(turn_result, "tool_results", []) if turn_result else [],
-        guard=send_json,
+        guard=guard_json,
         send=send_json,
         history_write=history_write_json,
         decision_chain=decision_chain,
     )
+
+
+def _ts_label(ts: str) -> str:
+    """Human-readable terminal state label."""
+    return {
+        "end_replied": "已回复",
+        "end_no_reply": "未回复",
+        "end_failed": "失败",
+        "end_fallback_sent": "兜底已发送",
+        "end_cancelled": "已取消（被新消息打断）",
+        "end_superseded_before_send": "发送前被取代",
+        "end_interrupted_during_reply_sequence": "回复序列中被中断",
+        "end_max_limit": "达到最大限制",
+        "end_protocol_error": "协议错误",
+        "end_aborted_by_system": "被系统中止",
+        "end_skipped_proactive": "主动跳过",
+        "end_failed_no_fallback": "失败（已抑制兜底）",
+        "end_proactive_guard_blocked": "Guard 拦截",
+        "end_proactive_max_reply_limit": "达到最大回复条数",
+        "end_proactive_max_llm_steps": "达到最大 LLM 步数",
+    }.get(ts.replace("TurnState.", ""), ts)
+
+
+def _build_suggestions(
+    ctx: ProactiveDebugContext,
+    eligibility_result: dict[str, Any] | None,
+    impulse_result: dict[str, Any] | None,
+    decision_chain: list[dict[str, Any]],
+    guard_blocked: bool,
+    execution_skip_reason: str,
+    is_dry: bool,
+    is_real: bool,
+    delivered: int,
+    history_count: int,
+    generated_messages: list[str],
+) -> list[str]:
+    """Build next-step suggestions from report data."""
+    suggestions: list[str] = []
+
+    if eligibility_result:
+        checks = eligibility_result.get("checks", [])
+        for c in checks:
+            name = str(c.get("name", ""))
+            passed = bool(c.get("passed"))
+            if name == "features.proactive" and not passed:
+                suggestions.append("主动消息功能未开启：请将 config.yaml 中 features.proactive 设为 true 后重启服务")
+            if name == "user_silent_window" and not passed:
+                suggestions.append("用户静默窗口未达标：可填写 simulate_user_silent_seconds=28800 模拟 8 小时静默")
+            if name == "sleep_hours" and not passed:
+                suggestions.append("当前处于睡眠时段：可设置 debug_now 为白天时间再试")
+            if name == "bridge_online" and not passed:
+                suggestions.append("微信 bridge 离线：请先部署/启动微信桥接")
+            if name == "daily_limit" and not passed:
+                suggestions.append("今日发送已达上限：可修改 daily_cap 配置或等待明天")
+
+    if eligibility_result and eligibility_result.get("eligible"):
+        sel = impulse_result.get("selected") if impulse_result else None
+        cands = impulse_result.get("candidates", []) if impulse_result else []
+        if not sel:
+            if not cands:
+                suggestions.append("没有候选被生成：试试 forced_impulse_type=PRESENCE 并填写 simulate_user_silent_seconds=3600，或在微信中发几条带情绪的消息制造 ECHO 场景")
+            else:
+                suggestions.append("候选被过滤：展开「工程详情 → 主动理由过滤」查看 dedup/expire/score/threshold 详情")
+
+    if guard_blocked:
+        suggestions.append("文案被 guard 拦截：展开「工程详情 → 文案安全检查 raw」查看具体拦截原因（编造观察/系统味/通知味）")
+
+    if is_dry and generated_messages:
+        suggestions.append("Dry-run 成功：检查上方生成的文案，确认像真人聊天后可执行 real-send")
+    elif is_dry and not generated_messages and not execution_skip_reason:
+        suggestions.append("Dry-run 未生成消息：模型可能调用了 skip_proactive，检查 terminal_state")
+
+    if is_real:
+        if delivered > 0:
+            suggestions.append("Real-send 成功：请去微信确认收到消息")
+            if history_count > 0:
+                suggestions.append(f"历史一致性正常：{history_count} 条已写入 assistant:proactive")
+            else:
+                suggestions.append("注意：送达但未写入历史，检查 history_written_count")
+        elif history_count == 0 and not guard_blocked:
+            suggestions.append("未送达且未写入历史：可能发送失败或 bridge 离线，检查 send 详情")
+
+    if execution_skip_reason and "scheduler_busy" in execution_skip_reason:
+        suggestions.append("Scheduler 正忙：另一个主动回合正在执行，稍后重试")
+
+    if not suggestions:
+        suggestions.append("一切正常，可在微信中验证实际效果")
+
+    return suggestions
 
 
 # ══════════════════════════════════════════════════════════════════

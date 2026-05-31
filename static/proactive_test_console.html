@@ -88,28 +88,59 @@
       <div id="labSummary" class="summary" style="display:none"></div>
     </section>
 
-    <!-- Eligibility panel -->
+    <!-- One-line conclusion (from labSummary div) -->
+
+    <!-- Core result cards -->
+    <section class="panel" id="resultCardsPanel" style="display:none">
+      <h2>核心结果</h2>
+      <div id="resultCards"></div>
+    </section>
+
+    <!-- Generated messages -->
+    <section class="panel" id="messagesPanel" style="display:none">
+      <h2>生成的主动消息</h2>
+      <div id="messagesResult"></div>
+    </section>
+
+    <!-- Explanation (precheck + execution) -->
+    <section class="panel" id="explainPanel" style="display:none">
+      <h2>原因解释</h2>
+      <div id="explainResult"></div>
+    </section>
+
+    <!-- Engineering details (folded) -->
+    <section class="panel" id="detailsPanel" style="display:none">
+      <h2>工程详情</h2>
+      <div id="detailsResult"></div>
+    </section>
+
+    <!-- Suggestions -->
+    <section class="panel" id="suggestionsPanel" style="display:none">
+      <div id="suggestionsContent"></div>
+    </section>
+
+    <!-- History consistency panel (keep as separate section) -->
+    <section class="panel" id="historyPanel" style="display:none">
+      <h2>发送与历史一致性</h2>
+      <div id="historyResult"></div>
+    </section>
+
+    <!-- Eligibility panel (for check-only display) -->
     <section class="panel" id="eligPanel" style="display:none">
       <h2>前置判定</h2>
       <div id="eligResult"></div>
     </section>
 
-    <!-- Impulse panel -->
+    <!-- Impulse panel (for impulse-only display) -->
     <section class="panel" id="impulsePanel" style="display:none">
       <h2>Impulse 候选</h2>
       <div id="impulseResult"></div>
     </section>
 
-    <!-- Execution chain panel -->
+    <!-- Execution chain panel (for check-only display) -->
     <section class="panel" id="chainPanel" style="display:none">
       <h2>主动回合执行链</h2>
       <div id="chainResult"></div>
-    </section>
-
-    <!-- History consistency panel -->
-    <section class="panel" id="historyPanel" style="display:none">
-      <h2>历史一致性检查</h2>
-      <div id="historyResult"></div>
     </section>
 
     <!-- Recent runs -->

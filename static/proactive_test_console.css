@@ -81,6 +81,44 @@ body { font-family: -apple-system, "Microsoft YaHei", sans-serif; font-size: 14p
 
 .error-msg { color: #c62828; font-size: 13px; margin-top: 8px; }
 
+/* Result cards grid */
+.result-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; margin-bottom: 12px; }
+.rcard { background: #f9f9f9; border-radius: 6px; padding: 12px; text-align: center; }
+.rcard-label { font-size: 11px; color: #888; margin-bottom: 4px; }
+.rcard-value { font-size: 16px; font-weight: 600; }
+.rcard-pass { border-left: 3px solid #2e7d32; }
+.rcard-fail { border-left: 3px solid #c62828; }
+.rcard-yellow { border-left: 3px solid #f57f17; }
+.rcard-gray { border-left: 3px solid #999; }
+
+/* Message bubbles */
+.msg-bubble { background: #e8f5e9; border-radius: 8px; padding: 10px 14px; margin: 6px 0; font-size: 14px; max-width: 100%; }
+.dim { color: #999; font-size: 13px; }
+
+/* Check rows */
+.check-row { padding: 4px 0; font-size: 13px; display: flex; align-items: center; gap: 6px; }
+.check-icon { width: 18px; text-align: center; font-weight: 600; }
+.c-pass { color: #2e7d32; }
+.c-fail { color: #c62828; }
+.check-reason { color: #c62828; font-size: 12px; }
+.check-detail { font-size: 12px; color: #888; padding-left: 24px; }
+
+/* Execution */
+.exec-skip { color: #f57f17; font-weight: 500; }
+
+/* Suggestion box */
+.suggestion-box { background: #e3f2fd; border-radius: 6px; padding: 12px 16px; }
+.suggestion-box h3 { font-size: 13px; margin-bottom: 6px; color: #1565c0; }
+.suggestion-box li { font-size: 13px; margin: 4px 0; }
+
+/* Details fold */
+.details-fold { margin: 8px 0; }
+.details-fold > summary { cursor: pointer; font-size: 13px; color: #666; padding: 4px 0; }
+.details-fold > summary:hover { color: #333; }
+
+/* Explain section */
+.explain-section h3 { font-size: 13px; margin: 10px 0 6px; color: #555; }
+
 /* Real-send confirm overlay */
 .overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,.4); z-index: 100; justify-content: center; align-items: center; }
 .overlay.show { display: flex; }

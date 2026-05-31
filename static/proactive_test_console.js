@@ -156,7 +156,94 @@
   }
 
   // ══════════════════════════════════════════════════════════════
-  // Eligibility check
+  // v2.3 readability: translation tables
+  // ══════════════════════════════════════════════════════════════
+
+  var STAGE_LABELS = {
+    bootstrap: '启动',
+    eligibility: '资格检查',
+    impulse_generation: '主动理由生成',
+    impulse_filtering: '主动理由过滤',
+    impulse_selection: '主动理由选择',
+    proactive_context_build: '上下文构建',
+    llm_step: '模型调用',
+    model_tool_call: '工具调用',
+    guard: '文案安全检查',
+    send: '发送检查',
+    history_write: '历史写入检查',
+    terminal: '本轮结束状态'
+  };
+
+  var STAGE_STATUS_LABELS = {
+    pass: '通过', ok: '通过', done: '完成', written: '已写入',
+    fail: '未通过', block: '已拦截', empty: '无结果',
+    simulated: '已模拟', skip: '已跳过', not_written: '未写入', skipped: '已跳过',
+    end: '结束'
+  };
+
+  var REASON_LABELS = {
+    'no_impulse_selected': '没有选中主动理由',
+    'proactive feature is disabled': '主动消息功能未开启',
+    'eligibility_failed': '资格检查未通过',
+    'dry_run_never_writes_visible_history': 'Dry-run 不写入可见历史',
+    'active_proactive_turn_running': '另一个主动回合正在执行',
+    'scheduler_busy': '另一个主动回合正在执行',
+    'no candidate passed filters': '所有候选被过滤（去重/过期/评分不达标）',
+    'no candidate passed score threshold': '候选评分未达阈值',
+    'no candidates generated': '未生成任何候选',
+    'user_silent_window_not_met': '用户静默窗口未达标',
+    'sleep_hours': '当前处于睡眠时段',
+    'daily_limit_reached': '今日发送已达上限',
+    'min_interval_not_met': '距上次主动消息太近'
+  };
+
+  var TS_LABELS = {
+    'end_replied': '已回复',
+    'end_no_reply': '未回复',
+    'end_failed': '失败',
+    'end_fallback_sent': '兜底已发送',
+    'end_cancelled': '已取消（被新消息打断）',
+    'end_superseded_before_send': '发送前被取代',
+    'end_interrupted_during_reply_sequence': '回复序列中被中断',
+    'end_max_limit': '达到最大限制',
+    'end_protocol_error': '协议错误',
+    'end_aborted_by_system': '被系统中止',
+    'end_skipped_proactive': '主动跳过',
+    'end_failed_no_fallback': '失败（已抑制兜底）',
+    'end_proactive_guard_blocked': 'Guard 拦截',
+    'end_proactive_max_reply_limit': '达到最大回复条数',
+    'end_proactive_max_llm_steps': '达到最大 LLM 步数'
+  };
+
+  function tsLabel(ts) {
+    if (!ts) return '—';
+    var clean = String(ts).replace('TurnState.', '');
+    return TS_LABELS[clean] || clean;
+  }
+
+  function reasonLabel(r) { return REASON_LABELS[r] || r || ''; }
+  function stageLabel(s) { return STAGE_LABELS[s] || s; }
+  function stageStatusLabel(s) { return STAGE_STATUS_LABELS[s] || s; }
+
+  function _chainGuardBlocked(chain) {
+    for (var i = 0; i < chain.length; i++) {
+      if (chain[i].stage === 'guard') {
+        var s = chain[i].status;
+        return s === 'block' || s === 'fail';
+      }
+    }
+    return false;
+  }
+
+  function _chainGuardExecuted(chain) {
+    for (var i = 0; i < chain.length; i++) {
+      if (chain[i].stage === 'guard') return true;
+    }
+    return false;
+  }
+
+  // ══════════════════════════════════════════════════════════════
+  // Eligibility check (simplified display for check-only result)
   // ══════════════════════════════════════════════════════════════
 
   btnCheck.addEventListener('click', function () {
@@ -288,74 +375,303 @@
   }
 
   function renderReport(report) {
-    // Summary
-    var cls = 'info';
-    if (report.terminal_state && report.terminal_state.indexOf('REPLIED') >= 0) cls = 'pass';
-    else if (report.terminal_state && (report.terminal_state.indexOf('FAILED') >= 0 || report.terminal_state.indexOf('BLOCKED') >= 0)) cls = 'fail';
-    else if (report.execution_skip_reason) cls = 'skip';
+    var cls = _summaryClass(report);
     showLabSummary(cls, report.summary);
 
-    // Precheck vs execution
-    var precheckHtml = '';
-    if (report.precheck_eligibility) {
-      precheckHtml += '<h3 style="font-size:13px;margin-bottom:4px">Precheck (预检)</h3>';
-      precheckHtml += '<p style="font-size:13px">eligibility: <span class="' + (report.precheck_passed ? 'pass-badge' : 'fail-badge') + '">' + (report.precheck_passed ? 'passed' : 'failed') + '</span></p>';
-      if (report.precheck_selected_impulse) {
-        precheckHtml += '<p style="font-size:13px">selected impulse: ' + esc(report.precheck_selected_impulse.impulse_type || '—') + '</p>';
+    // ── Layer 2: Core result cards ──────────────────────────────
+    renderResultCards(report);
+
+    // ── Layer 3: Generated messages ─────────────────────────────
+    renderMessages(report);
+
+    // ── Layer 4: Explanation (precheck + execution split) ───────
+    renderExplain(report);
+
+    // ── Layer 5: Engineering details (folded) ───────────────────
+    renderDetails(report);
+
+    // ── Layer 6: Suggestions ────────────────────────────────────
+    renderSuggestions(report);
+
+    // ── History consistency (separate section) ──────────────────
+    renderHistoryConsistency(report);
+  }
+
+  function _summaryClass(report) {
+    var ts = String(report.terminal_state || '');
+    if (report.execution_skip_reason) return 'skip';
+    if (ts.indexOf('REPLIED') >= 0) return 'pass';
+    if (ts.indexOf('FAILED') >= 0 || ts.indexOf('BLOCKED') >= 0 || ts.indexOf('ERROR') >= 0) return 'fail';
+    if (report.simulated_delivered_count > 0 || report.real_delivered_count > 0) return 'pass';
+    return 'info';
+  }
+
+  // ── Layer 2: Core result cards ────────────────────────────────
+
+  function renderResultCards(report) {
+    var eligOk = report.precheck_passed;
+    var eligFailed = report.precheck_eligibility && !report.precheck_eligibility.eligible;
+    var guardBlocked = _chainGuardBlocked(report.decision_chain);
+    var guardExecuted = report.guard_summary ? report.guard_summary.executed : _chainGuardExecuted(report.decision_chain);
+    var guardOk = guardExecuted && !guardBlocked;
+    var guardLabel = report.mode === 'dry_run' && !guardExecuted ? 'dry-run 已模拟'
+                   : !guardExecuted ? '未执行'
+                   : guardBlocked ? '拦截'
+                   : '通过';
+    var impulseLabel = report.actual_impulse_type || (report.selected_impulse || {}).impulse_type || '无';
+    var msgTexts = report.generated_messages || [];
+    var msgCount = msgTexts.length || report.simulated_delivered_count || report.real_delivered_count || 0;
+
+    var sendLabel, sendClass;
+    if (report.mode === 'dry_run') {
+      sendLabel = 'dry-run 未真实发送';
+      sendClass = 'rcard-yellow';
+    } else if (report.real_send_attempted) {
+      if (report.real_delivered_count > 0) {
+        sendLabel = '真实发送成功（' + report.real_delivered_count + ' 条）';
+        sendClass = 'rcard-pass';
+      } else {
+        sendLabel = '发送失败（0 条送达）';
+        sendClass = 'rcard-fail';
       }
+    } else {
+      sendLabel = '未执行';
+      sendClass = 'rcard-gray';
     }
-    if (report.execution_result) {
-      precheckHtml += '<h3 style="font-size:13px;margin:8px 0 4px">Execution (执行结果)</h3>';
-      precheckHtml += '<p style="font-size:13px">terminal: ' + esc(report.terminal_state || '—') + '</p>';
-      precheckHtml += '<p style="font-size:13px">turn_id: ' + esc(report.turn_id || '—') + '</p>';
+
+    var hwLabel, hwClass;
+    if (report.mode === 'dry_run') {
+      hwLabel = '未写入（dry-run）';
+      hwClass = 'rcard-yellow';
+    } else if (report.history_written_count > 0) {
+      hwLabel = '已写入 ' + report.history_written_count + ' 条';
+      hwClass = 'rcard-pass';
+    } else {
+      hwLabel = '未写入';
+      if (report.history_write && report.history_write.reason) {
+        hwLabel += '（' + report.history_write.reason + '）';
+      }
+      hwClass = 'rcard-gray';
     }
+
+    var cardsHtml = '<div class="result-cards">'
+      + '<div class="rcard ' + (eligOk ? 'rcard-pass' : (eligFailed ? 'rcard-fail' : 'rcard-gray')) + '"><div class="rcard-label">资格检查</div><div class="rcard-value">' + (eligOk ? '通过' : (eligFailed ? '失败' : '—')) + '</div></div>'
+      + '<div class="rcard ' + (impulseLabel !== '无' ? 'rcard-pass' : 'rcard-gray') + '"><div class="rcard-label">主动理由</div><div class="rcard-value">' + esc(impulseLabel) + '</div></div>'
+      + '<div class="rcard ' + (msgCount > 0 ? 'rcard-pass' : 'rcard-gray') + '"><div class="rcard-label">生成消息</div><div class="rcard-value">' + msgCount + ' 条</div></div>'
+      + '<div class="rcard ' + (guardOk ? 'rcard-pass' : (guardBlocked ? 'rcard-fail' : 'rcard-gray')) + '"><div class="rcard-label">Guard</div><div class="rcard-value">' + esc(guardLabel) + '</div></div>'
+      + '<div class="rcard ' + sendClass + '"><div class="rcard-label">发送</div><div class="rcard-value">' + esc(sendLabel) + '</div></div>'
+      + '<div class="rcard ' + hwClass + '"><div class="rcard-label">历史写入</div><div class="rcard-value">' + esc(hwLabel) + '</div></div>'
+      + '</div>';
+
+    var dest = $('#resultCards') || document.createElement('div');
+    dest.innerHTML = cardsHtml;
+    var panel = $('section[id="resultCardsPanel"]');
+    if (panel) panel.style.display = '';
+  }
+
+  // ── Layer 3: Generated messages ───────────────────────────────
+
+  function renderMessages(report) {
+    var msgs = report.generated_messages || [];
+    var html = '';
+    if (msgs.length > 0) {
+      html += '<p style="font-size:12px;color:#888;margin-bottom:8px">以下文案是模型实际生成的微信消息（' + (report.mode === 'dry_run' ? 'dry-run 模拟送达' : 'real-send 确认送达') + '）：</p>';
+      for (var i = 0; i < msgs.length; i++) {
+        html += '<div class="msg-bubble">' + esc(msgs[i]) + '</div>';
+      }
+    } else if (report.execution_skip_reason) {
+      html += '<p class="dim">未生成消息（执行被跳过：' + esc(report.execution_skip_reason) + '）</p>';
+    } else if (report.terminal_state) {
+      html += '<p class="dim">未生成消息（模型调用了 skip_proactive 或 done(status=no_reply)，终端 ' + tsLabel(report.terminal_state) + '）</p>';
+    } else {
+      html += '<p class="dim">未生成消息（未执行 LLM 调用）</p>';
+    }
+    var dest = $('#messagesResult') || document.createElement('div');
+    dest.innerHTML = html;
+    var panel = $('section[id="messagesPanel"]');
+    if (panel) panel.style.display = '';
+  }
+
+  // ── Layer 4: Explanation (precheck + execution split) ─────────
+
+  function renderExplain(report) {
+    var parts = [];
+    parts.push('<div class="explain-section">');
+    parts.push('<h3>预检查结果</h3>');
+    parts.push(renderPrecheck(report));
+    parts.push('<h3>正式执行结果</h3>');
+    parts.push(renderExecution(report));
+    parts.push('</div>');
+
+    var dest = $('#explainResult') || document.createElement('div');
+    dest.innerHTML = parts.join('');
+    var panel = $('section[id="explainPanel"]');
+    if (panel) panel.style.display = '';
+  }
+
+  function renderPrecheck(report) {
+    var html = '<div class="explain-precheck">';
+    var elig = report.precheck_eligibility;
+
+    if (elig && elig.checks) {
+      for (var i = 0; i < elig.checks.length; i++) {
+        var c = elig.checks[i];
+        var icon = c.passed ? '✓' : '✗';
+        var cls = c.passed ? 'c-pass' : 'c-fail';
+        html += '<div class="check-row"><span class="check-icon ' + cls + '">' + icon + '</span><span>' + esc(c.name) + '</span>';
+        if (!c.passed && c.reason) html += '<span class="check-reason"> — ' + esc(reasonLabel(c.reason)) + '</span>';
+        html += '</div>';
+      }
+      // Show impulse result
+      if (report.precheck_selected_impulse) {
+        var si = report.precheck_selected_impulse;
+        html += '<div class="check-row"><span class="check-icon c-pass">✓</span><span>主动理由: <strong>' + esc(si.impulse_type || '') + '</strong></span></div>';
+      } else if (elig.eligible) {
+        html += '<div class="check-row"><span class="check-icon c-fail">✗</span><span>主动理由: 无候选被选中</span></div>';
+        if (report.candidates && report.candidates.length > 0) {
+          html += '<div class="check-detail">候选: ' + report.candidates.map(function(c){return c.type}).join(', ') + '</div>';
+        }
+      }
+    } else if (report.execution_skip_reason) {
+      html += '<p class="exec-skip">执行被跳过：' + esc(reasonLabel(report.execution_skip_reason)) + '</p>';
+    }
+
+    html += '</div>';
+    return html;
+  }
+
+  function renderExecution(report) {
+    var html = '<div class="explain-execution">';
     if (report.execution_skip_reason) {
-      precheckHtml += '<p style="color:#f57f17;font-size:13px">skip reason: ' + esc(report.execution_skip_reason) + '</p>';
+      html += '<p class="exec-skip">执行被跳过：' + esc(reasonLabel(report.execution_skip_reason)) + '</p>';
     }
-    if (precheckHtml) {
-      historyPanel.style.display = '';
-      historyResult.innerHTML = precheckHtml;
+    if (report.terminal_state) {
+      var tsClean = String(report.terminal_state).replace('TurnState.', '');
+      var extra = '';
+      if (tsClean === 'end_cancelled' || tsClean === 'END_CANCELLED') {
+        extra = ' — 本轮被更新的用户消息打断。已发送的消息保留，未发送的文本丢弃。';
+      }
+      html += '<p>终端状态: <strong>' + tsLabel(report.terminal_state) + '</strong>' + extra + '</p>';
     }
+    if (report.execution_result && report.execution_result.delivered_count !== undefined) {
+      html += '<p>送达条数: ' + report.execution_result.delivered_count + '</p>';
+    }
+    if (report.turn_id) {
+      html += '<p>turn_id: <code>' + esc(report.turn_id) + '</code></p>';
+    }
+    html += '</div>';
+    return html;
+  }
 
-    // History consistency
-    var hc = '<h3 style="font-size:13px;margin-bottom:4px">发送与历史一致性</h3>';
-    hc += '<table class="checks-table"><tbody>';
-    hc += row('real_send_attempted', report.real_send_attempted ? 'YES' : 'NO');
-    hc += row('send_simulated', report.send_simulated ? 'YES' : 'NO');
-    hc += row('real_delivered_count', report.real_delivered_count);
-    hc += row('simulated_delivered_count', report.simulated_delivered_count);
-    hc += row('history_written_count', report.history_written_count);
-    if (report.history_write && report.history_write.reason) hc += row('未写入原因', report.history_write.reason);
-    if (report.error_code) hc += row('error_code', report.error_code);
-    if (report.error_message) hc += row('error_message', report.error_message);
-    hc += '</tbody></table>';
-    historyResult.innerHTML = (historyResult.innerHTML || '') + hc;
+  // ── Layer 5: Engineering details (folded) ─────────────────────
 
-    // Decision chain
+  function renderDetails(report) {
+    var parts = [];
+
+    // Decision chain (folded by default)
     var chain = report.decision_chain || [];
     if (chain.length > 0) {
-      chainPanel.style.display = '';
-      var ch = '';
+      var ch = '<details class="details-fold"><summary>决策链（工程详情）</summary>';
       for (var i = 0; i < chain.length; i++) {
         var s = chain[i];
         var sc = s.status === 'pass' || s.status === 'ok' || s.status === 'done' || s.status === 'written' ? 'st-green' :
                  s.status === 'fail' || s.status === 'block' || s.status === 'empty' ? 'st-red' :
-                 s.status === 'simulated' || s.status === 'skip' || s.status === 'not_written' ? 'st-yellow' : 'st-gray';
+                 s.status === 'simulated' || s.status === 'skip' || s.status === 'not_written' || s.status === 'skipped' ? 'st-yellow' : 'st-gray';
         ch += '<div class="chain-step">';
-        ch += '<span class="stage-name">' + esc(s.stage) + '</span>';
-        ch += '<span class="stage-status ' + sc + '">' + esc(s.status) + '</span>';
-        ch += '<span class="stage-reason">' + esc(s.reason || '') + '</span>';
+        ch += '<span class="stage-name">' + stageLabel(s.stage) + '</span>';
+        ch += '<span class="stage-status ' + sc + '">' + stageStatusLabel(s.status) + '</span>';
+        ch += '<span class="stage-reason">' + esc(reasonLabel(s.reason)) + '</span>';
         if (s.raw && Object.keys(s.raw).length > 0) {
           ch += '<span class="stage-raw" onclick="this.classList.toggle(\'open\')">raw <pre>' + esc(JSON.stringify(s.raw, null, 2)) + '</pre></span>';
         }
         ch += '</div>';
       }
-      chainResult.innerHTML = ch;
+      ch += '</details>';
+      parts.push(ch);
     }
+
+    // Candidates detail (folded)
+    if (report.candidates && report.candidates.length > 0) {
+      var cd = '<details class="details-fold"><summary>主动理由候选详情（系统为什么想主动发）</summary><pre style="font-size:11px">' + esc(JSON.stringify(report.candidates, null, 2)) + '</pre></details>';
+      parts.push(cd);
+    }
+
+    // Full raw JSON (folded)
+    parts.push('<details class="details-fold"><summary>完整 Raw JSON</summary><pre style="font-size:11px;max-height:400px;overflow:auto">' + esc(JSON.stringify(report, null, 2)) + '</pre></details>');
+
+    var dest = $('#detailsResult') || document.createElement('div');
+    dest.innerHTML = parts.join('<br>');
+    var panel = $('section[id="detailsPanel"]');
+    if (panel) panel.style.display = '';
+  }
+
+  // ── Layer 6: Suggestions ──────────────────────────────────────
+
+  function renderSuggestions(report) {
+    var suggestions = report.next_step_suggestions || [];
+    // Frontend fallback: old runs without backend-generated suggestions
+    if (suggestions.length === 0) {
+      suggestions = _localSuggestions(report);
+    }
+    if (suggestions.length === 0) return;
+    var html = '<div class="suggestion-box"><h3>下一步建议</h3><ul>';
+    for (var i = 0; i < suggestions.length; i++) {
+      html += '<li>' + esc(suggestions[i]) + '</li>';
+    }
+    html += '</ul></div>';
+    var dest = $('#suggestionsContent') || document.createElement('div');
+    dest.innerHTML = html;
+    var panel = $('section[id="suggestionsPanel"]');
+    if (panel) panel.style.display = '';
+  }
+
+  function _localSuggestions(report) {
+    var s = [];
+    var elig = report.precheck_eligibility;
+    if (elig && elig.checks) {
+      for (var i = 0; i < elig.checks.length; i++) {
+        var c = elig.checks[i];
+        if (c.name === 'features.proactive' && !c.passed) s.push('主动消息功能未开启：config.yaml 中 features.proactive 设为 true');
+        if (c.name === 'user_silent_window' && !c.passed) s.push('用户静默窗口未达标：填写 simulate_user_silent_seconds=28800 模拟长时间静默');
+        if (c.name === 'sleep_hours' && !c.passed) s.push('处于睡眠时段：设置 debug_now 为白天时间');
+        if (c.name === 'bridge_online' && !c.passed) s.push('微信 bridge 离线：先部署/启动微信桥接');
+      }
+    }
+    if (elig && elig.eligible && !report.selected_impulse) {
+      s.push('没有选中主动理由：试试 forced_impulse_type=PRESENCE');
+    }
+    if (_chainGuardBlocked(report.decision_chain || [])) {
+      s.push('文案被 guard 拦截：展开工程详情查看原因');
+    }
+    if (report.mode === 'dry_run' && (report.generated_messages || []).length > 0) {
+      s.push('Dry-run 成功：检查上方文案后可执行 real-send');
+    }
+    return s;
+  }
+
+  // ── History consistency (separate section) ────────────────────
+
+  function renderHistoryConsistency(report) {
+    var parts = ['<h3>发送与历史一致性</h3><table class="checks-table"><tbody>'];
+    parts.push(row('执行模式', report.mode === 'dry_run' ? 'dry-run（未真实发送）' : 'real-send（已真实发送）'));
+    parts.push(row('是否调用真实微信', report.real_send_attempted ? '是' : '否（dry-run）'));
+    parts.push(row('发送步骤是否执行', report.send && report.send.send_step_executed ? '是' : '否'));
+    parts.push(row('真实送达条数', report.real_delivered_count || '—'));
+    parts.push(row('模拟送达条数', report.simulated_delivered_count || '—'));
+    parts.push(row('写入历史条数', report.history_written_count || (report.mode === 'dry_run' ? '未写入（dry-run）' : '0'));
+    if (report.history_write && report.history_write.reason) parts.push(row('未写入原因', esc(report.history_write.reason)));
+    if (report.error_code) parts.push(row('错误码', report.error_code));
+    if (report.error_message) parts.push(row('错误信息', esc(report.error_message)));
+    parts.push('</tbody></table>');
+
+    var dest = $('#historyResult') || document.createElement('div');
+    dest.innerHTML = parts.join('');
+    var panel = $('section[id="historyPanel"]');
+    if (panel) panel.style.display = '';
   }
 
   function row(label, value) {
-    return '<tr><td style="color:#888">' + esc(String(label)) + '</td><td>' + esc(String(value)) + '</td></tr>';
+    return '<tr><td style="color:#888;width:180px">' + esc(String(label)) + '</td><td>' + esc(String(value)) + '</td></tr>';
   }
 
   // ══════════════════════════════════════════════════════════════
@@ -422,8 +738,19 @@
     chainPanel.style.display = 'none';
     historyPanel.style.display = 'none';
     labSummary.style.display = 'none';
+    // New v2.3 panels
+    hideIfExists('resultCardsPanel');
+    hideIfExists('messagesPanel');
+    hideIfExists('explainPanel');
+    hideIfExists('detailsPanel');
+    hideIfExists('suggestionsPanel');
     lastReport = null;
     btnCopyReport.style.display = 'none';
+  }
+
+  function hideIfExists(id) {
+    var el = document.getElementById(id);
+    if (el) el.style.display = 'none';
   }
 
   function showLabSummary(cls, text) {
