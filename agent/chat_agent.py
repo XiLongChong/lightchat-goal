@@ -12,7 +12,7 @@ import logging
 import random
 import re as _re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Coroutine
 
 from agent.state_machine import (
@@ -27,7 +27,6 @@ from agent.state_machine import (
     TERMINAL_STATES,
     ContextBuildResult,
     DeliveryStatus,
-    ErrorClass,
     InterruptChecker,
     ModelAttempt,
     ModelProfile,
@@ -36,15 +35,11 @@ from agent.state_machine import (
     TurnScratchpad,
     TurnState,
     VisibleMessage,
-    classify_error,
 )
 from agent.tool_classifier import classify_single_tool_call
 from agent.tool_registry import TOOL_REGISTRY
 
 logger = logging.getLogger(__name__)
-
-# Safeguard constants
-MAX_MESSAGE_LEN = 500
 
 # Route constants (kept for diagnostics)
 ROUTE_SYSTEM_FAST = "SystemFastPath"
@@ -86,7 +81,6 @@ class ChatAgent:
         post_turn_hooks: list[PostTerminalCallback] | None = None,
     ):
         self.llm_gateway = llm_gateway
-        self.model = model          # legacy default (kept for backward compat)
         self.persona = persona
         self.personality = personality
         self.temperature = temperature
@@ -490,48 +484,6 @@ class ChatAgent:
 
         return TurnState.CALL_LLM
 
-    # ================================================================
-    # v1.2: CLASSIFY_TOOL_ERROR handler
-    # ================================================================
-
-    def _do_classify_tool_error(self, turn: TurnScratchpad) -> TurnState:
-        """CLASSIFY_TOOL_ERROR: classify tool execution results.
-
-        v1.2 §10.3:
-        - success / recoverable (timeout, general failure) → CALL_LLM
-        - invalid args (JSON parse, missing required) → PROTOCOL_RETRY
-        - fatal (registry corrupted, executor unavailable) → HARD_FALLBACK
-        """
-        for tr in turn.tool_results:
-            result = str(tr.get("result", ""))
-            et = _classify_tool_result(result)
-
-            if et == "success":
-                continue  # ok
-
-            if et in ("tool_execution_error", "unknown_error"):
-                # Recoverable: feed failure to model → CALL_LLM
-                logger.warning("classify_tool_error: recoverable error for %s: %s",
-                               tr.get("name", "?"), result[:80])
-                continue
-
-            if et in ("invalid_arguments_json", "missing_required_arg"):
-                turn.add_fallback_event("tool_invalid_args",
-                                        f"{tr.get('name', '?')}: {result[:200]}")
-                return TurnState.PROTOCOL_RETRY
-
-            if et in ("unknown_tool", "not_allowed", "not_eligible"):
-                # Should have been caught by classifier; treat as protocol error
-                turn.add_fallback_event("tool_protocol_mismatch",
-                                        f"{tr.get('name', '?')}: {result[:200]}")
-                return TurnState.PROTOCOL_RETRY
-
-        return TurnState.CALL_LLM
-
-    # ================================================================
-    # v1.2: Post-terminal pipeline (inside ChatAgent)
-    # ================================================================
-
     async def _run_post_terminal_pipeline(
         self,
         turn: TurnScratchpad,
@@ -593,9 +545,24 @@ class ChatAgent:
             {"role": "system", "content": prompt},
         ]
 
-        # Time + city as separate system messages to keep main prompt cache-stable
-        now = datetime.now().strftime("%Y年%m月%d日 %H:%M 周%u")
-        messages.append({"role": "system", "content": f"当前时间：{now}"})
+        # ── Temporal context: time + gap + resume_type + time dividers ──
+        from agent.temporal_context import TemporalContextBuilder
+        _tz = timezone(timedelta(hours=8))
+        now_dt = datetime.now(tz=_tz)
+        current_user_ts = turn.input_cutoff_time if turn.input_cutoff_time > 0 else now_dt.timestamp()
+
+        temporal_builder = TemporalContextBuilder(timezone_offset_hours=8)
+        temporal_result = temporal_builder.build(
+            now=now_dt,
+            history=history,
+            current_user_ts=current_user_ts,
+        )
+        messages.append({"role": "system", "content": temporal_result.temporal_message})
+
+        # Store temporal diagnostics on turn for post-turn observability
+        turn.add_fallback_event("temporal_context", str(temporal_result.diagnostics))
+
+        # City as separate system message (cache-stable)
         default_city = str(self.defaults.get("default_city", "") or "").strip()
         if default_city:
             messages.append({
@@ -603,8 +570,8 @@ class ChatAgent:
                 "content": f"用户默认天气城市：{default_city}。用户只问天气时，直接查这个城市，不要反问。",
             })
 
-        # Short-term history
-        recent = history[-24:] if len(history) > 24 else history
+        # Short-term history (with temporal dividers from augmented history)
+        recent = temporal_result.augmented_history[-24:] if len(temporal_result.augmented_history) > 24 else temporal_result.augmented_history
         for h in recent:
             role = h.get("role", "user")
             if role not in ("system", "user", "assistant"):
@@ -980,74 +947,6 @@ class ChatAgent:
 
         turn._resume_state = TurnState.CALL_LLM
         return TurnState.INTERRUPT_CHECK
-
-    async def _do_exec_state_tools(self, turn: TurnScratchpad) -> TurnState:
-        """EXEC_STATE_TOOLS: execute state tools (v1.2 strict mode).
-
-        No STATE_TOOL registrations exist yet — reaching this state means
-        the classifier allowed a tool that shouldn't be here.
-        Future: registered STATE_TOOLs execute → INTERRUPT_CHECK →
-        CLASSIFY_TOOL_ERROR → CALL_LLM.
-        """
-        # Check if any STATE_TOOL is registered
-        has_state_tools = any(
-            t.tool_category == "state_tool" for t in TOOL_REGISTRY.iter_defs()
-        )
-        if not has_state_tools:
-            # Should never reach here — classifier would catch unknown tools
-            turn.add_fallback_event(
-                "state_tools_unreachable",
-                "no STATE_TOOL registered; protocol error",
-            )
-            return TurnState.PROTOCOL_RETRY
-
-        # v1.2: registered STATE_TOOLs — execute (future)
-        turn._resume_state = TurnState.CLASSIFY_TOOL_ERROR
-        return TurnState.INTERRUPT_CHECK
-
-    # ================================================================
-    # v1.3: Model routing handlers
-    # ================================================================
-
-    def _do_route_retry_model(self, turn: TurnScratchpad) -> TurnState:
-        """ROUTE_RETRY_MODEL: inject protocol retry note, then decide model.
-
-        v1.3: same retry note injection as v1.2 _do_protocol_retry.
-        After injection, decides: flash → FLASH_TO_PRO_UPGRADE,
-        pro → same-model retry → CALL_LLM, exceeded → HARD_FALLBACK.
-        """
-        turn.protocol_retry_count += 1
-
-        if turn.protocol_retry_count > turn.max_protocol_retries:
-            turn.add_fallback_event(
-                "protocol_retry_exceeded",
-                f"exceeded max protocol retries ({turn.max_protocol_retries})",
-            )
-            return TurnState.HARD_FALLBACK
-
-        turn.add_fallback_event(
-            "protocol_retry",
-            f"attempt {turn.protocol_retry_count}/{turn.max_protocol_retries}",
-        )
-        logger.info(
-            "route_retry_model: protocol_retry_count=%d/%d",
-            turn.protocol_retry_count, turn.max_protocol_retries,
-        )
-
-        # Inject retry note (same as v1.2)
-        retry_note = "必须调用 send_wechat_messages 或 skip_reply 结束本轮。"
-        turn.messages.append({"role": "system", "content": retry_note})
-
-        # Decide model for retry
-        last = turn.model_attempts[-1] if turn.model_attempts else None
-        if last and last.selected_model == "flash":
-            if self._routing_mode == "manual_flash" and not self._manual_flash_allow_upgrade:
-                logger.info("route_retry_model: manual_flash no upgrade → same-model retry")
-                return TurnState.CALL_LLM
-            return TurnState.FLASH_TO_PRO_UPGRADE
-
-        # pro → same-model retry (already enforced by protocol_retry_count check above)
-        return TurnState.CALL_LLM
 
     def _do_flash_to_pro_upgrade(self, turn: TurnScratchpad) -> TurnState:
         """FLASH_TO_PRO_UPGRADE: upgrade flash → pro.
