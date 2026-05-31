@@ -188,7 +188,7 @@
     'dry_run_never_writes_visible_history': 'Dry-run 不写入可见历史',
     'active_proactive_turn_running': '另一个主动回合正在执行',
     'scheduler_busy': '另一个主动回合正在执行',
-    'no candidate passed filters': '所有候选被过滤（去重/过期/评分不达标）',
+    'no candidate passed filters': '所有候选被过滤(去重/过期/评分不达标)',
     'no candidate passed score threshold': '候选评分未达阈值',
     'no candidates generated': '未生成任何候选',
     'user_silent_window_not_met': '用户静默窗口未达标',
@@ -202,14 +202,14 @@
     'end_no_reply': '未回复',
     'end_failed': '失败',
     'end_fallback_sent': '兜底已发送',
-    'end_cancelled': '已取消（被新消息打断）',
+    'end_cancelled': '已取消(被新消息打断)',
     'end_superseded_before_send': '发送前被取代',
     'end_interrupted_during_reply_sequence': '回复序列中被中断',
     'end_max_limit': '达到最大限制',
     'end_protocol_error': '协议错误',
     'end_aborted_by_system': '被系统中止',
     'end_skipped_proactive': '主动跳过',
-    'end_failed_no_fallback': '失败（已抑制兜底）',
+    'end_failed_no_fallback': '失败(已抑制兜底)',
     'end_proactive_guard_blocked': 'Guard 拦截',
     'end_proactive_max_reply_limit': '达到最大回复条数',
     'end_proactive_max_llm_steps': '达到最大 LLM 步数'
@@ -428,10 +428,10 @@
       sendClass = 'rcard-yellow';
     } else if (report.real_send_attempted) {
       if (report.real_delivered_count > 0) {
-        sendLabel = '真实发送成功（' + report.real_delivered_count + ' 条）';
+        sendLabel = '真实发送成功(' + report.real_delivered_count + ' 条)';
         sendClass = 'rcard-pass';
       } else {
-        sendLabel = '发送失败（0 条送达）';
+        sendLabel = '发送失败(0 条送达)';
         sendClass = 'rcard-fail';
       }
     } else {
@@ -441,7 +441,7 @@
 
     var hwLabel, hwClass;
     if (report.mode === 'dry_run') {
-      hwLabel = '未写入（dry-run）';
+      hwLabel = '未写入(dry-run)';
       hwClass = 'rcard-yellow';
     } else if (report.history_written_count > 0) {
       hwLabel = '已写入 ' + report.history_written_count + ' 条';
@@ -449,7 +449,7 @@
     } else {
       hwLabel = '未写入';
       if (report.history_write && report.history_write.reason) {
-        hwLabel += '（' + report.history_write.reason + '）';
+        hwLabel += '(' + report.history_write.reason + ')';
       }
       hwClass = 'rcard-gray';
     }
@@ -475,16 +475,16 @@
     var msgs = report.generated_messages || [];
     var html = '';
     if (msgs.length > 0) {
-      html += '<p style="font-size:12px;color:#888;margin-bottom:8px">以下文案是模型实际生成的微信消息（' + (report.mode === 'dry_run' ? 'dry-run 模拟送达' : 'real-send 确认送达') + '）：</p>';
+      html += '<p style="font-size:12px;color:#888;margin-bottom:8px">以下文案是模型实际生成的微信消息(' + (report.mode === 'dry_run' ? 'dry-run 模拟送达' : 'real-send 确认送达') + ')：</p>';
       for (var i = 0; i < msgs.length; i++) {
         html += '<div class="msg-bubble">' + esc(msgs[i]) + '</div>';
       }
     } else if (report.execution_skip_reason) {
-      html += '<p class="dim">未生成消息（执行被跳过：' + esc(report.execution_skip_reason) + '）</p>';
+      html += '<p class="dim">未生成消息(执行被跳过：' + esc(report.execution_skip_reason) + ')</p>';
     } else if (report.terminal_state) {
-      html += '<p class="dim">未生成消息（模型调用了 skip_proactive 或 done(status=no_reply)，终端 ' + tsLabel(report.terminal_state) + '）</p>';
+      html += '<p class="dim">未生成消息(模型调用了 skip_proactive 或 done(status=no_reply)，终端 ' + tsLabel(report.terminal_state) + ')</p>';
     } else {
-      html += '<p class="dim">未生成消息（未执行 LLM 调用）</p>';
+      html += '<p class="dim">未生成消息(未执行 LLM 调用)</p>';
     }
     var dest = $('#messagesResult') || document.createElement('div');
     dest.innerHTML = html;
@@ -571,7 +571,7 @@
     // Decision chain (folded by default)
     var chain = report.decision_chain || [];
     if (chain.length > 0) {
-      var ch = '<details class="details-fold"><summary>决策链（工程详情）</summary>';
+      var ch = '<details class="details-fold"><summary>决策链(工程详情)</summary>';
       for (var i = 0; i < chain.length; i++) {
         var s = chain[i];
         var sc = s.status === 'pass' || s.status === 'ok' || s.status === 'done' || s.status === 'written' ? 'st-green' :
@@ -592,7 +592,7 @@
 
     // Candidates detail (folded)
     if (report.candidates && report.candidates.length > 0) {
-      var cd = '<details class="details-fold"><summary>主动理由候选详情（系统为什么想主动发）</summary><pre style="font-size:11px">' + esc(JSON.stringify(report.candidates, null, 2)) + '</pre></details>';
+      var cd = '<details class="details-fold"><summary>主动理由候选详情(系统为什么想主动发)</summary><pre style="font-size:11px">' + esc(JSON.stringify(report.candidates, null, 2)) + '</pre></details>';
       parts.push(cd);
     }
 
@@ -653,12 +653,12 @@
 
   function renderHistoryConsistency(report) {
     var parts = ['<h3>发送与历史一致性</h3><table class="checks-table"><tbody>'];
-    parts.push(row('执行模式', report.mode === 'dry_run' ? 'dry-run（未真实发送）' : 'real-send（已真实发送）'));
-    parts.push(row('是否调用真实微信', report.real_send_attempted ? '是' : '否（dry-run）'));
+    parts.push(row('执行模式', report.mode === 'dry_run' ? 'dry-run(未真实发送)' : 'real-send(已真实发送)'));
+    parts.push(row('是否调用真实微信', report.real_send_attempted ? '是' : '否(dry-run)'));
     parts.push(row('发送步骤是否执行', report.send && report.send.send_step_executed ? '是' : '否'));
     parts.push(row('真实送达条数', report.real_delivered_count || '—'));
     parts.push(row('模拟送达条数', report.simulated_delivered_count || '—'));
-    parts.push(row('写入历史条数', report.history_written_count || (report.mode === 'dry_run' ? '未写入（dry-run）' : '0'));
+    parts.push(row('写入历史条数', report.history_written_count || (report.mode === 'dry_run' ? '未写入(dry-run)' : '0')));
     if (report.history_write && report.history_write.reason) parts.push(row('未写入原因', esc(report.history_write.reason)));
     if (report.error_code) parts.push(row('错误码', report.error_code));
     if (report.error_message) parts.push(row('错误信息', esc(report.error_message)));
