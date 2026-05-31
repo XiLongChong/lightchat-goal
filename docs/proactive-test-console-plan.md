@@ -2,7 +2,8 @@
 
 > 基于设计文档 `11/v1.6/proactive_test_console_design.md`
 > 代码现状审查: 2026-05-31 (v3.1 proactive pipeline)
-> 修订: 2026-05-31 — 审查意见修正
+> 修订: 2026-05-31 — v2 审查意见修正
+> 补充修订: 2026-05-31 — v2.1 开工前小修订
 > 状态: **等待确认**
 
 ---
@@ -885,3 +886,307 @@ real-send 单测使用 **fake sender** 验证链路结构:
 | `proactive_debug.py` 构造 business impulse | impulse 必须来自 ProactiveScheduler |
 | `run_heartbeat` 支持测试参数 | heartbeat 是生产入口 |
 | `admin_proactive_test_routes.py` import main 全局 | 依赖注入模式 |
+
+---
+
+## 附录 A: v2.1 开工前小修订
+
+> 基于 v2 审查意见"方向通过，补充以下 4 点后再开工"。
+> 本附录覆盖必须修改的 4 点 + 3 点顺手补充。
+> 不作为独立文档，嵌入原计划对应章节的修正。
+
+---
+
+### A.1 LLM trace 拦截：request-scoped trace override（必须修改）
+
+**问题**: v2 计划中 dry-run 通过 `try/finally` 临时替换 `llm_gateway._on_trace_callbacks` 拦截 trace。这是全局共享对象，dry-run 与普通聊天 / real-send 并发时会污染 trace。
+
+**修正方案**: request-scoped trace override。
+
+**实现方式**:
+
+`LLMGateway.complete()` 新增可选参数 `trace_handler: Callable | None = None`:
+
+```python
+# agent/llm_gateway.py (小改动)
+async def complete(self, request: LLMRequest, *,
+                   trace_handler: Callable | None = None) -> LLMResponse:
+    response = await self.adapter.complete(request)
+    if trace_handler is not None:
+        # 局部 trace handler，不影响全局 _on_trace_callbacks
+        await trace_handler(self._build_trace(request, response))
+    else:
+        # 走全局 trace callbacks
+        for cb in self._on_trace_callbacks:
+            await cb(self._build_trace(request, response))
+    return response
+```
+
+ChatAgent 侧透传:
+
+`ChatAgent._do_call_llm()` 从 turn scratchpad 读取可选的 `_debug_trace_handler`，传给 gateway:
+
+```python
+# agent/chat_agent.py (小改动)
+_trace_handler = getattr(turn, "_debug_trace_handler", None)
+response = await self.llm_gateway.complete(request, trace_handler=_trace_handler)
+```
+
+Dry-run 侧设置:
+
+```python
+# agent/proactive_debug.py
+turn._debug_trace_handler = create_dry_run_trace_handler(run_id)
+```
+
+`create_dry_run_trace_handler(run_id)` 返回一个 async callable，将 trace 写入 `proactive_debug_runs.llm_steps_json`，标记 `dry_run_id=run_id`，**不**写入全局 `llm_traces` 表。
+
+**优于原有方案**: 不修改全局状态，并发安全；正常路径的 trace handler 为 None，走原有全局逻辑，零性能开销。
+
+---
+
+### A.2 模拟 sender 契约验证（必须修改）
+
+**问题**: v2 的 `m["send_status"] = "delivered"` 伪代码需要对照真实契约确认。
+
+**已审查的代码**:
+
+1. `WeChatSender` 类型定义 (`chat_agent.py:56`):
+   ```python
+   WeChatSender = Callable[[list[dict[str, Any]]], Coroutine[Any, Any, list[dict[str, Any]]]]
+   ```
+   输入 `list[dict]`，输出 `list[dict]`。单参数，无 user_id/context_token。
+
+2. 真实 `wechat_sender` (`main.py:426`):
+   ```python
+   async def wechat_sender(user_id: str, context_token: str, messages: list[dict]) -> list[dict]:
+   ```
+   三参数版本被 `_bound_sender` 包装为单参数后注入 ChatAgent。
+
+3. ChatAgent 调用点 (`chat_agent.py:1291`):
+   ```python
+   send_batch = [{"text": guarded_text, "delay": 0.0, "_vm_index": 0}]
+   raw_results = await wechat_sender(send_batch)
+   ```
+
+4. 结果读取 (`chat_agent.py:1309`):
+   ```python
+   send_status = raw_results[0].get("send_status", "unknown")
+   # "delivered" → success path (sent_message_count += 1)
+   # "failed" / "rate_limited" / "blocked" / "unknown" → failure path
+   ```
+
+**结论**: v2 伪代码 `m["send_status"] = "delivered"` **直接正确**，因为:
+- 真实 wechat_sender 就是在原 dict 上设置 `send_status` 后返回
+- `"delivered"` 是唯一触发成功路径的值
+- 模拟 sender 不需要导入 bridge 模块
+
+**修正后的模拟 sender 实现**:
+
+```python
+def create_simulated_sender() -> WeChatSender:
+    """模拟 sender：不调用微信，对 ChatAgent 返回 delivered。"""
+    async def _sender(messages: list[dict]) -> list[dict]:
+        for m in messages:
+            m["send_status"] = "delivered"
+        return messages
+    return _sender
+```
+
+**补充验证**:
+- 模拟 sender 需确保 `messages` 不为空且为 list
+- 模拟 sender 不调用 `asyncio.sleep` (dry-run 不需要模拟延迟)
+
+---
+
+### A.3 并发安全：dry-run 复用 scheduler 锁（必须修改）
+
+**问题**: v2 中 dry-run 直接调用 `chat_agent.chat()`，绕过 `ProactiveScheduler._lock`。如果 heartbeat 或 real-send 同时在使用 scheduler，会并发跑主动回合。
+
+**修正方案**: 新增 `ProactiveScheduler.run_debug_turn()`，由 scheduler 获取同一把 proactive lock。
+
+**实现**:
+
+```python
+# agent/scheduler.py (新增)
+async def run_debug_turn(
+    self,
+    user_id: str,
+    bot_id: str,
+    *,
+    impulse_meta: dict[str, Any],
+    chat_agent_kwargs: dict[str, Any],  # system_prompt, history, wechat_sender 等
+) -> dict[str, Any]:
+    """Debug-only：在 scheduler 锁内执行主动回合。
+    
+    与 run_manual_trigger / run_heartbeat 共用同一把 _lock。
+    chat_agent_kwargs 由 proactive_debug 组装（含模拟 sender 和 no-op callbacks）。
+    """
+    if self._lock.locked():
+        return {"status": "skipped", "reason": "active_proactive_turn_running"}
+    
+    async with self._lock:
+        turn_id = f"debug_{user_id}_{int(time.time() * 1000)}"
+        self._active_proactive_turn_id = turn_id
+        try:
+            from agent.state_machine import SOURCE_PROACTIVE_IMPULSE
+            result = await self._chat_agent.chat(
+                user_message=None,
+                source=SOURCE_PROACTIVE_IMPULSE,
+                proactive_meta=impulse_meta,
+                **chat_agent_kwargs,
+            )
+            return {"status": "ok", "result": result, "turn_id": turn_id}
+        except Exception as e:
+            logger.error("proactive_scheduler: debug turn failed: %s", e)
+            return {"status": "error", "reason": str(e)[:500], "turn_id": turn_id}
+        finally:
+            self._active_proactive_turn_id = None
+```
+
+**`proactive_debug.py` 调用方式**:
+
+```python
+# dry-run
+scheduler_result = await scheduler.run_debug_turn(
+    user_id=ctx.user_id,
+    bot_id=ctx.bot_id,
+    impulse_meta=impulses["selected"],
+    chat_agent_kwargs={
+        "history": history,
+        "system_prompt": system_prompt,
+        "wechat_sender": create_simulated_sender(),
+        "write_model_history": create_dry_run_write_history(),
+        "post_turn_hooks": create_dry_run_post_turn_hooks(),
+        "trigger": "proactive",
+        ...
+    },
+)
+```
+
+```python
+# real-send: 仍走 run_manual_trigger（已有锁）
+scheduler_result = await scheduler.run_manual_trigger(
+    user_id=ctx.user_id,
+    impulse_meta=impulses["selected"],
+    bot_id=ctx.bot_id,
+    providers...,
+)
+```
+
+**并发安全保证**:
+- dry-run、real-send、heartbeat 三者共用 `ProactiveScheduler._lock`
+- 同一时刻只有一个针对同一 user_id 的主动回合在执行
+- `run_debug_turn()` 如果锁被占用，返回 `{"status": "skipped"}`
+
+---
+
+### A.4 Real-send precheck 与 execution 分离（必须修改）
+
+**问题**: v2 的 `ProactiveDebugReport` 把 eligibility / impulse / execution 混在一起。如果 `run_debug_eligibility` 返回 eligible=true，但 `run_manual_trigger` 内部再次检查时却不通过（时序差异、状态变化），前端解释不清。
+
+**修正方案**: `ProactiveDebugReport` 新增 precheck/execution 双层结构。
+
+```python
+@dataclass
+class ProactiveDebugReport:
+    # ... 原有字段 ...
+
+    # ── v2.1: Precheck vs execution 分离 ──
+    precheck_eligibility: dict | None         # run_debug_eligibility 的结果
+    precheck_selected_impulse: dict | None    # run_debug_impulse_pipeline 的结果
+    precheck_passed: bool                     # 预检是否全部通过
+    execution_result: dict | None             # run_manual_trigger / run_debug_turn 的实际 TurnResult
+    execution_skip_reason: str                # 如果 execution 被跳过，原因是什么
+```
+
+**前端展示逻辑**:
+
+```
+Precheck 面板:
+  eligibility: ✅ eligible
+  selected impulse: ECHO (score 0.82)
+
+Execution 面板:
+  实际结果: ✅ END_REPLIED
+  发送: real_send_attempted=true, 2 delivered
+  历史写入: 2 条 assistant:proactive
+
+---
+或者:
+
+Precheck 面板:
+  eligibility: ✅ eligible
+  selected impulse: ECHO (score 0.82)
+
+Execution 面板:
+  实际结果: ⚠️ SKIPPED
+  跳过原因: active_proactive_turn_running（heartbeat 正在执行主动回合）
+  发送: 未发送
+  历史写入: 未写入
+```
+
+**关键规则**:
+1. `precheck_*` 是预检的快照，只展示"如果现在发，检查结果是什么"
+2. `execution_result` 是实际执行的结果，以 `run_manual_trigger` / `run_debug_turn` 返回值为准
+3. 当 `execution_skip_reason` 非空时，前端明确标注"预检通过但实际执行跳过"
+
+---
+
+### A.5 run_id 区分前缀（顺手补充）
+
+- dry-run → `pro-dry-{YYYYMMDD}-{HHMMSS}-{6位随机}`
+- real-send → `pro-real-{YYYYMMDD}-{HHMMSS}-{6位随机}`
+
+便于前端列表快速区分模式。
+
+---
+
+### A.6 decision_chain IMPULSE_FILTERING.raw 固定子结构（顺手补充）
+
+```json
+{
+  "stage": "impulse_filtering",
+  "status": "pass",
+  "reason": "3 candidates → 1 after filtering",
+  "raw": {
+    "dedup": {"input": 3, "output": 3, "removed": []},
+    "expire": {"input": 3, "output": 2, "removed": [{"type": "ECHO", "reason": "TTL expired 4h"}]},
+    "score": {"input": 2, "scored": [{"type": "PRESENCE", "score": 55}, {"type": "TOPIC_CONTINUE", "score": 70}]},
+    "threshold": {"min_score": 0, "passed": true}
+  }
+}
+```
+
+测试可验证 `decision_chain[*].raw` 包含这 4 个子键（不验证具体值）。
+
+---
+
+### A.7 list_debug_runs 支持过滤（顺手补充）
+
+`GET /admin/proactive-test/runs` 新增可选 query params:
+
+| param | 默认值 | 说明 |
+|-------|--------|------|
+| `limit` | 20 | 返回条数 |
+| `mode` | all | dry_run / real_send / all |
+| `terminal_state` | — | 按终态过滤 |
+| `send_simulated` | — | true=仅 dry-run, false=仅 real-send |
+| `real_send_attempted` | — | true=仅 real-send, false=仅 dry-run |
+| `impulse_type` | — | 按 impulse_type 过滤 |
+
+SQLite 层实现: 在 `list_debug_runs()` 中动态拼接 WHERE 条件。不新增索引，查询量小 (< 1000 条)。
+
+---
+
+### 修正涉及的文件变更
+
+| 文件 | 原计划 | v2.1 修正 |
+|------|--------|----------|
+| `agent/llm_gateway.py` | 不改 | `complete()` 新增 `trace_handler` 可选参数 |
+| `agent/chat_agent.py` | 不改 | `_do_call_llm()` 从 turn 读取 `_debug_trace_handler` 传给 gateway |
+| `agent/scheduler.py` | `run_debug_eligibility()` / `run_debug_impulse_pipeline()` | 新增 `run_debug_turn()` (含锁) |
+| `agent/proactive_debug.py` | 直接调 `chat_agent.chat()` | 调 `scheduler.run_debug_turn()` (dry-run)；调 `scheduler.run_manual_trigger()` (real-send) |
+| `agent/proactive_debug.py` | `ProactiveDebugReport` 无 precheck/execution 分离 | 新增 6 个 precheck/execution 字段 |
+| `agent/proactive_debug.py` | run_id 格式 | pro-dry-* / pro-real-* 前缀 |
+| `memory/store.py` | `list_debug_runs(limit, mode)` | 新增 4 个可选过滤参数 |
