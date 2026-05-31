@@ -992,27 +992,40 @@ class ProactiveScheduler:
         simulate_user_silent_seconds: int | None = None,
         simulate_last_proactive_seconds: int | None = None,
     ) -> dict[str, Any]:
-        """Run eligibility check for debug console. Does NOT call LLM.
+        """v1.6-A: Run eligibility check for debug console. Does NOT call LLM.
 
-        Returns {"eligible": bool, "checks": [...], "final_reason": str}.
-        Each check: {"name": str, "passed": bool, "actual": ..., "required": ..., "reason": str|None}.
+        Removed: user message quiet window, min_interval.
+        Added: settings-based checks, autonomous trigger cap, last_visible_message_at,
+        trigger_mode determination.
+
+        Returns {"eligible": bool, "checks": [...], "final_reason": str,
+                 "last_visible_message_at": float, "elapsed_since_last_visible_seconds": int,
+                 "trigger_mode": str | None, "autonomous_trigger_count_today": int,
+                 "daily_autonomous_trigger_cap": int, "daily_active_message_cap": int,
+                 "intensity": str}.
         """
         checks: list[dict[str, Any]] = []
-        cfg = self._config.get("proactive", {})
+        settings = self._get_settings()
 
-        # 1. features.proactive
-        proactive_on = bool(
-            (self._config.get("features") or {}).get("proactive", False)
-        )
+        # 1. Master switch
         checks.append({
-            "name": "features.proactive",
-            "passed": proactive_on,
-            "actual": proactive_on,
+            "name": "proactive_master_switch",
+            "passed": settings.enabled,
+            "actual": settings.enabled,
             "required": True,
-            "reason": None if proactive_on else "proactive feature is disabled",
+            "reason": None if settings.enabled else "proactive master switch is off",
         })
 
-        # 2. bridge online
+        # 2. Autonomous sub-switch
+        checks.append({
+            "name": "autonomous_enabled",
+            "passed": settings.autonomous_enabled,
+            "actual": settings.autonomous_enabled,
+            "required": True,
+            "reason": None if settings.autonomous_enabled else "autonomous sub-switch is off",
+        })
+
+        # 3. Bridge online
         bridge_ok = True
         if self._bridge_online_check and callable(self._bridge_online_check):
             try:
@@ -1027,83 +1040,64 @@ class ProactiveScheduler:
             "reason": None if bridge_ok else "WeChat bridge is offline",
         })
 
-        # 3. sleep hours
-        sleep_cfg = cfg.get("eligibility", {}).get("sleep_hours", {})
-        in_sleep = False
-        if sleep_cfg:
-            in_sleep = self._in_sleep_hours(sleep_cfg, debug_now=debug_now)
+        # 4. Quiet hours
+        quiet_cfg = {}
+        if settings.quiet_hours_enabled:
+            quiet_cfg = {"start": settings.quiet_hours_start, "end": settings.quiet_hours_end}
+        in_sleep = bool(quiet_cfg and self._in_sleep_hours(quiet_cfg, debug_now=debug_now))
         checks.append({
-            "name": "sleep_hours",
+            "name": "quiet_hours",
             "passed": not in_sleep,
             "actual": in_sleep,
             "required": False,
-            "reason": "current time is in sleep window" if in_sleep else None,
+            "reason": "current time is in quiet hours" if in_sleep else None,
         })
 
-        # 4. User message quiet window
-        quiet_passed = True
-        quiet_actual = "N/A"
-        quiet_required = "N/A"
+        # 5. Daily active message cap
+        daily_msg_cap = int(settings.daily_active_message_cap)
+        daily_msg_passed = True
+        daily_msg_actual = "N/A"
         if self._store:
             try:
-                ds = await self._store.get_dialogue_state(user_id, bot_id)
-                last_user_at = float(ds.get("last_user_message_at", 0)) if ds else 0
-                effective_now = debug_now.timestamp() if debug_now else time.time()
-                if simulate_user_silent_seconds is not None:
-                    # Simulate: pretend user last message was N seconds ago
-                    simulated_last = effective_now - simulate_user_silent_seconds
-                    gap = effective_now - simulated_last
-                elif last_user_at > 0:
-                    gap = effective_now - last_user_at
-                else:
-                    gap = 999999  # no user message ever → quiet enough
-
-                quiet_min = int(cfg.get("eligibility", {}).get(
-                    "after_user_message_quiet_seconds_min", 60))
-                quiet_passed = gap >= quiet_min
-                quiet_actual = f"{int(gap)} seconds"
-                quiet_required = f"{quiet_min} seconds"
-            except Exception:
-                pass
-        checks.append({
-            "name": "user_silent_window",
-            "passed": quiet_passed,
-            "actual": quiet_actual,
-            "required": quiet_required,
-            "reason": None if quiet_passed else "user_silent_window_not_met",
-        })
-
-        # 5. Daily cap
-        daily_passed = True
-        daily_actual = "N/A"
-        daily_required = "N/A"
-        if self._store:
-            try:
-                daily_cap = int(cfg.get("eligibility", {}).get("daily_cap", 10))
                 tz = timezone(timedelta(hours=8))
                 effective_dt = debug_now if debug_now else datetime.now(tz)
                 if not effective_dt.tzinfo:
                     effective_dt = effective_dt.replace(tzinfo=tz)
-                today_start = datetime.combine(
-                    effective_dt.date(),
-                    datetime_time.min,
-                    tzinfo=tz,
-                ).timestamp()
+                today_start = datetime.combine(effective_dt.date(), datetime_time.min, tzinfo=tz).timestamp()
                 sent_today = await self._store.count_today_proactive_sent(today_start)
-                daily_passed = sent_today < daily_cap
-                daily_actual = f"{sent_today} sent"
-                daily_required = f"< {daily_cap}"
+                daily_msg_passed = sent_today < daily_msg_cap
+                daily_msg_actual = f"{sent_today} / {daily_msg_cap}"
             except Exception:
                 pass
         checks.append({
-            "name": "daily_limit",
-            "passed": daily_passed,
-            "actual": daily_actual,
-            "required": daily_required,
-            "reason": None if daily_passed else "daily limit reached",
+            "name": "daily_active_message_cap",
+            "passed": daily_msg_passed,
+            "actual": daily_msg_actual,
+            "required": f"< {daily_msg_cap}",
+            "reason": None if daily_msg_passed else "daily message cap reached",
         })
 
-        # 6. User opt-out
+        # 6. Daily autonomous trigger cap
+        trigger_cap = 5
+        trigger_count = 0
+        if self._store:
+            try:
+                intensity = settings.autonomous_intensity
+                profile = get_intensity_profile(intensity)
+                trigger_cap = int(profile.get("daily_trigger_cap", 5))
+                trigger_count, _ = await self._store.get_autonomous_trigger_count(user_id, bot_id)
+            except Exception:
+                pass
+        trigger_passed = trigger_count < trigger_cap
+        checks.append({
+            "name": "daily_autonomous_trigger_cap",
+            "passed": trigger_passed,
+            "actual": f"{trigger_count} / {trigger_cap}",
+            "required": f"< {trigger_cap}",
+            "reason": None if trigger_passed else "autonomous trigger cap reached",
+        })
+
+        # 7. User opt-out
         optout_passed = True
         if self._store:
             try:
@@ -1118,37 +1112,7 @@ class ProactiveScheduler:
             "passed": optout_passed,
             "actual": "paused" if not optout_passed else "not paused",
             "required": "not paused",
-            "reason": None if optout_passed else "user has opted out of proactive messages",
-        })
-
-        # 7. Min interval since last proactive
-        interval_passed = True
-        interval_actual = "N/A"
-        interval_required = "N/A"
-        if self._store:
-            try:
-                ps = await self._store.get_proactive_schedule_state(user_id, bot_id)
-                last_sent = float(ps.get("last_sent_ts", 0)) if ps else 0
-                effective_now = debug_now.timestamp() if debug_now else time.time()
-                if simulate_last_proactive_seconds is not None:
-                    simulated_last = effective_now - simulate_last_proactive_seconds
-                    gap = effective_now - simulated_last
-                elif last_sent > 0:
-                    gap = effective_now - last_sent
-                else:
-                    gap = 999999
-                min_interval_s = int(cfg.get("eligibility", {}).get("min_interval_minutes", 30)) * 60
-                interval_passed = gap >= min_interval_s
-                interval_actual = f"{int(gap)} seconds"
-                interval_required = f"{min_interval_s} seconds"
-            except Exception:
-                pass
-        checks.append({
-            "name": "min_interval",
-            "passed": interval_passed,
-            "actual": interval_actual,
-            "required": interval_required,
-            "reason": None if interval_passed else "min_interval_not_met",
+            "reason": None if optout_passed else "user has opted out",
         })
 
         # 8. Scheduler busy
@@ -1161,6 +1125,27 @@ class ProactiveScheduler:
             "reason": "another proactive turn is running" if busy else None,
         })
 
+        # ── last_visible_message_at + trigger mode ──
+        last_visible = 0.0
+        elapsed_s = 0
+        trigger_mode = None
+        if self._store:
+            try:
+                last_visible = await self._store.get_last_visible_message_at(user_id, bot_id)
+                if last_visible > 0:
+                    effective_now_ts = debug_now.timestamp() if debug_now else time.time()
+                    if simulate_user_silent_seconds is not None:
+                        last_visible = effective_now_ts - simulate_user_silent_seconds
+                    elapsed_s = int(effective_now_ts - last_visible)
+                    intensity = settings.autonomous_intensity
+                    profile = get_intensity_profile(intensity)
+                    if elapsed_s >= profile.get("required_after_minutes", 180) * 60:
+                        trigger_mode = "required"
+                    elif elapsed_s >= profile.get("optional_after_minutes", 120) * 60:
+                        trigger_mode = "optional"
+            except Exception:
+                pass
+
         all_passed = all(c["passed"] for c in checks)
         failed = [c for c in checks if not c["passed"]]
         final_reason = failed[0]["reason"] if failed else ""
@@ -1169,6 +1154,13 @@ class ProactiveScheduler:
             "eligible": all_passed,
             "checks": checks,
             "final_reason": final_reason,
+            "last_visible_message_at": last_visible,
+            "elapsed_since_last_visible_seconds": elapsed_s,
+            "trigger_mode": trigger_mode,
+            "autonomous_trigger_count_today": trigger_count,
+            "daily_autonomous_trigger_cap": trigger_cap,
+            "daily_active_message_cap": daily_msg_cap,
+            "intensity": settings.autonomous_intensity,
         }
 
     async def run_debug_impulse_pipeline(
