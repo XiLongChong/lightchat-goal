@@ -22,7 +22,7 @@ import re
 import sys
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, time as datetime_time
+from datetime import datetime, time as datetime_time, timedelta
 from typing import Any
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -82,7 +82,7 @@ if _native_override in ("true", "1", "yes", "on"):
     _ntc = cfg.setdefault("model", {}).setdefault("native_tool_calls", {})
     _ntc["chat_agent"] = True
     if not _ntc.get("allowed_tools"):
-        _ntc["allowed_tools"] = ["get_time", "get_weather"]
+        _ntc["allowed_tools"] = ["get_time", "get_weather", "create_scheduled_trigger"]
 RUNTIME_SETTINGS_PATH = Path("./data/runtime_settings.json")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
 ADMIN_SESSIONS: set[str] = set()
@@ -398,7 +398,7 @@ def build_system_prompt_for_turn() -> str:
     personality = _read_personality()
     default_city = cfg.get("weather", {}).get("default_city", "")
     tool_names = cfg.get("model", {}).get("native_tool_calls", {}).get(
-        "allowed_tools", ["get_time", "get_weather", "wechat_reply", "done"]
+        "allowed_tools", ["get_time", "get_weather", "create_scheduled_trigger", "wechat_reply", "done"]
     )
     return build_chat_system_prompt(
         persona=persona,
@@ -532,6 +532,122 @@ def _make_interrupt_checker(user_id: str, input_latest_seq: int):
         return interrupted
 
     return _check
+
+
+def _get_current_inbound_seq(user_id: str) -> int:
+    return int(_user_latest_inbound_seq.get(user_id, 0) or 0)
+
+
+def _parse_scheduled_trigger_at(value: str) -> float:
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("trigger_at is required")
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    dt = datetime.fromisoformat(raw)
+    tz = ZoneInfo("Asia/Shanghai")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=tz)
+    return dt.timestamp()
+
+
+def _shift_due_out_of_quiet_hours(due_ts: float) -> float:
+    from agent.proactive_settings import load_proactive_settings
+
+    settings = load_proactive_settings(cfg)
+    if not settings.quiet_hours_enabled:
+        return due_ts
+    tz = ZoneInfo("Asia/Shanghai")
+    due_dt = datetime.fromtimestamp(due_ts, tz)
+    sleep_cfg = {
+        "start": settings.quiet_hours_start,
+        "end": settings.quiet_hours_end,
+    }
+    if not proactive_scheduler._in_sleep_hours(sleep_cfg, debug_now=due_dt):
+        return due_ts
+    try:
+        end_t = datetime_time.fromisoformat(settings.quiet_hours_end)
+    except Exception:
+        end_t = datetime_time(hour=8)
+    end_dt = datetime.combine(due_dt.date(), end_t, tzinfo=tz)
+    if end_dt <= due_dt:
+        end_dt = end_dt + timedelta(days=1)
+    return end_dt.timestamp()
+
+
+def _build_state_tool_executor(user_id: str, context_token: str, bot_id: str):
+    async def _exec(tool_name: str, args: dict[str, Any], turn: TurnScratchpad) -> dict[str, Any]:
+        if tool_name != "create_scheduled_trigger":
+            return {"status": "error", "recoverable": False, "reason": "unknown_state_tool"}
+
+        message = str(args.get("message", "") or args.get("text", "") or "").strip()
+        if not message:
+            return {
+                "status": "error",
+                "recoverable": True,
+                "reason": "missing_message",
+                "hint": "message is required",
+            }
+        message = message[:500]
+        title = str(args.get("title", "") or "").strip()[:80]
+        trigger_at = str(args.get("trigger_at", "") or "").strip()
+        delay_raw = args.get("delay_minutes", None)
+        has_trigger_at = bool(trigger_at)
+        has_delay = delay_raw not in (None, "")
+        if has_trigger_at == has_delay:
+            return {
+                "status": "error",
+                "recoverable": True,
+                "reason": "invalid_time_selector",
+                "hint": "trigger_at and delay_minutes are mutually exclusive; provide exactly one",
+            }
+
+        now_ts = time.time()
+        try:
+            if has_delay:
+                delay_minutes = int(delay_raw)
+                if delay_minutes < 1 or delay_minutes > 43200:
+                    raise ValueError("delay_minutes must be 1-43200")
+                due_at = now_ts + delay_minutes * 60
+            else:
+                due_at = _parse_scheduled_trigger_at(trigger_at)
+        except Exception as e:
+            return {
+                "status": "error",
+                "recoverable": True,
+                "reason": "invalid_due_time",
+                "hint": str(e)[:200],
+            }
+
+        if due_at <= now_ts + 5:
+            return {
+                "status": "error",
+                "recoverable": True,
+                "reason": "due_time_in_past",
+                "hint": "scheduled trigger must be in the future",
+            }
+
+        due_at = _shift_due_out_of_quiet_hours(due_at)
+        task_id = await memory_store.create_scheduled_message(
+            user_id=user_id,
+            context_token=context_token,
+            messages=[{
+                "text": message,
+                "title": title,
+                "bot_id": bot_id,
+                "created_from_turn_id": turn.turn_id,
+                "source": "create_scheduled_trigger",
+            }],
+            due_at=due_at,
+        )
+        return {
+            "status": "ok",
+            "scheduled_task_id": task_id,
+            "due_at": due_at,
+            "message_preview": message[:80],
+        }
+
+    return _exec
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -1342,9 +1458,38 @@ async def lifespan(app: FastAPI):
                     async def _hb_wechat_sender(messages: list) -> list:
                         return await wechat_sender(uid, ctx_token, messages)
 
-                    _hb_int_checker = _make_interrupt_checker(uid, input_latest_seq=0)
+                    _hb_interrupt_baseline = _get_current_inbound_seq(uid)
+                    _hb_int_checker = _make_interrupt_checker(uid, input_latest_seq=_hb_interrupt_baseline)
                     _hb_wmh = _build_proactive_write_model_history(uid, bot_id)
                     _hb_hooks = _build_proactive_post_turn_hooks(uid, bot_id, {})
+
+                    scheduled_result = await proactive_scheduler.run_scheduled_heartbeat(
+                        user_id=uid,
+                        bot_id=bot_id,
+                        history_provider=_hb_history_provider,
+                        system_prompt_provider=_hb_system_prompt_provider,
+                        wechat_sender_provider=_hb_wechat_sender,
+                        interrupt_checker_provider=_hb_int_checker,
+                        input_latest_seq=_hb_interrupt_baseline,
+                        write_model_history=_hb_wmh,
+                        post_turn_hooks=_hb_hooks,
+                    )
+                    if scheduled_result.get("status") == "ok":
+                        turn_result = scheduled_result.get("result")
+                        terminal = getattr(turn_result, "terminal_state", "")
+                        delivered = int(getattr(turn_result, "proactive_delivered_count", 0) or 0)
+                        logger.info(
+                            "scheduled_heartbeat: task_ok kind=%s task_id=%s proactive_result=%s delivered=%d baseline_seq=%d latest_seq=%d",
+                            scheduled_result.get("scheduled_kind", ""),
+                            scheduled_result.get("scheduled_task_id", ""),
+                            terminal,
+                            delivered,
+                            _hb_interrupt_baseline,
+                            _get_current_inbound_seq(uid),
+                        )
+                        continue
+                    if scheduled_result.get("status") == "error":
+                        logger.warning("scheduled_heartbeat: error: %s", scheduled_result.get("reason", ""))
 
                     result = await proactive_scheduler.run_heartbeat(
                         user_id=uid,
@@ -1353,11 +1498,28 @@ async def lifespan(app: FastAPI):
                         system_prompt_provider=_hb_system_prompt_provider,
                         wechat_sender_provider=_hb_wechat_sender,
                         interrupt_checker_provider=_hb_int_checker,
+                        input_latest_seq=_hb_interrupt_baseline,
                         write_model_history=_hb_wmh,
                         post_turn_hooks=_hb_hooks,
                     )
                     if result.get("status") != "skipped":
-                        logger.info("proactive_heartbeat: %s", result.get("status"))
+                        turn_result = result.get("result")
+                        terminal = getattr(turn_result, "terminal_state", "")
+                        attempts = int(getattr(turn_result, "proactive_attempt_count", 0) or 0)
+                        delivered = int(getattr(turn_result, "proactive_delivered_count", 0) or 0)
+                        latest_seq = _get_current_inbound_seq(uid)
+                        if str(terminal) == str(TurnState.END_CANCELLED):
+                            reason = "interrupt_baseline" if attempts == 0 and latest_seq <= _hb_interrupt_baseline else "user_interrupt"
+                            logger.info(
+                                "proactive_heartbeat: cancelled reason=%s baseline_seq=%d latest_seq=%d attempts=%d delivered=%d",
+                                reason, _hb_interrupt_baseline, latest_seq, attempts, delivered,
+                            )
+                        else:
+                            logger.info(
+                                "proactive_heartbeat: task_ok proactive_result=%s delivered=%d baseline_seq=%d latest_seq=%d",
+                                terminal or result.get("status"), delivered,
+                                _hb_interrupt_baseline, latest_seq,
+                            )
                 except Exception as e:
                     logger.warning("proactive_heartbeat: error: %s", e)
 
@@ -1982,6 +2144,7 @@ async def chat(request: Request):
                 input_latest_seq=input_latest_seq,
                 input_cutoff_time=input_cutoff_time,
                 interrupt_checker=interrupt_checker,
+                state_tool_executor=_build_state_tool_executor(user_id, context_token, bot_id),
                 write_model_history=_wmh_cb,
                 post_turn_hooks=_hook_cbs,
             )
@@ -2053,7 +2216,7 @@ async def chat(request: Request):
                 source="wechat", route=route,
             )
 
-            scheduled_task_ids: list[str] = []
+            scheduled_task_ids: list[str] = list(getattr(result, "scheduled_task_ids", []) or [])
 
             logger.info(
                 f"[{user_id}] terminal_state={result.terminal_state} "
@@ -2554,6 +2717,9 @@ def _build_proactive_post_turn_hooks(
 # ── v1.6: Proactive settings routes ────────────────────────────
 from agent.proactive_settings import set_runtime_settings_path
 set_runtime_settings_path(RUNTIME_SETTINGS_PATH)
+from agent.proactive_settings import load_proactive_settings
+
+proactive_scheduler._settings_provider = lambda: load_proactive_settings(cfg)
 
 from admin_proactive_settings_routes import create_proactive_settings_router
 
@@ -2578,6 +2744,7 @@ _proactive_test_router = create_proactive_test_router(
     bot_id=BOT_ID,
     build_proactive_write_model_history=_build_proactive_write_model_history,
     build_proactive_post_turn_hooks=_build_proactive_post_turn_hooks,
+    get_current_inbound_seq=_get_current_inbound_seq,
 )
 app.include_router(_proactive_test_router)
 logger.info("Proactive test routes mounted: /admin/proactive-test/*")
@@ -2617,7 +2784,8 @@ async def admin_trigger_proactive(request: Request):
     async def _system_prompt_provider(uid: str) -> str:
         return await build_enriched_system_prompt(uid, "")
 
-    interrupt_checker = _make_interrupt_checker(user_id, input_latest_seq=0)
+    interrupt_baseline = _get_current_inbound_seq(user_id)
+    interrupt_checker = _make_interrupt_checker(user_id, input_latest_seq=interrupt_baseline)
 
     # ── Proactive callbacks ──
     wmh_cb = _build_proactive_write_model_history(user_id, bot_id)
@@ -2631,6 +2799,7 @@ async def admin_trigger_proactive(request: Request):
         system_prompt_provider=_system_prompt_provider,
         wechat_sender_provider=_bound_wechat_sender,
         interrupt_checker_provider=interrupt_checker,
+        input_latest_seq=interrupt_baseline,
         write_model_history=wmh_cb,
         post_turn_hooks=hook_cbs,
     )

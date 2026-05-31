@@ -690,6 +690,7 @@ async def run_dry_run(
     history_provider: Any = None,
     system_prompt_provider: Any = None,
     interrupt_checker_provider: Any = None,
+    input_latest_seq: int = 0,
 ) -> ProactiveDebugReport:
     """Execute a complete dry-run proactive turn.
 
@@ -772,6 +773,7 @@ async def run_dry_run(
         user_id=ctx.user_id,
         bot_id=ctx.bot_id,
         impulse_meta=impulse_result["selected"],
+        input_latest_seq=input_latest_seq,
         chat_agent_kwargs={
             "history": history,
             "system_prompt": system_prompt,
@@ -819,6 +821,7 @@ async def run_real_send(
     system_prompt_provider: Any = None,
     wechat_sender_provider: Any = None,
     interrupt_checker_provider: Any = None,
+    input_latest_seq: int = 0,
     write_model_history: Any = None,
     post_turn_hooks: list[Any] | None = None,
 ) -> ProactiveDebugReport:
@@ -893,6 +896,7 @@ async def run_real_send(
         system_prompt_provider=system_prompt_provider,
         wechat_sender_provider=wechat_sender_provider,
         interrupt_checker_provider=interrupt_checker_provider,
+        input_latest_seq=input_latest_seq,
         write_model_history=write_model_history,
         post_turn_hooks=post_turn_hooks or [],
     )

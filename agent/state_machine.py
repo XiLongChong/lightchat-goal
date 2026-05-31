@@ -39,6 +39,7 @@ class TurnState(StrEnum):
 
     # --- fact tools ---
     EXEC_FACT_TOOLS = "exec_fact_tools"
+    EXEC_STATE_TOOL = "exec_state_tool"
 
     # --- wechat_reply pipeline (v1.5: action tool, NOT terminal) ---
     VALIDATE_REPLY_ARGS = "validate_reply_args"
@@ -283,6 +284,7 @@ class TurnScratchpad:
     proactive_delivered_count: int = 0     # confirmed delivered count (allowed_tools phase judgment basis)
     proactive_llm_step_count: int = 0      # LLM call count for proactive (max_llm_steps_per_proactive_turn limits this)
     proactive_delivered_texts: list[str] = field(default_factory=list)  # confirmed delivered text content (only this writes to history)
+    scheduled_task_ids: list[str] = field(default_factory=list)
 
     # ── v1.6-A: Fact tool counter for required trigger constraint ──
     _proactive_fact_tool_count_since_last_reply: int = 0
@@ -368,6 +370,7 @@ class TurnResult:
     proactive_delivered_texts: list[str] = field(default_factory=list)
     proactive_attempt_count: int = 0
     proactive_send_attempt_count: int = 0
+    scheduled_task_ids: list[str] = field(default_factory=list)
 
     @property
     def was_sent(self) -> bool:

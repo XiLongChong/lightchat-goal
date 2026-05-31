@@ -237,6 +237,39 @@ def _build_default_registries() -> None:
         tool_category="fact_tool",
     ))
 
+    # ── v1.6-C: create_scheduled_trigger — persistent state tool ──
+    TOOL_REGISTRY.register(ToolDef(
+        name="create_scheduled_trigger",
+        description=(
+            "创建一条未来主动触发任务。用于用户明确要求稍后提醒、稍后再说或在指定时间发起一次主动消息。"
+            "trigger_at 和 delay_minutes 二选一；message 描述到点后要主动说什么。"
+        ),
+        args_schema={
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "description": "到点后要主动发送或围绕其生成的内容，不能为空，最多 500 字。",
+                },
+                "trigger_at": {
+                    "type": "string",
+                    "description": "ISO 8601 时间，如 2026-05-31T20:30:00+08:00。与 delay_minutes 二选一。",
+                },
+                "delay_minutes": {
+                    "type": "integer",
+                    "description": "从现在起延迟多少分钟触发。与 trigger_at 二选一。",
+                },
+                "title": {
+                    "type": "string",
+                    "description": "可选的短标题，便于诊断。",
+                },
+            },
+            "required": ["message"],
+        },
+        side_effect_level="internal_message",
+        native_tool_call_eligible=True,
+        tool_category="state_tool",
+    ))
+
     # ── v1.5: wechat_reply — single bubble, NOT terminal ────────
     # Registered as fact_tool but routed by tool_name in chat_agent.
     # Must NEVER enter EXEC_FACT_TOOLS path.
@@ -372,4 +405,3 @@ def is_action(name: str) -> bool:
 
 def is_external_tool(name: str) -> bool:
     return name in TOOL_REGISTRY
-

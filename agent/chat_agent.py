@@ -157,6 +157,7 @@ class ChatAgent:
         input_latest_seq: int = 0,
         input_cutoff_time: float = 0.0,
         interrupt_checker: InterruptChecker | None = None,
+        state_tool_executor: Callable[[str, dict[str, Any], TurnScratchpad], Coroutine[Any, Any, dict[str, Any]]] | None = None,
         # ── v1.2 Phase 5C: per-request post-terminal callbacks ──
         write_model_history: PostTerminalCallback | None = None,
         post_turn_hooks: list[PostTerminalCallback] | None = None,
@@ -236,6 +237,7 @@ class ChatAgent:
                 history=history,
                 trigger=trigger,
                 wechat_sender=wechat_sender,
+                state_tool_executor=state_tool_executor,
             )
             turn.iteration += 1
 
@@ -292,6 +294,7 @@ class ChatAgent:
             proactive_delivered_texts=list(turn.proactive_delivered_texts),
             proactive_attempt_count=turn.proactive_attempt_count,
             proactive_send_attempt_count=turn.proactive_send_attempt_count,
+            scheduled_task_ids=list(turn.scheduled_task_ids),
         )
 
     # ================================================================
@@ -307,6 +310,7 @@ class ChatAgent:
         history: list[dict[str, Any]],
         trigger: str,
         wechat_sender: WeChatSender | None,
+        state_tool_executor: Callable[[str, dict[str, Any], TurnScratchpad], Coroutine[Any, Any, dict[str, Any]]] | None = None,
     ) -> TurnState:
         """Route each state to its handler. Returns the next state."""
 
@@ -339,6 +343,9 @@ class ChatAgent:
 
         elif state == TurnState.EXEC_FACT_TOOLS:
             return await self._do_exec_fact_tools(turn)
+
+        elif state == TurnState.EXEC_STATE_TOOL:
+            return await self._do_exec_state_tool(turn, state_tool_executor)
 
         elif state == TurnState.VALIDATE_REPLY_ARGS:
             return self._do_validate_reply_args(turn)
@@ -942,6 +949,8 @@ class ChatAgent:
         # wechat_reply is registered as fact_tool but MUST NOT enter EXEC_FACT_TOOLS.
         if name in ("get_time", "get_weather"):
             return TurnState.EXEC_FACT_TOOLS
+        elif name == "create_scheduled_trigger":
+            return TurnState.EXEC_STATE_TOOL
         elif name == "wechat_reply":
             # ── v3.1: Proactive attempt counter (LLM behavior audit) ──
             if turn.source == SOURCE_PROACTIVE_IMPULSE:
@@ -1055,6 +1064,83 @@ class ChatAgent:
             for r in results:
                 if r["success"]:
                     turn._proactive_fact_tool_count_since_last_reply += 1
+
+        turn._resume_state = TurnState.CALL_LLM
+        return TurnState.INTERRUPT_CHECK
+
+    async def _do_exec_state_tool(
+        self,
+        turn: TurnScratchpad,
+        state_tool_executor: Callable[[str, dict[str, Any], TurnScratchpad], Coroutine[Any, Any, dict[str, Any]]] | None,
+    ) -> TurnState:
+        """EXEC_STATE_TOOL: execute state-mutating tools via caller injection."""
+        classified = turn._classified_single
+        serialized = classified.serialized or {}
+        fn = serialized.get("function", {})
+        tool_name = str(fn.get("name", ""))
+        args_raw = str(fn.get("arguments", "") or "")
+        call_id = turn._current_tool_call_id
+
+        try:
+            args = _json.loads(args_raw) if args_raw.strip() else {}
+        except _json.JSONDecodeError as e:
+            result = {
+                "status": "error",
+                "recoverable": True,
+                "reason": "invalid_json",
+                "hint": f"state tool arguments JSON parse failed: {e}",
+            }
+            turn.messages.append({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": _json.dumps(result, ensure_ascii=False),
+            })
+            return TurnState.CALL_LLM
+
+        if not isinstance(args, dict):
+            result = {
+                "status": "error",
+                "recoverable": True,
+                "reason": "invalid_arguments",
+                "hint": "state tool arguments must be a JSON object",
+            }
+        elif state_tool_executor is None:
+            result = {
+                "status": "error",
+                "recoverable": False,
+                "reason": "state_tool_executor_unavailable",
+                "hint": "state tool execution is not available in this context",
+            }
+        else:
+            try:
+                result = await state_tool_executor(tool_name, args, turn)
+            except Exception as e:
+                logger.error("state_tool %s exception: %s", tool_name, e)
+                result = {
+                    "status": "error",
+                    "recoverable": False,
+                    "reason": "state_tool_exception",
+                    "hint": str(e)[:200],
+                }
+
+        if not isinstance(result, dict):
+            result = {"status": "error", "recoverable": False, "reason": "invalid_state_tool_result"}
+
+        task_id = str(result.get("scheduled_task_id", "") or "")
+        if task_id:
+            turn.scheduled_task_ids.append(task_id)
+
+        turn.tool_results.append({
+            "name": tool_name,
+            "result": str(result.get("status", "")),
+            "scheduled_task_id": task_id,
+        })
+        turn.messages.append({
+            "role": "tool",
+            "tool_call_id": call_id,
+            "content": _json.dumps(result, ensure_ascii=False),
+        })
+        logger.info("state_tool: %s executed status=%s task_id=%s", tool_name, result.get("status"), task_id)
 
         turn._resume_state = TurnState.CALL_LLM
         return TurnState.INTERRUPT_CHECK

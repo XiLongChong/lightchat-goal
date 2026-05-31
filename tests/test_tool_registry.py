@@ -43,17 +43,18 @@ class TestActionRegistryContent:
 
 class TestToolRegistryContent:
     def test_contains_external_tools(self):
-        """v1.5: 7 tools registered (5 active + 2 deprecated)."""
+        """v1.6-C: 8 tools registered (6 active + 2 deprecated)."""
         names = TOOL_REGISTRY.names()
         assert "get_time" in names
         assert "get_weather" in names
         assert "wechat_reply" in names
         assert "done" in names
+        assert "create_scheduled_trigger" in names
         assert "send_wechat_messages" in names   # kept deprecated
         assert "skip_reply" in names             # kept deprecated
         assert "search_memory" not in names
         assert "send_email" not in names
-        assert len(names) == 7
+        assert len(names) == 8
 
     def test_get_weather_not_in_action_registry(self):
         assert "get_weather" not in ACTION_REGISTRY
@@ -137,13 +138,16 @@ class TestNativeEligibility:
         assert t.tool_category == "terminal_tool"
 
     def test_get_native_tool_specs_only_eligible(self):
-        """v3.1: 5 native-eligible tools (get_time, get_weather, wechat_reply, done, skip_proactive)."""
+        """v1.6-C: native specs include the scheduled state tool."""
         specs = TOOL_REGISTRY.get_native_tool_specs(eligible_only=True)
         names = {s["function"]["name"] for s in specs}
-        assert names == {"get_time", "get_weather", "wechat_reply", "done", "skip_proactive"}
+        assert names == {
+            "get_time", "get_weather", "wechat_reply", "done",
+            "skip_proactive", "create_scheduled_trigger",
+        }
 
     def test_get_native_tool_specs_includes_all_when_eligible_only_false(self):
-        """v3.1: all 7 tools visible when eligible_only=False."""
+        """v1.6-C: all registered tools visible when eligible_only=False."""
         specs = TOOL_REGISTRY.get_native_tool_specs(eligible_only=False)
         names = {s["function"]["name"] for s in specs}
         assert "get_time" in names
@@ -151,9 +155,10 @@ class TestNativeEligibility:
         assert "wechat_reply" in names
         assert "done" in names
         assert "skip_proactive" in names
+        assert "create_scheduled_trigger" in names
         assert "send_wechat_messages" in names
         assert "skip_reply" in names
-        assert len(names) == 7
+        assert len(names) == 8
 
     def test_native_specs_have_correct_structure(self):
         specs = TOOL_REGISTRY.get_native_tool_specs()
@@ -251,21 +256,22 @@ class TestRegistryAPI:
         assert not is_external_tool("send_email")
 
     def test_get_all_tool_names_union(self):
-        """v3.1: 7 tools (5 active + 2 deprecated)."""
+        """v1.6-C: 8 tools (6 active + 2 deprecated)."""
         all_names = get_all_tool_names()
         assert "get_time" in all_names
         assert "get_weather" in all_names
         assert "wechat_reply" in all_names
         assert "done" in all_names
         assert "skip_proactive" in all_names
+        assert "create_scheduled_trigger" in all_names
         assert "send_wechat_messages" in all_names
         assert "skip_reply" in all_names
         assert "send_email" not in all_names
-        assert len(all_names) == 7
+        assert len(all_names) == 8
 
     def test_registry_len(self):
         assert len(ACTION_REGISTRY) == 0
-        assert len(TOOL_REGISTRY) == 7
+        assert len(TOOL_REGISTRY) == 8
 
     def test_empty_registry(self):
         r = ActionRegistry()

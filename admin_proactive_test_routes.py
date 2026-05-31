@@ -31,6 +31,7 @@ def create_proactive_test_router(
     bot_id: str,
     build_proactive_write_model_history: Any,         # Callable[[str, str], PostTerminalCallback]
     build_proactive_post_turn_hooks: Any,             # Callable[[str, str, dict], list]
+    get_current_inbound_seq: Any = None,             # Callable[[str], int]
 ) -> APIRouter:
     """Build and return a router for /admin/proactive-test/* endpoints."""
 
@@ -48,6 +49,14 @@ def create_proactive_test_router(
             return dt
         except (ValueError, TypeError):
             raise HTTPException(status_code=400, detail=f"Invalid debug_now: {raw}")
+
+    def _interrupt_baseline(uid: str) -> int:
+        if callable(get_current_inbound_seq):
+            try:
+                return int(get_current_inbound_seq(uid) or 0)
+            except Exception:
+                return 0
+        return 0
 
     # ══════════════════════════════════════════════════════════════
     # GET /admin/proactive-test/bootstrap
@@ -192,7 +201,9 @@ def create_proactive_test_router(
                 return await build_enriched_system_prompt(uid, "")
 
             def _int_checker_provider(uid: str):
-                return make_interrupt_checker(uid, 0)
+                return make_interrupt_checker(uid, _interrupt_baseline(uid))
+
+            baseline = _interrupt_baseline(user_id)
 
             report = await run_dry_run(
                 ctx,
@@ -202,6 +213,7 @@ def create_proactive_test_router(
                 history_provider=_hist_provider,
                 system_prompt_provider=_sys_prompt_provider,
                 interrupt_checker_provider=_int_checker_provider(user_id),
+                input_latest_seq=baseline,
             )
         else:
             # Real-send: use production providers
@@ -218,7 +230,9 @@ def create_proactive_test_router(
                 return await wechat_sender(user_id, ctx_token, messages)
 
             def _int_checker_provider(uid: str):
-                return make_interrupt_checker(uid, 0)
+                return make_interrupt_checker(uid, _interrupt_baseline(uid))
+
+            baseline = _interrupt_baseline(user_id)
 
             wmh = build_proactive_write_model_history(user_id, bot)
             hooks = build_proactive_post_turn_hooks(user_id, bot, {})
@@ -231,6 +245,7 @@ def create_proactive_test_router(
                 system_prompt_provider=_sys_prompt_provider,
                 wechat_sender_provider=_ws_provider,
                 interrupt_checker_provider=_int_checker_provider(user_id),
+                input_latest_seq=baseline,
                 write_model_history=wmh,
                 post_turn_hooks=hooks,
             )

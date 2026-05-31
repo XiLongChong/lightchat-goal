@@ -15,6 +15,15 @@ import aiosqlite
 from memory.dedup import is_duplicate, compute_importance, jaccard_similarity
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 async def _migrate_history_summaries(db: aiosqlite.Connection):
     """Ensure history_summaries has PRIMARY KEY (user_id, bot_id).
 
@@ -606,6 +615,7 @@ class MemoryStore:
             "ALTER TABLE dialogue_state ADD COLUMN last_visible_message_at REAL NOT NULL DEFAULT 0",
             "ALTER TABLE dialogue_state ADD COLUMN daily_autonomous_trigger_count INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE dialogue_state ADD COLUMN daily_autonomous_trigger_date TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE proactive_schedule_state ADD COLUMN scheduled_task_state_json TEXT NOT NULL DEFAULT '{}'",
         ]:
             try:
                 await db.execute(col_sql)
@@ -1097,6 +1107,7 @@ class MemoryStore:
         self,
         now_ts: float | None = None,
         limit: int = 20,
+        user_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Atomically claim pending due tasks by marking them 'sending'.
 
@@ -1109,13 +1120,22 @@ class MemoryStore:
         async with self._lock:
             db = await self._get_db()
             # 1. Read pending due IDs
-            pending = await db.execute_fetchall(
-                """SELECT id FROM scheduled_messages
-                   WHERE status = 'pending' AND due_at <= ?
-                   ORDER BY due_at ASC
-                   LIMIT ?""",
-                (now_ts, limit),
-            )
+            if user_id:
+                pending = await db.execute_fetchall(
+                    """SELECT id FROM scheduled_messages
+                       WHERE status = 'pending' AND due_at <= ? AND user_id = ?
+                       ORDER BY due_at ASC
+                       LIMIT ?""",
+                    (now_ts, user_id, limit),
+                )
+            else:
+                pending = await db.execute_fetchall(
+                    """SELECT id FROM scheduled_messages
+                       WHERE status = 'pending' AND due_at <= ?
+                       ORDER BY due_at ASC
+                       LIMIT ?""",
+                    (now_ts, limit),
+                )
             ids = [row["id"] for row in pending]
             if not ids:
                 await db.commit()
@@ -2425,6 +2445,7 @@ class MemoryStore:
             "next_due_ts": 0,
             "last_attempt_ts": 0,
             "last_sent_ts": 0,
+            "scheduled_task_state_json": "{}",
         }
 
     async def update_proactive_schedule_state(
@@ -2824,6 +2845,57 @@ class MemoryStore:
             await db.commit()
         return True
 
+    async def get_scheduled_task_state(
+        self,
+        user_id: str,
+        bot_id: str,
+    ) -> dict[str, Any]:
+        """Return persisted V1.6-B default scheduled task state."""
+        state = await self.get_proactive_schedule_state(user_id, bot_id)
+        raw = state.get("scheduled_task_state_json", "{}")
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else {}
+        except Exception:
+            parsed = {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    async def update_scheduled_task_state(
+        self,
+        user_id: str,
+        bot_id: str,
+        updates: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Merge and persist V1.6-B default scheduled task state."""
+        current = await self.get_scheduled_task_state(user_id, bot_id)
+        current.update(updates)
+        payload = json.dumps(current, ensure_ascii=False)
+        now = time.time()
+        import uuid
+
+        async with self._lock:
+            db = await self._get_db()
+            cur = await db.execute(
+                "SELECT id FROM proactive_schedule_state WHERE user_id = ? AND bot_id = ?",
+                (user_id, bot_id),
+            )
+            existing = await cur.fetchone()
+            if not existing:
+                await db.execute(
+                    """INSERT INTO proactive_schedule_state
+                       (id, user_id, bot_id, scheduled_task_state_json, updated_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (f"pss_{uuid.uuid4().hex[:12]}", user_id, bot_id, payload, now),
+                )
+            else:
+                await db.execute(
+                    """UPDATE proactive_schedule_state
+                       SET scheduled_task_state_json = ?, updated_at = ?
+                       WHERE user_id = ? AND bot_id = ?""",
+                    (payload, now, user_id, bot_id),
+                )
+            await db.commit()
+        return current
+
     async def insert_bot_emotion_event(
         self,
         user_id: str,
@@ -2950,16 +3022,16 @@ class MemoryStore:
                     user_id, bot_id,
                     str(state.get("wait_state", "none")),
                     str(state.get("last_state_reason", "")),
-                    float(state.get("last_user_message_at", 0)),
-                    float(state.get("last_assistant_message_at", 0)),
+                    _safe_float(state.get("last_user_message_at", 0)),
+                    _safe_float(state.get("last_assistant_message_at", 0)),
                     str(state.get("last_user_message_excerpt", ""))[:200],
                     str(state.get("last_assistant_message_excerpt", ""))[:200],
-                    float(state.get("silent_started_at", 0)),
+                    _safe_float(state.get("silent_started_at", 0)),
                     str(state.get("silent_reason", "")),
                     max(0, int(state.get("user_messages_since_silent", 0))),
                     max(0, int(state.get("silent_must_reply_after_count", 2))),
-                    float(state.get("silent_must_reply_after_ts", 0)),
-                    float(state.get("proactive_paused_until", 0)),
+                    _safe_float(state.get("silent_must_reply_after_ts", 0)),
+                    _safe_float(state.get("proactive_paused_until", 0)),
                     now,
                     int(state.get("version", 1)) + 1,
                 ),
@@ -3067,8 +3139,81 @@ class MemoryStore:
             (user_id, bot_id),
         )
         if rows and rows[0]["last_visible_message_at"]:
-            return float(rows[0]["last_visible_message_at"])
+            return _safe_float(rows[0]["last_visible_message_at"], 0.0)
         return 0.0
+
+    async def resolve_last_visible_message_at(
+        self, user_id: str, bot_id: str,
+    ) -> dict[str, Any]:
+        """Return a safe last_visible_message_at with backfill diagnostics.
+
+        Reasons:
+        - existing_last_visible_message_at: stored value was usable.
+        - backfilled_last_visible_message_at: recovered from visible history.
+        - no_visible_message_yet: no visible history; initialized to now.
+        - missing_last_visible_message_at: dialogue row/field was missing.
+        """
+        db = await self._get_db()
+        rows = await db.execute_fetchall(
+            """SELECT last_visible_message_at FROM dialogue_state
+               WHERE user_id = ? AND bot_id = ?""",
+            (user_id, bot_id),
+        )
+        raw_value = rows[0]["last_visible_message_at"] if rows else None
+        try:
+            last_visible = _safe_float(raw_value, 0.0)
+        except (TypeError, ValueError):
+            last_visible = 0.0
+        if last_visible > 0:
+            return {
+                "timestamp": last_visible,
+                "reason": "existing_last_visible_message_at",
+                "backfilled": False,
+            }
+
+        history_rows = await db.execute_fetchall(
+            """SELECT MAX(ts) AS last_ts FROM conversation_history
+               WHERE user_id = ? AND bot_id = ?
+                 AND (role = 'user'
+                      OR (role = 'assistant' AND source != 'assistant:fallback'))""",
+            (user_id, bot_id),
+        )
+        hist_raw = history_rows[0]["last_ts"] if history_rows else None
+        try:
+            history_ts = _safe_float(hist_raw, 0.0)
+        except (TypeError, ValueError):
+            history_ts = 0.0
+
+        now = time.time()
+        if history_ts > 0:
+            resolved = history_ts
+            reason = "backfilled_last_visible_message_at"
+            backfilled = True
+        else:
+            resolved = now
+            reason = "no_visible_message_yet" if rows else "missing_last_visible_message_at"
+            backfilled = False
+
+        async with self._lock:
+            await db.execute(
+                """INSERT OR IGNORE INTO dialogue_state
+                   (user_id, bot_id, updated_at, version)
+                   VALUES (?, ?, ?, 1)""",
+                (user_id, bot_id, now),
+            )
+            await db.execute(
+                """UPDATE dialogue_state
+                   SET last_visible_message_at = ?, updated_at = ?
+                   WHERE user_id = ? AND bot_id = ?""",
+                (resolved, now, user_id, bot_id),
+            )
+            await db.commit()
+
+        return {
+            "timestamp": resolved,
+            "reason": reason,
+            "backfilled": backfilled,
+        }
 
     async def get_autonomous_trigger_count(
         self, user_id: str, bot_id: str,

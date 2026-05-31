@@ -45,6 +45,11 @@ class ProactiveSettings:
     quiet_hours_start: str = "00:00"
     quiet_hours_end: str = "08:00"
     daily_active_message_cap: int = 50
+    scheduled_enabled: bool = True
+    scheduled_morning_enabled: bool = True
+    scheduled_morning_time: str = "08:00"
+    scheduled_night_enabled: bool = True
+    scheduled_night_time: str = "23:00"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -59,6 +64,11 @@ class ProactiveSettings:
             quiet_hours_start=str(d.get("quiet_hours_start", "00:00")),
             quiet_hours_end=str(d.get("quiet_hours_end", "08:00")),
             daily_active_message_cap=int(d.get("daily_active_message_cap", 50)),
+            scheduled_enabled=bool(d.get("scheduled_enabled", True)),
+            scheduled_morning_enabled=bool(d.get("scheduled_morning_enabled", True)),
+            scheduled_morning_time=str(d.get("scheduled_morning_time", "08:00")),
+            scheduled_night_enabled=bool(d.get("scheduled_night_enabled", True)),
+            scheduled_night_time=str(d.get("scheduled_night_time", "23:00")),
         )
 
 
@@ -100,6 +110,16 @@ def _validate_settings(d: dict[str, Any]) -> None:
     cap = int(cap)
     if cap < 1 or cap > 200:
         raise ValueError(f"daily_active_message_cap must be 1-200, got {cap}")
+
+    for field in ("scheduled_enabled", "scheduled_morning_enabled", "scheduled_night_enabled"):
+        if field in d and not isinstance(d.get(field), bool):
+            raise ValueError(f"{field} must be a boolean")
+
+    for field in ("scheduled_morning_time", "scheduled_night_time"):
+        if field in d:
+            val = str(d.get(field, ""))
+            if not _TIME_RE.match(val):
+                raise ValueError(f"{field} must be HH:mm format, got {val!r}")
 
 
 # ── Persistence ───────────────────────────────────────────────
@@ -168,6 +188,11 @@ def load_proactive_settings(config: dict[str, Any]) -> ProactiveSettings:
         quiet_hours_start="00:00",
         quiet_hours_end="08:00",
         daily_active_message_cap=50,
+        scheduled_enabled=True,
+        scheduled_morning_enabled=True,
+        scheduled_morning_time="08:00",
+        scheduled_night_enabled=True,
+        scheduled_night_time="23:00",
     )
     return settings
 
