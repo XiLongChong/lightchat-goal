@@ -130,6 +130,58 @@ def _make_proactive_meta(**overrides) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════
+class _FakeStore:
+    """Minimal fake store for scheduler tests."""
+    def __init__(self):
+        self._last_visible = 0.0
+        self.history_rows: list = []
+
+    async def resolve_last_visible_message_at(self, user_id, bot_id):
+        return {"timestamp": self._last_visible, "reason": "fake"}
+
+    async def get_last_visible_message_at(self, user_id, bot_id):
+        return self._last_visible
+
+    async def get_recent_conversation_history(self, user_id, limit=40, bot_id=""):
+        return self.history_rows
+
+    async def count_today_proactive_sent(self, today_start):
+        return 0
+
+    async def get_autonomous_trigger_count(self, user_id, bot_id):
+        return (0, "")
+
+    async def get_dialogue_state(self, user_id, bot_id):
+        return {}
+
+    async def get_latest_recap(self, user_id, bot_id=""):
+        return None
+
+    async def create_scheduled_wake_up(self, user_id, bot_id, task):
+        return "fake_task_id"
+
+    async def get_pending_proactive_wake_up(self, user_id, bot_id):
+        return None
+
+    async def claim_due_scheduled_messages(self, now_ts=None, limit=1, user_id=""):
+        return []
+
+    async def cancel_pending_proactive_wake_ups(self, user_id, bot_id):
+        return 0
+
+    async def count_turns_since_last_snapshot(self, user_id, bot_id):
+        return 0
+
+    async def get_latest_snapshot(self, user_id, bot_id=""):
+        return None
+
+    async def get_turns_since_last_snapshot(self, user_id, bot_id, limit=20):
+        return []
+
+    async def mark_scheduled_message_status(self, task_id, status, error=""):
+        pass
+
+
 # Phase 0: Source constants + proactive_meta contract
 # ══════════════════════════════════════════════════════════════════
 
@@ -216,8 +268,9 @@ class TestSkipProactiveRegistration:
         t = TOOL_REGISTRY.get("skip_proactive")
         props = t.args_schema.get("properties", {})
         reason_enum = props.get("reason", {}).get("enum", [])
-        assert "insufficient_evidence" in reason_enum
         assert "too_soon" in reason_enum
+        assert "user_might_be_busy" in reason_enum
+        assert "next_check_minutes" in props
 
 
 class TestSkipProactiveRouting:
@@ -398,7 +451,7 @@ class TestProactiveContextInjection:
     def test_proactive_context_injected(self):
         """Proactive turn gets a proactive context system message."""
         responses = [
-            _make_response("", tool_calls=[_make_tc("skip_proactive", '{"reason":"too_soon"}')]),
+            _make_response("", tool_calls=[_make_tc("skip_proactive", '{"reason":"too_soon","next_check_minutes":15}')]),
         ]
         mgw = _make_mgw(responses)
         agent = _make_agent()
@@ -413,13 +466,13 @@ class TestProactiveContextInjection:
         # Check that the LLM request includes proactive context in system messages
         req = mgw.requests[0]
         system_messages = [m for m in req.messages if m["role"] == "system"]
-        proactive_msgs = [m for m in system_messages if "主动消息回合" in m["content"]]
+        proactive_msgs = [m for m in system_messages if "主动回合" in m["content"]]
         assert len(proactive_msgs) >= 1
 
     def test_proactive_context_has_no_user_message(self):
         """Proactive turn messages should not include a user role entry."""
         responses = [
-            _make_response("", tool_calls=[_make_tc("skip_proactive", '{"reason":"too_soon"}')]),
+            _make_response("", tool_calls=[_make_tc("skip_proactive", '{"reason":"too_soon","next_check_minutes":15}')]),
         ]
         mgw = _make_mgw(responses)
         agent = _make_agent()
@@ -438,9 +491,9 @@ class TestProactiveContextInjection:
         assert len(user_msgs) == 0, "Proactive turn should not have role=user messages"
 
     def test_proactive_context_contains_impulse_info(self):
-        """Proactive context must include impulse metadata."""
+        """Proactive context must include tool stage info."""
         responses = [
-            _make_response("", tool_calls=[_make_tc("skip_proactive", '{"reason":"too_soon"}')]),
+            _make_response("", tool_calls=[_make_tc("skip_proactive", '{"reason":"too_soon","next_check_minutes":15}')]),
         ]
         mgw = _make_mgw(responses)
         agent = _make_agent()
@@ -449,15 +502,78 @@ class TestProactiveContextInjection:
         asyncio.run(agent.chat(
             user_message=None, history=[], trigger="proactive",
             source=SOURCE_PROACTIVE_IMPULSE,
-            proactive_meta=_make_proactive_meta(impulse_type="ECHO", impulse_id="imp_001"),
+            proactive_meta=_make_proactive_meta(impulse_type="PROACTIVE_WAKE"),
         ))
 
         req = mgw.requests[0]
         system_msgs = [m["content"] for m in req.messages if m["role"] == "system"]
-        proactive_ctx = next((m for m in system_msgs if "主动消息回合" in m), "")
-        assert "PROACTIVE_IMPULSE" in proactive_ctx
-        assert "ECHO" in proactive_ctx
-        assert "imp_001" in proactive_ctx
+        proactive_ctx = next((m for m in system_msgs if "主动回合" in m), "")
+        assert "阶段A-optional" in proactive_ctx
+        assert "skip_proactive" in proactive_ctx
+
+    def test_required_context_matches_exposed_tools(self):
+        """Wake-up proactive stage must not expose skip_proactive."""
+        responses = [
+            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"先吃点东西，别硬撑"}')]),
+            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied","next_check_minutes":15}')]),
+        ]
+        mgw = _make_mgw(responses)
+        agent = _make_agent()
+        agent.llm_gateway = mgw
+
+        async def fake_sender(messages):
+            for m in messages:
+                m["send_status"] = "delivered"
+            return messages
+
+        asyncio.run(agent.chat(
+            user_message=None, history=[], trigger="proactive",
+            source=SOURCE_PROACTIVE_IMPULSE,
+            proactive_meta=_make_proactive_meta(trigger_mode="required"),
+            wechat_sender=fake_sender,
+        ))
+
+        req = mgw.requests[0]
+        tool_names = [t["function"]["name"] for t in (req.tools or [])]
+        assert "wechat_reply" in tool_names
+        assert "skip_proactive" not in tool_names
+        assert "done" not in tool_names
+
+        system_msgs = [m["content"] for m in req.messages if m["role"] == "system"]
+        proactive_ctx = next((m for m in system_msgs if "主动回合" in m), "")
+        assert "阶段A-wake-up" in proactive_ctx
+        assert "skip_proactive 不可用" in proactive_ctx
+        assert "必须" in proactive_ctx
+
+    def test_proactive_context_marks_assistant_history_as_own_messages(self):
+        """Context must explicitly prevent treating prior assistant bubbles as user replies."""
+        responses = [
+            _make_response("", tool_calls=[_make_tc("skip_proactive", '{"reason":"low_value","next_check_minutes":30}')]),
+        ]
+        mgw = _make_mgw(responses)
+        agent = _make_agent()
+        agent.llm_gateway = mgw
+
+        asyncio.run(agent.chat(
+            user_message=None,
+            history=[
+                {"role": "user", "content": "好累", "source": "wechat", "ts": 1},
+                {"role": "assistant", "content": "累就趴一会儿，别硬撑", "source": "assistant", "ts": 2},
+            ],
+            trigger="proactive",
+            source=SOURCE_PROACTIVE_IMPULSE,
+            proactive_meta=_make_proactive_meta(
+                trigger_mode="optional",
+                last_user_message="好累",
+                assistant_messages_after_last_user=["累就趴一会儿，别硬撑"],
+            ),
+        ))
+
+        req = mgw.requests[0]
+        system_msgs = [m["content"] for m in req.messages if m["role"] == "system"]
+        proactive_ctx = next((m for m in system_msgs if "主动回合" in m or "对话边界" in m), "")
+        assert "assistant 的历史消息都是你已说过的话" in proactive_ctx
+        assert "不要把自己刚发过的话当成用户回答" in proactive_ctx
 
 
 class TestAllowedToolsPhaseBased:
@@ -901,6 +1017,34 @@ class TestProactiveWriteHistoryCallback:
         assert len(history_written) == 0
 
 
+class TestProactiveContextEnrichment:
+    def test_enrich_splits_recent_proactive_messages_into_visible_bubbles(self):
+        history = [
+            {"role": "user", "content": "你好？", "source": "wechat", "ts": 1},
+            {"role": "assistant", "content": "你好啊", "source": "assistant", "ts": 2},
+            {
+                "role": "assistant",
+                "content": "人呢\n打个招呼就不见了",
+                "source": "assistant:proactive",
+                "ts": 3,
+            },
+        ]
+        impulse = {"evidence_pack": {"recent_proactive_messages": []}}
+
+        ProactiveScheduler._enrich_impulse_with_context(None, impulse, history)
+
+        assert impulse["last_user_message"] == "你好？"
+        assert impulse["assistant_messages_after_last_user"] == [
+            "你好啊",
+            "人呢",
+            "打个招呼就不见了",
+        ]
+        assert [m["text"] for m in impulse["evidence_pack"]["recent_proactive_messages"]] == [
+            "人呢",
+            "打个招呼就不见了",
+        ]
+
+
 class TestProactiveCounterIndependence:
     """v3.1 §1.4: Three independent counters — attempt, send_attempt, delivered."""
 
@@ -1066,70 +1210,83 @@ class TestEligibilityChecks:
     """Phase 5.1: System pre-checks (no LLM)."""
 
     def test_eligibility_proactive_disabled(self):
-        """features.proactive=false → skipped."""
-        scheduler = ProactiveScheduler(config={"features": {"proactive": False}})
+        """proactive.enabled=false → eligibility blocked."""
+        scheduler = ProactiveScheduler(
+            config={"features": {"proactive": False}},
+            settings_provider=lambda: ProactiveSettings(enabled=False),
+        )
 
         async def _test():
-            result = await scheduler.run_heartbeat("u1", "b1")
-            assert result["status"] == "skipped"
-            assert "proactive_disabled" in result["reason"]
+            eligible, reason = await scheduler._check_eligibility("u1", "b1")
+            assert eligible is False
+            assert "proactive_disabled" in reason
 
         asyncio.run(_test())
 
     def test_eligibility_scheduler_busy(self):
-        """Lock held → skipped."""
-        scheduler = ProactiveScheduler(config={"features": {"proactive": True}})
+        """dispatch_wake_up when lock held → skipped."""
+        scheduler = ProactiveScheduler(
+            config={"features": {"proactive": True}},
+            settings_provider=lambda: ProactiveSettings(enabled=True, autonomous_enabled=True),
+        )
 
         async def _test():
             async with scheduler._lock:
-                result = await scheduler.run_heartbeat("u1", "b1")
+                result = await scheduler.dispatch_wake_up("u1", "b1", {"trigger": "proactive"})
                 assert result["status"] == "skipped"
-                assert "scheduler_busy" in result["reason"]
+                assert "active_proactive_turn_running" in result["reason"]
 
         asyncio.run(_test())
 
     def test_eligibility_sleep_hours(self):
-        """Sleep hours block when current time is in range."""
-        import datetime
-
-        # Mock _in_sleep_hours to always return True
+        """Sleep hours block eligibility."""
         class SchedulerWithSleep(ProactiveScheduler):
             def _in_sleep_hours(self, sleep_cfg):
                 return True
 
         scheduler = SchedulerWithSleep(
-            config={
-                "features": {"proactive": True},
-                "proactive": {"eligibility": {"sleep_hours": {"start": "23:00", "end": "08:00"}}},
-            },
+            config={"features": {"proactive": True}},
+            settings_provider=lambda: ProactiveSettings(
+                enabled=True, autonomous_enabled=True,
+                quiet_hours_enabled=True, quiet_hours_start="23:00", quiet_hours_end="08:00",
+            ),
         )
 
         async def _test():
-            result = await scheduler.run_heartbeat("u1", "b1")
-            assert result["status"] == "skipped"
-            assert "sleep_hours" in result["reason"]
+            eligible, reason = await scheduler._check_eligibility("u1", "b1")
+            assert eligible is False
+            assert "sleep_hours" in reason
 
         asyncio.run(_test())
 
-    def test_eligibility_metrics_tracking(self):
-        """Eligibility failures are tracked in fail_reasons."""
-        scheduler = ProactiveScheduler(config={"features": {"proactive": False}})
+    def test_cold_start_after_2_minutes(self):
+        """check_cold_start returns context when last_visible > 120s ago."""
+        scheduler = ProactiveScheduler()
+
+        fake_store = _FakeStore()
+        fake_store._last_visible = time.time() - 180
+        scheduler._store = fake_store
 
         async def _test():
-            await scheduler.run_heartbeat("u1", "b1")
-            metrics = scheduler.get_metrics()
-            assert metrics["eligibility_fail_count"] >= 1
-            assert "proactive_disabled" in metrics["eligibility_fail_reasons"]
+            result = await scheduler.check_cold_start("u1", "b1")
+            assert result is not None
+            assert result["trigger"] == "proactive"
+            assert result["trigger_kind"] == "cold_start"
+            assert result["is_wake_up"] is False
 
         asyncio.run(_test())
 
-    def test_heartbeat_tick_count(self):
-        """Heartbeat increments tick count."""
-        scheduler = ProactiveScheduler(config={"features": {"proactive": False}})
+    def test_cold_start_not_triggered_too_early(self):
+        """check_cold_start returns None when last_visible < 120s ago."""
+        scheduler = ProactiveScheduler()
+
+        fake_store = _FakeStore()
+        fake_store._last_visible = time.time() - 30
+        scheduler._store = fake_store
 
         async def _test():
-            await scheduler.run_heartbeat("u1", "b1")
-            assert scheduler.heartbeat_tick_count >= 1
+            result = await scheduler.check_cold_start("u1", "b1")
+            assert result is None
 
         asyncio.run(_test())
 
@@ -1138,162 +1295,7 @@ class TestEligibilityChecks:
 # Phase 6: Impulse generation / dedup / score
 # ══════════════════════════════════════════════════════════════════
 
-class TestImpulseGeneration:
-    """Phase 6.1: Rule-based impulse candidate generation."""
-
-    def test_dedup_removes_duplicate_keys(self):
-        scheduler = ProactiveScheduler()
-        candidates = [
-            {"dedupe_key": "a", "impulse_type": "ECHO", "_source_ts": time.time()},
-            {"dedupe_key": "a", "impulse_type": "ECHO", "_source_ts": time.time()},
-            {"dedupe_key": "b", "impulse_type": "PRESENCE", "_source_ts": time.time()},
-        ]
-        result = scheduler._dedup_candidates(candidates)
-        assert len(result) == 2
-        keys = {c["dedupe_key"] for c in result}
-        assert keys == {"a", "b"}
-
-    def test_expire_removes_old_candidates(self):
-        scheduler = ProactiveScheduler()
-        now = time.time()
-        candidates = [
-            {"dedupe_key": "fresh", "impulse_type": "ECHO", "_source_ts": now},
-            {"dedupe_key": "old", "impulse_type": "ECHO", "_source_ts": now - 10 * 3600},  # 10h ago
-        ]
-        # ECHO TTL is 4h → old should be expired
-        result = scheduler._expire_candidates(candidates)
-        assert len(result) == 1
-        assert result[0]["dedupe_key"] == "fresh"
-
-    def test_score_ranks_by_type(self):
-        """SCHEDULED_RITUAL (80) > TOPIC_CONTINUE (70) > ECHO (60) > PRESENCE (50)."""
-        scheduler = ProactiveScheduler()
-        now = time.time()
-        candidates = [
-            {"dedupe_key": "e", "impulse_type": "ECHO", "_source_ts": now,
-             "evidence_pack": {"topic_snapshot": ""}},
-            {"dedupe_key": "p", "impulse_type": "PRESENCE", "_source_ts": now},
-            {"dedupe_key": "r", "impulse_type": "SCHEDULED_RITUAL", "_source_ts": now},
-        ]
-        scored = scheduler._score_candidates(candidates)
-        # SCHEDULED_RITUAL should be highest
-        assert scored[0]["impulse_type"] == "SCHEDULED_RITUAL"
-
-    def test_select_best_returns_top_scored(self):
-        scheduler = ProactiveScheduler()
-        candidates = [
-            {"impulse_type": "ECHO", "_score": 60, "dedupe_key": "e"},
-            {"impulse_type": "SCHEDULED_RITUAL", "_score": 80, "dedupe_key": "r"},
-            {"impulse_type": "PRESENCE", "_score": 50, "dedupe_key": "p"},
-        ]
-        best = scheduler._select_best(candidates)
-        assert best["impulse_type"] == "SCHEDULED_RITUAL"
-        assert "_score" not in best  # internal field cleaned
-
-    def test_echo_impulse_from_emotional_message(self):
-        scheduler = ProactiveScheduler()
-        history = [
-            {"role": "user", "content": "今天好累啊", "ts": time.time()},
-        ]
-        candidates = scheduler._generate_echo_impulses(history, "u1", time.time(), 1)
-        assert len(candidates) == 1
-        assert candidates[0]["impulse_type"] == "ECHO"
-
-    def test_echo_impulse_no_emotion_no_candidate(self):
-        scheduler = ProactiveScheduler()
-        history = [
-            {"role": "user", "content": "今天天气不错", "ts": time.time()},
-        ]
-        candidates = scheduler._generate_echo_impulses(history, "u1", time.time(), 1)
-        assert len(candidates) == 0
-
-    def test_presence_impulse_builds_correctly(self):
-        scheduler = ProactiveScheduler()
-        now = time.time()
-        impulse = scheduler._build_presence_impulse("u1", now, now - 7200)  # 2h ago
-        assert impulse["impulse_type"] == "PRESENCE"
-        assert "分钟" in impulse["trigger_reason_summary"] or "小时" in impulse["trigger_reason_summary"]
-
-    def test_presence_generation_handles_none_last_visible_message_at(self):
-        class Store:
-            async def get_recent_conversation_history(self, *args, **kwargs):
-                return []
-            async def get_dialogue_state(self, *args, **kwargs):
-                return {}
-            async def resolve_last_visible_message_at(self, *args, **kwargs):
-                return {
-                    "timestamp": time.time(),
-                    "reason": "no_visible_message_yet",
-                    "backfilled": False,
-                }
-            async def get_proactive_schedule_state(self, *args, **kwargs):
-                return {}
-
-        scheduler = ProactiveScheduler(store=Store())
-
-        async def _test():
-            candidates = await scheduler._generate_forced_impulse_candidates("u1", "b1", "PRESENCE")
-            assert candidates == []
-
-        asyncio.run(_test())
-
-    def test_presence_generation_backfills_or_skips_when_time_missing(self):
-        now = time.time()
-
-        class BackfillStore:
-            async def resolve_last_visible_message_at(self, *args, **kwargs):
-                return {
-                    "timestamp": now - 7200,
-                    "reason": "backfilled_last_visible_message_at",
-                    "backfilled": True,
-                }
-
-        class MissingStore:
-            async def resolve_last_visible_message_at(self, *args, **kwargs):
-                return {
-                    "timestamp": now,
-                    "reason": "missing_last_visible_message_at",
-                    "backfilled": False,
-                }
-
-        async def _test():
-            backfilled = await ProactiveScheduler(store=BackfillStore())._generate_forced_impulse_candidates(
-                "u1", "b1", "PRESENCE"
-            )
-            assert len(backfilled) == 1
-            assert backfilled[0]["presence_reason"] == "backfilled_last_visible_message_at"
-
-            missing = await ProactiveScheduler(store=MissingStore())._generate_forced_impulse_candidates(
-                "u1", "b1", "PRESENCE"
-            )
-            assert missing == []
-
-        asyncio.run(_test())
-
-    def test_presence_generation_never_float_none(self):
-        class LegacyStore:
-            async def get_last_visible_message_at(self, *args, **kwargs):
-                return None
-
-        scheduler = ProactiveScheduler(store=LegacyStore())
-
-        async def _test():
-            state = await scheduler._resolve_presence_last_interaction("u1", "b1")
-            assert state["timestamp"] == 0.0
-            assert state["reason"] == "missing_last_visible_message_at"
-
-        asyncio.run(_test())
-
-    def test_ritual_impulse_builds_correctly(self):
-        scheduler = ProactiveScheduler()
-        impulse = scheduler._build_ritual_impulse("u1", time.time(), {"intent_hint": "morning"})
-        assert impulse["impulse_type"] == "SCHEDULED_RITUAL"
-        assert impulse["reply_window_seconds"] == 86400
-
-    def test_select_best_returns_none_for_empty(self):
-        scheduler = ProactiveScheduler()
-        assert scheduler._select_best([]) is None
-
+# v4.0 removed: TestImpulseGeneration
 
 class TestProactiveInterruptBaseline:
     """V1.6-A blocker: proactive turns use current seq as baseline."""
@@ -1326,253 +1328,7 @@ class TestProactiveInterruptBaseline:
         asyncio.run(_test())
 
 
-class TestScheduledTriggersV16BC:
-    """V1.6-B/C scheduled heartbeat and state tool coverage."""
-
-    def test_create_scheduled_trigger_state_tool_returns_task_id(self):
-        responses = [
-            _make_response("", tool_calls=[
-                _make_tc("create_scheduled_trigger", '{"message":"later","delay_minutes":10}')
-            ]),
-            _make_response("", tool_calls=[
-                _make_tc("done", '{"status":"no_reply","note":"scheduled"}')
-            ]),
-        ]
-        agent = _make_agent(
-            native_allowed_tools=[
-                "get_time", "get_weather", "create_scheduled_trigger",
-                "wechat_reply", "done",
-            ]
-        )
-        agent.llm_gateway = _make_mgw(responses)
-
-        calls = []
-
-        async def executor(tool_name, args, turn):
-            calls.append((tool_name, args, turn.turn_id))
-            return {"status": "ok", "scheduled_task_id": "sch_test_1", "due_at": time.time() + 600}
-
-        result = asyncio.run(agent.chat(
-            user_message="remind me later",
-            history=[],
-            trigger="user",
-            source=SOURCE_USER_MESSAGE,
-            state_tool_executor=executor,
-        ))
-
-        assert result.scheduled_task_ids == ["sch_test_1"]
-        assert result.tool_results[0]["name"] == "create_scheduled_trigger"
-        assert calls[0][0] == "create_scheduled_trigger"
-
-    def test_default_morning_scheduled_heartbeat_runs_once(self):
-        class Store:
-            def __init__(self):
-                self.state = {}
-
-            async def claim_due_scheduled_messages(self, *args, **kwargs):
-                return []
-
-            async def get_scheduled_task_state(self, *args, **kwargs):
-                return dict(self.state)
-
-            async def update_scheduled_task_state(self, user_id, bot_id, updates):
-                self.state.update(updates)
-                return dict(self.state)
-
-            async def get_recent_conversation_history(self, *args, **kwargs):
-                return []
-
-        class FakeChatAgent:
-            def __init__(self):
-                self.meta = None
-
-            async def chat(self, **kwargs):
-                self.meta = kwargs["proactive_meta"]
-                return TurnResult(
-                    terminal_state=TurnState.END_REPLIED,
-                    turn_id="scheduled_1",
-                    user_message="",
-                    proactive_delivered_count=1,
-                    proactive_delivered_texts=["hi"],
-                )
-
-        store = Store()
-        agent = FakeChatAgent()
-        scheduler = ProactiveScheduler(
-            chat_agent=agent,
-            store=store,
-            settings_provider=lambda: ProactiveSettings(
-                enabled=True,
-                autonomous_enabled=True,
-                quiet_hours_enabled=False,
-                scheduled_enabled=True,
-            ),
-        )
-
-        async def _test():
-            now = datetime(2026, 5, 31, 8, 1, tzinfo=timezone(timedelta(hours=8)))
-            first = await scheduler.run_scheduled_heartbeat("u1", "b1", now_dt=now)
-            second = await scheduler.run_scheduled_heartbeat("u1", "b1", now_dt=now)
-            assert first["status"] == "ok"
-            assert first["scheduled_kind"] == "default_morning"
-            assert agent.meta["trigger_kind"] == "scheduled"
-            assert agent.meta["impulse_type"] == "SCHEDULED_GREETING"
-            assert second["status"] == "skipped"
-            assert second["reason"] == "no_scheduled_due"
-
-        asyncio.run(_test())
-
-    def test_dynamic_scheduled_message_claim_runs_and_marks_sent(self):
-        class Store:
-            def __init__(self):
-                self.marked = []
-
-            async def claim_due_scheduled_messages(self, *args, **kwargs):
-                return [{
-                    "id": "sch_due",
-                    "user_id": "u1",
-                    "messages": [{"text": "check this", "title": "check"}],
-                    "due_at": time.time() - 1,
-                }]
-
-            async def mark_scheduled_message_status(self, task_id, status, error=""):
-                self.marked.append((task_id, status, error))
-
-            async def get_recent_conversation_history(self, *args, **kwargs):
-                return []
-
-        class FakeChatAgent:
-            def __init__(self):
-                self.meta = None
-
-            async def chat(self, **kwargs):
-                self.meta = kwargs["proactive_meta"]
-                return TurnResult(
-                    terminal_state=TurnState.END_REPLIED,
-                    turn_id="scheduled_dynamic",
-                    user_message="",
-                    proactive_delivered_count=1,
-                    proactive_delivered_texts=["check this"],
-                )
-
-        store = Store()
-        agent = FakeChatAgent()
-        scheduler = ProactiveScheduler(
-            chat_agent=agent,
-            store=store,
-            settings_provider=lambda: ProactiveSettings(enabled=True, scheduled_enabled=True),
-        )
-
-        async def _test():
-            result = await scheduler.run_scheduled_heartbeat("u1", "b1")
-            assert result["status"] == "ok"
-            assert result["scheduled_kind"] == "dynamic"
-            assert result["scheduled_task_id"] == "sch_due"
-            assert agent.meta["scheduled_task_id"] == "sch_due"
-            assert store.marked == [("sch_due", "sent", "")]
-
-        asyncio.run(_test())
-
-    def test_existing_user_messages_do_not_cancel_proactive_turn(self):
-        latest_seq = {"value": 3}
-        responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"在吗"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
-        ]
-        agent = _make_agent()
-        agent.llm_gateway = _make_mgw(responses)
-
-        async def sender(messages):
-            for m in messages:
-                m["send_status"] = "delivered"
-            return messages
-
-        def checker(_token: str) -> bool:
-            return latest_seq["value"] > 3
-
-        async def _test():
-            result = await agent.chat(
-                user_message=None,
-                history=[],
-                trigger="proactive",
-                source=SOURCE_PROACTIVE_IMPULSE,
-                proactive_meta=_make_proactive_meta(trigger_mode="optional"),
-                wechat_sender=sender,
-                interrupt_checker=checker,
-                input_latest_seq=3,
-            )
-            assert result.terminal_state == TurnState.END_REPLIED
-            assert result.proactive_delivered_count == 1
-
-        asyncio.run(_test())
-
-    def test_new_user_message_after_proactive_start_cancels_turn(self):
-        latest_seq = {"value": 3}
-
-        class MGW:
-            async def complete(self, req, **kwargs):
-                latest_seq["value"] = 4
-                return _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"在吗"}')])
-
-        agent = _make_agent()
-        agent.llm_gateway = MGW()
-
-        async def sender(messages):
-            raise AssertionError("send should not happen after new user message")
-
-        def checker(_token: str) -> bool:
-            return latest_seq["value"] > 3
-
-        async def _test():
-            result = await agent.chat(
-                user_message=None,
-                history=[],
-                trigger="proactive",
-                source=SOURCE_PROACTIVE_IMPULSE,
-                proactive_meta=_make_proactive_meta(trigger_mode="optional"),
-                wechat_sender=sender,
-                interrupt_checker=checker,
-                input_latest_seq=3,
-            )
-            assert result.terminal_state in (
-                TurnState.END_CANCELLED,
-                TurnState.END_SUPERSEDED_BEFORE_SEND,
-            )
-            assert result.proactive_delivered_count == 0
-
-        asyncio.run(_test())
-
-    def test_proactive_input_latest_seq_not_zero_when_history_seq_exists(self):
-        class FakeChatAgent:
-            def __init__(self):
-                self.input_latest_seq = 0
-
-            async def chat(self, **kwargs):
-                self.input_latest_seq = kwargs.get("input_latest_seq", 0)
-                return TurnResult(
-                    terminal_state=TurnState.END_SKIPPED_PROACTIVE,
-                    turn_id="t1",
-                    user_message="",
-                )
-
-        agent = FakeChatAgent()
-        scheduler = ProactiveScheduler(chat_agent=agent)
-
-        async def _test():
-            await scheduler.run_manual_trigger(
-                "u1", _make_proactive_meta(), "b1",
-                interrupt_checker_provider=lambda _token: False,
-                input_latest_seq=7,
-            )
-            assert agent.input_latest_seq == 7
-            assert agent.input_latest_seq != 0
-
-        asyncio.run(_test())
-
-
-# ══════════════════════════════════════════════════════════════════
-# Phase 7: Relationship temperature
-# ══════════════════════════════════════════════════════════════════
+# v4.0 removed: TestScheduledTriggersV16BC
 
 class TestRelationshipTemperature:
     """Phase 7.4: Relationship temperature updates based on events."""

@@ -49,7 +49,7 @@ class TestToolRegistryContent:
         assert "get_weather" in names
         assert "wechat_reply" in names
         assert "done" in names
-        assert "create_scheduled_trigger" in names
+        assert "schedule_wake_up" in names
         assert "send_wechat_messages" in names   # kept deprecated
         assert "skip_reply" in names             # kept deprecated
         assert "search_memory" not in names
@@ -143,7 +143,7 @@ class TestNativeEligibility:
         names = {s["function"]["name"] for s in specs}
         assert names == {
             "get_time", "get_weather", "wechat_reply", "done",
-            "skip_proactive", "create_scheduled_trigger",
+            "skip_proactive", "schedule_wake_up",
         }
 
     def test_get_native_tool_specs_includes_all_when_eligible_only_false(self):
@@ -155,7 +155,7 @@ class TestNativeEligibility:
         assert "wechat_reply" in names
         assert "done" in names
         assert "skip_proactive" in names
-        assert "create_scheduled_trigger" in names
+        assert "schedule_wake_up" in names
         assert "send_wechat_messages" in names
         assert "skip_reply" in names
         assert len(names) == 8
@@ -263,7 +263,7 @@ class TestRegistryAPI:
         assert "wechat_reply" in all_names
         assert "done" in all_names
         assert "skip_proactive" in all_names
-        assert "create_scheduled_trigger" in all_names
+        assert "schedule_wake_up" in all_names
         assert "send_wechat_messages" in all_names
         assert "skip_reply" in all_names
         assert "send_email" not in all_names

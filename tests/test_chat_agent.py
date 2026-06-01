@@ -67,7 +67,7 @@ def test_safe_parse_trailing_comma_fix():
 # Phase 1: ChatAgent native tool call tests
 # ================================================================
 from agent.llm_types import LLMRequest, LLMResponse, LLMUsage, LLMError
-from agent.chat_agent import ChatAgent, _build_context_sample
+from agent.chat_agent import ChatAgent, _build_context_sample, _build_visible_transcript
 
 
 def _make_response(content="", tool_calls=None, **kw):
@@ -1060,6 +1060,61 @@ class TestHistoryLeakPrevention:
             persona="p", personality="", tool_names=["wechat_reply", "done"],
         )
         assert history_text not in prompt
+
+
+class TestCanonicalTranscript:
+    def test_visible_transcript_excludes_system_dividers(self):
+        history = [
+            {"role": "user", "content": "你好", "source": "wechat", "ts": 1},
+            {"role": "system", "content": "[距离上次发言约 30 分钟]", "_temporal_divider": True},
+            {"role": "assistant", "content": "你好啊", "source": "assistant", "ts": 2},
+        ]
+
+        transcript = _build_visible_transcript(history)
+
+        assert [m["role"] for m in transcript] == ["user", "assistant"]
+        assert [m["content"] for m in transcript] == ["你好", "你好啊"]
+
+    def test_visible_transcript_splits_legacy_proactive_bubbles(self):
+        history = [
+            {
+                "role": "assistant",
+                "content": "人呢\n打个招呼就不见了",
+                "source": "assistant:proactive",
+                "ts": 1,
+            },
+        ]
+
+        transcript = _build_visible_transcript(history)
+
+        assert [m["role"] for m in transcript] == ["assistant", "assistant"]
+        assert [m["content"] for m in transcript] == ["人呢", "打个招呼就不见了"]
+
+    def test_chat_context_uses_clean_transcript_not_augmented_history(self):
+        gw = FakeGateway(response=_make_response("", tool_calls=[
+            _make_tc("done", '{"status":"no_reply","note":"ok"}')
+        ]))
+        agent = ChatAgent(
+            model="test", persona="p", personality="",
+            llm_gateway=gw, native_tool_calls=True,
+            native_allowed_tools=["wechat_reply", "done"],
+            test_mode=True,
+        )
+        history = [
+            {"role": "user", "content": "你好", "source": "wechat", "ts": 1717000000},
+            {"role": "assistant", "content": "你好啊", "source": "assistant", "ts": 1717000001},
+        ]
+
+        import asyncio
+        asyncio.run(agent.chat(user_message="ok", history=history, trigger="user"))
+
+        req = gw.requests[0]
+        transcript = [
+            m for m in req.messages
+            if m["role"] in ("user", "assistant") and str(m.get("content", "")).strip()
+        ]
+        assert [m["content"] for m in transcript] == ["你好", "你好啊", "ok"]
+        assert not any(m["role"] == "system" and m.get("_temporal_divider") for m in req.messages)
 
 
 # ================================================================
