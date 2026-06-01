@@ -299,6 +299,7 @@ class MemoryStore:
                 start_turn_id TEXT NOT NULL DEFAULT '',
                 end_turn_id TEXT NOT NULL DEFAULT '',
                 turn_count INTEGER NOT NULL DEFAULT 0,
+                recap_type TEXT NOT NULL DEFAULT 'recap',
                 created_at REAL NOT NULL
             )
         """)
@@ -620,7 +621,12 @@ class MemoryStore:
             try:
                 await db.execute(col_sql)
             except Exception:
-                pass  # column already exists
+                pass
+        # ── v4.0: recaps table recap_type column ──────────────────
+        try:
+            await db.execute("ALTER TABLE recaps ADD COLUMN recap_type TEXT NOT NULL DEFAULT 'recap'")
+        except Exception:
+            pass  # column already exists
         # Backfill last_visible_message_at from conversation_history
         # Default 0 is unsafe — immediate required trigger after upgrade.
         # Priority: last visible conversation_history message. Fallback: now.
@@ -1863,8 +1869,9 @@ class MemoryStore:
         start_turn_id: str = "",
         end_turn_id: str = "",
         turn_count: int = 0,
+        recap_type: str = "recap",
     ) -> str:
-        """Save a recap entry (L3)."""
+        """Save a recap entry (L3). recap_type: 'recap' | 'snapshot'."""
         import uuid
         recap_id = f"recap_{uuid.uuid4().hex[:12]}"
         now = time.time()
@@ -1873,13 +1880,78 @@ class MemoryStore:
             await db.execute(
                 """INSERT INTO recaps
                    (id, user_id, bot_id, recap_text,
-                    start_turn_id, end_turn_id, turn_count, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    start_turn_id, end_turn_id, turn_count,
+                    recap_type, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (recap_id, user_id, bot_id, str(recap_text)[:4000],
-                 start_turn_id, end_turn_id, turn_count, now),
+                 start_turn_id, end_turn_id, turn_count, recap_type, now),
             )
             await db.commit()
         return recap_id
+
+    async def get_latest_snapshot(
+        self, user_id: str, bot_id: str = "",
+    ) -> dict[str, Any] | None:
+        """v4.0: Get the most recent snapshot."""
+        db = await self._get_db()
+        rows = await db.execute_fetchall(
+            """SELECT * FROM recaps
+               WHERE user_id = ? AND bot_id = ? AND recap_type = 'snapshot'
+               ORDER BY created_at DESC LIMIT 1""",
+            (user_id, bot_id),
+        )
+        return dict(rows[0]) if rows else None
+
+    async def count_turns_since_last_snapshot(
+        self, user_id: str, bot_id: str,
+    ) -> int:
+        """v4.0: Count L2 turns since last snapshot."""
+        db = await self._get_db()
+        snap_row = await db.execute_fetchall(
+            """SELECT MAX(created_at) as last_ts FROM recaps
+               WHERE user_id = ? AND bot_id = ? AND recap_type = 'snapshot'""",
+            (user_id, bot_id),
+        )
+        last_ts = snap_row[0]["last_ts"] if snap_row and snap_row[0]["last_ts"] else 0
+        count_row = await db.execute_fetchall(
+            """SELECT COUNT(*) as cnt FROM turns
+               WHERE user_id = ? AND bot_id = ? AND created_at > ?""",
+            (user_id, bot_id, last_ts),
+        )
+        return count_row[0]["cnt"] if count_row else 0
+
+    async def get_turns_since_last_snapshot(
+        self, user_id: str, bot_id: str, limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """v4.0: Get turns since last snapshot."""
+        db = await self._get_db()
+        snap_row = await db.execute_fetchall(
+            """SELECT MAX(created_at) as last_ts FROM recaps
+               WHERE user_id = ? AND bot_id = ? AND recap_type = 'snapshot'""",
+            (user_id, bot_id),
+        )
+        last_ts = snap_row[0]["last_ts"] if snap_row and snap_row[0]["last_ts"] else 0
+        rows = await db.execute_fetchall(
+            """SELECT * FROM turns
+               WHERE user_id = ? AND bot_id = ? AND created_at > ?
+               ORDER BY created_at ASC LIMIT ?""",
+            (user_id, bot_id, last_ts, limit),
+        )
+        return [dict(r) for r in (rows or [])]
+
+    async def cancel_pending_proactive_wake_ups(
+        self, user_id: str, bot_id: str,
+    ) -> int:
+        """v4.0: Cancel pending proactive wake-up tasks. Returns count cancelled."""
+        db = await self._get_db()
+        # Mark as cancelled via status column
+        cur = await db.execute(
+            """UPDATE scheduled_messages SET status = 'cancelled'
+               WHERE user_id = ? AND status = 'pending'""",
+            (user_id,),
+        )
+        await db.commit()
+        return cur.rowcount
 
     async def get_latest_recap(
         self,

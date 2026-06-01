@@ -67,6 +67,19 @@ def _visible_transcript_items(history: list[dict[str, Any]]) -> list[dict[str, A
     return visible
 
 
+def _format_turns_for_snapshot(turns: list[dict]) -> str:
+    """Format turns into compact text for snapshot prompt."""
+    lines = []
+    for t in turns[-16:]:
+        role = str(t.get("role", ""))
+        content = str(t.get("content", ""))[:200]
+        if role == "user":
+            lines.append(f"用户: {content}")
+        elif role == "assistant":
+            lines.append(f"bot: {content}")
+    return "\n".join(lines)
+
+
 class ProactiveScheduler:
     """主动消息调度器。
 
@@ -273,6 +286,68 @@ class ProactiveScheduler:
     # v4.0 removed: _build_default_scheduled_impulse
 
     # v4.0 removed: _build_dynamic_scheduled_impulse
+
+    # ══════════════════════════════════════════════════════════════
+    # v4.0: Snapshot
+    # ══════════════════════════════════════════════════════════════
+
+    SNAPSHOT_EVERY_N_TURNS: int = 8
+
+    async def maybe_generate_snapshot(
+        self, user_id: str, bot_id: str,
+        llm_provider: Any,
+    ) -> str | None:
+        """Generate or update snapshot every N turns. Returns snapshot_id or None."""
+        if self._store is None:
+            return None
+
+        try:
+            turns_since = await self._store.count_turns_since_last_snapshot(user_id, bot_id)
+            if turns_since < self.SNAPSHOT_EVERY_N_TURNS:
+                return None
+
+            prev = await self._store.get_latest_snapshot(user_id, bot_id)
+            recent_turns = await self._store.get_turns_since_last_snapshot(
+                user_id, bot_id, limit=self.SNAPSHOT_EVERY_N_TURNS + 4,
+            )
+
+            if not recent_turns:
+                return None
+
+            prev_text = prev.get("recap_text", "") if prev else ""
+            turns_text = _format_turns_for_snapshot(recent_turns)
+
+            prompt = (
+                "基于以下信息，更新对话状态快照。\n\n"
+                f"[上一份快照]\n{prev_text}\n\n"
+                f"[新增对话轮次]\n{turns_text}\n\n"
+                "输出一份结构化的状态快照，包含：\n"
+                "- 当前话题（1-2句话）\n"
+                "- 用户情绪/状态\n"
+                "- 关键事实（用户提到的、bot应记住的）\n"
+                "- 关系备注\n"
+                "用第一人称（bot视角）写。不超过500字。"
+            )
+
+            response = await llm_provider(
+                messages=[{"role": "user", "content": prompt}],
+                purpose="snapshot",
+                temperature=0.5,
+                max_tokens=500,
+            )
+            snapshot_text = response.content.strip()
+            if not snapshot_text:
+                return None
+
+            snapshot_id = await self._store.save_recap(
+                user_id=user_id, bot_id=bot_id,
+                recap_text=snapshot_text, recap_type="snapshot",
+            )
+            logger.info("snapshot: generated id=%s turns_since=%d", snapshot_id, turns_since)
+            return snapshot_id
+        except Exception as e:
+            logger.warning("snapshot: generation failed: %s", e)
+            return None
 
     async def _mark_dynamic_scheduled_result(self, task_id: str, result: Any) -> None:
         try:
