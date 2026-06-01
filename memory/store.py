@@ -1103,6 +1103,37 @@ class MemoryStore:
 
         return task_id
 
+    async def create_scheduled_wake_up(
+        self, user_id: str, bot_id: str, task: dict[str, Any],
+    ) -> str:
+        """v4.0: Create a scheduled wake-up task.
+
+        task dict keys:
+          - message_hint: str — hint text for LLM at wake-up
+          - trigger_at: str — ISO 8601 datetime
+          - recurring: str | None — None or 'daily'
+          - skip_quiet_hours: bool
+          - wake_up_type: str — 'proactive' | 'morning_greeting' | 'night_summary' | 'user_requested'
+          - is_wake_up: bool — True if skip is disabled
+        """
+        hint = str(task.get("message_hint", ""))[:500]
+        trigger_at_str = str(task.get("trigger_at", ""))
+        try:
+            due_at = datetime.fromisoformat(trigger_at_str).timestamp()
+        except Exception:
+            due_at = time.time() + 3600
+
+        messages = [{
+            "text": hint,
+            "wake_up_type": task.get("wake_up_type", "proactive"),
+            "is_wake_up": task.get("is_wake_up", False),
+            "skip_quiet_hours": task.get("skip_quiet_hours", False),
+            "recurring": task.get("recurring"),
+        }]
+        return await self.create_scheduled_message(
+            user_id, "", messages, due_at,
+        )
+
     async def claim_due_scheduled_messages(
         self,
         now_ts: float | None = None,

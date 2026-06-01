@@ -285,6 +285,257 @@ class ProactiveScheduler:
         except Exception:
             pass
 
+    # ══════════════════════════════════════════════════════════════
+    # v4.0: Unified wake-up dispatcher
+    # ══════════════════════════════════════════════════════════════
+
+    async def check_cold_start(
+        self, user_id: str, bot_id: str,
+    ) -> dict[str, Any] | None:
+        """Check if cold-start should trigger. Returns wake-up context or None.
+
+        Called after each user message is processed. If last_visible_message_at
+        is more than COLD_START_SECONDS ago, returns context for a proactive LLM call.
+        """
+        if self._store is None:
+            return None
+
+        last_visible = 0.0
+        try:
+            if hasattr(self._store, "resolve_last_visible_message_at"):
+                resolved = await self._store.resolve_last_visible_message_at(user_id, bot_id)
+                last_visible = _safe_float(resolved.get("timestamp"), 0.0)
+            else:
+                last_visible = _safe_float(
+                    await self._store.get_last_visible_message_at(user_id, bot_id), 0.0,
+                )
+        except Exception:
+            return None
+
+        if last_visible <= 0:
+            return None
+
+        elapsed = time.time() - last_visible
+        if elapsed < self.COLD_START_SECONDS:
+            return None
+
+        return {
+            "trigger": "proactive",
+            "trigger_kind": "cold_start",
+            "is_wake_up": False,
+            "elapsed_seconds": int(elapsed),
+        }
+
+    async def dispatch_wake_up(
+        self,
+        user_id: str,
+        bot_id: str,
+        wake_up_context: dict[str, Any],
+        *,
+        history_provider=None,
+        system_prompt_provider=None,
+        wechat_sender_provider=None,
+        interrupt_checker_provider=None,
+        input_latest_seq: int = 0,
+        write_model_history=None,
+        post_turn_hooks=None,
+    ) -> dict[str, Any]:
+        """Unified wake-up dispatcher. All proactive triggers enter through here.
+
+        wake_up_context keys:
+          - trigger: "proactive" | "morning_greeting" | "night_summary" | "user_requested"
+          - trigger_kind: "cold_start" | "wake_up" | "scheduled" | "user_requested"
+          - is_wake_up: bool — True if this is a wake-up after a skip (skip disabled)
+          - message_hint: str — from scheduled_task, if applicable
+          - task_id: str — scheduled_task id, for marking complete
+        """
+        if self._lock.locked():
+            return {"status": "skipped", "reason": "active_proactive_turn_running"}
+
+        async with self._lock:
+            turn_id = f"wake_{user_id}_{int(time.time() * 1000)}"
+            self._active_proactive_turn_id = turn_id
+            logger.info("wake_up: dispatch turn_id=%s context=%s", turn_id, wake_up_context)
+
+            try:
+                impulse_meta = await self._build_wake_up_impulse(
+                    user_id, bot_id, wake_up_context,
+                )
+
+                result = await self._execute_proactive_turn(
+                    user_id=user_id,
+                    impulse_meta=impulse_meta,
+                    bot_id=bot_id,
+                    turn_id=turn_id,
+                    history_provider=history_provider,
+                    system_prompt_provider=system_prompt_provider,
+                    wechat_sender_provider=wechat_sender_provider,
+                    interrupt_checker_provider=interrupt_checker_provider,
+                    input_latest_seq=input_latest_seq,
+                    write_model_history=write_model_history,
+                    post_turn_hooks=post_turn_hooks or [],
+                )
+
+                await self._schedule_next_from_turn_result(
+                    user_id, bot_id, result, wake_up_context,
+                )
+
+                task_id = wake_up_context.get("task_id", "")
+                if task_id:
+                    await self._mark_dynamic_scheduled_result(task_id, result)
+
+                return {"status": "ok", "result": result}
+            except Exception as e:
+                logger.error("wake_up: dispatch failed: %s", e)
+                await self._schedule_fallback_retry(user_id, bot_id)
+                return {"status": "error", "reason": str(e)[:500]}
+            finally:
+                self._active_proactive_turn_id = None
+
+    async def _build_wake_up_impulse(
+        self, user_id: str, bot_id: str, wake_up_context: dict,
+    ) -> dict[str, Any]:
+        """Build impulse_meta from wake_up_context + latest snapshot."""
+        settings = self._get_settings()
+        intensity = settings.autonomous_intensity
+        profile = get_intensity_profile(intensity)
+
+        now_ts = time.time()
+        trigger = wake_up_context.get("trigger", "proactive")
+        is_wake_up = wake_up_context.get("is_wake_up", False)
+
+        impulse = {
+            "impulse_id": f"wake_{user_id}_{int(now_ts * 1000)}",
+            "impulse_type": "PROACTIVE_WAKE",
+            "proactive_chain_id": f"chain_wake_{int(now_ts * 1000)}",
+            "trigger_reason_summary": wake_up_context.get("message_hint", "主动唤醒"),
+            "trigger_mode": "required" if is_wake_up else "optional",
+            "trigger_kind": wake_up_context.get("trigger_kind", "cold_start"),
+            "trigger_source": trigger,
+            "evidence_pack": {
+                "source_topic_id": "",
+                "source_message_ids": [],
+                "recent_proactive_messages": [],
+                "relationship_temperature": None,
+                "topic_snapshot": "",
+            },
+            "dedupe_key": f"wake_{user_id}_{int(now_ts / 3600)}",
+            "reply_window_seconds": 14400,
+            "max_wechat_reply": int(
+                self._config.get("proactive", {})
+                .get("turn", {})
+                .get("default_max_wechat_reply_per_turn", 3)
+            ),
+            "min_next_minutes": profile["min_minutes"],
+            "max_next_minutes": profile["max_minutes"],
+            "intensity": intensity,
+            "_source_ts": now_ts,
+        }
+
+        # Load latest snapshot as context
+        if self._store:
+            try:
+                snapshot = await self._store.get_latest_recap(user_id, bot_id)
+                if snapshot:
+                    impulse["snapshot"] = str(snapshot.get("recap_text", ""))[:500]
+            except Exception:
+                pass
+
+        # Merge message_hint from wake_up_context
+        hint = wake_up_context.get("message_hint", "")
+        if hint:
+            impulse["trigger_reason_summary"] = str(hint)[:200]
+
+        # Enrich with conversation context
+        if self._store:
+            try:
+                history = await self._store.get_recent_conversation_history(
+                    user_id, limit=40, bot_id=bot_id,
+                )
+                self._enrich_impulse_with_context(impulse, history)
+            except Exception:
+                pass
+
+        return impulse
+
+    async def _schedule_next_from_turn_result(
+        self, user_id: str, bot_id: str,
+        result: Any, wake_up_context: dict,
+    ) -> None:
+        """After a proactive turn, schedule the next wake-up."""
+        if self._store is None:
+            return
+
+        settings = self._get_settings()
+        profile = get_intensity_profile(settings.autonomous_intensity)
+
+        next_minutes = getattr(result, "proactive_next_check_minutes", None) if result else None
+        if next_minutes is None:
+            next_minutes = (profile["min_minutes"] + profile["max_minutes"]) // 2
+
+        # Clamp to intensity range
+        next_minutes = max(profile["min_minutes"], min(profile["max_minutes"], int(next_minutes)))
+
+        trigger_at = time.time() + next_minutes * 60
+
+        task = {
+            "message_hint": f"主动消息自动唤醒（上次: {wake_up_context.get('trigger_reason_summary', '')[:100]}）",
+            "trigger_at": datetime.fromtimestamp(trigger_at, tz=timezone(timedelta(hours=8))).isoformat(),
+            "recurring": None,
+            "skip_quiet_hours": False,
+            "wake_up_type": "proactive",
+            "is_wake_up": True,
+        }
+        await self._store.create_scheduled_wake_up(user_id, bot_id, task)
+
+    async def _schedule_fallback_retry(self, user_id: str, bot_id: str) -> None:
+        """Schedule a fallback retry after LLM failure."""
+        if self._store is None:
+            return
+        settings = self._get_settings()
+        profile = get_intensity_profile(settings.autonomous_intensity)
+        delay = (profile["min_minutes"] + profile["max_minutes"]) // 2
+        trigger_at = time.time() + delay * 60
+        task = {
+            "message_hint": "故障恢复重试",
+            "trigger_at": datetime.fromtimestamp(trigger_at, tz=timezone(timedelta(hours=8))).isoformat(),
+            "recurring": None,
+            "skip_quiet_hours": False,
+            "wake_up_type": "proactive",
+            "is_wake_up": True,
+        }
+        await self._store.create_scheduled_wake_up(user_id, bot_id, task)
+
+    async def _claim_due_wake_up(
+        self, user_id: str, bot_id: str,
+        now_ts: float | None = None,
+    ) -> dict[str, Any] | None:
+        """Claim the next due wake-up task. Returns None if nothing due."""
+        if self._store is None:
+            return None
+        now = now_ts or time.time()
+        tasks = await self._store.claim_due_scheduled_messages(
+            now_ts=now, limit=1, user_id=user_id,
+        )
+        if not tasks:
+            return None
+        task = tasks[0]
+        messages = task.get("messages") or []
+        first = messages[0] if messages and isinstance(messages[0], dict) else {}
+        return {
+            "task_id": str(task.get("id", "")),
+            "trigger": task.get("wake_up_type", "proactive"),
+            "trigger_kind": "wake_up",
+            "is_wake_up": task.get("is_wake_up", False),
+            "message_hint": str(first.get("text", "") or first.get("message", "") or "")[:500],
+            "skip_quiet_hours": bool(task.get("skip_quiet_hours", False)),
+            "recurring": task.get("recurring"),
+        }
+
+    # ══════════════════════════════════════════════════════════════
+    # Eligibility checks
+    # ══════════════════════════════════════════════════════════════
+
     async def _check_eligibility(
         self, user_id: str, bot_id: str,
     ) -> tuple[bool, str]:
