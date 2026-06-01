@@ -81,29 +81,15 @@ features:
   proactive: true        # v3.1: proactive / scheduled messages
   email: false          # send_email tool in chat
 
-# ---- v3.1: Proactive messages -------------------------------------------
+# ---- v4.0: Proactive messages (scheduled wake-up) -----------------
 proactive:
-  heartbeat_interval_seconds: 60
+  cold_start_seconds: 120        # hardcoded, config for override in dev
 
   eligibility:
-    min_interval_minutes: 30
-    hot_relationship_min_interval_minutes: 10
-    cold_relationship_min_interval_minutes: 120
-    after_user_message_quiet_seconds_min: 60
-    after_user_message_quiet_seconds_max: 600
     daily_cap: 10
     sleep_hours:
       start: "23:00"
       end: "08:00"
-
-  impulse:
-    max_candidates_per_check: 3
-    max_per_type: 1
-    default_ttl_hours:
-      ECHO: 4
-      TOPIC_CONTINUE: 8
-      PRESENCE: 12
-      SCHEDULED_RITUAL: 24
 
   turn:
     default_max_wechat_reply_per_turn: 3
@@ -119,11 +105,16 @@ proactive:
 
   attribution:
     reply_window_seconds:
-      ECHO: 14400
-      TOPIC_CONTINUE: 28800
-      PRESENCE: 43200
-      SCHEDULED_RITUAL: 86400
+      PROACTIVE_WAKE: 14400
+      MORNING_GREETING: 7200
+      NIGHT_SUMMARY: 7200
+      USER_REQUESTED: 14400
     topic_switch_keyword_overlap_threshold: 3
+
+  snapshot:
+    trigger_every_n_turns: 8
+    max_chars: 500
+    temperature: 0.5
 
 # ---- WeChat iLink Bridge -----------------------------------------------
 wechat:
