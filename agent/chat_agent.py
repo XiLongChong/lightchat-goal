@@ -292,6 +292,7 @@ class ChatAgent:
             # ── v3.1: Proactive fields for callbacks ──
             proactive_delivered_count=turn.proactive_delivered_count,
             proactive_delivered_texts=list(turn.proactive_delivered_texts),
+            proactive_next_check_minutes=turn.proactive_next_check_minutes,
             proactive_attempt_count=turn.proactive_attempt_count,
             proactive_send_attempt_count=turn.proactive_send_attempt_count,
             scheduled_task_ids=list(turn.scheduled_task_ids),
@@ -1599,6 +1600,12 @@ class ChatAgent:
         note = str(args.get("note", "") or "").strip()
         sent_count = turn.sent_message_count
 
+        # ── v4.0: extract next_check_minutes for proactive turns ──
+        if turn.source == SOURCE_PROACTIVE_IMPULSE:
+            next_check = args.get("next_check_minutes")
+            if next_check is not None:
+                turn.proactive_next_check_minutes = int(next_check)
+
         # ── status must be valid ──
         if status not in ("replied", "no_reply", "failed"):
             turn.messages.append({
@@ -1695,9 +1702,16 @@ class ChatAgent:
             return TurnState.PROTOCOL_RETRY
 
         note = str(args.get("note", "") or "").strip()
+
+        # ── v4.0: extract next_check_minutes from skip_proactive ──
+        next_check = args.get("next_check_minutes")
+        if next_check is not None:
+            turn.proactive_next_check_minutes = int(next_check)
+
         turn._skip_reason = reason
         turn._skip_note = note
-        logger.info("validate_skip_proactive: reason=%s note=%s", reason, note[:80] if note else "(none)")
+        logger.info("validate_skip_proactive: reason=%s next_check=%s note=%s",
+                    reason, next_check, note[:80] if note else "(none)")
         return TurnState.EXEC_SKIP_PROACTIVE
 
     def _do_exec_skip_proactive(self, turn: TurnScratchpad) -> TurnState:

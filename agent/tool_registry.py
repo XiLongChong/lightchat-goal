@@ -329,6 +329,10 @@ def _build_default_registries() -> None:
                     "type": "string",
                     "description": "简短说明。status=replied 时可省略；no_reply/failed 时必填。",
                 },
+                "next_check_minutes": {
+                    "type": "integer",
+                    "description": "仅主动回合：建议下一次主动 check 的间隔分钟数。必须在当前强度的 [min_minutes, max_minutes] 范围内。省略时系统按强度中值安排。非主动回合忽略此字段。",
+                },
             },
             "required": ["status"],
         },

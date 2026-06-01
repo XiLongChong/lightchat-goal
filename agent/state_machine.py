@@ -284,6 +284,7 @@ class TurnScratchpad:
     proactive_delivered_count: int = 0     # confirmed delivered count (allowed_tools phase judgment basis)
     proactive_llm_step_count: int = 0      # LLM call count for proactive (max_llm_steps_per_proactive_turn limits this)
     proactive_delivered_texts: list[str] = field(default_factory=list)  # confirmed delivered text content (only this writes to history)
+    proactive_next_check_minutes: int | None = None  # v4.0: next proactive check minutes from done/skip
     scheduled_task_ids: list[str] = field(default_factory=list)
 
     # ── v1.6-A: Fact tool counter for required trigger constraint ──
@@ -368,6 +369,7 @@ class TurnResult:
     # ── v3.1: Proactive turn fields (for main.py callbacks) ──
     proactive_delivered_count: int = 0
     proactive_delivered_texts: list[str] = field(default_factory=list)
+    proactive_next_check_minutes: int | None = None  # v4.0
     proactive_attempt_count: int = 0
     proactive_send_attempt_count: int = 0
     scheduled_task_ids: list[str] = field(default_factory=list)
