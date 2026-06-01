@@ -514,6 +514,16 @@ def _record_user_message_arrival(user_id: str, seq: int = 0) -> None:
             _user_latest_inbound_seq[user_id] = seq
 
 
+async def _cancel_pending_proactive_on_user_message(user_id: str) -> None:
+    """Cancel pending proactive wake-ups when user sends a message."""
+    try:
+        cancelled = await memory_store.cancel_pending_proactive_wake_ups(user_id, BOT_ID)
+        if cancelled > 0:
+            logger.info("cancelled %d pending proactive wake-ups for user=%s", cancelled, user_id)
+    except Exception:
+        pass
+
+
 def _make_interrupt_checker(user_id: str, input_latest_seq: int):
     """Return an InterruptChecker for the given user.
 
@@ -1454,105 +1464,98 @@ async def lifespan(app: FastAPI):
     if _bridge is not None and _bridge.token:
         await _bridge.start()
 
-    # ── v3.1 Phase 5: Proactive heartbeat loop ──────────────────
-    _proactive_heartbeat_task: asyncio.Task | None = None
+    # ── v4.0: Proactive wake-up dispatch loop ────────────────────
+    _proactive_wake_up_task: asyncio.Task | None = None
     _proactive_enabled = (cfg.get("features") or {}).get("proactive", False)
     if _proactive_enabled:
-        async def _proactive_heartbeat_loop():
-            interval = int(cfg.get("proactive", {}).get("heartbeat_interval_seconds", 60))
+        async def _proactive_wake_up_loop():
+            """Check for due scheduled wake-ups every 30 seconds.
+
+            Unlike the old heartbeat (which ran eligibility + LLM every tick),
+            this only checks if a scheduled_task is due. No LLM calls here.
+            """
+            check_interval = 30
             while True:
-                await asyncio.sleep(interval)
+                await asyncio.sleep(check_interval)
                 try:
                     contact = await memory_store.get_contact_state()
                     uid = contact.get("user_id", "")
                     if not uid:
                         continue
-                    ctx_token = contact.get("context_token", "")
                     bot_id = BOT_ID
 
-                    async def _hb_history_provider(uid: str, bid: str) -> list:
+                    wake_up = await proactive_scheduler._claim_due_wake_up(uid, bot_id)
+                    if not wake_up:
+                        # No due wake-ups — check cold-start
+                        cold_start = await proactive_scheduler.check_cold_start(uid, bot_id)
+                        if cold_start:
+                            # Check eligibility before cold-start dispatch
+                            eligible, reason = await proactive_scheduler._check_eligibility(uid, bot_id)
+                            if eligible:
+                                wake_up = cold_start
+
+                    if not wake_up:
+                        continue
+
+                    # Check quiet hours (skip_quiet_hours=true tasks bypass)
+                    if not wake_up.get("skip_quiet_hours", False) and not wake_up.get("trigger_kind") == "cold_start":
+                        eligible, reason = await proactive_scheduler._check_eligibility(uid, bot_id)
+                        if not eligible:
+                            if reason == ELIGIBILITY_BLOCK_SLEEP_HOURS:
+                                continue  # delay until quiet hours end
+                            logger.info("wake_up: eligibility failed reason=%s", reason)
+                            continue
+
+                    ctx_token = contact.get("context_token", "")
+                    _wu_baseline = _get_current_inbound_seq(uid)
+
+                    async def _wu_history_provider(uid: str, bid: str) -> list:
                         return await get_history_async(uid, bot_id=bid)
 
-                    async def _hb_system_prompt_provider(uid: str) -> str:
+                    async def _wu_system_prompt_provider(uid: str) -> str:
                         return await build_enriched_system_prompt(uid, "")
 
-                    async def _hb_wechat_sender(messages: list) -> list:
+                    async def _wu_wechat_sender(messages: list) -> list:
                         return await wechat_sender(uid, ctx_token, messages)
 
-                    _hb_interrupt_baseline = _get_current_inbound_seq(uid)
-                    _hb_int_checker = _make_interrupt_checker(uid, input_latest_seq=_hb_interrupt_baseline)
-                    _hb_wmh = _build_proactive_write_model_history(uid, bot_id)
-                    _hb_hooks = _build_proactive_post_turn_hooks(uid, bot_id, {})
+                    _wu_int_checker = _make_interrupt_checker(uid, input_latest_seq=_wu_baseline)
+                    _wu_wmh = _build_proactive_write_model_history(uid, bot_id)
+                    _wu_hooks = _build_proactive_post_turn_hooks(uid, bot_id, {})
 
-                    scheduled_result = await proactive_scheduler.run_scheduled_heartbeat(
+                    result = await proactive_scheduler.dispatch_wake_up(
                         user_id=uid,
                         bot_id=bot_id,
-                        history_provider=_hb_history_provider,
-                        system_prompt_provider=_hb_system_prompt_provider,
-                        wechat_sender_provider=_hb_wechat_sender,
-                        interrupt_checker_provider=_hb_int_checker,
-                        input_latest_seq=_hb_interrupt_baseline,
-                        write_model_history=_hb_wmh,
-                        post_turn_hooks=_hb_hooks,
+                        wake_up_context=wake_up,
+                        history_provider=_wu_history_provider,
+                        system_prompt_provider=_wu_system_prompt_provider,
+                        wechat_sender_provider=_wu_wechat_sender,
+                        interrupt_checker_provider=_wu_int_checker,
+                        input_latest_seq=_wu_baseline,
+                        write_model_history=_wu_wmh,
+                        post_turn_hooks=_wu_hooks,
                     )
-                    if scheduled_result.get("status") == "ok":
-                        turn_result = scheduled_result.get("result")
+                    if result.get("status") == "ok":
+                        turn_result = result.get("result")
                         terminal = getattr(turn_result, "terminal_state", "")
                         delivered = int(getattr(turn_result, "proactive_delivered_count", 0) or 0)
                         logger.info(
-                            "scheduled_heartbeat: task_ok kind=%s task_id=%s proactive_result=%s delivered=%d baseline_seq=%d latest_seq=%d",
-                            scheduled_result.get("scheduled_kind", ""),
-                            scheduled_result.get("scheduled_task_id", ""),
-                            terminal,
-                            delivered,
-                            _hb_interrupt_baseline,
-                            _get_current_inbound_seq(uid),
+                            "wake_up: dispatched trigger=%s terminal=%s delivered=%d",
+                            wake_up.get("trigger", ""), terminal, delivered,
                         )
-                        continue
-                    if scheduled_result.get("status") == "error":
-                        logger.warning("scheduled_heartbeat: error: %s", scheduled_result.get("reason", ""))
-
-                    result = await proactive_scheduler.run_heartbeat(
-                        user_id=uid,
-                        bot_id=bot_id,
-                        history_provider=_hb_history_provider,
-                        system_prompt_provider=_hb_system_prompt_provider,
-                        wechat_sender_provider=_hb_wechat_sender,
-                        interrupt_checker_provider=_hb_int_checker,
-                        input_latest_seq=_hb_interrupt_baseline,
-                        write_model_history=_hb_wmh,
-                        post_turn_hooks=_hb_hooks,
-                    )
-                    if result.get("status") != "skipped":
-                        turn_result = result.get("result")
-                        terminal = getattr(turn_result, "terminal_state", "")
-                        attempts = int(getattr(turn_result, "proactive_attempt_count", 0) or 0)
-                        delivered = int(getattr(turn_result, "proactive_delivered_count", 0) or 0)
-                        latest_seq = _get_current_inbound_seq(uid)
-                        if str(terminal) == str(TurnState.END_CANCELLED):
-                            reason = "interrupt_baseline" if attempts == 0 and latest_seq <= _hb_interrupt_baseline else "user_interrupt"
-                            logger.info(
-                                "proactive_heartbeat: cancelled reason=%s baseline_seq=%d latest_seq=%d attempts=%d delivered=%d",
-                                reason, _hb_interrupt_baseline, latest_seq, attempts, delivered,
-                            )
-                        else:
-                            logger.info(
-                                "proactive_heartbeat: task_ok proactive_result=%s delivered=%d baseline_seq=%d latest_seq=%d",
-                                terminal or result.get("status"), delivered,
-                                _hb_interrupt_baseline, latest_seq,
-                            )
+                    elif result.get("status") == "error":
+                        logger.warning("wake_up: error: %s", result.get("reason", ""))
                 except Exception as e:
-                    logger.warning("proactive_heartbeat: error: %s", e)
+                    logger.warning("wake_up: loop error: %s", e)
 
-        _proactive_heartbeat_task = asyncio.create_task(_proactive_heartbeat_loop())
-        logger.info("Proactive heartbeat loop started (interval=%ds)", int(cfg.get("proactive", {}).get("heartbeat_interval_seconds", 60)))
+        _proactive_wake_up_task = asyncio.create_task(_proactive_wake_up_loop())
+        logger.info("Proactive wake-up loop started (check_interval=30s)")
 
     yield
 
     # Shutdown
     logger.info("Shutting down...")
-    if _proactive_heartbeat_task:
-        _proactive_heartbeat_task.cancel()
+    if _proactive_wake_up_task:
+        _proactive_wake_up_task.cancel()
     if _bridge is not None:
         await _bridge.stop()
     await memory_store.close()
@@ -2093,6 +2096,8 @@ async def chat(request: Request):
     # latest_seq=M > N and cancel itself.  This batch won't cancel itself
     # because latest_seq == input_latest_seq, and > is strict.
     _record_user_message_arrival(user_id, seq=input_latest_seq)
+    # v4.0: Cancel pending proactive wake-ups when user messages
+    asyncio.create_task(_cancel_pending_proactive_on_user_message(user_id))
 
     lock = _get_user_lock(user_id)
     turn_id = ""
