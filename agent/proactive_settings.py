@@ -19,10 +19,10 @@ logger = logging.getLogger(__name__)
 # ── Intensity profiles (constant, not persisted) ──────────────
 
 INTENSITY_PROFILES: dict[str, dict[str, int]] = {
-    "quiet":     {"daily_trigger_cap": 2,  "optional_after_minutes": 360, "required_after_minutes": 480},
-    "daily":     {"daily_trigger_cap": 5,  "optional_after_minutes": 120, "required_after_minutes": 180},
-    "caring":    {"daily_trigger_cap": 10, "optional_after_minutes": 30,  "required_after_minutes": 60},
-    "companion": {"daily_trigger_cap": 20, "optional_after_minutes": 5,   "required_after_minutes": 20},
+    "quiet":     {"daily_trigger_cap": 2,  "min_minutes": 360, "max_minutes": 720},
+    "daily":     {"daily_trigger_cap": 5,  "min_minutes": 120, "max_minutes": 480},
+    "caring":    {"daily_trigger_cap": 10, "min_minutes": 30,  "max_minutes": 120},
+    "companion": {"daily_trigger_cap": 20, "min_minutes": 5,   "max_minutes": 20},
 }
 
 VALID_INTENSITIES = frozenset(INTENSITY_PROFILES.keys())
@@ -209,5 +209,6 @@ def save_proactive_settings(settings: ProactiveSettings) -> None:
 def get_intensity_profile(intensity: str) -> dict[str, int]:
     """Return the intensity profile dict for the given intensity key.
     Falls back to 'daily' if intensity is invalid.
+    Keys: daily_trigger_cap, min_minutes, max_minutes.
     """
     return INTENSITY_PROFILES.get(intensity, INTENSITY_PROFILES["daily"])
