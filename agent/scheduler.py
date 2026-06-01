@@ -25,11 +25,9 @@ logger = logging.getLogger(__name__)
 # v3.1 §5.1: Known eligibility block reasons (for metrics).
 ELIGIBILITY_BLOCK_PROACTIVE_DISABLED = "proactive_disabled"
 ELIGIBILITY_BLOCK_BRIDGE_OFFLINE = "bridge_offline"
-ELIGIBILITY_BLOCK_USER_QUIET = "user_message_quiet_window"
 ELIGIBILITY_BLOCK_DAILY_CAP = "daily_cap_exceeded"
 ELIGIBILITY_BLOCK_USER_OPT_OUT = "user_opt_out"
 ELIGIBILITY_BLOCK_SCHEDULER_BUSY = "scheduler_busy"
-ELIGIBILITY_BLOCK_MIN_INTERVAL = "min_interval_not_met"
 ELIGIBILITY_BLOCK_SLEEP_HOURS = "sleep_hours"
 
 
@@ -76,6 +74,9 @@ class ProactiveScheduler:
     External callers (main.py) must NOT acquire `_lock` directly.
     admin trigger and heartbeat share the same lock and are mutually exclusive.
     """
+
+    # ── v4.0: Cold-start timing ────────────────────────────────────
+    COLD_START_SECONDS: int = 120  # hardcoded 2 minutes
 
     def __init__(
         self,
@@ -245,249 +246,12 @@ class ProactiveScheduler:
         )
         return result
 
-    # ══════════════════════════════════════════════════════════════
-    # Phase 5: Heartbeat + eligibility
-    # ══════════════════════════════════════════════════════════════
+    # v4.0 removed: Phase 5: Heartbeat + eligibility
+    # v4.0 removed: run_heartbeat
 
-    async def run_heartbeat(
-        self,
-        user_id: str,
-        bot_id: str,
-        *,
-        history_provider: Any = None,
-        system_prompt_provider: Any = None,
-        wechat_sender_provider: Any = None,
-        interrupt_checker_provider: Any = None,
-        input_latest_seq: int = 0,
-        write_model_history: Any = None,
-        post_turn_hooks: list[Any] | None = None,
-    ) -> dict[str, Any]:
-        """Heartbeat entry point. Runs eligibility pre-checks, then executes if eligible.
+    # v4.0 removed: run_scheduled_heartbeat
 
-        v3.1 §5.1-5.2: System pre-checks run BEFORE any LLM call.
-        Internal lock ensures mutual exclusion with manual triggers.
-        """
-        self.heartbeat_tick_count += 1
-
-        # ── Fast pre-checks (no store access) ────────────────────
-        settings = self._get_settings()
-        if not settings.enabled:
-            return self._eligibility_fail(ELIGIBILITY_BLOCK_PROACTIVE_DISABLED)
-
-        if self._lock.locked():
-            return self._eligibility_fail(ELIGIBILITY_BLOCK_SCHEDULER_BUSY)
-
-        async with self._lock:
-            eligible, reason = await self._check_eligibility(user_id, bot_id)
-            if not eligible:
-                return self._eligibility_fail(reason)
-
-            self.eligibility_pass_count += 1
-
-            # ── v1.6-A: determine trigger mode based on last_visible_message_at ──
-            trigger_mode, block_reason, context_meta = await self._determine_trigger_mode(
-                user_id, bot_id, settings,
-            )
-            if trigger_mode is None:
-                return {"status": "skipped", "reason": block_reason or "too_early"}
-
-            # ── Build impulse ──
-            if trigger_mode == "required":
-                impulse = self._build_required_impulse(user_id, context_meta)
-            else:
-                impulse = await self._select_impulse(user_id, bot_id)
-                if not impulse:
-                    return {"status": "skipped", "reason": "no_impulse"}
-                impulse["trigger_mode"] = "optional"
-                impulse["trigger_kind"] = "autonomous"
-                # Merge context_meta into impulse
-                for k, v in (context_meta or {}).items():
-                    impulse.setdefault(k, v)
-
-            # Add context fields (last_user_message + assistant_messages_after_last_user)
-            if self._store:
-                try:
-                    history = await self._store.get_recent_conversation_history(
-                        user_id, limit=40, bot_id=bot_id,
-                    )
-                    self._enrich_impulse_with_context(impulse, history)
-                except Exception:
-                    pass
-
-            turn_id = f"heartbeat_{user_id}_{int(time.time() * 1000)}"
-            self._active_proactive_turn_id = turn_id
-            logger.info("proactive_scheduler: heartbeat start turn_id=%s", turn_id)
-            try:
-                result = await self._execute_proactive_turn(
-                    user_id=user_id,
-                    impulse_meta=impulse,
-                    bot_id=bot_id,
-                    turn_id=turn_id,
-                    history_provider=history_provider,
-                    system_prompt_provider=system_prompt_provider,
-                    wechat_sender_provider=wechat_sender_provider,
-                    interrupt_checker_provider=interrupt_checker_provider,
-                    input_latest_seq=input_latest_seq,
-                    write_model_history=write_model_history,
-                    post_turn_hooks=post_turn_hooks,
-                )
-                return {"status": "ok", "result": result, "interrupt_baseline": input_latest_seq}
-            except Exception as e:
-                logger.error("proactive_scheduler: heartbeat turn failed: %s", e)
-                return {"status": "error", "reason": str(e)[:500]}
-            finally:
-                self._active_proactive_turn_id = None
-
-    async def run_scheduled_heartbeat(
-        self,
-        user_id: str,
-        bot_id: str,
-        *,
-        history_provider: Any = None,
-        system_prompt_provider: Any = None,
-        wechat_sender_provider: Any = None,
-        interrupt_checker_provider: Any = None,
-        input_latest_seq: int = 0,
-        write_model_history: Any = None,
-        post_turn_hooks: list[Any] | None = None,
-        now_dt: datetime | None = None,
-    ) -> dict[str, Any]:
-        """V1.6-B/C scheduled entry point sharing the proactive lock."""
-        settings = self._get_settings()
-        if not settings.enabled:
-            return {"status": "skipped", "reason": ELIGIBILITY_BLOCK_PROACTIVE_DISABLED}
-        if not getattr(settings, "scheduled_enabled", True):
-            return {"status": "skipped", "reason": "scheduled_disabled"}
-        if self._store is None:
-            return {"status": "skipped", "reason": "no_store"}
-        if self._lock.locked():
-            return self._eligibility_fail(ELIGIBILITY_BLOCK_SCHEDULER_BUSY)
-
-        async with self._lock:
-            due = await self._claim_next_scheduled_impulse(user_id, bot_id, settings, now_dt=now_dt)
-            if not due:
-                return {"status": "skipped", "reason": "no_scheduled_due"}
-
-            impulse = due["impulse"]
-            if self._store:
-                try:
-                    history = await self._store.get_recent_conversation_history(
-                        user_id, limit=40, bot_id=bot_id,
-                    )
-                    self._enrich_impulse_with_context(impulse, history)
-                except Exception:
-                    pass
-
-            turn_id = f"scheduled_{user_id}_{int(time.time() * 1000)}"
-            self._active_proactive_turn_id = turn_id
-            logger.info(
-                "proactive_scheduler: scheduled start turn_id=%s kind=%s task_id=%s",
-                turn_id, due.get("kind"), due.get("task_id", ""),
-            )
-            try:
-                result = await self._execute_proactive_turn(
-                    user_id=user_id,
-                    impulse_meta=impulse,
-                    bot_id=bot_id,
-                    turn_id=turn_id,
-                    history_provider=history_provider,
-                    system_prompt_provider=system_prompt_provider,
-                    wechat_sender_provider=wechat_sender_provider,
-                    interrupt_checker_provider=interrupt_checker_provider,
-                    input_latest_seq=input_latest_seq,
-                    write_model_history=write_model_history,
-                    post_turn_hooks=post_turn_hooks,
-                )
-                if due.get("task_id"):
-                    await self._mark_dynamic_scheduled_result(due["task_id"], result)
-                return {
-                    "status": "ok",
-                    "result": result,
-                    "interrupt_baseline": input_latest_seq,
-                    "scheduled_kind": due.get("kind", ""),
-                    "scheduled_task_id": due.get("task_id", ""),
-                }
-            except Exception as e:
-                if due.get("task_id"):
-                    try:
-                        await self._store.mark_scheduled_message_status(due["task_id"], "failed", str(e)[:200])
-                    except Exception:
-                        pass
-                logger.error("proactive_scheduler: scheduled turn failed: %s", e)
-                return {"status": "error", "reason": str(e)[:500]}
-            finally:
-                self._active_proactive_turn_id = None
-
-    async def _claim_next_scheduled_impulse(
-        self,
-        user_id: str,
-        bot_id: str,
-        settings: ProactiveSettings,
-        *,
-        now_dt: datetime | None = None,
-    ) -> dict[str, Any] | None:
-        """Return one due dynamic/default scheduled impulse, marking it claimed."""
-        now_ts = time.time()
-
-        # V1.6-C dynamic scheduled tasks take priority.
-        try:
-            tasks = await self._store.claim_due_scheduled_messages(now_ts=now_ts, limit=5, user_id=user_id)
-            for task in tasks:
-                return {
-                    "kind": "dynamic",
-                    "task_id": task.get("id", ""),
-                    "impulse": self._build_dynamic_scheduled_impulse(user_id, now_ts, task),
-                }
-        except Exception as e:
-            logger.warning("scheduled_heartbeat: dynamic claim failed: %s", e)
-
-        # V1.6-B default 08:00/23:00 tasks.
-        tz = timezone(timedelta(hours=8))
-        now = now_dt or datetime.now(tz)
-        if now.tzinfo is None:
-            now = now.replace(tzinfo=tz)
-        today = now.strftime("%Y-%m-%d")
-        task_state = await self._store.get_scheduled_task_state(user_id, bot_id)
-
-        if getattr(settings, "scheduled_morning_enabled", True):
-            due_dt = self._scheduled_due_datetime(now, getattr(settings, "scheduled_morning_time", "08:00"))
-            if settings.quiet_hours_enabled and self._in_sleep_hours(
-                {"start": settings.quiet_hours_start, "end": settings.quiet_hours_end},
-                debug_now=due_dt,
-            ):
-                due_dt = self._quiet_hours_end_datetime(due_dt, settings.quiet_hours_end)
-            if now >= due_dt and task_state.get("default_morning_date") != today:
-                await self._store.update_scheduled_task_state(
-                    user_id, bot_id,
-                    {"default_morning_date": today, "default_morning_status": "claimed"},
-                )
-                return {
-                    "kind": "default_morning",
-                    "impulse": self._build_default_scheduled_impulse(user_id, now_ts, "SCHEDULED_GREETING"),
-                }
-
-        if getattr(settings, "scheduled_night_enabled", True):
-            due_dt = self._scheduled_due_datetime(now, getattr(settings, "scheduled_night_time", "23:00"))
-            if now >= due_dt and task_state.get("default_night_date") != today:
-                quiet_now = settings.quiet_hours_enabled and self._in_sleep_hours(
-                    {"start": settings.quiet_hours_start, "end": settings.quiet_hours_end},
-                    debug_now=now,
-                )
-                await self._store.update_scheduled_task_state(
-                    user_id, bot_id,
-                    {
-                        "default_night_date": today,
-                        "default_night_status": "skipped_quiet_hours" if quiet_now else "claimed",
-                    },
-                )
-                if quiet_now:
-                    return None
-                return {
-                    "kind": "default_night",
-                    "impulse": self._build_default_scheduled_impulse(user_id, now_ts, "SCHEDULED_SUMMARY"),
-                }
-
-        return None
+    # v4.0 removed: _claim_next_scheduled_impulse
 
     def _scheduled_due_datetime(self, now: datetime, hhmm: str) -> datetime:
         try:
@@ -506,69 +270,9 @@ class ProactiveScheduler:
             end_dt += timedelta(days=1)
         return end_dt
 
-    def _build_default_scheduled_impulse(
-        self, user_id: str, now_ts: float, impulse_type: str,
-    ) -> dict[str, Any]:
-        is_morning = impulse_type == "SCHEDULED_GREETING"
-        summary = "morning default scheduled greeting" if is_morning else "night default scheduled summary"
-        return {
-            "impulse_id": f"{impulse_type.lower()}_{user_id}_{int(now_ts * 1000)}",
-            "impulse_type": impulse_type,
-            "proactive_chain_id": f"chain_scheduled_{int(now_ts * 1000)}",
-            "trigger_reason_summary": summary,
-            "trigger_mode": "scheduled",
-            "trigger_kind": "scheduled",
-            "trigger_source": impulse_type,
-            "evidence_pack": {
-                "source_topic_id": "",
-                "source_message_ids": [],
-                "recent_proactive_messages": [],
-                "relationship_temperature": None,
-                "topic_snapshot": "morning greeting" if is_morning else "night summary",
-            },
-            "dedupe_key": f"{impulse_type.lower()}_{user_id}_{int(now_ts / 86400)}",
-            "reply_window_seconds": 86400,
-            "max_wechat_reply": int(
-                self._config.get("proactive", {})
-                .get("turn", {})
-                .get("default_max_wechat_reply_per_turn", 3)
-            ),
-            "_source_ts": now_ts,
-        }
+    # v4.0 removed: _build_default_scheduled_impulse
 
-    def _build_dynamic_scheduled_impulse(
-        self, user_id: str, now_ts: float, task: dict[str, Any],
-    ) -> dict[str, Any]:
-        messages = task.get("messages") or []
-        first = messages[0] if messages and isinstance(messages[0], dict) else {}
-        text = str(first.get("text", "") or first.get("message", "") or "")[:500]
-        title = str(first.get("title", "") or "")[:80]
-        task_id = str(task.get("id", ""))
-        return {
-            "impulse_id": f"scheduled_task_{task_id or int(now_ts * 1000)}",
-            "impulse_type": "SCHEDULED_TASK",
-            "proactive_chain_id": f"chain_scheduled_task_{task_id or int(now_ts * 1000)}",
-            "trigger_reason_summary": title or text or "dynamic scheduled trigger",
-            "trigger_mode": "scheduled",
-            "trigger_kind": "scheduled",
-            "trigger_source": "schedule_wake_up",
-            "scheduled_task_id": task_id,
-            "evidence_pack": {
-                "source_topic_id": "",
-                "source_message_ids": [],
-                "recent_proactive_messages": [],
-                "relationship_temperature": None,
-                "topic_snapshot": text,
-            },
-            "dedupe_key": f"scheduled_task_{task_id}",
-            "reply_window_seconds": 86400,
-            "max_wechat_reply": int(
-                self._config.get("proactive", {})
-                .get("turn", {})
-                .get("default_max_wechat_reply_per_turn", 3)
-            ),
-            "_source_ts": now_ts,
-        }
+    # v4.0 removed: _build_dynamic_scheduled_impulse
 
     async def _mark_dynamic_scheduled_result(self, task_id: str, result: Any) -> None:
         try:
@@ -584,11 +288,10 @@ class ProactiveScheduler:
     async def _check_eligibility(
         self, user_id: str, bot_id: str,
     ) -> tuple[bool, str]:
-        """Run all eligibility pre-checks (no LLM).
+        """Run eligibility pre-checks (no LLM).
 
-        v1.6-A: User message quiet window and min_interval removed.
-        Frequency is now controlled by last_visible_message_at + intensity profile.
-        Uses proactive settings (runtime_settings.json or config.yaml fallback).
+        v4.0: Frequency is controlled by cold-start 2min + intensity range.
+        No optional/required thresholds.
 
         Returns (eligible: bool, block_reason: str).
         """
@@ -678,67 +381,8 @@ class ProactiveScheduler:
         except Exception:
             return False
 
-    # ══════════════════════════════════════════════════════════════
-    # v1.6-A: trigger mode determination
-    # ══════════════════════════════════════════════════════════════
-
-    async def _determine_trigger_mode(
-        self, user_id: str, bot_id: str, settings: ProactiveSettings,
-    ) -> tuple[str | None, str | None, dict[str, Any] | None]:
-        """Based on last_visible_message_at + intensity profile.
-
-        Returns (trigger_mode, block_reason, context_meta):
-          - ("optional", None, {...})  → trigger allowed, skip_proactive OK
-          - ("required", None, {...})  → trigger required, skip_proactive forbidden
-          - (None, "too_early", None)  → not yet time
-          - (None, "no_visible_message_yet", None) → no visible message recorded
-        """
-        if self._store is None:
-            return (None, "no_store", None)
-
-        last_visible_reason = ""
-        try:
-            if hasattr(self._store, "resolve_last_visible_message_at"):
-                resolved = await self._store.resolve_last_visible_message_at(user_id, bot_id)
-                last_visible = _safe_float(resolved.get("timestamp"), 0.0)
-                last_visible_reason = str(resolved.get("reason", ""))
-            else:
-                last_visible = _safe_float(
-                    await self._store.get_last_visible_message_at(user_id, bot_id),
-                    0.0,
-                )
-        except Exception as e:
-            logger.warning("trigger_mode: last_visible resolve failed: %s", e)
-            last_visible = 0.0
-            last_visible_reason = "missing_last_visible_message_at"
-
-        if last_visible <= 0:
-            return (None, "no_visible_message_yet", None)
-
-        elapsed = time.time() - last_visible
-        intensity = settings.autonomous_intensity
-        profile = get_intensity_profile(intensity)
-
-        optional_after = int(profile.get("optional_after_minutes", 120)) * 60
-        required_after = int(profile.get("required_after_minutes", 180)) * 60
-
-        # Build context meta used for proactive turn context
-        context_meta = {
-            "last_visible_message_at": last_visible,
-            "last_visible_message_reason": last_visible_reason,
-            "elapsed_since_last_visible_message_seconds": int(elapsed),
-            "trigger_kind": "autonomous",
-        }
-
-        if elapsed >= required_after:
-            context_meta["trigger_mode"] = "required"
-            context_meta["trigger_source"] = "REQUIRED_PRESENCE"
-            return ("required", None, context_meta)
-        elif elapsed >= optional_after:
-            context_meta["trigger_mode"] = "optional"
-            return ("optional", None, context_meta)  # trigger_source filled by impulse pipeline
-        else:
-            return (None, "too_early", None)
+    # v4.0 removed: v1.6-A trigger mode determination
+    # v4.0 removed: _determine_trigger_mode
 
     def _eligibility_fail(self, reason: str) -> dict[str, Any]:
         """Record eligibility failure metric and return skipped result."""
@@ -746,336 +390,28 @@ class ProactiveScheduler:
         self.eligibility_fail_reasons[reason] = self.eligibility_fail_reasons.get(reason, 0) + 1
         return {"status": "skipped", "reason": reason}
 
-    # ══════════════════════════════════════════════════════════════
-    # Phase 6: Impulse generation / dedup / expire / score / select
-    # ══════════════════════════════════════════════════════════════
+    # v4.0 removed: Phase 6: Impulse generation / dedup / expire / score / select
+    # v4.0 removed: _select_impulse
 
-    async def _select_impulse(
-        self, user_id: str, bot_id: str,
-    ) -> dict[str, Any] | None:
-        """Select the best impulse candidate via rule-based pipeline.
+    # v4.0 removed: _generate_impulse_candidates
 
-        v3.1 §6: No LLM calls — pure rule-based generation.
-        Steps: generate → dedup → expire → score → select best.
-        """
-        candidates = await self._generate_impulse_candidates(user_id, bot_id)
-        if not candidates:
-            return None
+    # v4.0 removed: _resolve_presence_last_interaction
 
-        # Deduplicate by dedupe_key
-        candidates = self._dedup_candidates(candidates)
-        if not candidates:
-            return None
+    # v4.0 removed: ECHO generation
+    # v4.0 removed: _EMOTION_KEYWORDS
+    # v4.0 removed: _generate_echo_impulses
 
-        # Expire old candidates
-        candidates = self._expire_candidates(candidates)
-        if not candidates:
-            return None
+    # v4.0 removed: TOPIC_CONTINUE generation
+    # v4.0 removed: _generate_topic_impulses
 
-        # Score and select best
-        scored = self._score_candidates(candidates)
-        best = self._select_best(scored)
-        if not best:
-            return None
+    # v4.0 removed: PRESENCE impulse
+    # v4.0 removed: _build_presence_impulse
 
-        logger.info(
-            "proactive_scheduler: selected impulse type=%s score=%.1f candidates=%d",
-            best.get("impulse_type"), best.get("_score", 0), len(candidates),
-        )
-        return best
+    # v4.0 removed: SCHEDULED_RITUAL impulse
+    # v4.0 removed: _build_ritual_impulse
 
-    async def _generate_impulse_candidates(
-        self, user_id: str, bot_id: str,
-    ) -> list[dict[str, Any]]:
-        """Generate impulse candidates from rule-based sources.
-
-        v3.1 §6.1: Four impulse types, no LLM:
-          ECHO — recent user messages contain emotional keywords
-          TOPIC_CONTINUE — active_topics has unclosed topics
-          PRESENCE — time since last interaction > threshold
-          SCHEDULED_RITUAL — scheduled time reached
-
-        Max 1 per type, max 3 total per check.
-        """
-        cfg = self._config.get("proactive", {})
-        max_total = int(cfg.get("impulse", {}).get("max_candidates_per_check", 3))
-        max_per_type = int(cfg.get("impulse", {}).get("max_per_type", 1))
-        settings = self._get_settings()
-        intensity_profile = get_intensity_profile(settings.autonomous_intensity)
-        presence_threshold_s = int(intensity_profile.get("optional_after_minutes", 120)) * 60
-        now_ts = time.time()
-        tz = timezone(timedelta(hours=8))
-        now_dt = datetime.now(tz)
-
-        candidates: list[dict[str, Any]] = []
-
-        # ── ECHO: recent user messages with emotional keywords ──
-        if self._store and len(candidates) < max_total:
-            try:
-                history = await self._store.get_recent_conversation_history(
-                    user_id, limit=6, bot_id=bot_id,
-                )
-                echo_candidates = self._generate_echo_impulses(
-                    history, user_id, now_ts, max_per_type,
-                )
-                candidates.extend(echo_candidates[:max_per_type])
-            except Exception as e:
-                logger.warning("proactive_scheduler: ECHO generation failed: %s", e)
-
-        # ── TOPIC_CONTINUE: unclosed active topics ──
-        # Phase 6: topics are looked up individually since store has get_active_topic(id).
-        # Phase 7+ can add a list-active-topics query.
-        if self._store and len(candidates) < max_total:
-            try:
-                # Try to get dialogue_state's last_active_topic_id
-                ds = await self._store.get_dialogue_state(user_id, bot_id)
-                topic_id = str(ds.get("active_topic_id", "")) if ds else ""
-                if topic_id:
-                    topic = await self._store.get_active_topic(topic_id)
-                    if topic and not topic.get("closed_at"):
-                        topic_candidates = self._generate_topic_impulses(
-                            [topic], user_id, now_ts, max_per_type,
-                        )
-                        candidates.extend(topic_candidates[:max_per_type])
-            except Exception as e:
-                logger.warning("proactive_scheduler: TOPIC_CONTINUE generation failed: %s", e)
-
-        # ── PRESENCE: time since last visible interaction ──
-        if len(candidates) < max_total:
-            try:
-                presence_state = await self._resolve_presence_last_interaction(user_id, bot_id)
-                last_interaction = _safe_float(presence_state.get("timestamp"), 0.0)
-                presence_reason = str(presence_state.get("reason") or "")
-                if not presence_state.get("eligible", False):
-                    logger.info(
-                        "proactive_scheduler: PRESENCE skipped reason=%s last_visible=%.3f",
-                        presence_reason or "missing_last_visible_message_at",
-                        last_interaction,
-                    )
-                    last_interaction = 0.0
-                if last_interaction > 0 and (now_ts - last_interaction) >= presence_threshold_s:
-                    impulse = self._build_presence_impulse(user_id, now_ts, last_interaction)
-                    impulse["presence_reason"] = presence_reason
-                    candidates.append(impulse)
-                elif last_interaction > 0:
-                    logger.info(
-                        "proactive_scheduler: PRESENCE skipped reason=too_recent elapsed_seconds=%d threshold_seconds=%d",
-                        int(now_ts - last_interaction),
-                        presence_threshold_s,
-                    )
-            except Exception as e:
-                logger.warning("proactive_scheduler: PRESENCE generation failed: %s", e)
-
-        # ── SCHEDULED_RITUAL: due-time check ──
-        if self._store and len(candidates) < max_total:
-            try:
-                ps = await self._store.get_proactive_schedule_state(user_id, bot_id)
-                next_due = float(ps.get("next_due_ts", 0)) if ps else 0
-                if next_due > 0 and now_ts >= next_due:
-                    candidates.append(self._build_ritual_impulse(
-                        user_id, now_ts, ps,
-                    ))
-            except Exception as e:
-                logger.warning("proactive_scheduler: SCHEDULED_RITUAL generation failed: %s", e)
-
-        return candidates[:max_total]
-
-    async def _resolve_presence_last_interaction(
-        self, user_id: str, bot_id: str,
-    ) -> dict[str, Any]:
-        if self._store is None:
-            return {
-                "timestamp": 0.0,
-                "reason": "missing_last_visible_message_at",
-                "eligible": False,
-            }
-
-        if hasattr(self._store, "resolve_last_visible_message_at"):
-            resolved = await self._store.resolve_last_visible_message_at(user_id, bot_id)
-            ts = _safe_float(resolved.get("timestamp"), 0.0)
-            reason = str(resolved.get("reason") or "missing_last_visible_message_at")
-        else:
-            ts = _safe_float(await self._store.get_last_visible_message_at(user_id, bot_id), 0.0)
-            reason = "existing_last_visible_message_at" if ts > 0 else "missing_last_visible_message_at"
-
-        if ts <= 0:
-            return {"timestamp": 0.0, "reason": reason, "eligible": False}
-        if reason in {"no_visible_message_yet", "missing_last_visible_message_at"}:
-            return {"timestamp": ts, "reason": reason, "eligible": False}
-        return {"timestamp": ts, "reason": reason, "eligible": True}
-
-    # ── ECHO generation ─────────────────────────────────────────
-
-    _EMOTION_KEYWORDS = [
-        "开心", "难过", "烦", "累", "困", "无聊", "生气", "焦虑",
-        "紧张", "兴奋", "期待", "失望", "孤独", "想", "好想",
-        "哈哈", "唉", "哎", "嗯", "……",
-    ]
-
-    def _generate_echo_impulses(
-        self, history: list[dict], user_id: str, now_ts: float, max_count: int,
-    ) -> list[dict[str, Any]]:
-        """Generate ECHO impulses from recent user messages containing emotional keywords."""
-        candidates = []
-        recent_user_msgs = [
-            m for m in history[-6:]
-            if m.get("role") == "user"
-        ]
-        for msg in recent_user_msgs[-3:]:  # last 3 user messages
-            content = str(msg.get("content", ""))[:200]
-            ts = float(msg.get("ts", 0))
-            if any(kw in content for kw in self._EMOTION_KEYWORDS):
-                candidates.append({
-                    "impulse_id": f"echo_{user_id}_{int(ts * 1000) if ts else int(now_ts * 1000)}",
-                    "impulse_type": "ECHO",
-                    "proactive_chain_id": f"chain_echo_{int(now_ts * 1000)}",
-                    "trigger_reason_summary": f"用户最近消息包含情绪表达：{content[:60]}",
-                    "evidence_pack": {
-                        "source_topic_id": "",
-                        "source_message_ids": [str(msg.get("id", ""))],
-                        "recent_proactive_messages": [],
-                        "relationship_temperature": None,
-                        "topic_snapshot": f"最近用户消息：{content[:80]}",
-                    },
-                    "dedupe_key": f"echo_{user_id}_{ts}",
-                    "reply_window_seconds": 14400,
-                    "max_wechat_reply": int(
-                        self._config.get("proactive", {})
-                        .get("turn", {})
-                        .get("default_max_wechat_reply_per_turn", 3)
-                    ),
-                    "_source_ts": ts,
-                })
-                if len(candidates) >= max_count:
-                    break
-        return candidates
-
-    # ── TOPIC_CONTINUE generation ────────────────────────────────
-
-    def _generate_topic_impulses(
-        self, topics: list[dict], user_id: str, now_ts: float, max_count: int,
-    ) -> list[dict[str, Any]]:
-        """Generate TOPIC_CONTINUE impulses from unclosed active topics."""
-        candidates = []
-        for topic in topics[:max_count]:
-            topic_id = str(topic.get("id", ""))
-            topic_name = str(topic.get("topic_name", ""))
-            topic_snapshot = str(topic.get("snapshot", ""))
-            candidates.append({
-                "impulse_id": f"topic_{topic_id}_{int(now_ts * 1000)}",
-                "impulse_type": "TOPIC_CONTINUE",
-                "proactive_chain_id": f"chain_topic_{topic_id}",
-                "trigger_reason_summary": f"未关闭的话题：{topic_name}",
-                "evidence_pack": {
-                    "source_topic_id": topic_id,
-                    "source_message_ids": [],
-                    "recent_proactive_messages": [],
-                    "relationship_temperature": None,
-                    "topic_snapshot": topic_snapshot[:200] if topic_snapshot else topic_name,
-                },
-                "dedupe_key": f"topic_{user_id}_{topic_id}",
-                "reply_window_seconds": 28800,
-                "max_wechat_reply": int(
-                    self._config.get("proactive", {})
-                    .get("turn", {})
-                    .get("default_max_wechat_reply_per_turn", 3)
-                ),
-                "_source_ts": now_ts,
-            })
-        return candidates
-
-    # ── PRESENCE impulse ─────────────────────────────────────────
-
-    def _build_presence_impulse(
-        self, user_id: str, now_ts: float, last_interaction: float,
-    ) -> dict[str, Any]:
-        """Build a PRESENCE impulse when user has been away for a while."""
-        gap_minutes = int((now_ts - last_interaction) / 60)
-        return {
-            "impulse_id": f"presence_{user_id}_{int(now_ts * 1000)}",
-            "impulse_type": "PRESENCE",
-            "proactive_chain_id": f"chain_presence_{int(now_ts * 1000)}",
-            "trigger_reason_summary": f"距上次互动已过 {gap_minutes} 分钟，检查是否适合联系",
-            "evidence_pack": {
-                "source_topic_id": "",
-                "source_message_ids": [],
-                "recent_proactive_messages": [],
-                "relationship_temperature": None,
-                "topic_snapshot": "",
-            },
-            "dedupe_key": f"presence_{user_id}_{int(now_ts / 3600)}",  # hourly dedup
-            "reply_window_seconds": 43200,
-            "max_wechat_reply": int(
-                self._config.get("proactive", {})
-                .get("turn", {})
-                .get("default_max_wechat_reply_per_turn", 3)
-            ),
-            "_source_ts": now_ts,
-        }
-
-    # ── SCHEDULED_RITUAL impulse ─────────────────────────────────
-
-    def _build_ritual_impulse(
-        self, user_id: str, now_ts: float, schedule_state: dict,
-    ) -> dict[str, Any]:
-        """Build a SCHEDULED_RITUAL impulse from due-time schedule."""
-        return {
-            "impulse_id": f"ritual_{user_id}_{int(now_ts * 1000)}",
-            "impulse_type": "SCHEDULED_RITUAL",
-            "proactive_chain_id": f"chain_ritual_{int(now_ts * 1000)}",
-            "trigger_reason_summary": "定时触发的主动消息",
-            "evidence_pack": {
-                "source_topic_id": "",
-                "source_message_ids": [],
-                "recent_proactive_messages": [],
-                "relationship_temperature": None,
-                "topic_snapshot": str(schedule_state.get("intent_hint", "")),
-            },
-            "dedupe_key": f"ritual_{user_id}_{int(now_ts / 3600)}",
-            "reply_window_seconds": 86400,
-            "max_wechat_reply": int(
-                self._config.get("proactive", {})
-                .get("turn", {})
-                .get("default_max_wechat_reply_per_turn", 3)
-            ),
-            "_source_ts": now_ts,
-        }
-
-    # ── v1.6-A: Required impulse + context enrichment ────────────
-
-    def _build_required_impulse(
-        self, user_id: str, context_meta: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Build REQUIRED_PRESENCE impulse when elapsed >= required_after."""
-        now_ts = time.time()
-        return {
-            "impulse_id": f"required_{user_id}_{int(now_ts * 1000)}",
-            "impulse_type": "REQUIRED_PRESENCE",
-            "proactive_chain_id": f"chain_required_{int(now_ts * 1000)}",
-            "trigger_reason_summary": "超过当前强度的最迟触发时间",
-            "trigger_mode": "required",
-            "trigger_kind": "autonomous",
-            "trigger_source": "REQUIRED_PRESENCE",
-            "evidence_pack": {
-                "source_topic_id": "",
-                "source_message_ids": [],
-                "recent_proactive_messages": [],
-                "relationship_temperature": None,
-                "topic_snapshot": "",
-            },
-            "dedupe_key": f"required_{user_id}_{int(now_ts / 3600)}",
-            "reply_window_seconds": 43200,
-            "max_wechat_reply": int(
-                self._config.get("proactive", {})
-                .get("turn", {})
-                .get("default_max_wechat_reply_per_turn", 3)
-            ),
-            "last_visible_message_at": context_meta.get("last_visible_message_at", 0),
-            "elapsed_since_last_visible_message_seconds": context_meta.get(
-                "elapsed_since_last_visible_message_seconds", 0,
-            ),
-            "_source_ts": now_ts,
-        }
+    # v4.0 removed: v1.6-A required impulse
+    # v4.0 removed: _build_required_impulse
 
     def _enrich_impulse_with_context(
         self, impulse: dict[str, Any], history: list[dict],
@@ -1128,93 +464,14 @@ class ProactiveScheduler:
             "不要编造用户正在做什么",
         ]
 
-    # ── Dedup / Expire / Score / Select ──────────────────────────
+    # v4.0 removed: Dedup / Expire / Score / Select pipeline
+    # v4.0 removed: _dedup_candidates
 
-    def _dedup_candidates(
-        self, candidates: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        """Remove duplicate candidates by dedupe_key."""
-        seen: set[str] = set()
-        unique = []
-        for c in candidates:
-            key = str(c.get("dedupe_key", ""))
-            if key and key not in seen:
-                seen.add(key)
-                unique.append(c)
-        dedup_count = len(candidates) - len(unique)
-        if dedup_count > 0:
-            logger.info("proactive_scheduler: dedup removed %d candidates", dedup_count)
-        return unique
+    # v4.0 removed: _expire_candidates
 
-    def _expire_candidates(
-        self, candidates: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        """Expire candidates past their TTL."""
-        cfg = self._config.get("proactive", {})
-        ttl_map = cfg.get("impulse", {}).get("default_ttl_hours", {
-            "ECHO": 4, "TOPIC_CONTINUE": 8, "PRESENCE": 12, "SCHEDULED_RITUAL": 24,
-        })
-        now_ts = time.time()
-        valid = []
-        for c in candidates:
-            impulse_type = str(c.get("impulse_type", ""))
-            source_ts = float(c.get("_source_ts", now_ts))
-            ttl_hours = float(ttl_map.get(impulse_type, 24))
-            if (now_ts - source_ts) < (ttl_hours * 3600):
-                valid.append(c)
-        expired = len(candidates) - len(valid)
-        if expired > 0:
-            logger.info("proactive_scheduler: expired %d candidates", expired)
-        return valid
+    # v4.0 removed: _score_candidates
 
-    def _score_candidates(
-        self, candidates: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        """Score candidates with fixed base + adjustments.
-
-        v3.1 §6.2: Simplified scoring:
-          ECHO: base 60 + content length bonus (up to 20)
-          TOPIC_CONTINUE: base 70 + topic freshness (up to 15)
-          PRESENCE: base 50 + gap duration bonus (up to 30)
-          SCHEDULED_RITUAL: base 80
-        """
-        now_ts = time.time()
-        for c in candidates:
-            impulse_type = str(c.get("impulse_type", ""))
-            base = 50
-
-            if impulse_type == "ECHO":
-                base = 60
-                content = str(c.get("evidence_pack", {}).get("topic_snapshot", ""))
-                base += min(20, len(content) // 5)
-            elif impulse_type == "TOPIC_CONTINUE":
-                base = 70
-                source_ts = float(c.get("_source_ts", now_ts))
-                freshness_hours = (now_ts - source_ts) / 3600
-                base += max(0, 15 - int(freshness_hours))
-            elif impulse_type == "PRESENCE":
-                base = 50
-                source_ts = float(c.get("_source_ts", now_ts))
-                gap_hours = (now_ts - source_ts) / 3600
-                base += min(30, int(gap_hours * 2))
-            elif impulse_type == "SCHEDULED_RITUAL":
-                base = 80
-
-            c["_score"] = float(base)
-
-        return sorted(candidates, key=lambda c: c.get("_score", 0), reverse=True)
-
-    def _select_best(
-        self, scored: list[dict[str, Any]],
-    ) -> dict[str, Any] | None:
-        """Select the highest-scoring candidate. Removes _score and _source_ts."""
-        if not scored:
-            return None
-        # Sort by score descending (defensive — caller may have already sorted)
-        best = max(scored, key=lambda c: c.get("_score", 0))
-        # Return a copy with internal fields cleaned
-        result = {k: v for k, v in best.items() if k not in ("_score", "_source_ts")}
-        return result
+    # v4.0 removed: _select_best
 
     # ══════════════════════════════════════════════════════════════
     # Phase 7: Relationship temperature
@@ -1503,12 +760,11 @@ class ProactiveScheduler:
                     if simulate_user_silent_seconds is not None:
                         last_visible = effective_now_ts - simulate_user_silent_seconds
                     elapsed_s = int(effective_now_ts - last_visible)
-                    intensity = settings.autonomous_intensity
-                    profile = get_intensity_profile(intensity)
-                    if elapsed_s >= profile.get("required_after_minutes", 180) * 60:
-                        trigger_mode = "required"
-                    elif elapsed_s >= profile.get("optional_after_minutes", 120) * 60:
-                        trigger_mode = "optional"
+                    # v4.0: cold-start at hardcoded 2 minutes
+                    if elapsed_s >= self.COLD_START_SECONDS:
+                        trigger_mode = "cold_start"
+                    else:
+                        trigger_mode = None
             except Exception:
                 pass
 
@@ -1530,168 +786,9 @@ class ProactiveScheduler:
             "intensity": settings.autonomous_intensity,
         }
 
-    async def run_debug_impulse_pipeline(
-        self,
-        user_id: str,
-        bot_id: str,
-        *,
-        forced_impulse_type: str = "AUTO",
-        debug_now: Any = None,
-    ) -> dict[str, Any]:
-        """Run impulse generation pipeline for debug console. Does NOT call LLM.
+    # v4.0 removed: run_debug_impulse_pipeline
 
-        forced_impulse_type:
-          "AUTO" → full pipeline (generate all types → dedup → expire → score → select)
-          "ECHO" / "TOPIC_CONTINUE" / "PRESENCE" / "SCHEDULED_RITUAL" →
-            only generate that type, still go through dedup/expire/score/select.
-
-        Returns {"eligible": bool, "candidates": [...], "selected": {...}|None,
-                 "filtering_dedup": {...}, "filtering_expire": {...},
-                 "filtering_score": {...}, "filtering_threshold": {...},
-                 "selection_reason": str}.
-        """
-        # Eligibility must pass first
-        eligibility = await self.run_debug_eligibility(
-            user_id, bot_id, debug_now=debug_now,
-        )
-        if not eligibility["eligible"]:
-            return {
-                "eligible": False,
-                "candidates": [],
-                "selected": None,
-                "filtering_dedup": {},
-                "filtering_expire": {},
-                "filtering_score": {},
-                "filtering_threshold": {},
-                "selection_reason": eligibility["final_reason"],
-            }
-
-        # Generate candidates — if forced, only generate that type
-        if forced_impulse_type == "AUTO":
-            candidates = await self._generate_impulse_candidates(user_id, bot_id)
-        else:
-            candidates = await self._generate_forced_impulse_candidates(
-                user_id, bot_id, forced_impulse_type,
-            )
-
-        if not candidates:
-            return {
-                "eligible": True,
-                "candidates": [],
-                "selected": None,
-                "filtering_dedup": {"input": 0, "output": 0, "removed": []},
-                "filtering_expire": {"input": 0, "output": 0, "removed": []},
-                "filtering_score": {"input": 0, "scored": []},
-                "filtering_threshold": {"min_score": 0, "passed": False},
-                "selection_reason": "no candidates generated",
-            }
-
-        # Dedup
-        before_dedup = len(candidates)
-        candidates = self._dedup_candidates(candidates)
-        dedup_info = {
-            "input": before_dedup,
-            "output": len(candidates),
-            "removed": before_dedup - len(candidates),
-        }
-
-        # Expire
-        before_expire = len(candidates)
-        candidates = self._expire_candidates(candidates)
-        expire_info = {
-            "input": before_expire,
-            "output": len(candidates),
-            "removed": before_expire - len(candidates),
-        }
-
-        # Score
-        scored = self._score_candidates(candidates)
-        score_info = {
-            "input": len(candidates),
-            "scored": [
-                {"type": c.get("impulse_type", "?"), "score": c.get("_score", 0)}
-                for c in scored
-            ],
-        }
-
-        # Threshold (min score = 0 for now, always pass)
-        threshold_info = {"min_score": 0, "passed": len(scored) > 0}
-
-        # Select best
-        selected = self._select_best(scored)
-
-        return {
-            "eligible": True,
-            "candidates": [
-                {
-                    "type": c.get("impulse_type", ""),
-                    "score": c.get("_score", 0) if "_score" in c else None,
-                    "reason": c.get("trigger_reason_summary", ""),
-                    "selected": selected is not None and c is selected,
-                }
-                for c in candidates
-            ],
-            "selected": selected,
-            "filtering_dedup": dedup_info,
-            "filtering_expire": expire_info,
-            "filtering_score": score_info,
-            "filtering_threshold": threshold_info,
-            "selection_reason": "" if selected else "no candidate passed score threshold",
-        }
-
-    async def _generate_forced_impulse_candidates(
-        self, user_id: str, bot_id: str, impulse_type: str,
-    ) -> list[dict[str, Any]]:
-        """Generate candidates for a single forced impulse type.
-
-        v2.1: Only limits the source type. The result still goes through
-        dedup/expire/score/select in run_debug_impulse_pipeline().
-        """
-        now_ts = time.time()
-        if impulse_type == "ECHO":
-            if self._store:
-                try:
-                    history = await self._store.get_recent_conversation_history(
-                        user_id, limit=6, bot_id=bot_id,
-                    )
-                    return self._generate_echo_impulses(history, user_id, now_ts, 3)
-                except Exception:
-                    pass
-            return []
-        elif impulse_type == "TOPIC_CONTINUE":
-            if self._store:
-                try:
-                    ds = await self._store.get_dialogue_state(user_id, bot_id)
-                    topic_id = str(ds.get("active_topic_id", "")) if ds else ""
-                    if topic_id:
-                        topic = await self._store.get_active_topic(topic_id)
-                        if topic and not topic.get("closed_at"):
-                            return self._generate_topic_impulses([topic], user_id, now_ts, 1)
-                except Exception:
-                    pass
-            return []
-        elif impulse_type == "PRESENCE":
-            presence_state = await self._resolve_presence_last_interaction(user_id, bot_id)
-            last_interaction = _safe_float(presence_state.get("timestamp"), 0.0)
-            if not presence_state.get("eligible", False):
-                logger.info(
-                    "proactive_debug: forced PRESENCE skipped reason=%s last_visible=%.3f",
-                    presence_state.get("reason", "missing_last_visible_message_at"),
-                    last_interaction,
-                )
-                return []
-            impulse = self._build_presence_impulse(user_id, now_ts, last_interaction)
-            impulse["presence_reason"] = str(presence_state.get("reason") or "")
-            return [impulse]
-        elif impulse_type == "SCHEDULED_RITUAL":
-            ps = {}
-            if self._store:
-                try:
-                    ps = await self._store.get_proactive_schedule_state(user_id, bot_id) or {}
-                except Exception:
-                    pass
-            return [self._build_ritual_impulse(user_id, now_ts, ps)]
-        return []
+    # v4.0 removed: _generate_forced_impulse_candidates
 
     async def run_debug_turn(
         self,
