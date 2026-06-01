@@ -2213,11 +2213,11 @@ def _get_proactive_allowed_tools(turn: TurnScratchpad) -> list[str]:
 
     if delivered == 0:
         if trigger_mode == "required":
-            return ["wechat_reply"] + fact_tools
+            return ["wechat_reply", "schedule_wake_up"] + fact_tools
         else:
-            return ["wechat_reply", "skip_proactive"] + fact_tools
+            return ["wechat_reply", "skip_proactive", "schedule_wake_up"] + fact_tools
     else:
-        return ["wechat_reply", "done"] + fact_tools
+        return ["wechat_reply", "done", "schedule_wake_up"] + fact_tools
 
 
 def _validate_proactive_tool_constraints(
@@ -2262,133 +2262,101 @@ def _validate_proactive_tool_constraints(
 
 
 def _build_proactive_context_system_message(turn: TurnScratchpad) -> str:
-    """Build the proactive context system message injected for proactive turns.
+    """Build proactive context system message from snapshot + transcript.
 
-    v3.1: This is an independent system message, NOT modifying the main system prompt.
-    It tells the model this is a proactive impulse, not a user reply.
+    v4.0: Reads snapshot, min_next_minutes, max_next_minutes from impulse_meta.
+    No longer uses individual evidence_pack fields.
     """
     from datetime import datetime, timezone, timedelta
 
     meta = turn.proactive_meta or {}
-    impulse_id = str(meta.get("impulse_id", ""))
-    impulse_type = str(meta.get("impulse_type", "UNKNOWN"))
-    chain_id = str(meta.get("proactive_chain_id", impulse_id))
-    trigger_reason = str(meta.get("trigger_reason_summary", "主动触发"))
-    max_reply = int(meta.get("max_wechat_reply", 3))
+    snapshot_text = str(meta.get("snapshot", ""))
+    trigger_kind = str(meta.get("trigger_kind", "cold_start"))
+    is_wake_up = str(meta.get("trigger_mode", "")) == "required"
+    min_minutes = int(meta.get("min_next_minutes", 30))
+    max_minutes = int(meta.get("max_next_minutes", 480))
+
     delivered = turn.proactive_delivered_count
-
-    # recent_proactive_messages (only confirmed delivered)
-    evidence = meta.get("evidence_pack", {}) if isinstance(meta.get("evidence_pack"), dict) else {}
-    recent_proactive = evidence.get("recent_proactive_messages", [])
-    recent_proactive_texts = [
-        m.get("text", "") for m in recent_proactive
-        if isinstance(m, dict) and m.get("text")
-    ]
-
-    relationship_temp = evidence.get("relationship_temperature", None)
-    topic_snapshot = str(evidence.get("topic_snapshot", ""))
-    reply_window_s = int(meta.get("reply_window_seconds", 14400))
+    max_reply = int(meta.get("max_wechat_reply", 3))
 
     now = datetime.now(tz=timezone(timedelta(hours=8)))
     current_time = now.strftime("%Y年%m月%d日 %H:%M")
 
-    # allowed_tools stage info. Keep this text exactly aligned with
-    # _get_proactive_allowed_tools(); otherwise the model may choose a tool that
-    # is not exposed in the provider payload.
-    if delivered == 0 and str(meta.get("trigger_mode", "")) == "required":
-        stage_desc = "阶段A-required：尚未发送任何消息。可用工具：wechat_reply（发送消息）、get_time、get_weather。skip_proactive 和 done 不可用。"
-    elif delivered == 0:
-        stage_desc = "阶段A-optional：尚未发送任何消息。可用工具：wechat_reply（发送消息）、skip_proactive（跳过本轮）、get_time、get_weather。done 不可用。"
-    elif delivered < max_reply:
-        stage_desc = f"阶段B：已发送 {delivered} 条，最多可再发 {max_reply - delivered} 条。可用工具：wechat_reply、done"
-    else:
-        stage_desc = "阶段C：已达发送上限。只能调用 done 结束。"
+    parts = [f"现在是 {current_time}。这是一个主动回合。"]
 
-    parts = [
-        "=== 主动消息回合 ===",
-        "这是一次你主动发起的微信聊天。",
-        "当前没有新的用户消息。",
-        "你不是在回答用户。",
-        "你正在判断这个主动冲动是否适合说出口。",
-        "",
-        f"turn_source = PROACTIVE_IMPULSE",
-        f"initiator = assistant",
-        f"has_new_user_message = false",
-        f"impulse_id = {impulse_id}",
-        f"impulse_type = {impulse_type}",
-        f"proactive_chain_id = {chain_id}",
-        f"触发原因：{trigger_reason}",
-        f"当前时间：{current_time}",
-        f"回复窗口：{reply_window_s} 秒",
-        f"本轮发送上限：{max_reply} 条",
-        f"当前已送达：{delivered} 条",
-        f"当前阶段：{stage_desc}",
-    ]
-
-    if recent_proactive_texts:
+    # Snapshot context
+    if snapshot_text:
         parts.append("")
-        parts.append("近期已发送的主动消息（用户已收到）：")
-        for t in recent_proactive_texts[-5:]:
-            parts.append(f"  - {t[:120]}")
+        parts.append("[当前状态快照]")
+        parts.append(f"  {snapshot_text}")
 
-    if relationship_temp is not None:
-        parts.append(f"关系热度：{relationship_temp}")
-
-    if topic_snapshot:
-        parts.append(f"话题快照：{topic_snapshot}")
-
-    # ── v1.6-A: contextual fields for natural-feeling proactive messages ──
-    trigger_mode = str(meta.get("trigger_mode", ""))
+    # Last user message + assistant after
     last_user_msg = str(meta.get("last_user_message", ""))
     assistant_after = meta.get("assistant_messages_after_last_user", [])
-    forbidden = meta.get("forbidden_claims", [])
-    last_visible_at = meta.get("last_visible_message_at", 0)
-    elapsed_s = meta.get("elapsed_since_last_visible_message_seconds", 0)
-
-    if trigger_mode:
-        parts.append(f"触发模式：{trigger_mode}")
-    if elapsed_s > 0:
-        parts.append(f"距离上一条可见消息：{elapsed_s} 秒")
-
-    if last_user_msg:
+    if last_user_msg or assistant_after:
         parts.append("")
-        parts.append(f"[用户最后一条消息] {last_user_msg}")
-    if assistant_after:
-        parts.append("")
-        parts.append("[你随后已发送的消息]")
-        for i, m in enumerate(assistant_after):
-            parts.append(f"  {i + 1}. {m}")
+        parts.append("[最近对话]")
+        if last_user_msg:
+            parts.append(f"  用户最后一条消息: {last_user_msg[:500]}")
+        if assistant_after:
+            parts.append("  之后你说的话（用户还没回）:")
+            for i, m in enumerate(assistant_after[:6]):
+                parts.append(f"    {i + 1}. {m}")
+
+    # Tool availability
+    if delivered == 0 and not is_wake_up:
+        stage_desc = (
+            "阶段A-optional：尚未发送任何消息。可用：wechat_reply、skip_proactive、"
+            "get_time、get_weather、schedule_wake_up。done 不可用。"
+            f"如果 skip，必须在 skip_proactive 的 next_check_minutes 参数承诺下次时间"
+            f"（{min_minutes}-{max_minutes} 分钟之间）。"
+        )
+    elif delivered == 0 and is_wake_up:
+        stage_desc = (
+            "阶段A-wake-up：承诺的唤醒时间已到。必须用 wechat_reply 发送至少一条消息。"
+            "skip_proactive 不可用（你上次已承诺）。可用：wechat_reply、get_time、get_weather、"
+            "schedule_wake_up。发送后用 done(next_check_minutes=N) 设定下次时间"
+            f"（{min_minutes}-{max_minutes} 分钟之间）。"
+        )
+    elif delivered < max_reply:
+        stage_desc = (
+            f"阶段B：已发 {delivered} 条，最多再发 {max_reply - delivered} 条。"
+            f"done(next_check_minutes=N, {min_minutes}-{max_minutes}) 结束。"
+        )
+    else:
+        stage_desc = f"阶段C：已达上限 {max_reply} 条。done(next_check_minutes=N) 结束。"
 
     parts.append("")
-    parts.append("[对话边界]")
-    parts.append("  上方 role=assistant 的历史消息都是你已经说过的话，不是用户的新回复。")
-    parts.append("  不要把自己刚发过的问题当成用户回答；不要回答自己的上一句话。")
-    parts.append("  如果用户没有回你，就按“用户暂时没回”理解。")
+    parts.append(f"[工具阶段] {stage_desc}")
 
+    # Conversation boundary
+    parts.append("")
+    parts.append("[对话边界]")
+    parts.append("  上方 role=assistant 的历史消息都是你已说过的话，不是用户的新回复。")
+    parts.append("  不要把自己刚发过的话当成用户回答。")
+    parts.append("  如果用户没有回复，就按'用户暂时没回'理解。")
+
+    # Forbidden claims
+    forbidden = meta.get("forbidden_claims", [])
     if forbidden:
         parts.append("")
         parts.append("[禁止的表达]")
         for f in forbidden:
             parts.append(f"  {f}")
 
+    # Style
     parts.append("")
-    parts.append("[风格指引]")
-    parts.append("  短一点、轻一点。像微信里等不到回复后又补了一句。")
-    parts.append("  可以顺着上一段话自然延伸，也可以轻轻转弯。")
-    parts.append("  如果你已经围绕同一个问题追问过，就不要继续重复追问；可以改成一句轻松的观察、收束或低风险转场。")
-    parts.append("  允许说“你是不是又忙去了”“那先别硬撑”“我这边也刚忙完一点”这类低事实风险的话。")
-    parts.append("  不要编造具体经历、阅读内容、新闻、计划或你刚做了什么，除非上文或工具结果明确给了依据。")
-    parts.append("  想转到天气/时间等客观话题时，优先先用 fact tool 获取依据。")
+    parts.append("[风格]")
+    parts.append("  短、轻、自然。像微信里又补了一句。")
+    parts.append("  可以顺着话题延伸，也可以轻轻转弯。")
+    parts.append("  不要追问同一件事。可以改成观察、收束或低风险转场。")
+    parts.append("  可以自然地说'你是不是在忙'、'那先别硬撑'等低事实风险的话。")
+    parts.append("  不要编造具体经历或你刚做了什么。")
+    parts.append("  转天气/时间等客观话题优先用工具获取依据。")
     parts.append("  不要像通知，不要像客服，不要像系统提醒。")
 
-    parts.append("")
-    if trigger_mode == "required":
-        parts.append("这是 required 主动回合：你必须先用 wechat_reply 发送至少一条合适的消息。")
-        parts.append("本阶段不要调用 skip_proactive，也不要在发送前调用 done。")
-    else:
-        parts.append("这是 optional 主动回合：如果现在说话价值不高，可以调用 skip_proactive。")
-    parts.append("你也可以说一句或几句，但每次只能通过 wechat_reply 发一条。")
-    parts.append("如果已经说完，请调用 done 结束。")
+    if is_wake_up:
+        parts.append("  这是你承诺的唤醒时间——必须开口。哪怕一句'还在吗'也可以。")
 
     return "\n".join(parts)
 
