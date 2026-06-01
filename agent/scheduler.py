@@ -42,6 +42,33 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _visible_transcript_items(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return user-visible chat bubbles from raw history.
+
+    Old proactive history rows may contain several delivered bubbles joined with
+    newlines. Split those rows so context metadata follows the same bubble
+    boundaries the user saw.
+    """
+    visible: list[dict[str, Any]] = []
+    for item in history or []:
+        role = str(item.get("role", ""))
+        if role not in ("user", "assistant"):
+            continue
+        content = str(item.get("content", ""))
+        if not content.strip():
+            continue
+        source = str(item.get("source", ""))
+        parts = [content]
+        if role == "assistant" and source == "assistant:proactive" and "\n" in content:
+            parts = [p.strip() for p in content.splitlines() if p.strip()]
+        for part in parts:
+            cloned = dict(item)
+            cloned["role"] = role
+            cloned["content"] = part
+            visible.append(cloned)
+    return visible
+
+
 class ProactiveScheduler:
     """主动消息调度器。
 
@@ -281,7 +308,7 @@ class ProactiveScheduler:
             if self._store:
                 try:
                     history = await self._store.get_recent_conversation_history(
-                        user_id, limit=10, bot_id=bot_id,
+                        user_id, limit=40, bot_id=bot_id,
                     )
                     self._enrich_impulse_with_context(impulse, history)
                 except Exception:
@@ -345,7 +372,7 @@ class ProactiveScheduler:
             if self._store:
                 try:
                     history = await self._store.get_recent_conversation_history(
-                        user_id, limit=10, bot_id=bot_id,
+                        user_id, limit=40, bot_id=bot_id,
                     )
                     self._enrich_impulse_with_context(impulse, history)
                 except Exception:
@@ -524,7 +551,7 @@ class ProactiveScheduler:
             "trigger_reason_summary": title or text or "dynamic scheduled trigger",
             "trigger_mode": "scheduled",
             "trigger_kind": "scheduled",
-            "trigger_source": "create_scheduled_trigger",
+            "trigger_source": "schedule_wake_up",
             "scheduled_task_id": task_id,
             "evidence_pack": {
                 "source_topic_id": "",
@@ -773,6 +800,9 @@ class ProactiveScheduler:
         cfg = self._config.get("proactive", {})
         max_total = int(cfg.get("impulse", {}).get("max_candidates_per_check", 3))
         max_per_type = int(cfg.get("impulse", {}).get("max_per_type", 1))
+        settings = self._get_settings()
+        intensity_profile = get_intensity_profile(settings.autonomous_intensity)
+        presence_threshold_s = int(intensity_profile.get("optional_after_minutes", 120)) * 60
         now_ts = time.time()
         tz = timezone(timedelta(hours=8))
         now_dt = datetime.now(tz)
@@ -823,15 +853,15 @@ class ProactiveScheduler:
                         last_interaction,
                     )
                     last_interaction = 0.0
-                presence_threshold_s = 3600  # 1 hour default
-                if last_interaction > 0 and (now_ts - last_interaction) > presence_threshold_s:
+                if last_interaction > 0 and (now_ts - last_interaction) >= presence_threshold_s:
                     impulse = self._build_presence_impulse(user_id, now_ts, last_interaction)
                     impulse["presence_reason"] = presence_reason
                     candidates.append(impulse)
                 elif last_interaction > 0:
                     logger.info(
-                        "proactive_scheduler: PRESENCE skipped reason=too_recent elapsed_seconds=%d",
+                        "proactive_scheduler: PRESENCE skipped reason=too_recent elapsed_seconds=%d threshold_seconds=%d",
                         int(now_ts - last_interaction),
+                        presence_threshold_s,
                     )
             except Exception as e:
                 logger.warning("proactive_scheduler: PRESENCE generation failed: %s", e)
@@ -1056,7 +1086,8 @@ class ProactiveScheduler:
         with non-fallback source). Dry-run / send failed / guard blocked content
         is not in conversation_history and therefore not included.
         """
-        user_msgs = [m for m in history if m.get("role") == "user"]
+        visible = _visible_transcript_items(history)
+        user_msgs = [m for m in visible if m.get("role") == "user"]
         if user_msgs:
             last_user = user_msgs[-1]
             impulse["last_user_message"] = str(last_user.get("content", ""))[:500]
@@ -1064,7 +1095,7 @@ class ProactiveScheduler:
             # Find assistant messages after the last user message
             last_user_ts = float(last_user.get("ts", 0))
             assistant_after = [
-                m for m in history
+                m for m in visible
                 if m.get("role") == "assistant"
                 and m.get("source") != "assistant:fallback"
                 and float(m.get("ts", 0)) > last_user_ts
@@ -1073,6 +1104,20 @@ class ProactiveScheduler:
                 str(m.get("content", ""))[:300]
                 for m in assistant_after[-6:]  # max 6 messages, each ≤ 300 chars
             ]
+
+        evidence = impulse.setdefault("evidence_pack", {})
+        if isinstance(evidence, dict):
+            recent_proactive = [
+                {
+                    "text": str(m.get("content", ""))[:300],
+                    "ts": float(m.get("ts", 0) or 0),
+                }
+                for m in visible
+                if m.get("role") == "assistant"
+                and str(m.get("source", "")) == "assistant:proactive"
+                and str(m.get("content", "")).strip()
+            ]
+            evidence["recent_proactive_messages"] = recent_proactive[-6:]
 
         # Forbidden claims for the model
         impulse["forbidden_claims"] = [

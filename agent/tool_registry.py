@@ -237,33 +237,46 @@ def _build_default_registries() -> None:
         tool_category="fact_tool",
     ))
 
-    # ── v1.6-C: create_scheduled_trigger — persistent state tool ──
+    # ── v4.0: schedule_wake_up — persistent state tool ──
     TOOL_REGISTRY.register(ToolDef(
-        name="create_scheduled_trigger",
+        name="schedule_wake_up",
         description=(
-            "创建一条未来主动触发任务。用于用户明确要求稍后提醒、稍后再说或在指定时间发起一次主动消息。"
-            "trigger_at 和 delay_minutes 二选一；message 描述到点后要主动说什么。"
+            "创建一个未来的唤醒任务。唤醒时 bot 会根据 message_hint 和当前上下文生成消息。"
+            "用于三种场景："
+            "1) 用户说'X分钟后提醒我' → delay_minutes=X, skip_quiet_hours=true"
+            "2) 管理台配置每日定时 → trigger_at='08:00', recurring='daily'"
+            "3) 主动消息冷场跳过 → delay_minutes=N, skip_quiet_hours=false"
+            "delay_minutes 和 trigger_at 二选一。"
         ),
         args_schema={
             "properties": {
-                "message": {
+                "message_hint": {
                     "type": "string",
-                    "description": "到点后要主动发送或围绕其生成的内容，不能为空，最多 500 字。",
-                },
-                "trigger_at": {
-                    "type": "string",
-                    "description": "ISO 8601 时间，如 2026-05-31T20:30:00+08:00。与 delay_minutes 二选一。",
+                    "description": "唤醒时给 LLM 看的备忘，描述到点后要围绕什么内容生成消息。最多 500 字。",
                 },
                 "delay_minutes": {
                     "type": "integer",
-                    "description": "从现在起延迟多少分钟触发。与 trigger_at 二选一。",
+                    "description": "从现在起延迟多少分钟唤醒。与 trigger_at 二选一。",
+                },
+                "trigger_at": {
+                    "type": "string",
+                    "description": "绝对唤醒时间。格式 HH:mm（每天）或 YYYY-MM-DDTHH:mm+08:00（一次性）。与 delay_minutes 二选一。",
+                },
+                "recurring": {
+                    "type": "string",
+                    "enum": [None, "daily"],
+                    "description": "null=一次性, 'daily'=每天同一时间重复",
+                },
+                "skip_quiet_hours": {
+                    "type": "boolean",
+                    "description": "true=勿扰期间照发（用户明确要求的提醒），false=可被勿扰延迟（默认）",
                 },
                 "title": {
                     "type": "string",
-                    "description": "可选的短标题，便于诊断。",
+                    "description": "可选短标题，便于管理台诊断",
                 },
             },
-            "required": ["message"],
+            "required": ["message_hint"],
         },
         side_effect_level="internal_message",
         native_tool_call_eligible=True,

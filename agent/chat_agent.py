@@ -606,11 +606,14 @@ class ChatAgent:
                 "content": f"用户默认天气城市：{default_city}。用户只问天气时，直接查这个城市，不要反问。",
             })
 
-        # Short-term history (with temporal dividers from augmented history)
-        recent = temporal_result.augmented_history[-24:] if len(temporal_result.augmented_history) > 24 else temporal_result.augmented_history
+        # Short-term transcript: only user-visible chat bubbles.
+        # Time gap facts stay in the temporal system message above; transcript
+        # must remain a clean user/assistant message stream.
+        transcript = _build_visible_transcript(history)
+        recent = transcript[-24:] if len(transcript) > 24 else transcript
         for h in recent:
             role = h.get("role", "user")
-            if role not in ("system", "user", "assistant"):
+            if role not in ("user", "assistant"):
                 role = "user"
             content = _format_history_entry(h)
             if content.strip():
@@ -949,7 +952,7 @@ class ChatAgent:
         # wechat_reply is registered as fact_tool but MUST NOT enter EXEC_FACT_TOOLS.
         if name in ("get_time", "get_weather"):
             return TurnState.EXEC_FACT_TOOLS
-        elif name == "create_scheduled_trigger":
+        elif name == "schedule_wake_up":
             return TurnState.EXEC_STATE_TOOL
         elif name == "wechat_reply":
             # ── v3.1: Proactive attempt counter (LLM behavior audit) ──
@@ -2029,6 +2032,37 @@ def _format_history_entry(item: dict[str, Any]) -> str:
     return content
 
 
+def _build_visible_transcript(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return model-visible transcript matching user-visible chat bubbles.
+
+    The transcript layer intentionally excludes system dividers, debug events,
+    tool traces, and metadata summaries. Older proactive rows may contain
+    several delivered bubbles joined by newlines; split those back into separate
+    assistant messages so the model sees the same bubble shape the user saw.
+    """
+    transcript: list[dict[str, Any]] = []
+    for item in history or []:
+        role = str(item.get("role", ""))
+        if role not in ("user", "assistant"):
+            continue
+
+        content = _format_history_entry(item)
+        if not content.strip():
+            continue
+
+        source = str(item.get("source", ""))
+        parts = [content]
+        if role == "assistant" and source == "assistant:proactive" and "\n" in content:
+            parts = [p.strip() for p in content.splitlines() if p.strip()]
+
+        for part in parts:
+            cloned = dict(item)
+            cloned["role"] = role
+            cloned["content"] = part
+            transcript.append(cloned)
+    return transcript
+
+
 def _extract_visible_text(content: str) -> str:
     """Extract visible text, stripping tool_call_id contamination."""
     if not content or not content.strip():
@@ -2244,9 +2278,13 @@ def _build_proactive_context_system_message(turn: TurnScratchpad) -> str:
     now = datetime.now(tz=timezone(timedelta(hours=8)))
     current_time = now.strftime("%Y年%m月%d日 %H:%M")
 
-    # allowed_tools stage info
-    if delivered == 0:
-        stage_desc = "阶段A：尚未发送任何消息。可用工具：wechat_reply（发送消息）、skip_proactive（跳过本轮）"
+    # allowed_tools stage info. Keep this text exactly aligned with
+    # _get_proactive_allowed_tools(); otherwise the model may choose a tool that
+    # is not exposed in the provider payload.
+    if delivered == 0 and str(meta.get("trigger_mode", "")) == "required":
+        stage_desc = "阶段A-required：尚未发送任何消息。可用工具：wechat_reply（发送消息）、get_time、get_weather。skip_proactive 和 done 不可用。"
+    elif delivered == 0:
+        stage_desc = "阶段A-optional：尚未发送任何消息。可用工具：wechat_reply（发送消息）、skip_proactive（跳过本轮）、get_time、get_weather。done 不可用。"
     elif delivered < max_reply:
         stage_desc = f"阶段B：已发送 {delivered} 条，最多可再发 {max_reply - delivered} 条。可用工具：wechat_reply、done"
     else:
@@ -2307,6 +2345,12 @@ def _build_proactive_context_system_message(turn: TurnScratchpad) -> str:
         for i, m in enumerate(assistant_after):
             parts.append(f"  {i + 1}. {m}")
 
+    parts.append("")
+    parts.append("[对话边界]")
+    parts.append("  上方 role=assistant 的历史消息都是你已经说过的话，不是用户的新回复。")
+    parts.append("  不要把自己刚发过的问题当成用户回答；不要回答自己的上一句话。")
+    parts.append("  如果用户没有回你，就按“用户暂时没回”理解。")
+
     if forbidden:
         parts.append("")
         parts.append("[禁止的表达]")
@@ -2316,11 +2360,19 @@ def _build_proactive_context_system_message(turn: TurnScratchpad) -> str:
     parts.append("")
     parts.append("[风格指引]")
     parts.append("  短一点、轻一点。像微信里等不到回复后又补了一句。")
-    parts.append("  可以顺着上一段话自然延伸，可以轻轻冒泡。")
+    parts.append("  可以顺着上一段话自然延伸，也可以轻轻转弯。")
+    parts.append("  如果你已经围绕同一个问题追问过，就不要继续重复追问；可以改成一句轻松的观察、收束或低风险转场。")
+    parts.append("  允许说“你是不是又忙去了”“那先别硬撑”“我这边也刚忙完一点”这类低事实风险的话。")
+    parts.append("  不要编造具体经历、阅读内容、新闻、计划或你刚做了什么，除非上文或工具结果明确给了依据。")
+    parts.append("  想转到天气/时间等客观话题时，优先先用 fact tool 获取依据。")
     parts.append("  不要像通知，不要像客服，不要像系统提醒。")
 
     parts.append("")
-    parts.append("你可以不说，调用 skip_proactive。")
+    if trigger_mode == "required":
+        parts.append("这是 required 主动回合：你必须先用 wechat_reply 发送至少一条合适的消息。")
+        parts.append("本阶段不要调用 skip_proactive，也不要在发送前调用 done。")
+    else:
+        parts.append("这是 optional 主动回合：如果现在说话价值不高，可以调用 skip_proactive。")
     parts.append("你也可以说一句或几句，但每次只能通过 wechat_reply 发一条。")
     parts.append("如果已经说完，请调用 done 结束。")
 

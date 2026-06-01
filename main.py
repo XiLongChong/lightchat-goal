@@ -30,7 +30,7 @@ from zoneinfo import ZoneInfo
 import yaml
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 # Add project root to path
@@ -82,7 +82,7 @@ if _native_override in ("true", "1", "yes", "on"):
     _ntc = cfg.setdefault("model", {}).setdefault("native_tool_calls", {})
     _ntc["chat_agent"] = True
     if not _ntc.get("allowed_tools"):
-        _ntc["allowed_tools"] = ["get_time", "get_weather", "create_scheduled_trigger"]
+        _ntc["allowed_tools"] = ["get_time", "get_weather", "schedule_wake_up"]
 RUNTIME_SETTINGS_PATH = Path("./data/runtime_settings.json")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
 ADMIN_SESSIONS: set[str] = set()
@@ -398,7 +398,7 @@ def build_system_prompt_for_turn() -> str:
     personality = _read_personality()
     default_city = cfg.get("weather", {}).get("default_city", "")
     tool_names = cfg.get("model", {}).get("native_tool_calls", {}).get(
-        "allowed_tools", ["get_time", "get_weather", "create_scheduled_trigger", "wechat_reply", "done"]
+        "allowed_tools", ["get_time", "get_weather", "schedule_wake_up", "wechat_reply", "done"]
     )
     return build_chat_system_prompt(
         persona=persona,
@@ -577,7 +577,7 @@ def _shift_due_out_of_quiet_hours(due_ts: float) -> float:
 
 def _build_state_tool_executor(user_id: str, context_token: str, bot_id: str):
     async def _exec(tool_name: str, args: dict[str, Any], turn: TurnScratchpad) -> dict[str, Any]:
-        if tool_name != "create_scheduled_trigger":
+        if tool_name != "schedule_wake_up":
             return {"status": "error", "recoverable": False, "reason": "unknown_state_tool"}
 
         message = str(args.get("message", "") or args.get("text", "") or "").strip()
@@ -636,7 +636,7 @@ def _build_state_tool_executor(user_id: str, context_token: str, bot_id: str):
                 "title": title,
                 "bot_id": bot_id,
                 "created_from_turn_id": turn.turn_id,
-                "source": "create_scheduled_trigger",
+                "source": "schedule_wake_up",
             }],
             due_at=due_at,
         )
@@ -1213,6 +1213,7 @@ def normalize_qr_payload(raw: dict) -> dict:
     svg = make_qr_svg(qr_url)
     return {
         "qrcode": qrcode,
+        "qrcode_content": qr_url,
         "qrcode_img": image,
         "qrcode_url": qr_url,
         "qrcode_svg": svg,
@@ -1246,6 +1247,26 @@ def make_qr_svg(content: str) -> str:
     qr.make(fit=True)
     img = qr.make_image(image_factory=SvgPathImage)
     return img.to_string(encoding="unicode")
+
+
+def make_qr_png(content: str) -> bytes:
+    """Render QR content to PNG bytes for browsers that cannot use raw SVG."""
+    if not content:
+        return b""
+    import qrcode
+
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=10,
+        border=2,
+    )
+    qr.add_data(content)
+    qr.make(fit=True)
+    img = qr.make_image()
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 def parse_memory_upload(filename: str, data: bytes) -> list[dict]:
@@ -1559,13 +1580,10 @@ async def health():
     return {"status": "ok", "model": model_name}
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/")
 async def landing_page():
-    """Public landing page."""
-    html_path = STATIC_DIR / "index.html"
-    if not html_path.exists():
-        raise HTTPException(status_code=404, detail="landing page not found")
-    return HTMLResponse(html_path.read_text(encoding="utf-8"))
+    """Only the admin console is kept as a UI entry point."""
+    return RedirectResponse(url="/admin", status_code=307)
 
 
 @app.get("/admin", response_class=HTMLResponse)
@@ -1577,13 +1595,10 @@ async def admin_page():
     return HTMLResponse(html_path.read_text(encoding="utf-8"))
 
 
-@app.get("/admin/proactive-test-console", response_class=HTMLResponse)
+@app.get("/admin/proactive-test-console")
 async def proactive_test_console_page():
-    """v3.1: Proactive test console — explicit path."""
-    html_path = STATIC_DIR / "proactive_test_console.html"
-    if not html_path.exists():
-        raise HTTPException(status_code=404, detail="test console not found")
-    return HTMLResponse(html_path.read_text(encoding="utf-8"))
+    """Legacy console path kept as a redirect to the single admin UI."""
+    return RedirectResponse(url="/admin", status_code=307)
 
 
 @app.get("/admin/auth/status")
@@ -2400,6 +2415,18 @@ async def wechat_deploy_start(request: Request):
     return normalize_qr_payload(qr)
 
 
+@app.get("/wechat/deploy/qr-image")
+async def wechat_deploy_qr_image(request: Request, data: str = ""):
+    """Render iLink QR content as a PNG image for the admin frontend."""
+    require_admin(request)
+    if not data:
+        raise HTTPException(status_code=400, detail="Missing data parameter")
+    png = make_qr_png(data)
+    if not png:
+        raise HTTPException(status_code=400, detail="Invalid QR content")
+    return Response(content=png, media_type="image/png")
+
+
 @app.get("/wechat/deploy/status")
 async def wechat_deploy_status(request: Request, qrcode: str):
     """Poll QR deployment status; persist credentials when confirmed."""
@@ -2561,11 +2588,11 @@ def _build_proactive_write_model_history(
             # delivered empty → no assistant:proactive written
             return
 
-        content = "\n".join(delivered_texts)
-        await append_history_async(
-            user_id, "assistant", content,
-            source="assistant:proactive", bot_id=bot_id,
-        )
+        for text in delivered_texts:
+            await append_history_async(
+                user_id, "assistant", text,
+                source="assistant:proactive", bot_id=bot_id,
+            )
         _logger = logging.getLogger("goal")
         _logger.info(
             "proactive_write_history: wrote %d delivered texts turn_id=%s terminal=%s",
