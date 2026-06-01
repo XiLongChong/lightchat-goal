@@ -324,30 +324,35 @@ def _build_default_registries() -> None:
         tool_category="terminal_tool",
     ))
 
-    # ── v3.1: skip_proactive — proactive-only terminal tool ──────
+    # ── v4.0: skip_proactive — proactive-only terminal tool ──────
     TOOL_REGISTRY.register(ToolDef(
         name="skip_proactive",
         description=(
-            "主动冲动不适合说出口时调用，跳过本次主动回合。"
+            "本轮主动消息不适合说出口时调用，跳过并同时承诺下次 check 时间。"
             "只能在尚未发送任何消息时调用（proactive_delivered_count == 0）。"
-            "已发送过消息后请用 done 结束。"
+            "必须在当前强度允许的范围内选择 next_check_minutes。"
+            "唤醒时 skip_proactive 不可用——必须开口。"
         ),
         args_schema={
             "properties": {
                 "reason": {
                     "type": "string",
                     "enum": [
-                        "insufficient_evidence", "too_soon", "too_intrusive",
-                        "low_value", "repeated", "unsafe", "user_might_be_busy",
+                        "too_soon", "too_intrusive", "low_value",
+                        "repeated", "unsafe", "user_might_be_busy",
                     ],
                     "description": "跳过原因",
+                },
+                "next_check_minutes": {
+                    "type": "integer",
+                    "description": "下次主动 check 的分钟数。必须在当前强度的 [min_minutes, max_minutes] 范围内。",
                 },
                 "note": {
                     "type": "string",
                     "description": "简短补充说明",
                 },
             },
-            "required": ["reason"],
+            "required": ["reason", "next_check_minutes"],
         },
         side_effect_level="none",
         native_tool_call_eligible=True,
