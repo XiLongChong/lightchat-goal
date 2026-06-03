@@ -1072,7 +1072,7 @@ class ChatAgent:
         )
 
         # ── Flag pending send_text_message for interrupt differentiation ──
-        if tool_name in ("wechat_reply", "send_text_message"):
+        if tool_name == "send_text_message":
             turn._has_pending_wechat_reply = True
 
         return TurnState.CLASSIFY_ONE_TOOL_CALL
@@ -1119,35 +1119,32 @@ class ChatAgent:
                 })
                 return TurnState.PROTOCOL_RETRY
 
-        # ── Name-based routing (NOT category-based) ─────────────
-        # Canonical names: send_text_message, finish_turn, skip_initiative, schedule_user_reminder
+        # ── Name-based routing (canonical names only) ────────────
         if name in ("get_time", "get_weather"):
             return TurnState.EXEC_FACT_TOOLS
-        elif name in ("schedule_wake_up", "schedule_user_reminder"):
+        elif name == "schedule_user_reminder":
             return TurnState.EXEC_STATE_TOOL
-        elif name in ("wechat_reply", "send_text_message"):
+        elif name == "send_text_message":
             # ── v3.1: Proactive attempt counter (LLM behavior audit) ──
             if turn.source == SOURCE_PROACTIVE_IMPULSE:
                 turn.proactive_attempt_count += 1
-            # Check if already at reply limit
             if turn.source == SOURCE_PROACTIVE_IMPULSE:
                 meta = turn.proactive_meta or {}
                 max_reply = int(meta.get("max_wechat_reply", 3))
                 if turn.sent_message_count >= max_reply:
                     logger.info("classify_one_tool_call: proactive send after limit sent=%d", turn.sent_message_count)
-                    turn.add_fallback_event("wechat_reply_after_limit",
+                    turn.add_fallback_event("send_text_after_limit",
                         f"sent_count={turn.sent_message_count} >= max={max_reply}")
                     return TurnState.END_PROACTIVE_MAX_REPLY_LIMIT
             elif turn.sent_message_count >= turn.max_reply_messages_per_turn:
                 logger.info("classify_one_tool_call: send after limit sent_count=%d", turn.sent_message_count)
-                turn.add_fallback_event("wechat_reply_after_limit",
+                turn.add_fallback_event("send_text_after_limit",
                     f"sent_count={turn.sent_message_count} >= max={turn.max_reply_messages_per_turn}")
                 return TurnState.END_MAX_LIMIT
             return TurnState.VALIDATE_REPLY_ARGS
-        elif name in ("done", "finish_turn"):
+        elif name == "finish_turn":
             return TurnState.VALIDATE_DONE_ARGS
-        elif name in ("skip_proactive", "skip_initiative"):
-            # Only valid in proactive phase A (delivered_count == 0)
+        elif name == "skip_initiative":
             if turn.source != SOURCE_PROACTIVE_IMPULSE:
                 turn.add_fallback_event("skip_in_non_proactive",
                     f"source={turn.source}")
@@ -1902,7 +1899,7 @@ class ChatAgent:
         else:
             skip_status = "SKIPPED_BY_MODEL"
 
-        turn.add_fallback_event("skip_proactive", f"reason={reason} status={skip_status} note={note}")
+        turn.add_fallback_event("skip_initiative", f"reason={reason} status={skip_status} note={note}")
         turn.reply_sequence_status = "skipped_proactive"
         turn._skip_status = skip_status
         logger.info("exec_skip_proactive: reason=%s status=%s sent_attempts=%d delivered=%d",
@@ -2389,12 +2386,6 @@ def _get_proactive_allowed_tools(turn: TurnScratchpad) -> list[str]:
         return ["send_text_message", "finish_turn"] + fact_tools
 
 
-# Phase 13: canonical + legacy tool name sets
-_SEND_TEXT_NAMES = frozenset({"send_text_message", "wechat_reply"})
-_FINISH_TURN_NAMES = frozenset({"finish_turn", "done"})
-_SKIP_INITIATIVE_NAMES = frozenset({"skip_initiative", "skip_proactive"})
-
-
 def _validate_proactive_tool_constraints(
     tool_name: str, turn: TurnScratchpad,
 ) -> str | None:
@@ -2415,18 +2406,18 @@ def _validate_proactive_tool_constraints(
     delivered = turn.proactive_delivered_count
 
     # finish_turn: forbidden before first delivery
-    if tool_name in _FINISH_TURN_NAMES and delivered == 0:
+    if tool_name == "finish_turn" and delivered == 0:
         if trigger_mode == "required":
             return "尚未发送任何消息，不能调用 finish_turn。必须先调用 send_text_message 发送一条消息。"
         else:
             return "尚未发送任何消息，不能调用 finish_turn。如果不想说，请调用 skip_initiative。"
 
     # skip_initiative: forbidden after first delivery
-    if tool_name in _SKIP_INITIATIVE_NAMES and delivered > 0:
+    if tool_name == "skip_initiative" and delivered > 0:
         return "已发送过消息，不能调用 skip_initiative。如果说完请调用 finish_turn。"
 
     # skip_initiative: forbidden in required trigger (any time)
-    if tool_name in _SKIP_INITIATIVE_NAMES and trigger_mode == "required":
+    if tool_name == "skip_initiative" and trigger_mode == "required":
         return "当前是最迟触发模式，不能调用 skip_initiative。必须调用 send_text_message 发送一条消息。"
 
     # fact tools: max 1 in required + delivered == 0

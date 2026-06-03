@@ -1,4 +1,4 @@
-"""Tests for v3.1 proactive message pipeline — Phase 0-4.
+﻿"""Tests for v3.1 proactive message pipeline — Phase 0-4.
 
 Covers: source constants, proactive_meta contract, skip_proactive routing,
 proactive-specific terminal states, allowed_tools phase-based filtering,
@@ -84,7 +84,7 @@ def _make_mgw(responses: list):
             idx = call_count[0]
             call_count[0] += 1
             if idx >= len(responses):
-                return _make_response("", tool_calls=[_make_tc("done", '{"status":"no_reply","note":"out of responses"}')])
+                return _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"no_reply","note":"out of responses"}')])
             return responses[idx]
 
     return _MGW()
@@ -100,7 +100,7 @@ def _make_agent(native_allowed_tools=None, test_mode=True):
         personality="",
         llm_gateway=_make_mgw([]),
         native_tool_calls=True,
-        native_allowed_tools=native_allowed_tools or ["get_time", "get_weather", "wechat_reply", "done", "skip_proactive"],
+        native_allowed_tools=native_allowed_tools or ["get_time", "get_weather", "send_text_message", "finish_turn", "skip_initiative"],
         test_mode=test_mode,
         flash_profile=ModelProfile(model_name="test-flash"),
         pro_profile=ModelProfile(model_name="test-pro"),
@@ -212,7 +212,7 @@ class TestSourceConstants:
     def test_proactive_turn_accepts_none_user_message(self):
         """v3.1 §0.4: user_message=None is valid for proactive turns."""
         responses = [
-            _make_response("", tool_calls=[_make_tc("skip_proactive", '{"reason":"too_soon"}')]),
+            _make_response("", tool_calls=[_make_tc("skip_initiative", '{"reason":"too_soon"}')]),
         ]
         mgw = _make_mgw(responses)
         agent = _make_agent()
@@ -254,24 +254,24 @@ class TestProactiveMetaContract:
 class TestSkipProactiveRegistration:
     """Phase 1.1: skip_proactive is registered as native-eligible terminal tool."""
 
-    def test_skip_proactive_registered(self):
-        t = TOOL_REGISTRY.get("skip_proactive")
+    def test_skip_initiative_registered(self):
+        t = TOOL_REGISTRY.get("skip_initiative")
         assert t is not None
         assert t.tool_category == "terminal_tool"
-        assert t.native_tool_call_eligible is False  # Phase 11: deprecated, use skip_initiative
+        assert t.native_tool_call_eligible is True  # Phase 13: canonical
 
     def test_skip_proactive_arg_schema_has_reason_required(self):
-        t = TOOL_REGISTRY.get("skip_proactive")
+        t = TOOL_REGISTRY.get("skip_initiative")
         required = t.args_schema.get("required", [])
         assert "reason" in required
 
-    def test_skip_proactive_reason_enum(self):
-        t = TOOL_REGISTRY.get("skip_proactive")
+    def test_skip_initiative_reason_enum(self):
+        t = TOOL_REGISTRY.get("skip_initiative")
         props = t.args_schema.get("properties", {})
         reason_enum = props.get("reason", {}).get("enum", [])
         assert "too_soon" in reason_enum
         assert "user_might_be_busy" in reason_enum
-        assert "next_check_minutes" in props
+        assert "next_wake_minutes" in props
 
 
 class TestSkipProactiveRouting:
@@ -280,7 +280,7 @@ class TestSkipProactiveRouting:
     def test_skip_proactive_in_proactive_turn(self):
         """skip_proactive is valid in proactive phase A."""
         responses = [
-            _make_response("", tool_calls=[_make_tc("skip_proactive", '{"reason":"low_value"}')]),
+            _make_response("", tool_calls=[_make_tc("skip_initiative", '{"reason":"low_value"}')]),
         ]
         mgw = _make_mgw(responses)
         agent = _make_agent()
@@ -299,8 +299,8 @@ class TestSkipProactiveRouting:
         """skip_proactive in non-proactive turn → PROTOCOL_RETRY."""
         # Model calls skip_proactive → PROTOCOL_RETRY → then model calls done
         responses = [
-            _make_response("", tool_calls=[_make_tc("skip_proactive", '{"reason":"low_value"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"no_reply","note":"cannot skip"}')]),
+            _make_response("", tool_calls=[_make_tc("skip_initiative", '{"reason":"low_value"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"no_reply","note":"cannot skip"}')]),
         ]
         mgw = _make_mgw(responses)
         agent = _make_agent()
@@ -318,9 +318,9 @@ class TestSkipProactiveRouting:
     def test_skip_proactive_after_delivery_rejected(self):
         """Phase 1.6: skip_proactive after delivered > 0 → PROTOCOL_RETRY."""
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"hello"}')]),
-            _make_response("", tool_calls=[_make_tc("skip_proactive", '{"reason":"too_soon"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"hello"}')]),
+            _make_response("", tool_calls=[_make_tc("skip_initiative", '{"reason":"too_soon"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
         mgw = _make_mgw(responses)
         agent = _make_agent()
@@ -346,8 +346,8 @@ class TestSkipProactiveRouting:
     def test_skip_proactive_reason_validation(self):
         """Invalid reason → PROTOCOL_RETRY."""
         responses = [
-            _make_response("", tool_calls=[_make_tc("skip_proactive", '{"reason":"invalid_reason"}')]),
-            _make_response("", tool_calls=[_make_tc("skip_proactive", '{"reason":"too_soon"}')]),
+            _make_response("", tool_calls=[_make_tc("skip_initiative", '{"reason":"invalid_reason"}')]),
+            _make_response("", tool_calls=[_make_tc("skip_initiative", '{"reason":"too_soon"}')]),
         ]
         mgw = _make_mgw(responses)
         agent = _make_agent()
@@ -369,7 +369,7 @@ class TestSkipProactiveSkipStatus:
     def test_skip_without_send_attempt_is_skipped_by_model(self):
         """No send attempts → SKIPPED_BY_MODEL."""
         responses = [
-            _make_response("", tool_calls=[_make_tc("skip_proactive", '{"reason":"too_soon"}')]),
+            _make_response("", tool_calls=[_make_tc("skip_initiative", '{"reason":"too_soon"}')]),
         ]
         mgw = _make_mgw(responses)
         agent = _make_agent()
@@ -384,15 +384,15 @@ class TestSkipProactiveSkipStatus:
         ))
         assert result.terminal_state == TurnState.END_SKIPPED_PROACTIVE
         # Check fallback events for skip status
-        skip_events = [e for e in result.fallback_events if e.get("type") == "skip_proactive"]
+        skip_events = [e for e in result.fallback_events if e.get("type") == "skip_initiative"]
         assert len(skip_events) == 1
         assert "SKIPPED_BY_MODEL" in skip_events[0]["detail"]
 
     def test_skip_after_send_failure_not_skipped_by_model(self):
         """send_attempt > 0 but delivered == 0 → SKIPPED_AFTER_SEND_FAILURE."""
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"msg1"}')]),
-            _make_response("", tool_calls=[_make_tc("skip_proactive", '{"reason":"too_soon"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"msg1"}')]),
+            _make_response("", tool_calls=[_make_tc("skip_initiative", '{"reason":"too_soon"}')]),
         ]
         mgw = _make_mgw(responses)
         agent = _make_agent()
@@ -413,7 +413,7 @@ class TestSkipProactiveSkipStatus:
             wechat_sender=failing_sender,
         ))
         assert result.terminal_state == TurnState.END_SKIPPED_PROACTIVE
-        skip_events = [e for e in result.fallback_events if e.get("type") == "skip_proactive"]
+        skip_events = [e for e in result.fallback_events if e.get("type") == "skip_initiative"]
         assert len(skip_events) == 1
         assert "SKIPPED_AFTER_SEND_FAILURE" in skip_events[0]["detail"]
 
@@ -452,7 +452,7 @@ class TestProactiveContextInjection:
     def test_proactive_context_injected(self):
         """Proactive turn gets a proactive context system message."""
         responses = [
-            _make_response("", tool_calls=[_make_tc("skip_proactive", '{"reason":"too_soon","next_check_minutes":15}')]),
+            _make_response("", tool_calls=[_make_tc("skip_initiative", '{"reason":"too_soon","next_check_minutes":15}')]),
         ]
         mgw = _make_mgw(responses)
         agent = _make_agent()
@@ -473,7 +473,7 @@ class TestProactiveContextInjection:
     def test_proactive_context_has_no_user_message(self):
         """Proactive turn messages should not include a user role entry."""
         responses = [
-            _make_response("", tool_calls=[_make_tc("skip_proactive", '{"reason":"too_soon","next_check_minutes":15}')]),
+            _make_response("", tool_calls=[_make_tc("skip_initiative", '{"reason":"too_soon","next_check_minutes":15}')]),
         ]
         mgw = _make_mgw(responses)
         agent = _make_agent()
@@ -494,7 +494,7 @@ class TestProactiveContextInjection:
     def test_proactive_context_contains_impulse_info(self):
         """Proactive context must include tool stage info."""
         responses = [
-            _make_response("", tool_calls=[_make_tc("skip_proactive", '{"reason":"too_soon","next_check_minutes":15}')]),
+            _make_response("", tool_calls=[_make_tc("skip_initiative", '{"reason":"too_soon","next_check_minutes":15}')]),
         ]
         mgw = _make_mgw(responses)
         agent = _make_agent()
@@ -515,8 +515,8 @@ class TestProactiveContextInjection:
     def test_required_context_matches_exposed_tools(self):
         """Wake-up proactive stage must not expose skip_proactive."""
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"先吃点东西，别硬撑"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied","next_check_minutes":15}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"先吃点东西，别硬撑"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied","next_check_minutes":15}')]),
         ]
         mgw = _make_mgw(responses)
         agent = _make_agent()
@@ -549,7 +549,7 @@ class TestProactiveContextInjection:
     def test_proactive_context_marks_assistant_history_as_own_messages(self):
         """Context must explicitly prevent treating prior assistant bubbles as user replies."""
         responses = [
-            _make_response("", tool_calls=[_make_tc("skip_proactive", '{"reason":"low_value","next_check_minutes":30}')]),
+            _make_response("", tool_calls=[_make_tc("skip_initiative", '{"reason":"low_value","next_check_minutes":30}')]),
         ]
         mgw = _make_mgw(responses)
         agent = _make_agent()
@@ -583,8 +583,8 @@ class TestAllowedToolsPhaseBased:
     def test_phase_a_allows_wechat_reply_and_skip_proactive(self):
         """delivered_count == 0 → [wechat_reply, skip_proactive]."""
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"msg1"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"msg1"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
         mgw = _make_mgw(responses)
         agent = _make_agent()
@@ -612,8 +612,8 @@ class TestAllowedToolsPhaseBased:
     def test_phase_a_done_is_rejected(self):
         """Phase A: calling done when delivered == 0 → PROTOCOL_RETRY."""
         responses = [
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"no_reply","note":"nothing to say"}')]),
-            _make_response("", tool_calls=[_make_tc("skip_proactive", '{"reason":"low_value"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"no_reply","note":"nothing to say"}')]),
+            _make_response("", tool_calls=[_make_tc("skip_initiative", '{"reason":"low_value"}')]),
         ]
         mgw = _make_mgw(responses)
         agent = _make_agent()
@@ -629,9 +629,9 @@ class TestAllowedToolsPhaseBased:
     def test_phase_b_allows_wechat_reply_and_done(self):
         """0 < delivered < max → [wechat_reply, done]."""
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"msg1"}')]),
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"msg2"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"msg1"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"msg2"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
         mgw = _make_mgw(responses)
         agent = _make_agent()
@@ -659,10 +659,10 @@ class TestAllowedToolsPhaseBased:
     def test_phase_c_only_done_allowed(self):
         """delivered >= max_reply → [done] only."""
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"m1"}')]),
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"m2"}')]),
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"m3"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"m1"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"m2"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"m3"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
         mgw = _make_mgw(responses)
         agent = _make_agent()
@@ -689,10 +689,10 @@ class TestAllowedToolsPhaseBased:
     def test_phase_c_wechat_reply_triggers_end_proactive_max_reply_limit(self):
         """Phase C: calling wechat_reply → END_PROACTIVE_MAX_REPLY_LIMIT."""
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"m1"}')]),
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"m2"}')]),
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"m3"}')]),
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"m4_too_many"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"m1"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"m2"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"m3"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"m4_too_many"}')]),
         ]
         mgw = _make_mgw(responses)
         agent = _make_agent()
@@ -722,7 +722,7 @@ class TestProactiveMaxLlmSteps:
         # the LLM call, so we need 9 calls to trigger (8 calls pass, 9th fails).
         responses = []
         for i in range(12):
-            responses.append(_make_response("", tool_calls=[_make_tc("wechat_reply", f'{{"text":"msg{i}"}}')]))
+            responses.append(_make_response("", tool_calls=[_make_tc("send_text_message", f'{{"text":"msg{i}"}}')]))
 
         mgw = _make_mgw(responses)
         agent = _make_agent()
@@ -795,9 +795,9 @@ class TestProactiveGuardIntegration:
     def test_guard_retry_feeds_back_to_model(self):
         """Proactive guard RETRY → feedback to model as tool result → CALL_LLM."""
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"我看到你还没睡"}')]),
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"今天天气真好"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"我看到你还没睡"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"今天天气真好"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
         mgw = _make_mgw(responses)
         agent = _make_agent()
@@ -856,9 +856,9 @@ class TestProactiveDeliveredOnlyHistory:
     def test_proactive_delivered_count_tracks_correctly(self):
         """proactive_delivered_count increments only on confirmed delivery."""
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"msg1"}')]),
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"msg2"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"msg1"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"msg2"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
         mgw = _make_mgw(responses)
         agent = _make_agent()
@@ -880,9 +880,9 @@ class TestProactiveDeliveredOnlyHistory:
     def test_proactive_delivered_texts_only_contains_delivered(self):
         """proactive_delivered_texts only stores confirmed delivered content."""
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"delivered_msg"}')]),
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"failed_msg"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"delivered_msg"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"failed_msg"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
         mgw = _make_mgw(responses)
         agent = _make_agent()
@@ -914,8 +914,8 @@ class TestProactiveDeliveredOnlyHistory:
     def test_proactive_delivered_texts_empty_when_none_delivered(self):
         """No delivery → proactive_delivered_texts is empty."""
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"failed1"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"failed","note":"send failed"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"failed1"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"failed","note":"send failed"}')]),
         ]
         mgw = _make_mgw(responses)
         agent = _make_agent()
@@ -953,9 +953,9 @@ class TestProactiveWriteHistoryCallback:
                 })
 
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"delivered1"}')]),
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"failed1"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"delivered1"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"failed1"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
         mgw = _make_mgw(responses)
         agent = _make_agent()
@@ -995,8 +995,8 @@ class TestProactiveWriteHistoryCallback:
                 history_written.append("should_not_happen")
 
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"fail"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"failed","note":"send error"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"fail"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"failed","note":"send error"}')]),
         ]
         mgw = _make_mgw(responses)
         agent = _make_agent()
@@ -1052,9 +1052,9 @@ class TestProactiveCounterIndependence:
     def test_attempt_count_increments_when_model_calls_wechat_reply(self):
         """proactive_attempt_count tracks model's wechat_reply tool calls."""
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"m1"}')]),
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"m2"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"m1"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"m2"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
         mgw = _make_mgw(responses)
         agent = _make_agent()
@@ -1076,8 +1076,8 @@ class TestProactiveCounterIndependence:
     def test_send_attempt_vs_delivered_diverge_on_failure(self):
         """send_attempt_count > delivered_count when sends fail."""
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"m1"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"failed","note":"fail"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"m1"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"failed","note":"fail"}')]),
         ]
         mgw = _make_mgw(responses)
         agent = _make_agent()
@@ -1104,11 +1104,11 @@ class TestProactiveStrictCCRegression:
 
     def test_proactive_turn_single_tool_call_per_llm_response(self):
         """v3.1 regression: multiple tool calls in one response → PROTOCOL_RETRY."""
-        tc1 = _make_tc("wechat_reply", '{"text":"m1"}', call_id="c1")
-        tc2 = _make_tc("wechat_reply", '{"text":"m2"}', call_id="c2")
+        tc1 = _make_tc("send_text_message", '{"text":"m1"}', call_id="c1")
+        tc2 = _make_tc("send_text_message", '{"text":"m2"}', call_id="c2")
         responses = [
             _make_response("", tool_calls=[tc1, tc2]),  # 2 tool calls → PROTOCOL_RETRY
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"no_reply","note":"error"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"no_reply","note":"error"}')]),
         ]
         mgw = _make_mgw(responses)
         agent = _make_agent()
@@ -1127,7 +1127,7 @@ class TestProactiveStrictCCRegression:
         tc = _make_tc("send_wechat_messages", '{"messages":["m1","m2"]}')
         responses = [
             _make_response("", tool_calls=[tc]),  # deprecated → PROTOCOL_RETRY
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"no_reply","note":"deprecated"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"no_reply","note":"deprecated"}')]),
         ]
         mgw = _make_mgw(responses)
         agent = _make_agent()
@@ -1144,7 +1144,7 @@ class TestProactiveStrictCCRegression:
         """v3.1 regression: assistant.content without tool call → PROTOCOL_RETRY."""
         responses = [
             _make_response("just plain text", tool_calls=[]),  # no tool call → PROTOCOL_RETRY
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"no_reply","note":"no content"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"no_reply","note":"no content"}')]),
         ]
         mgw = _make_mgw(responses)
         agent = _make_agent()
@@ -1185,7 +1185,7 @@ class TestProactiveTurnResultFields:
 
     def test_turn_result_has_proactive_fields(self):
         responses = [
-            _make_response("", tool_calls=[_make_tc("skip_proactive", '{"reason":"too_soon"}')]),
+            _make_response("", tool_calls=[_make_tc("skip_initiative", '{"reason":"too_soon"}')]),
         ]
         mgw = _make_mgw(responses)
         agent = _make_agent()

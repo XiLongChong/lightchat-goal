@@ -1,4 +1,4 @@
-"""Phase 1: Native tool call action tests.
+﻿"""Phase 1: Native tool call action tests.
 
 Old JSON action tests removed — no longer primary protocol.
 """
@@ -66,7 +66,7 @@ class TestSendWechatMessages:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True, routing_mode="manual_flash",
         )
         result = _run(agent)
@@ -78,8 +78,8 @@ class TestSendWechatMessages:
         """v1.5: wechat_reply sends one bubble, needs done to end."""
         call_count = [0]
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"hello"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"hello"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
         class MGW:
             def __init__(self): self.requests = []
@@ -98,7 +98,7 @@ class TestSendWechatMessages:
             model="test", persona="p", personality="",
             llm_gateway=MGW(),
             native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True, routing_mode="manual_flash",
         )
         result = _run(agent, wechat_sender=fake_sender)
@@ -114,7 +114,7 @@ class TestSendWechatMessages:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True, routing_mode="manual_flash",
         )
         result = _run(agent)
@@ -128,7 +128,7 @@ class TestSendWechatMessages:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True, routing_mode="manual_flash",
         )
         result = _run(agent)

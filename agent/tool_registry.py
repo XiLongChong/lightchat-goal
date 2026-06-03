@@ -196,11 +196,13 @@ TOOL_REGISTRY = ToolRegistry()
 
 
 def _build_default_registries() -> None:
-    """Populate the module-level registries with the v1.5 strict CC tool set.
+    """Populate the module-level registries with canonical tools.
 
-    v1.5 model-visible tools: get_time, get_weather, wechat_reply, done.
-    Old tools (send_wechat_messages, skip_reply) kept registered but
-    native_tool_call_eligible=False — they are NOT exposed to the model.
+    Phase 13: All tools use canonical names only.
+    Model-visible: send_text_message, finish_turn, skip_initiative,
+    schedule_user_reminder, get_time, get_weather, mark_reminder_delivered,
+    apply_forget_directive, generate_image_message, send_image_message,
+    send_sticker.
     """
 
     # ── Fact tools (model-visible) ──────────────────────────────
@@ -237,144 +239,7 @@ def _build_default_registries() -> None:
         tool_category="fact_tool",
     ))
 
-    # ── v4.0: schedule_wake_up — persistent state tool ──
-    TOOL_REGISTRY.register(ToolDef(
-        name="schedule_wake_up",
-        description=(
-            "创建一个未来的唤醒任务。唤醒时 bot 会根据 message_hint 和当前上下文生成消息。"
-            "用于三种场景："
-            "1) 用户说'X分钟后提醒我' → delay_minutes=X, skip_quiet_hours=true"
-            "2) 管理台配置每日定时 → trigger_at='08:00', recurring='daily'"
-            "3) 主动消息冷场跳过 → delay_minutes=N, skip_quiet_hours=false"
-            "delay_minutes 和 trigger_at 二选一。"
-        ),
-        args_schema={
-            "properties": {
-                "message_hint": {
-                    "type": "string",
-                    "description": "唤醒时给 LLM 看的备忘，描述到点后要围绕什么内容生成消息。最多 500 字。",
-                },
-                "delay_minutes": {
-                    "type": "integer",
-                    "description": "从现在起延迟多少分钟唤醒。与 trigger_at 二选一。",
-                },
-                "trigger_at": {
-                    "type": "string",
-                    "description": "绝对唤醒时间。格式 HH:mm（每天）或 YYYY-MM-DDTHH:mm+08:00（一次性）。与 delay_minutes 二选一。",
-                },
-                "recurring": {
-                    "type": "string",
-                    "enum": [None, "daily"],
-                    "description": "null=一次性, 'daily'=每天同一时间重复",
-                },
-                "skip_quiet_hours": {
-                    "type": "boolean",
-                    "description": "true=勿扰期间照发（用户明确要求的提醒），false=可被勿扰延迟（默认）",
-                },
-                "title": {
-                    "type": "string",
-                    "description": "可选短标题，便于管理台诊断",
-                },
-            },
-            "required": ["message_hint"],
-        },
-        side_effect_level="internal_message",
-        native_tool_call_eligible=False,  # Phase 11: use schedule_user_reminder instead
-        tool_category="state_tool",
-    ))
-
-    # ── v1.5: wechat_reply — [Phase 11 deprecated, use send_text_message] ──
-    TOOL_REGISTRY.register(ToolDef(
-        name="wechat_reply",
-        description=(
-            "发送一条微信消息给用户。每次调用只发送一条微信气泡。"
-            "如果想发多条微信，请多次调用此工具，每次传入一条消息。"
-            "发送成功后你会收到工具结果，然后可以决定是否继续发下一条。"
-            "text 不能包含任何换行符。"
-        ),
-        args_schema={
-            "properties": {
-                "text": {
-                    "type": "string",
-                    "description": "要发送的一条微信消息内容。不能为空。不能包含任何换行符（\\n）。想发多条请多次调用此工具。",
-                },
-            },
-            "required": ["text"],
-        },
-        side_effect_level="high",
-        requires_confirmation=False,
-        native_tool_call_eligible=False,  # Phase 11: use send_text_message instead
-        tool_category="action_tool",
-    ))
-
-    # ── v1.5: done — [Phase 11 deprecated, use finish_turn] ─────
-    TOOL_REGISTRY.register(ToolDef(
-        name="done",
-        description=(
-            "显式结束本轮对话。每轮必须以调用 done 结束。"
-            "已发过微信回复 → done(status='replied')。"
-            "判断不需要回复 → done(status='no_reply', note='原因')。"
-            "发生无法继续的错误 → done(status='failed', note='原因')。"
-        ),
-        args_schema={
-            "properties": {
-                "status": {
-                    "type": "string",
-                    "enum": ["replied", "no_reply", "failed"],
-                    "description": "replied=已回复, no_reply=不需回复, failed=失败",
-                },
-                "note": {
-                    "type": "string",
-                    "description": "简短说明。status=replied 时可省略；no_reply/failed 时必填。",
-                },
-                "next_check_minutes": {
-                    "type": "integer",
-                    "description": "仅主动回合：建议下一次主动 check 的间隔分钟数。必须在当前强度的 [min_minutes, max_minutes] 范围内。省略时系统按强度中值安排。非主动回合忽略此字段。",
-                },
-            },
-            "required": ["status"],
-        },
-        side_effect_level="none",
-        native_tool_call_eligible=False,  # Phase 11: use finish_turn instead
-        tool_category="terminal_tool",
-    ))
-
-    # ── v4.0: skip_proactive — [Phase 11 deprecated, use skip_initiative] ──
-    TOOL_REGISTRY.register(ToolDef(
-        name="skip_proactive",
-        description=(
-            "本轮主动消息不适合说出口时调用，跳过并同时承诺下次 check 时间。"
-            "只能在尚未发送任何消息时调用（proactive_delivered_count == 0）。"
-            "必须在当前强度允许的范围内选择 next_check_minutes。"
-            "唤醒时 skip_proactive 不可用——必须开口。"
-        ),
-        args_schema={
-            "properties": {
-                "reason": {
-                    "type": "string",
-                    "enum": [
-                        "too_soon", "too_intrusive", "low_value",
-                        "repeated", "unsafe", "user_might_be_busy",
-                    ],
-                    "description": "跳过原因",
-                },
-                "next_check_minutes": {
-                    "type": "integer",
-                    "description": "下次主动 check 的分钟数。必须在当前强度的 [min_minutes, max_minutes] 范围内。",
-                },
-                "note": {
-                    "type": "string",
-                    "description": "简短补充说明",
-                },
-            },
-            "required": ["reason", "next_check_minutes"],
-        },
-        side_effect_level="none",
-        native_tool_call_eligible=False,  # Phase 11: use skip_initiative instead
-        tool_category="terminal_tool",
-    ))
-
-    # ── Phase 11: canonical tool names ────────────────────────────
+    # ── Phase 13: canonical tool names only ─────────────────────────
     TOOL_REGISTRY.register(ToolDef(
         name="send_text_message",
         description="发送一条文字消息给用户。每次调用只发送一条。想发多条请多次调用。text 不能包含换行符。",
@@ -521,38 +386,6 @@ def _build_default_registries() -> None:
         native_tool_call_eligible=True,
         tool_category="action_tool",
     ))
-
-    # ── v1.5 deprecated: NOT exposed to model ───────────────────
-    # Kept registered for backward-compat diagnostics and old data readability.
-    # Models calling these → PROTOCOL_RETRY with migration hint.
-    TOOL_REGISTRY.register(ToolDef(
-        name="send_wechat_messages",
-        description="[已废弃] 请使用 wechat_reply 逐条发送，最后用 done 结束。",
-        args_schema={
-            "properties": {
-                "messages": {"type": "array", "items": {"type": "string"}},
-                "mode": {"type": "string", "enum": ["normal", "long", "short"]},
-            },
-            "required": ["messages"],
-        },
-        side_effect_level="high",
-        native_tool_call_eligible=False,           # NOT exposed to model
-        tool_category="terminal_tool",
-    ))
-    TOOL_REGISTRY.register(ToolDef(
-        name="skip_reply",
-        description="[已废弃] 请使用 done(status='no_reply', note='原因')。",
-        args_schema={
-            "properties": {
-                "reason": {"type": "string", "description": "简短说明"},
-            },
-            "required": [],
-        },
-        side_effect_level="none",
-        native_tool_call_eligible=False,           # NOT exposed to model
-        tool_category="terminal_tool",
-    ))
-
 
 # Build on import
 _build_default_registries()

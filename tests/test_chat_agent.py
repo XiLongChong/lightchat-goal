@@ -1,4 +1,4 @@
-"""Tests for JSON parser, output validation, history formatting, and Phase 1 native tools.
+﻿"""Tests for JSON parser, output validation, history formatting, and Phase 1 native tools.
 
 Phase 1: JSON action parsing tests removed - no longer primary protocol.
 """
@@ -20,28 +20,28 @@ from utils.json_parser import safe_parse_json, extract_json
 
 
 def test_extract_json_from_code_block():
-    raw = '```json\n{"actions": [], "done": true}\n```'
+    raw = '```json\n{"actions": [], "finish_turn": true}\n```'
     result = extract_json(raw)
-    assert result == '{"actions": [], "done": true}'
+    assert result == '{"actions": [], "finish_turn": true}'
 
 
 def test_extract_json_bare():
-    raw = '{"actions":[],"done":true}'
+    raw = '{"actions":[],"finish_turn":true}'
     result = extract_json(raw)
     assert result == raw
 
 
 def test_extract_json_with_text_around():
-    raw = '好的，以下是回复：\n{"actions":[{"type":"message","text":"你好"}],"done":true}'
+    raw = '好的，以下是回复：\n{"actions":[{"type":"message","text":"你好"}],"finish_turn":true}'
     result = extract_json(raw)
-    assert result == '{"actions":[{"type":"message","text":"你好"}],"done":true}'
+    assert result == '{"actions":[{"type":"message","text":"你好"}],"finish_turn":true}'
 
 
 def test_safe_parse_valid_json():
-    raw = '{"actions": [{"type": "message", "text": "hello"}], "done": true}'
+    raw = '{"actions": [{"type": "message", "text": "hello"}], "finish_turn": true}'
     result = safe_parse_json(raw)
     assert result is not None
-    assert result["done"] is True
+    assert result["finish_turn"] is True
     assert len(result["actions"]) == 1
 
 
@@ -57,10 +57,10 @@ def test_safe_parse_empty_string_returns_none():
 
 
 def test_safe_parse_trailing_comma_fix():
-    raw = '{"actions": [{"type": "message", "text": "hi"},], "done": true,}'
+    raw = '{"actions": [{"type": "message", "text": "hi"},], "finish_turn": true,}'
     result = safe_parse_json(raw)
     assert result is not None
-    assert result["done"] is True
+    assert result["finish_turn"] is True
 
 
 # ================================================================
@@ -112,7 +112,7 @@ class FakeGateway:
             raise self.error
         if self.response:
             return self.response
-        tc = _make_tc("wechat_reply", '{"text":"hello"}')
+        tc = _make_tc("send_text_message", '{"text":"hello"}')
         return _make_response("", tool_calls=[tc])
 
 
@@ -122,9 +122,9 @@ class TestWechatReplyV15:
     def test_single_wechat_reply_then_done(self):
         call_count = [0]
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"OK"}')],
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"OK"}')],
                            prompt_tokens=50, completion_tokens=10, total_tokens=60),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')],
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')],
                            prompt_tokens=60, completion_tokens=5, total_tokens=65),
         ]
         class MGW:
@@ -143,7 +143,7 @@ class TestWechatReplyV15:
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=MGW(), native_tool_calls=True,
-            native_allowed_tools=["get_time", "get_weather", "wechat_reply", "done"],
+            native_allowed_tools=["get_time", "get_weather", "send_text_message", "finish_turn"],
             test_mode=True,
         )
         import asyncio
@@ -159,10 +159,10 @@ class TestWechatReplyV15:
     def test_three_wechat_reply_then_done(self):
         call_count = [0]
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"msg1"}')]),
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"msg2"}')]),
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"msg3"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"msg1"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"msg2"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"msg3"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
         class MGW:
             def __init__(self): self.requests = []
@@ -180,7 +180,7 @@ class TestWechatReplyV15:
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=MGW(), native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True,
         )
         import asyncio
@@ -194,11 +194,11 @@ class TestWechatReplyV15:
 
     def test_done_no_reply_without_send(self):
         gw = FakeGateway(response=_make_response("", tool_calls=[
-            _make_tc("done", '{"status":"no_reply","note":"话题自然结束"}')]))
+            _make_tc("finish_turn", '{"status":"no_reply","note":"话题自然结束"}')]))
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=gw, native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True,
         )
         import asyncio
@@ -210,11 +210,11 @@ class TestWechatReplyV15:
 
     def test_done_failed(self):
         gw = FakeGateway(response=_make_response("", tool_calls=[
-            _make_tc("done", '{"status":"failed","note":"发送通道不可用"}')]))
+            _make_tc("finish_turn", '{"status":"failed","note":"发送通道不可用"}')]))
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=gw, native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True,
         )
         import asyncio
@@ -227,8 +227,8 @@ class TestWechatReplyV15:
         call_count = [0]
         responses = [
             _make_response("", tool_calls=[_make_tc("get_time", '{"timezone":"Asia/Shanghai"}')]),
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"现在是下午3点"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"现在是下午3点"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
         class MGW:
             def __init__(self): self.requests = []
@@ -247,7 +247,7 @@ class TestWechatReplyV15:
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=MGW(), native_tool_calls=True,
-            native_allowed_tools=["get_time", "wechat_reply", "done"],
+            native_allowed_tools=["get_time", "send_text_message", "finish_turn"],
             test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
@@ -266,7 +266,7 @@ class TestWechatReplyV15:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True,
         )
         import asyncio
@@ -292,7 +292,7 @@ class TestWechatReplyV15:
             model="test", persona="p", personality="",
             llm_gateway=MGW(),
             native_tool_calls=True,
-            native_allowed_tools=["get_time", "wechat_reply", "done"],
+            native_allowed_tools=["get_time", "send_text_message", "finish_turn"],
             test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
@@ -314,8 +314,8 @@ class TestPostSendThinkingDelay:
         """wechat_reply delivered → POST_SEND_THINKING_DELAY entered before next CALL_LLM."""
         call_count = [0]
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"msg1"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"msg1"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
 
         class MGW:
@@ -347,7 +347,7 @@ class TestPostSendThinkingDelay:
         agent = ProbeAgent(
             model="test", persona="p", personality="",
             llm_gateway=MGW(), native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True,
         )
         import asyncio
@@ -367,8 +367,8 @@ class TestPostSendThinkingDelay:
         """wechat_reply failed → no thinking delay, immediate re-decision."""
         call_count = [0]
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"msg1"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"failed","note":"cant send"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"msg1"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"failed","note":"cant send"}')]),
         ]
 
         class MGW:
@@ -390,7 +390,7 @@ class TestPostSendThinkingDelay:
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=MGW(), native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True,
         )
         import asyncio
@@ -411,8 +411,8 @@ class TestPostSendThinkingDelay:
         """
         call_count = [0]
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"msg1"}')]),
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"msg2"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"msg1"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"msg2"}')]),
             # should not reach here — interrupted before second CALL_LLM
         ]
 
@@ -447,7 +447,7 @@ class TestPostSendThinkingDelay:
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=MGW(), native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True,
         )
         import asyncio
@@ -468,8 +468,8 @@ class TestPostSendThinkingDelay:
         """Interrupted during reply sequence — already-sent messages are in result."""
         call_count = [0]
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"msg1"}')]),
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"msg2"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"msg1"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"msg2"}')]),
         ]
 
         class MGW:
@@ -502,7 +502,7 @@ class TestPostSendThinkingDelay:
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=MGW(), native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True,
         )
         import asyncio
@@ -533,9 +533,9 @@ class TestPostSendThinkingDelay:
         """In test_mode, POST_SEND_THINKING_DELAY is skipped entirely."""
         call_count = [0]
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"msg1"}')]),
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"msg2"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"msg1"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"msg2"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
 
         class MGW:
@@ -559,7 +559,7 @@ class TestPostSendThinkingDelay:
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=MGW(), native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True,
         )
         import asyncio
@@ -584,12 +584,12 @@ class TestPostSendThinkingDelay:
 class TestDoneNoReplyGuard:
     def test_no_reply_blocked_for_question_with_ma(self):
         """done(no_reply) rejected when user asks '吃的啥呀' (contains 啥)."""
-        tc = _make_tc("done", '{"status":"no_reply","note":"not needed"}')
+        tc = _make_tc("finish_turn", '{"status":"no_reply","note":"not needed"}')
         gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=gw, native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
@@ -602,12 +602,12 @@ class TestDoneNoReplyGuard:
 
     def test_no_reply_blocked_for_followup_question(self):
         """done(no_reply) rejected for '然后呢' (follow-up)."""
-        tc = _make_tc("done", '{"status":"no_reply","note":"not needed"}')
+        tc = _make_tc("finish_turn", '{"status":"no_reply","note":"not needed"}')
         gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=gw, native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
@@ -619,12 +619,12 @@ class TestDoneNoReplyGuard:
 
     def test_no_reply_allowed_for_goodnight(self):
         """done(no_reply) allowed for '晚安' (topic-ending signal)."""
-        tc = _make_tc("done", '{"status":"no_reply","note":"user said goodnight"}')
+        tc = _make_tc("finish_turn", '{"status":"no_reply","note":"user said goodnight"}')
         gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=gw, native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
@@ -635,12 +635,12 @@ class TestDoneNoReplyGuard:
 
     def test_no_reply_allowed_for_ok(self):
         """done(no_reply) allowed for '好的' (acknowledgment)."""
-        tc = _make_tc("done", '{"status":"no_reply","note":"user acknowledged"}')
+        tc = _make_tc("finish_turn", '{"status":"no_reply","note":"user acknowledged"}')
         gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=gw, native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
@@ -651,12 +651,12 @@ class TestDoneNoReplyGuard:
 
     def test_no_reply_blocked_for_why_question(self):
         """done(no_reply) rejected for '为啥' (why question)."""
-        tc = _make_tc("done", '{"status":"no_reply","note":"not needed"}')
+        tc = _make_tc("finish_turn", '{"status":"no_reply","note":"not needed"}')
         gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=gw, native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
@@ -689,7 +689,7 @@ class TestAssistantContentFallback:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True,
         )
         import asyncio
@@ -710,8 +710,8 @@ class TestAssistantContentFallback:
         """v1.5: wechat_reply → one send → done → END_REPLIED."""
         call_count = [0]
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"hello"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"hello"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
         class MGW:
             def __init__(self): self.requests = []
@@ -731,7 +731,7 @@ class TestAssistantContentFallback:
             model="test", persona="p", personality="",
             llm_gateway=MGW(),
             native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
@@ -759,7 +759,7 @@ class TestAssistantContentFallback:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True,
         )
         import asyncio
@@ -780,7 +780,7 @@ class TestAssistantContentFallback:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True,
         )
         import asyncio
@@ -804,8 +804,8 @@ class TestToolRetry:
         call_count = [0]
         responses = [
             _make_response("some text reply"),  # first: no tool_calls
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"retry_msg"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"retry_msg"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
 
         class MGW:
@@ -824,7 +824,7 @@ class TestToolRetry:
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=MGW(), native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
@@ -864,7 +864,7 @@ class TestToolRetry:
             user_message="你一条一条发给我", history=[], trigger="user",
         ))
         events = [e.get("type") for e in result.fallback_events]
-        assert "unroutable_tool" in events
+        assert "illegal_tool" in events  # Phase 13: unregistered
         assert result.sent_message_count == 0
 
     def test_retry_failure_then_content_fallback(self):
@@ -890,7 +890,7 @@ class TestToolRetry:
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=MGW(), native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
@@ -1029,7 +1029,7 @@ class TestHistoryLeakPrevention:
         HANDLE_MODEL_OUTPUT detects them and routes to PROTOCOL_RETRY.
         """
         from agent.chat_agent import _format_history_entry
-        raw_json = '{"actions":[{"type":"tool","name":"wechat_reply","args":{"text":"hello world","delay":0}}],"done":true}'
+        raw_json = '{"actions":[{"type":"tool","name":"send_text_message","args":{"text":"hello world","delay":0}}],"finish_turn":true}'
         result = _format_history_entry({
             "role": "assistant", "content": raw_json,
             "ts": 1717000000, "source": "assistant",
@@ -1042,7 +1042,7 @@ class TestHistoryLeakPrevention:
         from agent.context_builder import build_chat_system_prompt
         prompt = build_chat_system_prompt(
             persona="test persona", personality="casual",
-            tool_names=["get_time", "get_weather", "wechat_reply", "done"],
+            tool_names=["get_time", "get_weather", "send_text_message", "finish_turn"],
         )
         assert "history" not in prompt.lower() or "时间" in prompt
 
@@ -1057,7 +1057,7 @@ class TestHistoryLeakPrevention:
         from agent.context_builder import build_chat_system_prompt
         history_text = "user said hello yesterday"
         prompt = build_chat_system_prompt(
-            persona="p", personality="", tool_names=["wechat_reply", "done"],
+            persona="p", personality="", tool_names=["send_text_message", "finish_turn"],
         )
         assert history_text not in prompt
 
@@ -1092,12 +1092,12 @@ class TestCanonicalTranscript:
 
     def test_chat_context_uses_clean_transcript_not_augmented_history(self):
         gw = FakeGateway(response=_make_response("", tool_calls=[
-            _make_tc("done", '{"status":"no_reply","note":"ok"}')
+            _make_tc("finish_turn", '{"status":"no_reply","note":"ok"}')
         ]))
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=gw, native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True,
         )
         history = [
@@ -1191,7 +1191,7 @@ class TestSendMessagesGuard:
         from agent.output_guard import guard_send_message_batch
         result = guard_send_message_batch([
             '{"actions":[{"type":"message"}]}',
-            '{"wechat_reply":"bad"}',
+            '{"send_text_message":"bad"}',
         ])
         assert len(result.messages) == 0
         assert result.blocked_count == 2
@@ -1279,7 +1279,7 @@ class TestToolCallIdLeak:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True,
         )
         import asyncio
@@ -1307,8 +1307,8 @@ class TestTurnLifecycle:
         """v1.5: wechat_reply + done turn visits core lifecycle states."""
         call_count = [0]
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
         class MGW:
             def __init__(self): self.requests = []
@@ -1325,7 +1325,7 @@ class TestTurnLifecycle:
             model="test", persona="p", personality="",
             llm_gateway=MGW(),
             native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
@@ -1339,8 +1339,8 @@ class TestTurnLifecycle:
         """CREATE_TURN generates a non-empty interrupt_token."""
         call_count = [0]
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
         class MGW:
             def __init__(self): self.requests = []
@@ -1353,7 +1353,7 @@ class TestTurnLifecycle:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True,
         )
         import asyncio
@@ -1368,8 +1368,8 @@ class TestTurnLifecycle:
         """v1.5: OPTIONAL_PREPROCESS merges current time into messages[0] system content."""
         call_count = [0]
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
         class MGW:
             def __init__(self): self.requests = []
@@ -1387,7 +1387,7 @@ class TestTurnLifecycle:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
@@ -1412,8 +1412,8 @@ class TestToolChoice:
         """v1.5: Request with tools → tool_choice='auto' (thinking mode compat)."""
         call_count = [0]
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
 
         class MGW:
@@ -1427,7 +1427,7 @@ class TestToolChoice:
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=gw, native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
@@ -1469,8 +1469,8 @@ class TestToolChoice:
         call_count = [0]
         responses = [
             _make_response("text without tools"),  # violation
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"retry ok"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"retry ok"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
 
         class MGW:
@@ -1484,7 +1484,7 @@ class TestToolChoice:
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=gw, native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
@@ -1503,8 +1503,8 @@ class TestInterruptCheck:
         """Turn interrupted immediately after creation → END_CANCELLED."""
         call_count = [0]
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
         class MGW:
             def __init__(self): self.requests = []
@@ -1521,7 +1521,7 @@ class TestInterruptCheck:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True,
         )
         import asyncio
@@ -1535,8 +1535,8 @@ class TestInterruptCheck:
         """Always-false checker → normal completion."""
         call_count = [0]
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
         class MGW:
             def __init__(self): self.requests = []
@@ -1558,7 +1558,7 @@ class TestInterruptCheck:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True,
         )
         import asyncio
@@ -1582,7 +1582,7 @@ class TestInterruptCheck:
         responses = [
             _make_response("", tool_calls=[_make_tc("get_time", '{}')],
                            prompt_tokens=50, completion_tokens=10, total_tokens=60),
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"time"}')],
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"time"}')],
                            prompt_tokens=80, completion_tokens=10, total_tokens=90),
         ]
 
@@ -1599,7 +1599,7 @@ class TestInterruptCheck:
             model="test", persona="p", personality="",
             llm_gateway=MGW(),
             native_tool_calls=True,
-            native_allowed_tools=["get_time", "wechat_reply", "done"],
+            native_allowed_tools=["get_time", "send_text_message", "finish_turn"],
             test_mode=True,
         )
         import asyncio
@@ -1611,7 +1611,7 @@ class TestInterruptCheck:
 
     def test_interrupt_at_guard_output_cancels(self):
         """v1.5: interrupt after CALL_LLM but before send → END_SUPERSEDED_BEFORE_SEND."""
-        tc = _make_tc("wechat_reply", '{"text":"hello"}')
+        tc = _make_tc("send_text_message", '{"text":"hello"}')
         gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
         sent_msgs = []
         async def fake_sender(messages):
@@ -1629,7 +1629,7 @@ class TestInterruptCheck:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
@@ -1647,8 +1647,8 @@ class TestInterruptCheck:
         """In production (test_mode=False), missing interrupt_checker → ValueError."""
         call_count = [0]
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
         class MGW:
             def __init__(self): self.requests = []
@@ -1661,7 +1661,7 @@ class TestInterruptCheck:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=False,  # production mode, no checker provided
         )
         import asyncio
@@ -1678,8 +1678,8 @@ class TestContextErrorClassification:
         """No errors in context → continues to CALL_LLM."""
         call_count = [0]
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
         class MGW:
             def __init__(self): self.requests = []
@@ -1692,7 +1692,7 @@ class TestContextErrorClassification:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True,
         )
         import asyncio
@@ -1730,8 +1730,8 @@ class TestContextErrorClassification:
         """Empty system_prompt → warning in context_warnings, not fatal."""
         call_count = [0]
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
         class MGW:
             def __init__(self): self.requests = []
@@ -1750,7 +1750,7 @@ class TestContextErrorClassification:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True,
         )
         import asyncio
@@ -1771,8 +1771,8 @@ class TestClassifyToolError:
         call_count = [0]
         responses = [
             _make_response("", tool_calls=[_make_tc("get_time", '{}')]),
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"time ok"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"time ok"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
         class MGW:
             def __init__(self): self.requests = []
@@ -1788,7 +1788,7 @@ class TestClassifyToolError:
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=MGW(), native_tool_calls=True,
-            native_allowed_tools=["get_time", "wechat_reply", "done"],
+            native_allowed_tools=["get_time", "send_text_message", "finish_turn"],
             test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
@@ -1818,7 +1818,7 @@ class TestClassifyToolError:
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=MGW(), native_tool_calls=True,
-            native_allowed_tools=["get_time", "get_weather", "wechat_reply", "done"],
+            native_allowed_tools=["get_time", "get_weather", "send_text_message", "finish_turn"],
             test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
@@ -1894,8 +1894,8 @@ class TestProtocolHardening:
         call_count = [0]
         responses = [
             _make_response("just some text reply"),
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"retried ok"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"retried ok"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
         class MGW:
             def __init__(self): self.requests = []
@@ -1911,7 +1911,7 @@ class TestProtocolHardening:
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=MGW(), native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
@@ -1926,11 +1926,11 @@ class TestProtocolHardening:
     def test_old_json_actions_detected_as_protocol_error(self):
         """v1.5: old JSON actions format → detected → PROTOCOL_RETRY."""
         call_count = [0]
-        old_json = '{"actions": [{"type": "tool", "name": "wechat_reply", "args": {"text": "我在"}}], "done": false}'
+        old_json = '{"actions": [{"type": "tool", "name": "send_text_message", "args": {"text": "我在"}}], "finish_turn": false}'
         responses = [
             _make_response(old_json),
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
         class MGW:
             def __init__(self): self.requests = []
@@ -1946,7 +1946,7 @@ class TestProtocolHardening:
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=MGW(), native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
@@ -1969,7 +1969,7 @@ class TestProtocolHardening:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True,
         )
         import asyncio
@@ -2007,7 +2007,7 @@ class TestProtocolHardening:
             model="test", persona="p", personality="",
             llm_gateway=MGW(),
             native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True,
         )
         import asyncio
@@ -2027,8 +2027,8 @@ class TestFactToolErrors:
         call_count = [0]
         responses = [
             _make_response("", tool_calls=[_make_tc("get_weather", '{"city":"Shanghai"}')]),
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"weather ok"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"weather ok"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
         class MGW:
             def __init__(self): self.requests = []
@@ -2044,7 +2044,7 @@ class TestFactToolErrors:
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=MGW(), native_tool_calls=True,
-            native_allowed_tools=["get_weather", "wechat_reply", "done"],
+            native_allowed_tools=["get_weather", "send_text_message", "finish_turn"],
             test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
@@ -2061,7 +2061,7 @@ class TestFactToolErrors:
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=gw, native_tool_calls=True,
-            native_allowed_tools=["get_time", "get_weather", "wechat_reply", "done"],
+            native_allowed_tools=["get_time", "get_weather", "send_text_message", "finish_turn"],
             test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
@@ -2103,7 +2103,7 @@ class TestHardFallbackWithInterrupt:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True,
         )
         import asyncio
@@ -2132,7 +2132,7 @@ class TestHardFallbackWithInterrupt:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True,
         )
         import asyncio
@@ -2183,14 +2183,14 @@ class TestMessageLimitProtocolRetry:
             user_message="story please", history=[], trigger="user",
         ))
         types = [e.get("type") for e in result.fallback_events]
-        assert "unroutable_tool" in types
+        assert "illegal_tool" in types  # Phase 13: unregistered
 
     def test_single_bubble_within_limit(self):
         """v1.5: 1 wechat_reply → done → END_REPLIED, sent_count=1."""
         call_count = [0]
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"msg"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"msg"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
         class MGW:
             def __init__(self): self.requests = []
@@ -2208,7 +2208,7 @@ class TestMessageLimitProtocolRetry:
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=MGW(), native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
@@ -2223,8 +2223,8 @@ class TestMessageLimitProtocolRetry:
         """v1.5: failed send → error tool result, sent_count unchanged."""
         call_count = [0]
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"hello"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"failed","note":"send error"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"hello"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"failed","note":"send error"}')]),
         ]
         class MGW:
             def __init__(self): self.requests = []
@@ -2240,7 +2240,7 @@ class TestMessageLimitProtocolRetry:
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=MGW(), native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
@@ -2308,16 +2308,16 @@ class TestSkipReplyPath:
             user_message="晚安", history=[], trigger="user",
         ))
         types = [e.get("type") for e in result.fallback_events]
-        assert "unroutable_tool" in types
+        assert "illegal_tool" in types  # Phase 13: unregistered
 
     def test_done_no_reply_ends_no_reply(self):
         """v1.5: done(status='no_reply', note='...') → END_NO_REPLY."""
-        tc = _make_tc("done", '{"status":"no_reply","note":"user said goodnight"}')
+        tc = _make_tc("finish_turn", '{"status":"no_reply","note":"user said goodnight"}')
         gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=gw, native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
@@ -2352,8 +2352,8 @@ class TestSeqBasedInterrupt:
         """Single message with input_latest_seq=1 → not interrupted."""
         call_count = [0]
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
         class MGW:
             def __init__(self): self.requests = []
@@ -2378,7 +2378,7 @@ class TestSeqBasedInterrupt:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True,
         )
         import asyncio
@@ -2402,8 +2402,8 @@ class TestSeqBasedInterrupt:
 
         call_count = [0]
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
         class MGW:
             def __init__(self): self.requests = []
@@ -2421,7 +2421,7 @@ class TestSeqBasedInterrupt:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True,
         )
         import asyncio
@@ -2444,8 +2444,8 @@ class TestSeqBasedInterrupt:
 
         call_count = [0]
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
         class MGW:
             def __init__(self): self.requests = []
@@ -2463,7 +2463,7 @@ class TestSeqBasedInterrupt:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True,
         )
         import asyncio
@@ -2486,8 +2486,8 @@ class TestSeqBasedInterrupt:
 
         call_count = [0]
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
         class MGW:
             def __init__(self): self.requests = []
@@ -2505,7 +2505,7 @@ class TestSeqBasedInterrupt:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True,
         )
         import asyncio
@@ -2540,7 +2540,7 @@ class TestSeqBasedInterrupt:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True,
         )
         import asyncio
@@ -2561,8 +2561,8 @@ class TestModelRouting:
         """routing_mode=manual_flash → model_name=flash, reason=manual_flash."""
         call_count = [0]
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
 
         class MGW:
@@ -2583,7 +2583,7 @@ class TestModelRouting:
             model="default-model", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True,
             flash_profile=flash_p,
             pro_profile=pro_p,
@@ -2602,8 +2602,8 @@ class TestModelRouting:
         """routing_mode=manual_pro → model_name=pro, reason=manual_pro."""
         call_count = [0]
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
 
         class MGW:
@@ -2624,7 +2624,7 @@ class TestModelRouting:
             model="old", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True,
             flash_profile=flash_p,
             pro_profile=pro_p,
@@ -2643,8 +2643,8 @@ class TestModelRouting:
         """auto + short message (ChatLite) → flash."""
         call_count = [0]
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
 
         class MGW:
@@ -2665,7 +2665,7 @@ class TestModelRouting:
             model="x", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True,
             flash_profile=flash_p,
             pro_profile=pro_p,
@@ -2703,7 +2703,7 @@ class TestModelRouting:
             model="x", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True,
             flash_profile=flash_p,
             pro_profile=pro_p,
@@ -2721,8 +2721,8 @@ class TestModelRouting:
         call_count = [0]
         responses = [
             _make_response("text without tools"),  # flash violation
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"pro ok"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"pro ok"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
 
         class MGW:
@@ -2748,7 +2748,7 @@ class TestModelRouting:
             model="x", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True,
             flash_profile=flash_p,
             pro_profile=pro_p,
@@ -2770,8 +2770,8 @@ class TestModelRouting:
         """model_attempts list has entries after a turn."""
         call_count = [0]
         responses = [
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"ok"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"ok"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
 
         class MGW:
@@ -2793,7 +2793,7 @@ class TestModelRouting:
             model="x", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True,
             flash_profile=flash_p,
             pro_profile=ModelProfile(model_name="p-attempts"),

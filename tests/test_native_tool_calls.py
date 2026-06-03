@@ -1,4 +1,4 @@
-"""Phase 1: Native tool calls tests — feature flags, specs, execution, safety."""
+﻿"""Phase 1: Native tool calls tests — feature flags, specs, execution, safety."""
 
 import json
 import sys
@@ -64,11 +64,11 @@ class TestFeatureFlag:
         assert "send_email" not in names
 
     def test_send_text_message_in_specs(self):
-        """Phase 11: send_text_message is native-eligible."""
+        """Phase 13: send_text_message is canonical and native-eligible."""
         specs = _build_native_tool_specs(["send_text_message", "get_time"])
         names = {s["function"]["name"] for s in (specs or [])}
         assert "send_text_message" in names
-        assert "wechat_reply" not in names   # deprecated
+        assert "finish_turn" not in names  # not requested
 
     def test_schedule_wechat_message_not_in_specs(self):
         specs = _build_native_tool_specs(["schedule_wechat_message", "get_weather"])
@@ -134,7 +134,7 @@ class TestChatAgentPhase1:
             model="test", persona="p", personality="",
             llm_gateway=gw,
             native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True,
         )
         import asyncio
@@ -152,8 +152,8 @@ class TestChatAgentPhase1:
         call_count = [0]
         responses = [
             _make_response("", tool_calls=[_make_tc("get_time", '{}')]),
-            _make_response("", tool_calls=[_make_tc("wechat_reply", '{"text":"3pm"}')]),
-            _make_response("", tool_calls=[_make_tc("done", '{"status":"replied"}')]),
+            _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"3pm"}')]),
+            _make_response("", tool_calls=[_make_tc("finish_turn", '{"status":"replied"}')]),
         ]
 
         class MGW:
@@ -176,7 +176,7 @@ class TestChatAgentPhase1:
             model="test", persona="p", personality="",
             llm_gateway=MGW(),
             native_tool_calls=True,
-            native_allowed_tools=["get_time", "wechat_reply", "done"],
+            native_allowed_tools=["get_time", "send_text_message", "finish_turn"],
             test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
@@ -443,16 +443,8 @@ class TestToolCategorySafety:
         """send_email tool should NOT be in the registry at all."""
         assert TOOL_REGISTRY.get("send_email") is None
 
-    def test_send_wechat_messages_is_terminal(self):
-        tool = TOOL_REGISTRY.get("send_wechat_messages")
-        assert tool is not None
-        assert tool.tool_category == "terminal_tool"
-
-    def test_skip_reply_is_terminal(self):
-        tool = TOOL_REGISTRY.get("skip_reply")
-        assert tool is not None
-        assert tool.tool_category == "terminal_tool"
-
+    
+    
     def test_get_time_is_fact_tool(self):
         tool = TOOL_REGISTRY.get("get_time")
         assert tool is not None
@@ -463,11 +455,11 @@ class TestToolCategorySafety:
         assert tool is not None
         assert tool.tool_category == "fact_tool"
 
-    def test_wechat_reply_is_deprecated(self):
-        """Phase 11: wechat_reply still registered but deprecated."""
-        t = TOOL_REGISTRY.get("wechat_reply")
+    def test_send_text_message_is_canonical(self):
+        """Phase 13: send_text_message is the canonical message tool."""
+        t = TOOL_REGISTRY.get("send_text_message")
         assert t is not None
-        assert t.native_tool_call_eligible is False  # deprecated
+        assert t.native_tool_call_eligible is True  # canonical, not deprecated
 
     def test_skip_action_not_registered(self):
         """old skip action should NOT be registered."""

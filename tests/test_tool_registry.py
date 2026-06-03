@@ -1,4 +1,4 @@
-"""Tests for ActionRegistry / ToolRegistry (Phase 4B)."""
+﻿"""Tests for ActionRegistry / ToolRegistry (Phase 4B)."""
 
 import sys
 from pathlib import Path
@@ -30,9 +30,9 @@ class TestActionRegistryContent:
         names = ACTION_REGISTRY.names()
         assert len(names) == 0
 
-    def test_wechat_reply_is_in_tool_registry(self):
-        """v1.5: wechat_reply is a registered tool."""
-        assert "wechat_reply" in TOOL_REGISTRY
+    def test_send_text_message_is_in_tool_registry(self):
+        """Phase 13: send_text_message is the canonical message tool."""
+        assert "send_text_message" in TOOL_REGISTRY
 
     def test_schedule_not_in_tool_registry(self):
         assert "schedule_wechat_message" not in TOOL_REGISTRY
@@ -42,19 +42,28 @@ class TestActionRegistryContent:
 
 
 class TestToolRegistryContent:
-    def test_contains_external_tools(self):
-        """v1.6-C: 13 tools registered (11 active + 2 deprecated)."""
+    def test_contains_canonical_tools(self):
+        """Phase 13: only canonical tools registered (11 active)."""
         names = TOOL_REGISTRY.names()
         assert "get_time" in names
         assert "get_weather" in names
-        assert "wechat_reply" in names
-        assert "done" in names
-        assert "schedule_wake_up" in names
-        assert "send_wechat_messages" in names   # kept deprecated
-        assert "skip_reply" in names             # kept deprecated
+        assert "send_text_message" in names
+        assert "finish_turn" in names
+        assert "schedule_user_reminder" in names
+        assert "skip_initiative" in names
+        assert "mark_reminder_delivered" in names
+        assert "apply_forget_directive" in names
+        assert "generate_image_message" in names
+        assert "send_image_message" in names
+        assert "send_sticker" in names
         assert "search_memory" not in names
         assert "send_email" not in names
-        assert len(names) == 17  # 11 eligible + 6 deprecated
+        # Old deprecated names no longer registered
+        assert "wechat_reply" not in names
+        assert "done" not in names
+        assert "skip_proactive" not in names
+        assert "schedule_wake_up" not in names
+        assert len(names) == 11  # 11 canonical tools
 
     def test_get_weather_not_in_action_registry(self):
         assert "get_weather" not in ACTION_REGISTRY
@@ -112,44 +121,30 @@ class TestNativeEligibility:
         t = TOOL_REGISTRY.get("read_persona_file")
         assert t is None
 
-    def test_send_wechat_messages_not_native_eligible(self):
-        """v1.5: send_wechat_messages is deprecated, not native-eligible."""
-        t = TOOL_REGISTRY.get("send_wechat_messages")
-        assert t is not None
-        assert t.native_tool_call_eligible is False
-
-    def test_skip_reply_not_native_eligible(self):
-        """v1.5: skip_reply is deprecated, not native-eligible."""
-        t = TOOL_REGISTRY.get("skip_reply")
-        assert t is not None
-        assert t.native_tool_call_eligible is False
-
-    def test_wechat_reply_is_deprecated(self):
-        """Phase 11: wechat_reply is deprecated, not native-eligible."""
-        t = TOOL_REGISTRY.get("wechat_reply")
-        assert t is not None
-        assert t.native_tool_call_eligible is False
+    def test_old_names_not_registered(self):
+        """Phase 13: all old/deprecated tool names removed from registry."""
+        assert TOOL_REGISTRY.get("wechat_reply") is None
+        assert TOOL_REGISTRY.get("done") is None
+        assert TOOL_REGISTRY.get("skip_proactive") is None
+        assert TOOL_REGISTRY.get("schedule_wake_up") is None
+        assert TOOL_REGISTRY.get("skip_reply") is None
+        assert TOOL_REGISTRY.get("send_wechat_messages") is None
+        assert TOOL_REGISTRY.get("create_scheduled_trigger") is None
 
     def test_send_text_message_is_eligible(self):
-        """Phase 11: send_text_message is the canonical name."""
+        """Phase 13: send_text_message is the canonical name."""
         t = TOOL_REGISTRY.get("send_text_message")
         assert t is not None
         assert t.native_tool_call_eligible is True
 
-    def test_done_is_deprecated(self):
-        """Phase 11: done is deprecated, not native-eligible."""
-        t = TOOL_REGISTRY.get("done")
-        assert t is not None
-        assert t.native_tool_call_eligible is False
-
     def test_finish_turn_is_eligible(self):
-        """Phase 11: finish_turn is the canonical name."""
+        """Phase 13: finish_turn is the canonical name."""
         t = TOOL_REGISTRY.get("finish_turn")
         assert t is not None
         assert t.native_tool_call_eligible is True
 
     def test_get_native_tool_specs_only_eligible(self):
-        """Phase 11: eligible specs use canonical names only."""
+        """Phase 13: eligible specs use canonical names only."""
         specs = TOOL_REGISTRY.get_native_tool_specs(eligible_only=True)
         names = {s["function"]["name"] for s in specs}
         assert names == {
@@ -160,21 +155,16 @@ class TestNativeEligibility:
             "generate_image_message", "send_image_message", "send_sticker",
         }
 
-    def test_get_native_tool_specs_includes_all_when_eligible_only_false(self):
-        """Phase 11: all registered tools visible (old + new + deprecated)."""
+    def test_get_native_tool_specs_all_equal_eligible(self):
+        """Phase 13: eligible_only=False same as True when no deprecated tools."""
         specs = TOOL_REGISTRY.get_native_tool_specs(eligible_only=False)
         names = {s["function"]["name"] for s in specs}
         assert "send_text_message" in names
         assert "finish_turn" in names
         assert "skip_initiative" in names
         assert "schedule_user_reminder" in names
-        assert "wechat_reply" in names  # deprecated but still registered
-        assert "done" in names
-        assert "skip_proactive" in names
-        assert "schedule_wake_up" in names
-        assert "send_wechat_messages" in names
-        assert "skip_reply" in names
-        assert len(names) == 17  # 11 eligible + 6 deprecated
+        assert "wechat_reply" not in names
+        assert len(names) == 11  # all 11 canonical tools
 
     def test_native_specs_have_correct_structure(self):
         specs = TOOL_REGISTRY.get_native_tool_specs()
@@ -198,8 +188,8 @@ class TestSendEmailSafety:
         t = TOOL_REGISTRY.get("send_email")
         assert t is None
 
-    def test_send_wechat_messages_has_high_side_effect(self):
-        t = TOOL_REGISTRY.get("send_wechat_messages")
+    def test_send_text_message_has_high_side_effect(self):
+        t = TOOL_REGISTRY.get("send_text_message")
         assert t is not None
         assert t.side_effect_level == "high"
 
@@ -229,12 +219,11 @@ class TestRegistryMutableMetadata:
 class TestRegistryAPI:
     def test_action_registry_has(self):
         """v0.2: ActionRegistry is empty."""
-        assert not ACTION_REGISTRY.has("wechat_reply")
+        assert not ACTION_REGISTRY.has("send_text_message")
         assert not ACTION_REGISTRY.has("skip")
         assert not ACTION_REGISTRY.has("nonexistent")
 
     def test_action_registry_contains(self):
-        assert "wechat_reply" not in ACTION_REGISTRY
         assert "get_time" not in ACTION_REGISTRY
 
     def test_action_registry_get(self):
@@ -243,14 +232,14 @@ class TestRegistryAPI:
 
     def test_tool_registry_has(self):
         assert TOOL_REGISTRY.has("get_weather")
-        assert TOOL_REGISTRY.has("wechat_reply")   # v1.5
-        assert TOOL_REGISTRY.has("done")            # v1.5
+        assert TOOL_REGISTRY.has("send_text_message")
+        assert TOOL_REGISTRY.has("finish_turn")
         assert not TOOL_REGISTRY.has("nonexistent")
 
     def test_tool_registry_contains(self):
         assert "get_time" in TOOL_REGISTRY
-        assert "wechat_reply" in TOOL_REGISTRY      # v1.5
-        assert "done" in TOOL_REGISTRY              # v1.5
+        assert "send_text_message" in TOOL_REGISTRY
+        assert "finish_turn" in TOOL_REGISTRY
 
     def test_tool_registry_get(self):
         t = TOOL_REGISTRY.get("get_time")
@@ -260,34 +249,31 @@ class TestRegistryAPI:
 
     def test_is_action_helper(self):
         """v0.2: ActionRegistry empty, is_action() always False."""
-        assert not is_action("wechat_reply")
+        assert not is_action("send_text_message")
         assert not is_action("skip")
         assert not is_action("get_weather")
 
     def test_is_external_tool_helper(self):
         assert is_external_tool("get_time")
-        assert is_external_tool("send_wechat_messages")
-        assert is_external_tool("wechat_reply")    # v1.5: now a registered tool
-        assert is_external_tool("done")            # v1.5
+        assert is_external_tool("send_text_message")
+        assert is_external_tool("finish_turn")
         assert not is_external_tool("send_email")
 
     def test_get_all_tool_names_union(self):
-        """v1.6-C: 13 tools (11 active + 2 deprecated)."""
+        """Phase 13: 11 canonical tools only."""
         all_names = get_all_tool_names()
         assert "get_time" in all_names
         assert "get_weather" in all_names
-        assert "wechat_reply" in all_names
-        assert "done" in all_names
-        assert "skip_proactive" in all_names
-        assert "schedule_wake_up" in all_names
-        assert "send_wechat_messages" in all_names
-        assert "skip_reply" in all_names
+        assert "send_text_message" in all_names
+        assert "finish_turn" in all_names
+        assert "skip_initiative" in all_names
+        assert "schedule_user_reminder" in all_names
         assert "send_email" not in all_names
-        assert len(all_names) == 17  # 11 eligible + 6 deprecated
+        assert len(all_names) == 11  # 11 canonical tools
 
     def test_registry_len(self):
         assert len(ACTION_REGISTRY) == 0
-        assert len(TOOL_REGISTRY) == 17  # 11 eligible + 6 deprecated
+        assert len(TOOL_REGISTRY) == 11  # 11 canonical tools
 
     def test_empty_registry(self):
         r = ActionRegistry()
@@ -308,14 +294,12 @@ class TestRegistryAPI:
 
 class TestBackwardCompat:
     def test_tool_whitelist_is_union(self):
-        """v1.5: 6 tools in whitelist."""
+        """Phase 13: canonical tools in whitelist."""
         from agent.tools import TOOL_WHITELIST
         assert "get_time" in TOOL_WHITELIST
         assert "get_weather" in TOOL_WHITELIST
-        assert "wechat_reply" in TOOL_WHITELIST
-        assert "done" in TOOL_WHITELIST
-        assert "send_wechat_messages" in TOOL_WHITELIST
-        assert "skip_reply" in TOOL_WHITELIST
+        assert "send_text_message" in TOOL_WHITELIST
+        assert "finish_turn" in TOOL_WHITELIST
         assert "send_email" not in TOOL_WHITELIST
 
     def test_execute_tool_rejects_unknown(self):
@@ -325,13 +309,14 @@ class TestBackwardCompat:
         result = asyncio.run(execute_tool("nonexistent_tool", {}))
         assert "不在可用列表中" in result
 
-    def test_execute_tool_accepts_wechat_reply(self):
-        """v1.5: wechat_reply is a registered tool."""
+    def test_execute_tool_accepts_get_time(self):
+        """Phase 13: get_time is an external tool with executor."""
         import asyncio
         from agent.tools import execute_tool
 
-        result = asyncio.run(execute_tool("wechat_reply", {"text": "hi"}))
+        result = asyncio.run(execute_tool("get_time", {}))
         assert "错误" not in result
+        assert len(result) > 0
 
 
 if __name__ == "__main__":

@@ -45,7 +45,7 @@ def _looks_like_protocol_json(text: str) -> bool:
     lowered = sample.lower()
     if '"actions"' not in lowered and "'actions'" not in lowered:
         return False
-    if "wechat_reply" not in lowered and '"done"' not in lowered and "'done'" not in lowered:
+    if "wechat_reply" not in lowered and "send_text_message" not in lowered and '"done"' not in lowered and "'done'" not in lowered and '"finish_turn"' not in lowered and "'finish_turn'" not in lowered:
         return False
     try:
         parsed = json.loads(sample)
@@ -283,6 +283,7 @@ _PROTOCOL_LEAK_PATTERNS: list[re.Pattern] = [
     _TOOL_CALL_ID_PATTERN,
     re.compile(r'"actions"\s*:', re.IGNORECASE),
     re.compile(r'"wechat_reply"', re.IGNORECASE),
+    re.compile(r'"send_text_message"', re.IGNORECASE),
     re.compile(r'"tool_calls?"\s*:', re.IGNORECASE),
     re.compile(r'"function"\s*:', re.IGNORECASE),
     re.compile(r'{"name":\s*"(?:get_time|get_weather|send_wechat_messages|search_memory|send_email)"'),
