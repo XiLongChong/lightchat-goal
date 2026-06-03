@@ -376,6 +376,93 @@ def _build_default_registries() -> None:
         tool_category="terminal_tool",
     ))
 
+    # ── Phase 2: new-tool-name stubs (executor wiring in later phases) ──
+    TOOL_REGISTRY.register(ToolDef(
+        name="mark_reminder_delivered",
+        description="标记提醒已送达。提醒到期后发送完消息必须调用此工具标记完成。",
+        args_schema={
+            "properties": {
+                "reminder_task_id": {
+                    "type": "string",
+                    "description": "已送达的提醒任务 ID",
+                },
+            },
+            "required": ["reminder_task_id"],
+        },
+        side_effect_level="internal_message",
+        native_tool_call_eligible=True,
+        tool_category="state_tool",
+    ))
+    TOOL_REGISTRY.register(ToolDef(
+        name="apply_forget_directive",
+        description="应用用户的'别记这个'指令，屏蔽相关记忆并设置遗忘窗口。",
+        args_schema={
+            "properties": {
+                "directive_text": {
+                    "type": "string",
+                    "description": "用户要求忘记的内容描述",
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": ["local_window", "topic"],
+                    "description": "local_window=屏蔽前后几轮, topic=屏蔽整个话题类别",
+                },
+            },
+            "required": ["directive_text"],
+        },
+        side_effect_level="internal_message",
+        native_tool_call_eligible=True,
+        tool_category="state_tool",
+    ))
+    TOOL_REGISTRY.register(ToolDef(
+        name="generate_image_message",
+        description="根据描述生成一张图片并发送给用户。",
+        args_schema={
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "图片生成提示词，描述想要的图片内容",
+                },
+            },
+            "required": ["prompt"],
+        },
+        side_effect_level="high",
+        native_tool_call_eligible=True,
+        tool_category="action_tool",
+    ))
+    TOOL_REGISTRY.register(ToolDef(
+        name="send_image_message",
+        description="发送一张已有图片给用户。",
+        args_schema={
+            "properties": {
+                "image_ref": {
+                    "type": "string",
+                    "description": "图片引用地址或 ID",
+                },
+            },
+            "required": ["image_ref"],
+        },
+        side_effect_level="high",
+        native_tool_call_eligible=True,
+        tool_category="action_tool",
+    ))
+    TOOL_REGISTRY.register(ToolDef(
+        name="send_sticker",
+        description="发送一个表情包给用户。",
+        args_schema={
+            "properties": {
+                "sticker_id": {
+                    "type": "string",
+                    "description": "表情包 ID",
+                },
+            },
+            "required": ["sticker_id"],
+        },
+        side_effect_level="high",
+        native_tool_call_eligible=True,
+        tool_category="action_tool",
+    ))
+
     # ── v1.5 deprecated: NOT exposed to model ───────────────────
     # Kept registered for backward-compat diagnostics and old data readability.
     # Models calling these → PROTOCOL_RETRY with migration hint.

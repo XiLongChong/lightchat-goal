@@ -398,6 +398,8 @@ class TestToolRegistryNativeSpecs:
         assert native_names == {
             "get_time", "get_weather", "wechat_reply", "done",
             "skip_proactive", "schedule_wake_up",
+            "mark_reminder_delivered", "apply_forget_directive",
+            "generate_image_message", "send_image_message", "send_sticker",
         }
 
     def test_send_email_not_registered(self):

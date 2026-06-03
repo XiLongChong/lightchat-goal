@@ -43,7 +43,7 @@ class TestActionRegistryContent:
 
 class TestToolRegistryContent:
     def test_contains_external_tools(self):
-        """v1.6-C: 8 tools registered (6 active + 2 deprecated)."""
+        """v1.6-C: 13 tools registered (11 active + 2 deprecated)."""
         names = TOOL_REGISTRY.names()
         assert "get_time" in names
         assert "get_weather" in names
@@ -54,7 +54,7 @@ class TestToolRegistryContent:
         assert "skip_reply" in names             # kept deprecated
         assert "search_memory" not in names
         assert "send_email" not in names
-        assert len(names) == 8
+        assert len(names) == 13  # 6 original + 2 deprecated + 5 Phase 2
 
     def test_get_weather_not_in_action_registry(self):
         assert "get_weather" not in ACTION_REGISTRY
@@ -144,6 +144,8 @@ class TestNativeEligibility:
         assert names == {
             "get_time", "get_weather", "wechat_reply", "done",
             "skip_proactive", "schedule_wake_up",
+            "mark_reminder_delivered", "apply_forget_directive",
+            "generate_image_message", "send_image_message", "send_sticker",
         }
 
     def test_get_native_tool_specs_includes_all_when_eligible_only_false(self):
@@ -158,7 +160,7 @@ class TestNativeEligibility:
         assert "schedule_wake_up" in names
         assert "send_wechat_messages" in names
         assert "skip_reply" in names
-        assert len(names) == 8
+        assert len(names) == 13  # 11 active + 2 deprecated
 
     def test_native_specs_have_correct_structure(self):
         specs = TOOL_REGISTRY.get_native_tool_specs()
@@ -256,7 +258,7 @@ class TestRegistryAPI:
         assert not is_external_tool("send_email")
 
     def test_get_all_tool_names_union(self):
-        """v1.6-C: 8 tools (6 active + 2 deprecated)."""
+        """v1.6-C: 13 tools (11 active + 2 deprecated)."""
         all_names = get_all_tool_names()
         assert "get_time" in all_names
         assert "get_weather" in all_names
@@ -267,11 +269,11 @@ class TestRegistryAPI:
         assert "send_wechat_messages" in all_names
         assert "skip_reply" in all_names
         assert "send_email" not in all_names
-        assert len(all_names) == 8
+        assert len(all_names) == 13  # 11 active + 2 deprecated
 
     def test_registry_len(self):
         assert len(ACTION_REGISTRY) == 0
-        assert len(TOOL_REGISTRY) == 8
+        assert len(TOOL_REGISTRY) == 13  # 11 active + 2 deprecated
 
     def test_empty_registry(self):
         r = ActionRegistry()
