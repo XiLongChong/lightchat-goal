@@ -83,6 +83,7 @@ class ChatAgent:
         post_turn_hooks: list[PostTerminalCallback] | None = None,
         # ── Phase 12: facade injection ────────────────────────────
         tool_exposure_policy: Any = None,
+        context_builder: Any = None,
     ):
         self.llm_gateway = llm_gateway
         self.persona = persona
@@ -108,6 +109,7 @@ class ChatAgent:
 
         # ── Phase 12: facade injection ────────────────────────────
         self._tool_exposure_policy = tool_exposure_policy
+        self._context_builder = context_builder
 
     def set_interrupt_checker(self, checker: InterruptChecker | None) -> None:
         """Deprecated: use chat(interrupt_checker=...) instead.
@@ -566,12 +568,13 @@ class ChatAgent:
     ) -> TurnState:
         """BUILD_CONTEXT: assemble ContextBuildResult → CLASSIFY_CONTEXT_ERROR.
 
-        v1.2: system_prompt empty is a CONTEXT WARNING (recorded),
-        NOT a fatal error. An empty or whitespace-only system_prompt
-        that was explicitly passed in is still used. The caller
-        (main.py) is responsible for providing a non-empty prompt.
-        Only a genuinely missing/broken prompt construction is FATAL.
+        Phase 12: When context_builder is injected, delegates to ContextBuilder
+        facade. Otherwise falls back to inline context assembly.
         """
+        # ── Phase 12: Delegate to ContextBuilder facade when available ──
+        if self._context_builder is not None:
+            return self._build_context_via_facade(turn, system_prompt, history, trigger)
+
         warnings: list[dict[str, str]] = []
         fatal_error = ""
 
@@ -620,8 +623,6 @@ class ChatAgent:
             })
 
         # Short-term transcript: only user-visible chat bubbles.
-        # Time gap facts stay in the temporal system message above; transcript
-        # must remain a clean user/assistant message stream.
         transcript = _build_visible_transcript(history)
         recent = transcript[-24:] if len(transcript) > 24 else transcript
         for h in recent:
@@ -634,7 +635,6 @@ class ChatAgent:
 
         # Current user message (v3.1: skipped for proactive turns)
         if turn.source == SOURCE_PROACTIVE_IMPULSE:
-            # Proactive turns: no user message. Context is injected below.
             pass
         elif trigger == "user":
             messages.append({"role": "user", "content": turn.user_message})
@@ -652,7 +652,122 @@ class ChatAgent:
             warnings=warnings,
             fatal_error=fatal_error,
         )
-        turn._context_result = result  # transient, consumed by CLASSIFY_CONTEXT_ERROR
+        turn._context_result = result
+        return TurnState.CLASSIFY_CONTEXT_ERROR
+
+    def _build_context_via_facade(
+        self,
+        turn: TurnScratchpad,
+        system_prompt: str,
+        history: list[dict[str, Any]],
+        trigger: str,
+    ) -> TurnState:
+        """Phase 12: Build context through ContextBuilder facade.
+
+        Constructs BuildContextRequest from TurnScratchpad + ChatAgent state,
+        delegates to ContextBuilder.build(), and converts output back
+        to the messages format expected by the state machine.
+        """
+        from datetime import datetime, timezone, timedelta
+        from runtime_contracts import (
+            BuildContextRequest, SystemTime, SystemTimeBlock,
+            TurnType as RTTurnType, ConversationHistoryMessage,
+        )
+
+        warnings: list[dict[str, str]] = []
+        fatal_error = ""
+
+        # Build system prompt (same fallback logic as inline path)
+        prompt = system_prompt.strip() if system_prompt else ""
+        if not prompt:
+            prompt = self._default_system_prompt()
+
+        # ── Build simplified BuildContextRequest ──────────────────
+        _tz = timezone(timedelta(hours=8))
+        now_dt = datetime.now(tz=_tz)
+        current_user_ts = turn.input_cutoff_time if turn.input_cutoff_time > 0 else now_dt.timestamp()
+
+        # Determine turn_type
+        is_proactive = turn.source == SOURCE_PROACTIVE_IMPULSE
+        req_turn_type = RTTurnType.RELATIONSHIP_PROACTIVE if is_proactive else RTTurnType.USER_CHAT
+
+        # Build ConversationHistoryMessage list from history
+        conv_history: list = []
+        for h in (history or [])[-48:]:
+            role = str(h.get("role", ""))
+            if role not in ("user", "assistant"):
+                continue
+            content = str(h.get("content", ""))
+            if not content.strip():
+                continue
+            conv_history.append(ConversationHistoryMessage(
+                message_id=str(h.get("id", "")),
+                turn_id=str(h.get("turn_id", "")),
+                role=role,
+                content=content,
+                source=str(h.get("source", "user_message") if role == "user" else "assistant_reply"),
+                delivery_status="delivered",
+                created_at=now_dt,
+            ))
+
+        request = BuildContextRequest(
+            turn_id=turn.turn_id,
+            call_id=f"ctx_{turn.turn_id}_0",
+            turn_type=req_turn_type,
+            user_id="default",
+            bot_id="default",
+            persona=prompt,
+            system_time=SystemTime(
+                iso=now_dt.isoformat(),
+                weekday=now_dt.strftime("%A"),
+                timezone="Asia/Shanghai",
+                timestamp=now_dt.timestamp(),
+            ),
+            recent_history=conv_history,
+            fixed_system_protocol="",
+            fixed_output_protocol="",
+            fixed_tool_protocol="",
+        )
+
+        try:
+            built = self._context_builder.build(request)
+
+            # Convert BuiltContext.provider_messages to state machine format
+            messages: list[dict[str, Any]] = []
+            for pm in built.provider_messages:
+                role = str(pm.role) if hasattr(pm, 'role') else "system"
+                content = str(pm.content) if hasattr(pm, 'content') else ""
+                if content.strip():
+                    messages.append({"role": role, "content": content})
+
+            # Add user message (or proactive context) at the end
+            if turn.source == SOURCE_PROACTIVE_IMPULSE:
+                proactive_ctx = _build_proactive_context_system_message(turn)
+                messages.append({"role": "system", "content": proactive_ctx})
+            elif turn.user_message:
+                messages.append({"role": "user", "content": turn.user_message})
+
+            # Collect warnings from BuiltContext
+            for w in built.warnings:
+                warnings.append({
+                    "source": str(w.source) if hasattr(w, 'source') else "context_builder",
+                    "detail": str(w.detail) if hasattr(w, 'detail') else "",
+                })
+
+            turn.add_fallback_event("context_builder", f"built via facade, {len(messages)} messages")
+            logger.info("_build_context_via_facade: %d messages, %d blocks", len(messages), len(built.blocks))
+
+        except Exception as e:
+            logger.error("ContextBuilder.build() failed: %s, falling back to inline", e)
+            fatal_error = f"context_builder_failed: {e}"
+            messages = [{"role": "system", "content": prompt}]
+
+        result = ContextBuildResult(
+            messages=messages,
+            warnings=warnings,
+            fatal_error=fatal_error,
+        )
+        turn._context_result = result
         return TurnState.CLASSIFY_CONTEXT_ERROR
 
     # ================================================================

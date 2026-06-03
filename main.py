@@ -42,12 +42,14 @@ from agent.context_builder import compact_history, build_chat_system_prompt
 from agent.llm_gateway import LLMGateway
 from agent.llm_types import LLMRequest
 from agent.output_guard import guard_messages, guard_single_message
+from agent.runtime_context_builder import ContextBuilder
 from agent.scheduler import ProactiveScheduler
 from agent.state_machine import ModelProfile, TurnResult, TurnScratchpad, TurnState, DeliveryStatus, SOURCE_PROACTIVE_IMPULSE
 from agent.tool_exposure_policy import ToolExposurePolicy
 from agent.tools import configure_runtime, configure_tools
 from bridge.wechat_poller import WeChatBridge
 from memory.store import MemoryStore
+from runtime.chat_runtime import ChatRuntime, create_chat_runtime
 
 # ================================================================
 # Config loading
@@ -335,6 +337,11 @@ _max_upgrade = int(cfg.get("model", {}).get("max_flash_upgrade_attempts", 1) or 
 # Phase 12: ToolExposurePolicy as single source of truth for tool exposure
 _tool_exposure_policy = ToolExposurePolicy()
 
+# Phase 3+12: ContextBuilder for real context assembly
+_context_builder = ContextBuilder(
+    persona_text=f"{_read_persona()}\n\n{_read_personality()}",
+)
+
 chat_agent = ChatAgent(
     model=model_name,
     persona=_read_persona(),
@@ -357,8 +364,21 @@ chat_agent = ChatAgent(
     routing_mode=_routing_mode,
     manual_flash_allow_upgrade=_manual_upgrade,
     max_flash_upgrade_attempts=_max_upgrade,
-    # ── Phase 12: tool exposure policy ──
+    # ── Phase 12: facade injection ──
     tool_exposure_policy=_tool_exposure_policy,
+    context_builder=_context_builder,
+)
+
+# Phase 10: ChatRuntime as single entry point for /chat
+chat_runtime = create_chat_runtime(
+    user_id="",
+    bot_id=BOT_ID,
+    persona=_read_persona(),
+    personality=_read_personality(),
+    chat_agent=chat_agent,
+    context_builder=_context_builder,
+    tool_exposure_policy=_tool_exposure_policy,
+    memory_system=None,  # MemorySystem not yet wired; uses legacy MemoryHook
 )
 
 # ── v3.1: ProactiveScheduler ─────────────────────────────────────
@@ -2260,7 +2280,7 @@ async def chat(request: Request):
             # ── v1.2: Build seq-based checker (arrival already recorded outside lock) ──
             interrupt_checker = _make_interrupt_checker(user_id, input_latest_seq)
 
-            # Run Chat Agent (v1.2 state machine)
+            # Run through ChatRuntime (Phase 10/12: target architecture)
             _wmh_cb = _build_chatagent_write_model_history(user_id, bot_id)
             _hook_cbs = _build_chatagent_post_turn_hooks(
                 user_id=user_id, bot_id=bot_id,
@@ -2268,23 +2288,20 @@ async def chat(request: Request):
                 raw_messages=raw_messages,
                 memory_hook=memory_hook, memory_store=memory_store,
             )
-            result: TurnResult = await chat_agent.chat(
+            result: TurnResult = await chat_runtime.handle_chat(
                 user_message=user_message,
                 history=history,
-                trigger="user",
-                route=route,
-                context_policy=context_policy,
-                bot_id=bot_id,
                 system_prompt=system_prompt,
-                wechat_sender=_bound_sender,
+                trigger="user",
                 source="user_message",
+                wechat_sender=_bound_sender,
                 input_message_ids=input_message_ids,
                 input_first_seq=input_first_seq,
                 input_latest_seq=input_latest_seq,
                 input_cutoff_time=input_cutoff_time,
                 interrupt_checker=interrupt_checker,
                 state_tool_executor=_build_state_tool_executor(user_id, context_token, bot_id),
-                native_allowed_tools_override=_extra_tools if _extra_tools else None,
+                extra_tools=_extra_tools if _extra_tools else None,
                 write_model_history=_wmh_cb,
                 post_turn_hooks=_hook_cbs,
             )

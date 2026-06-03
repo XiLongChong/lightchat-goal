@@ -77,27 +77,77 @@ class TestChatRuntime:
         assert visible[0]["role"] == "user"
         assert visible[1]["role"] == "assistant"
 
-    def test_handle_chat_without_agent_returns_error(self):
+    def test_handle_chat_without_agent_raises(self):
+        """Phase 10: ChatRuntime raises RuntimeError when chat_agent not configured."""
         from runtime.chat_runtime import create_chat_runtime
         import asyncio
+        import pytest
         rt = create_chat_runtime()
 
         async def run():
-            result = await rt.handle_chat("hello")
-            assert result["success"] is False
-            assert "error" in result
+            with pytest.raises(RuntimeError, match="chat_agent not configured"):
+                await rt.handle_chat("hello")
 
         asyncio.run(run())
 
-    def test_handle_chat_exception_handled(self):
+    def test_handle_chat_with_none_agent_raises(self):
         from runtime.chat_runtime import create_chat_runtime
         import asyncio
+        import pytest
         rt = create_chat_runtime()
-        rt.chat_agent = None  # Explicitly None
+        rt.chat_agent = None
 
         async def run():
-            result = await rt.handle_chat("hello")
-            assert result["success"] is False
+            with pytest.raises(RuntimeError, match="chat_agent not configured"):
+                await rt.handle_chat("hello")
+
+        asyncio.run(run())
+
+    def test_create_runtime_with_all_facades(self):
+        """Phase 10: ChatRuntime created with all facade dependencies."""
+        from runtime.chat_runtime import create_chat_runtime
+        from agent.chat_agent import ChatAgent
+        from agent.tool_exposure_policy import ToolExposurePolicy
+        from agent.runtime_context_builder import ContextBuilder
+
+        policy = ToolExposurePolicy()
+        ctx = ContextBuilder(persona_text="test")
+        agent = ChatAgent(
+            model="test", persona="test", personality="",
+            llm_gateway=None,
+            tool_exposure_policy=policy,
+            context_builder=ctx,
+        )
+        rt = create_chat_runtime(
+            user_id="u1",
+            chat_agent=agent,
+            context_builder=ctx,
+            tool_exposure_policy=policy,
+        )
+        assert rt.chat_agent is agent
+        assert rt.context_builder is ctx
+        assert rt.tool_exposure_policy is policy
+
+    def test_handle_chat_delegates_to_agent(self):
+        """Phase 10: ChatRuntime.handle_chat() delegates to ChatAgent.chat()."""
+        from runtime.chat_runtime import create_chat_runtime
+        from agent.chat_agent import ChatAgent
+        from agent.state_machine import TurnState
+        import asyncio
+
+        agent = ChatAgent(
+            model="test", persona="test", personality="",
+            llm_gateway=None,
+            test_mode=True,
+        )
+        rt = create_chat_runtime(chat_agent=agent)
+
+        async def run():
+            result = await rt.handle_chat("hello", history=[])
+            assert result.terminal_state in (
+                TurnState.HARD_FALLBACK,  # no LLM gateway
+                TurnState.END_FAILED,
+            )
 
         asyncio.run(run())
 
@@ -266,6 +316,20 @@ class TestChatAgentPolicyInjection:
         )
         assert agent._tool_exposure_policy is policy
 
+    def test_chat_agent_accepts_context_builder_param(self):
+        from agent.chat_agent import ChatAgent
+        from agent.runtime_context_builder import ContextBuilder
+
+        ctx = ContextBuilder(persona_text="test")
+        agent = ChatAgent(
+            model="test",
+            persona="test",
+            personality="test",
+            llm_gateway=None,
+            context_builder=ctx,
+        )
+        assert agent._context_builder is ctx
+
     def test_chat_agent_without_policy_defaults_to_none(self):
         from agent.chat_agent import ChatAgent
 
@@ -276,6 +340,7 @@ class TestChatAgentPolicyInjection:
             llm_gateway=None,
         )
         assert agent._tool_exposure_policy is None
+        assert agent._context_builder is None
 
     def test_chat_agent_resolve_tools_via_policy_proactive(self):
         from agent.chat_agent import ChatAgent
