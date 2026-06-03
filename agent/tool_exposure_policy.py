@@ -27,19 +27,7 @@ from runtime_contracts import (
 
 logger = logging.getLogger(__name__)
 
-# ── Migration map: new canonical name → old registry name ──────────
-# Phase 11: delete this map after old names are removed from registry.
-_MIGRATION_MAP: dict[str, str] = {
-    "send_text_message": "wechat_reply",
-    "finish_turn": "done",
-    "skip_initiative": "skip_proactive",
-    "schedule_user_reminder": "schedule_wake_up",
-}
-
-# Reverse: old → new (for denied tool rendering)
-_OLD_TO_NEW: dict[str, str] = {v: k for k, v in _MIGRATION_MAP.items()}
-
-# Tool names in new semantics
+# ── Canonical tool names (Phase 13: migration map removed) ──────────
 _SEND_TEXT = "send_text_message"
 _FINISH_TURN = "finish_turn"
 _SKIP_INITIATIVE = "skip_initiative"
@@ -51,9 +39,6 @@ _SEND_STICKER = "send_sticker"
 _SCHEDULE_REMINDER = "schedule_user_reminder"
 _MARK_REMINDER_DELIVERED = "mark_reminder_delivered"
 _APPLY_FORGET = "apply_forget_directive"
-
-# Registry names that don't need migration
-_NO_MIGRATION = {_GET_TIME, _GET_WEATHER}
 
 
 # ── Phase 2 input type ──────────────────────────────────────────────
@@ -259,24 +244,16 @@ class ToolExposurePolicy:
 
     # ── Native schema construction ──────────────────────────────────
 
-    def _registry_name(self, new_name: str) -> str:
-        """Map new canonical name to old registry name."""
-        if new_name in _NO_MIGRATION:
-            return new_name
-        return _MIGRATION_MAP.get(new_name, new_name)
-
-    def _has_executor(self, new_name: str) -> bool:
-        reg_name = self._registry_name(new_name)
-        return self._registry.has(reg_name)
+    def _has_executor(self, tool_name: str) -> bool:
+        return self._registry.has(tool_name)
 
     def _build_native_schemas(self, exposed: list[str]) -> list[NativeToolSchema]:
         schemas: list[NativeToolSchema] = []
         for name in exposed:
-            reg_name = self._registry_name(name)
-            tool_def = self._registry.get(reg_name)
+            tool_def = self._registry.get(name)
             if tool_def is None:
                 raise ToolExposureBuildError(
-                    reason=f"registry_missing: {name} (looked up as {reg_name})",
+                    reason=f"registry_missing: {name}",
                     details={"tool_name": name},
                 )
             schemas.append(self._tool_def_to_schema(name, tool_def))
@@ -363,8 +340,7 @@ class ToolExposurePolicy:
         lines.append("本轮可用工具：")
 
         for name in exposed:
-            reg_name = self._registry_name(name)
-            tool_def = self._registry.get(reg_name)
+            tool_def = self._registry.get(name)
             if tool_def is None:
                 continue
             desc = tool_def.description.split("。")[0]
@@ -416,13 +392,11 @@ class ToolExposurePolicy:
 
     def _all_registered_new_names(self) -> set[str]:
         names: set[str] = set()
-        for old_name in self._registry.names():
-            new_name = _OLD_TO_NEW.get(old_name, old_name)
-            # Skip deprecated tools
-            td = self._registry.get(old_name)
+        for reg_name in self._registry.names():
+            td = self._registry.get(reg_name)
             if td is not None and not td.native_tool_call_eligible:
                 continue
-            names.add(new_name)
+            names.add(reg_name)
         return names
 
     def _deny_reason(

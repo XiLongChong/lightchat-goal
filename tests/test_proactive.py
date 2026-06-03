@@ -536,9 +536,9 @@ class TestProactiveContextInjection:
 
         req = mgw.requests[0]
         tool_names = [t["function"]["name"] for t in (req.tools or [])]
-        assert "wechat_reply" in tool_names
-        assert "skip_proactive" not in tool_names
-        assert "done" not in tool_names
+        assert "send_text_message" in tool_names
+        assert "skip_initiative" not in tool_names
+        assert "finish_turn" not in tool_names
 
         system_msgs = [m["content"] for m in req.messages if m["role"] == "system"]
         proactive_ctx = next((m for m in system_msgs if "主动回合" in m), "")
@@ -605,9 +605,9 @@ class TestAllowedToolsPhaseBased:
         # Check that the first LLM call only exposed phase A tools
         req = mgw.requests[0]
         tool_names = [t["function"]["name"] for t in (req.tools or [])]
-        assert "wechat_reply" in tool_names
-        assert "skip_proactive" in tool_names
-        assert "done" not in tool_names
+        assert "send_text_message" in tool_names
+        assert "skip_initiative" in tool_names
+        assert "finish_turn" not in tool_names
 
     def test_phase_a_done_is_rejected(self):
         """Phase A: calling done when delivered == 0 → PROTOCOL_RETRY."""
@@ -652,9 +652,9 @@ class TestAllowedToolsPhaseBased:
         # Second LLM call should have phase B tools (delivered = 1)
         req = mgw.requests[1]
         tool_names = [t["function"]["name"] for t in (req.tools or [])]
-        assert "wechat_reply" in tool_names
-        assert "done" in tool_names
-        assert "skip_proactive" not in tool_names
+        assert "send_text_message" in tool_names
+        assert "finish_turn" in tool_names
+        assert "skip_initiative" not in tool_names
 
     def test_phase_c_only_done_allowed(self):
         """delivered >= max_reply → [done] only."""
@@ -683,8 +683,8 @@ class TestAllowedToolsPhaseBased:
         # Fourth LLM call should have phase C tools (delivered = 3, max = 3)
         req = mgw.requests[3]
         tool_names = [t["function"]["name"] for t in (req.tools or [])]
-        assert "done" in tool_names
-        assert "wechat_reply" not in tool_names
+        assert "finish_turn" in tool_names
+        assert "send_text_message" not in tool_names
 
     def test_phase_c_wechat_reply_triggers_end_proactive_max_reply_limit(self):
         """Phase C: calling wechat_reply → END_PROACTIVE_MAX_REPLY_LIMIT."""

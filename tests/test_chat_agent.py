@@ -838,8 +838,8 @@ class TestToolRetry:
         assert result.terminal_state == TurnState.END_REPLIED
         assert len(sent_msgs) == 1
 
-    def test_deprecated_tool_rejected_in_retry(self):
-        """v1.5: deprecated send_wechat_messages → PROTOCOL_RETRY with hint."""
+    def test_unknown_tool_rejected_in_retry(self):
+        """Phase 13: unknown tools → PROTOCOL_RETRY via unroutable_tool."""
         call_count = [0]
         responses = [
             _make_response("ok let me split"),
@@ -856,7 +856,7 @@ class TestToolRetry:
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=MGW(), native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
@@ -864,7 +864,7 @@ class TestToolRetry:
             user_message="你一条一条发给我", history=[], trigger="user",
         ))
         events = [e.get("type") for e in result.fallback_events]
-        assert "deprecated_tool" in events
+        assert "unroutable_tool" in events
         assert result.sent_message_count == 0
 
     def test_retry_failure_then_content_fallback(self):
@@ -2167,15 +2167,15 @@ class TestFatalContextErrors:
 class TestMessageLimitProtocolRetry:
     """v1.5: per-bubble wechat_reply, deprecated batch tool rejected."""
 
-    def test_deprecated_batch_tool_rejected(self):
-        """v1.5: send_wechat_messages is deprecated → PROTOCOL_RETRY."""
+    def test_unknown_batch_tool_rejected(self):
+        """Phase 13: send_wechat_messages is unknown → PROTOCOL_RETRY."""
         msgs = [f"msg{i}" for i in range(9)]
         tc = _make_tc("send_wechat_messages", json.dumps({"messages": msgs}))
         gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=gw, native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
@@ -2183,7 +2183,7 @@ class TestMessageLimitProtocolRetry:
             user_message="story please", history=[], trigger="user",
         ))
         types = [e.get("type") for e in result.fallback_events]
-        assert "deprecated_tool" in types
+        assert "unroutable_tool" in types
 
     def test_single_bubble_within_limit(self):
         """v1.5: 1 wechat_reply → done → END_REPLIED, sent_count=1."""
@@ -2293,14 +2293,14 @@ class TestOptionalPreprocessNoWeather:
 class TestSkipReplyPath:
     """v1.5: skip_reply deprecated → done(status='no_reply') replaces it."""
 
-    def test_skip_reply_deprecated_rejected(self):
-        """v1.5: skip_reply is deprecated → PROTOCOL_RETRY."""
+    def test_skip_reply_unknown_rejected(self):
+        """Phase 13: skip_reply is unknown → PROTOCOL_RETRY."""
         tc = _make_tc("skip_reply", '{"reason":"user said goodnight"}')
         gw = FakeGateway(response=_make_response("", tool_calls=[tc]))
         agent = ChatAgent(
             model="test", persona="p", personality="",
             llm_gateway=gw, native_tool_calls=True,
-            native_allowed_tools=["wechat_reply", "done"],
+            native_allowed_tools=["send_text_message", "finish_turn"],
             test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
@@ -2308,7 +2308,7 @@ class TestSkipReplyPath:
             user_message="晚安", history=[], trigger="user",
         ))
         types = [e.get("type") for e in result.fallback_events]
-        assert "deprecated_tool" in types
+        assert "unroutable_tool" in types
 
     def test_done_no_reply_ends_no_reply(self):
         """v1.5: done(status='no_reply', note='...') → END_NO_REPLY."""

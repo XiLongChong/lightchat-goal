@@ -18,15 +18,6 @@ class ToolCategory(StrEnum):
     STATE_TOOL = "state_tool"
 
 
-# ── v1.5 deprecated tool hints ────────────────────────────────────
-_DEPRECATED_HINTS: dict[str, str] = {
-    "send_wechat_messages": (
-        "send_wechat_messages 已废弃。请使用 wechat_reply 逐条发送，最后用 done 结束。"
-    ),
-    "skip_reply": (
-        "skip_reply 已废弃。请使用 done(status='no_reply', note='原因')。"
-    ),
-}
 
 
 @dataclass(slots=True)
@@ -96,17 +87,6 @@ def classify_single_tool_call(
             tool_name=tool_name,
             serialized=serialized,
             violation_reason=f"未知或未注册的工具: {tool_name}",
-        )
-
-    # ── Check deprecated ─────────────────────────────────────────
-    if tool_name in _DEPRECATED_HINTS:
-        return ClassifiedSingleToolCall(
-            tool_name=tool_name,
-            serialized=serialized,
-            registry_category=getattr(tool_def, "tool_category", ""),
-            is_known=True,
-            is_deprecated=True,
-            deprecated_hint=_DEPRECATED_HINTS[tool_name],
         )
 
     return ClassifiedSingleToolCall(
