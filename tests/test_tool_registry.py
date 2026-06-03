@@ -54,7 +54,7 @@ class TestToolRegistryContent:
         assert "skip_reply" in names             # kept deprecated
         assert "search_memory" not in names
         assert "send_email" not in names
-        assert len(names) == 13  # 6 original + 2 deprecated + 5 Phase 2
+        assert len(names) == 17  # 11 eligible + 6 deprecated
 
     def test_get_weather_not_in_action_registry(self):
         assert "get_weather" not in ACTION_REGISTRY
@@ -124,43 +124,57 @@ class TestNativeEligibility:
         assert t is not None
         assert t.native_tool_call_eligible is False
 
-    def test_wechat_reply_is_native_eligible(self):
-        """v1.5: wechat_reply is native-eligible."""
+    def test_wechat_reply_is_deprecated(self):
+        """Phase 11: wechat_reply is deprecated, not native-eligible."""
         t = TOOL_REGISTRY.get("wechat_reply")
         assert t is not None
-        assert t.native_tool_call_eligible is True
+        assert t.native_tool_call_eligible is False
 
-    def test_done_is_native_eligible(self):
-        """v1.5: done is native-eligible terminal tool."""
-        t = TOOL_REGISTRY.get("done")
+    def test_send_text_message_is_eligible(self):
+        """Phase 11: send_text_message is the canonical name."""
+        t = TOOL_REGISTRY.get("send_text_message")
         assert t is not None
         assert t.native_tool_call_eligible is True
-        assert t.tool_category == "terminal_tool"
+
+    def test_done_is_deprecated(self):
+        """Phase 11: done is deprecated, not native-eligible."""
+        t = TOOL_REGISTRY.get("done")
+        assert t is not None
+        assert t.native_tool_call_eligible is False
+
+    def test_finish_turn_is_eligible(self):
+        """Phase 11: finish_turn is the canonical name."""
+        t = TOOL_REGISTRY.get("finish_turn")
+        assert t is not None
+        assert t.native_tool_call_eligible is True
 
     def test_get_native_tool_specs_only_eligible(self):
-        """v1.6-C: native specs include the scheduled state tool."""
+        """Phase 11: eligible specs use canonical names only."""
         specs = TOOL_REGISTRY.get_native_tool_specs(eligible_only=True)
         names = {s["function"]["name"] for s in specs}
         assert names == {
-            "get_time", "get_weather", "wechat_reply", "done",
-            "skip_proactive", "schedule_wake_up",
+            "get_time", "get_weather",
+            "send_text_message", "finish_turn",
+            "skip_initiative", "schedule_user_reminder",
             "mark_reminder_delivered", "apply_forget_directive",
             "generate_image_message", "send_image_message", "send_sticker",
         }
 
     def test_get_native_tool_specs_includes_all_when_eligible_only_false(self):
-        """v1.6-C: all registered tools visible when eligible_only=False."""
+        """Phase 11: all registered tools visible (old + new + deprecated)."""
         specs = TOOL_REGISTRY.get_native_tool_specs(eligible_only=False)
         names = {s["function"]["name"] for s in specs}
-        assert "get_time" in names
-        assert "get_weather" in names
-        assert "wechat_reply" in names
+        assert "send_text_message" in names
+        assert "finish_turn" in names
+        assert "skip_initiative" in names
+        assert "schedule_user_reminder" in names
+        assert "wechat_reply" in names  # deprecated but still registered
         assert "done" in names
         assert "skip_proactive" in names
         assert "schedule_wake_up" in names
         assert "send_wechat_messages" in names
         assert "skip_reply" in names
-        assert len(names) == 13  # 11 active + 2 deprecated
+        assert len(names) == 17  # 11 eligible + 6 deprecated
 
     def test_native_specs_have_correct_structure(self):
         specs = TOOL_REGISTRY.get_native_tool_specs()
@@ -269,11 +283,11 @@ class TestRegistryAPI:
         assert "send_wechat_messages" in all_names
         assert "skip_reply" in all_names
         assert "send_email" not in all_names
-        assert len(all_names) == 13  # 11 active + 2 deprecated
+        assert len(all_names) == 17  # 11 eligible + 6 deprecated
 
     def test_registry_len(self):
         assert len(ACTION_REGISTRY) == 0
-        assert len(TOOL_REGISTRY) == 13  # 11 active + 2 deprecated
+        assert len(TOOL_REGISTRY) == 17  # 11 eligible + 6 deprecated
 
     def test_empty_registry(self):
         r = ActionRegistry()

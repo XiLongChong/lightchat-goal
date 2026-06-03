@@ -279,13 +279,11 @@ def _build_default_registries() -> None:
             "required": ["message_hint"],
         },
         side_effect_level="internal_message",
-        native_tool_call_eligible=True,
+        native_tool_call_eligible=False,  # Phase 11: use schedule_user_reminder instead
         tool_category="state_tool",
     ))
 
-    # ── v1.5: wechat_reply — single bubble, NOT terminal ────────
-    # Registered as fact_tool but routed by tool_name in chat_agent.
-    # Must NEVER enter EXEC_FACT_TOOLS path.
+    # ── v1.5: wechat_reply — [Phase 11 deprecated, use send_text_message] ──
     TOOL_REGISTRY.register(ToolDef(
         name="wechat_reply",
         description=(
@@ -305,11 +303,11 @@ def _build_default_registries() -> None:
         },
         side_effect_level="high",
         requires_confirmation=False,
-        native_tool_call_eligible=True,
+        native_tool_call_eligible=False,  # Phase 11: use send_text_message instead
         tool_category="action_tool",
     ))
 
-    # ── v1.5: done — only normal terminal tool ──────────────────
+    # ── v1.5: done — [Phase 11 deprecated, use finish_turn] ─────
     TOOL_REGISTRY.register(ToolDef(
         name="done",
         description=(
@@ -337,11 +335,11 @@ def _build_default_registries() -> None:
             "required": ["status"],
         },
         side_effect_level="none",
-        native_tool_call_eligible=True,
+        native_tool_call_eligible=False,  # Phase 11: use finish_turn instead
         tool_category="terminal_tool",
     ))
 
-    # ── v4.0: skip_proactive — proactive-only terminal tool ──────
+    # ── v4.0: skip_proactive — [Phase 11 deprecated, use skip_initiative] ──
     TOOL_REGISTRY.register(ToolDef(
         name="skip_proactive",
         description=(
@@ -372,8 +370,69 @@ def _build_default_registries() -> None:
             "required": ["reason", "next_check_minutes"],
         },
         side_effect_level="none",
+        native_tool_call_eligible=False,  # Phase 11: use skip_initiative instead
+        tool_category="terminal_tool",
+    ))
+
+    # ── Phase 11: canonical tool names ────────────────────────────
+    TOOL_REGISTRY.register(ToolDef(
+        name="send_text_message",
+        description="发送一条文字消息给用户。每次调用只发送一条。想发多条请多次调用。text 不能包含换行符。",
+        args_schema={
+            "properties": {"text": {"type": "string", "description": "要发送的消息内容。不能为空。不能包含换行符。"}},
+            "required": ["text"],
+        },
+        side_effect_level="high",
+        native_tool_call_eligible=True,
+        tool_category="action_tool",
+    ))
+    TOOL_REGISTRY.register(ToolDef(
+        name="finish_turn",
+        description="显式结束本轮对话。每轮必须以调用 finish_turn 结束。status: replied=已回复, no_reply=不需回复, failed=失败。",
+        args_schema={
+            "properties": {
+                "status": {"type": "string", "enum": ["replied", "no_reply", "failed"], "description": "replied=已回复, no_reply=不需回复, failed=失败"},
+                "note": {"type": "string", "description": "简短说明。status=no_reply/failed 时必填。"},
+                "next_wake_minutes": {"type": "integer", "description": "仅主动回合：建议下一次主动唤醒的间隔分钟数。"},
+            },
+            "required": ["status"],
+        },
+        side_effect_level="none",
         native_tool_call_eligible=True,
         tool_category="terminal_tool",
+    ))
+    TOOL_REGISTRY.register(ToolDef(
+        name="skip_initiative",
+        description="本轮主动消息不适合说出口时调用。只能在尚未发送任何消息时调用。必须在强度范围内选择 next_wake_minutes。强制开口阶段不可用。",
+        args_schema={
+            "properties": {
+                "reason": {"type": "string", "enum": ["too_soon", "too_intrusive", "low_value", "repeated", "unsafe", "user_might_be_busy"], "description": "跳过原因"},
+                "next_wake_minutes": {"type": "integer", "description": "下次主动唤醒的分钟数。必须在系统允许的范围内。"},
+                "note": {"type": "string", "description": "简短补充说明"},
+            },
+            "required": ["reason", "next_wake_minutes"],
+        },
+        side_effect_level="none",
+        native_tool_call_eligible=True,
+        tool_category="terminal_tool",
+    ))
+    TOOL_REGISTRY.register(ToolDef(
+        name="schedule_user_reminder",
+        description="创建一个用户授权的未来提醒任务。delay_minutes 和 trigger_at 二选一。",
+        args_schema={
+            "properties": {
+                "message_hint": {"type": "string", "description": "提醒时给 LLM 看的备忘，描述提醒内容。最多 500 字。"},
+                "delay_minutes": {"type": "integer", "description": "从现在起延迟多少分钟提醒。与 trigger_at 二选一。"},
+                "trigger_at": {"type": "string", "description": "绝对提醒时间。格式 HH:mm（每天）或 ISO 时间戳。"},
+                "recurring": {"type": "string", "enum": [None, "daily"], "description": "null=一次性, daily=每天重复"},
+                "skip_quiet_hours": {"type": "boolean", "description": "true=勿扰期间照发"},
+                "title": {"type": "string", "description": "可选短标题"},
+            },
+            "required": ["message_hint"],
+        },
+        side_effect_level="internal_message",
+        native_tool_call_eligible=True,
+        tool_category="state_tool",
     ))
 
     # ── Phase 2: new-tool-name stubs (executor wiring in later phases) ──

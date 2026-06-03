@@ -63,12 +63,12 @@ class TestFeatureFlag:
         names = {s["function"]["name"] for s in (specs or [])}
         assert "send_email" not in names
 
-    def test_wechat_reply_in_specs(self):
-        """v1.5: wechat_reply is native-eligible."""
-        specs = _build_native_tool_specs(["wechat_reply", "get_time"])
+    def test_send_text_message_in_specs(self):
+        """Phase 11: send_text_message is native-eligible."""
+        specs = _build_native_tool_specs(["send_text_message", "get_time"])
         names = {s["function"]["name"] for s in (specs or [])}
-        assert "wechat_reply" in names
-        assert "send_wechat_messages" not in names   # deprecated, not eligible
+        assert "send_text_message" in names
+        assert "wechat_reply" not in names   # deprecated
 
     def test_schedule_wechat_message_not_in_specs(self):
         specs = _build_native_tool_specs(["schedule_wechat_message", "get_weather"])
@@ -76,13 +76,13 @@ class TestFeatureFlag:
         assert "schedule_wechat_message" not in names
 
     def test_mixed_config_correctly_filtered(self):
-        """v1.5: only native-eligible allowed_tools appear in specs."""
+        """Phase 11: only native-eligible allowed_tools appear in specs."""
         specs = _build_native_tool_specs([
-            "get_time", "send_email", "wechat_reply",
-            "get_weather", "search_memory", "done",
+            "get_time", "send_email", "send_text_message",
+            "get_weather", "search_memory", "finish_turn",
         ])
         names = {s["function"]["name"] for s in (specs or [])}
-        assert names == {"wechat_reply", "get_time", "get_weather", "done"}
+        assert names == {"send_text_message", "get_time", "get_weather", "finish_turn"}
 
 
 # 2. Native tool specs structure
@@ -228,10 +228,10 @@ class TestNativeToolExecution:
         assert "错误" in result  # not native eligible
 
     @pytest.mark.asyncio
-    async def test_wechat_reply_is_action_tool(self):
-        """v1.5: wechat_reply IS registered as action_tool — routed by name, not category."""
+    async def test_send_text_message_is_action_tool(self):
+        """Phase 11: send_text_message is the canonical action tool."""
         from agent.tool_registry import TOOL_REGISTRY
-        t = TOOL_REGISTRY.get("wechat_reply")
+        t = TOOL_REGISTRY.get("send_text_message")
         assert t is not None
         assert t.native_tool_call_eligible is True
         assert t.tool_category == "action_tool"
@@ -396,8 +396,9 @@ class TestToolRegistryNativeSpecs:
             if t.native_tool_call_eligible
         }
         assert native_names == {
-            "get_time", "get_weather", "wechat_reply", "done",
-            "skip_proactive", "schedule_wake_up",
+            "get_time", "get_weather",
+            "send_text_message", "finish_turn",
+            "skip_initiative", "schedule_user_reminder",
             "mark_reminder_delivered", "apply_forget_directive",
             "generate_image_message", "send_image_message", "send_sticker",
         }
@@ -462,11 +463,11 @@ class TestToolCategorySafety:
         assert tool is not None
         assert tool.tool_category == "fact_tool"
 
-    def test_wechat_reply_is_registered(self):
-        """v1.5: wechat_reply IS registered as a native tool."""
+    def test_wechat_reply_is_deprecated(self):
+        """Phase 11: wechat_reply still registered but deprecated."""
         t = TOOL_REGISTRY.get("wechat_reply")
         assert t is not None
-        assert t.native_tool_call_eligible is True
+        assert t.native_tool_call_eligible is False  # deprecated
 
     def test_skip_action_not_registered(self):
         """old skip action should NOT be registered."""

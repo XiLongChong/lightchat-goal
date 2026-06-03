@@ -135,6 +135,7 @@ class _FakeStore:
     def __init__(self):
         self._last_visible = 0.0
         self.history_rows: list = []
+        self.due_tasks: list = []
 
     async def resolve_last_visible_message_at(self, user_id, bot_id):
         return {"timestamp": self._last_visible, "reason": "fake"}
@@ -164,7 +165,7 @@ class _FakeStore:
         return None
 
     async def claim_due_scheduled_messages(self, now_ts=None, limit=1, user_id=""):
-        return []
+        return self.due_tasks[:limit]
 
     async def cancel_pending_proactive_wake_ups(self, user_id, bot_id):
         return 0
@@ -257,7 +258,7 @@ class TestSkipProactiveRegistration:
         t = TOOL_REGISTRY.get("skip_proactive")
         assert t is not None
         assert t.tool_category == "terminal_tool"
-        assert t.native_tool_call_eligible is True
+        assert t.native_tool_call_eligible is False  # Phase 11: deprecated, use skip_initiative
 
     def test_skip_proactive_arg_schema_has_reason_required(self):
         t = TOOL_REGISTRY.get("skip_proactive")
@@ -1296,6 +1297,34 @@ class TestEligibilityChecks:
 # ══════════════════════════════════════════════════════════════════
 
 # v4.0 removed: TestImpulseGeneration
+
+
+def test_claim_due_wake_up_restores_message_payload_identity():
+    """Due tasks must preserve user-requested reminder identity from the message payload."""
+    scheduler = ProactiveScheduler()
+    fake_store = _FakeStore()
+    fake_store.due_tasks = [{
+        "id": "sch_user",
+        "due_at": 1000.0,
+        "messages": [{
+            "text": "叫用户洗脚，时间到了催他去洗脚",
+            "wake_up_type": "user_requested",
+            "is_wake_up": True,
+            "skip_quiet_hours": True,
+            "recurring": None,
+        }],
+    }]
+    scheduler._store = fake_store
+
+    async def _test():
+        result = await scheduler._claim_due_wake_up("u1", "b1", now_ts=1000.0)
+        assert result["trigger"] == "user_requested"
+        assert result["trigger_kind"] == "wake_up"
+        assert result["is_wake_up"] is True
+        assert result["message_hint"] == "叫用户洗脚，时间到了催他去洗脚"
+        assert result["skip_quiet_hours"] is True
+
+    asyncio.run(_test())
 
 class TestProactiveInterruptBaseline:
     """V1.6-A blocker: proactive turns use current seq as baseline."""

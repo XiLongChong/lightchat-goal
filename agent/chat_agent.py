@@ -92,7 +92,6 @@ class ChatAgent:
         self.json_output_enabled = json_output_enabled
         self.test_mode = test_mode
         self._last_call_time = 0.0
-        self._interrupt_checker: InterruptChecker | None = None
 
         # ── v1.3: model routing ──────────────────────────────────
         self._flash_profile = flash_profile or ModelProfile()
@@ -106,32 +105,35 @@ class ChatAgent:
         self._post_turn_hooks: list[PostTerminalCallback] = list(post_turn_hooks or [])
 
     def set_interrupt_checker(self, checker: InterruptChecker | None) -> None:
-        """Inject an interrupt checker. Called before each turn.
+        """Deprecated: use chat(interrupt_checker=...) instead.
 
-        v1.2 signature: (interrupt_token: str) -> bool
-        Returns True when the turn identified by interrupt_token has been
-        superseded and should be cancelled (END_CANCELLED).
-
-        In test_mode, a missing checker defaults to always-false.
-        In production, a checker MUST be provided — ValueError otherwise.
+        Kept for backward compatibility — stores on the most recently
+        created TurnScratchpad, NOT on the ChatAgent instance.
         """
-        self._interrupt_checker = checker
+        import warnings
+        warnings.warn(
+            "set_interrupt_checker is deprecated. "
+            "Pass interrupt_checker directly to chat().",
+            DeprecationWarning, stacklevel=2,
+        )
 
-    def _is_interrupted(self, token: str = "") -> bool:
+    def _is_interrupted(self, token: str = "", *, checker: InterruptChecker | None = None) -> bool:
         """Check whether the current turn should be cancelled.
 
         Production: checker is required. If missing, raises ValueError.
         Test mode: missing checker defaults to always-false.
+
+        v2.0: checker is a required explicit parameter (no longer stored on instance).
         """
-        if not self._interrupt_checker:
+        if checker is None:
             if self.test_mode:
                 return False
             raise ValueError(
                 "interrupt_checker is required in production mode. "
-                "Inject via chat(interrupt_checker=...) or set_interrupt_checker()."
+                "Inject via chat(interrupt_checker=...)."
             )
         try:
-            return self._interrupt_checker(token)
+            return checker(token)
         except Exception:
             return False
 
@@ -158,6 +160,7 @@ class ChatAgent:
         input_cutoff_time: float = 0.0,
         interrupt_checker: InterruptChecker | None = None,
         state_tool_executor: Callable[[str, dict[str, Any], TurnScratchpad], Coroutine[Any, Any, dict[str, Any]]] | None = None,
+        native_allowed_tools_override: list[str] | None = None,
         # ── v1.2 Phase 5C: per-request post-terminal callbacks ──
         write_model_history: PostTerminalCallback | None = None,
         post_turn_hooks: list[PostTerminalCallback] | None = None,
@@ -179,10 +182,6 @@ class ChatAgent:
                     f"got {len(str(user_message))} chars"
                 )
 
-        # ── Inject interrupt checker for this turn ──────────────
-        if interrupt_checker is not None:
-            self._interrupt_checker = interrupt_checker
-
         turn = TurnScratchpad(
             user_message=user_message or "",
             trigger=trigger,
@@ -193,6 +192,8 @@ class ChatAgent:
             input_latest_seq=input_latest_seq,
             input_cutoff_time=input_cutoff_time,
             route=route,
+            interrupt_checker=interrupt_checker,
+            native_allowed_tools_override=native_allowed_tools_override,
             max_flash_upgrade_attempts=self._max_flash_upgrade_attempts,
             max_llm_steps_per_turn=MAX_LLM_STEPS_PER_TURN,
             max_reply_messages_per_turn=MAX_REPLY_MESSAGES_PER_TURN,
@@ -428,7 +429,7 @@ class ChatAgent:
 
         Resume to _resume_state if valid, else END_CANCELLED.
         """
-        interrupted = self._is_interrupted(turn.interrupt_token)
+        interrupted = self._is_interrupted(turn.interrupt_token, checker=turn.interrupt_checker)
         logger.info(
             "interrupt_check: input_latest_seq=%d interrupted=%s",
             turn.input_latest_seq, interrupted,
@@ -598,6 +599,12 @@ class ChatAgent:
 
         # Store temporal diagnostics on turn for post-turn observability
         turn.add_fallback_event("temporal_context", str(temporal_result.diagnostics))
+        logger.info(
+            "temporal: gap=%.0fs resume=%s last_visible=%.0f",
+            temporal_result.diagnostics.get("gap_seconds", 0),
+            temporal_result.diagnostics.get("resume_type", ""),
+            temporal_result.diagnostics.get("last_visible_interaction_at", 0),
+        )
 
         # City as separate system message (cache-stable)
         default_city = str(self.defaults.get("default_city", "") or "").strip()
@@ -723,6 +730,8 @@ class ChatAgent:
             if turn.source == SOURCE_PROACTIVE_IMPULSE:
                 allowed = _get_proactive_allowed_tools(turn)
                 request_tools = _build_native_tool_specs(allowed)
+            elif turn.native_allowed_tools_override is not None:
+                request_tools = _build_native_tool_specs(turn.native_allowed_tools_override)
             elif self.native_allowed_tools:
                 request_tools = _build_native_tool_specs(self.native_allowed_tools)
 
@@ -813,7 +822,7 @@ class ChatAgent:
         Interrupt after CALL_LLM: differentiates END_CANCELLED /
         END_SUPERSEDED_BEFORE_SEND / END_INTERRUPTED_DURING_REPLY_SEQUENCE.
         """
-        if self._is_interrupted():
+        if self._is_interrupted(checker=turn.interrupt_checker):
             turn.add_fallback_event("interrupted_after_llm", "turn superseded by newer event")
             if turn._has_pending_wechat_reply:
                 return TurnState.END_SUPERSEDED_BEFORE_SEND
@@ -1028,7 +1037,7 @@ class ChatAgent:
                 result_text = await _execute_native_fact_tool(
                     tool_name=tool_name,
                     tool_args_raw=tool_args_raw,
-                    native_allowed_tools=self.native_allowed_tools,
+                    native_allowed_tools=turn.native_allowed_tools_override or self.native_allowed_tools,
                 )
                 return {
                     "tool_name": tool_name,
@@ -1288,7 +1297,7 @@ class ChatAgent:
         v1.5: if interrupted before send → END_SUPERSEDED_BEFORE_SEND.
         The model's wechat_reply text is discarded, NOT sent to user.
         """
-        if self._is_interrupted():
+        if self._is_interrupted(checker=turn.interrupt_checker):
             turn.add_fallback_event("interrupted_before_send",
                 "turn superseded before wechat_reply could be sent")
             logger.info("pre_send_interrupt: interrupted=True → END_SUPERSEDED_BEFORE_SEND")
@@ -1493,7 +1502,7 @@ class ChatAgent:
             await asyncio.sleep(sleep_for)
             waited += sleep_for
 
-            if self._is_interrupted():
+            if self._is_interrupted(checker=turn.interrupt_checker):
                 interrupted = True
                 break
 
@@ -1527,7 +1536,7 @@ class ChatAgent:
         END_INTERRUPTED_DURING_REPLY_SEQUENCE.
         Already-sent messages are preserved.
         """
-        if self._is_interrupted():
+        if self._is_interrupted(checker=turn.interrupt_checker):
             turn.reply_sequence_status = "interrupted_by_user"
             turn.add_fallback_event("interrupted_during_reply_sequence",
                 f"sent {turn.sent_message_count} messages before user interruption")
@@ -1791,9 +1800,10 @@ class ChatAgent:
                         _has_match = True
                         break
                 if not _has_match:
+                    _insert_at = len(turn.messages) - _scan_offset + 1
                     for tc in _tcs:
                         cid = tc.get("id", "") if isinstance(tc, dict) else ""
-                        turn.messages.append({
+                        turn.messages.insert(_insert_at, {
                             "role": "tool",
                             "tool_call_id": cid,
                             "content": _json.dumps({
@@ -1802,6 +1812,7 @@ class ChatAgent:
                                 "hint": "上一个工具调用因协议违规被拒绝，请按提示重新调用正确的工具。",
                             }, ensure_ascii=False),
                         })
+                        _insert_at += 1
                     break
 
         retry_note = "必须调用 wechat_reply 或 done。每次只能调用一个工具。"
@@ -1862,7 +1873,7 @@ class ChatAgent:
         turn.add_fallback_event("hard_fallback_enter", "entering hard fallback")
 
         # v1.2: interrupt check before sending fallback
-        if self._is_interrupted():
+        if self._is_interrupted(checker=turn.interrupt_checker):
             turn.add_fallback_event("interrupted_before_fallback", "turn superseded by newer event")
             return TurnState.END_CANCELLED
 
@@ -1953,11 +1964,8 @@ def _build_native_tool_specs(allowed_tools: list[str]) -> list[dict[str, Any]] |
     native_names: set[str] = set()
 
     for tool in TOOL_REGISTRY.iter_defs():
-        if not tool.native_tool_call_eligible:
-            continue
-        if tool.name not in allowed_tools:
-            continue
-        native_names.add(tool.name)
+        if tool.name in allowed_tools:
+            native_names.add(tool.name)  # explicit allow always honored
 
     if native_names:
         from agent.tool_registry import ToolRegistry
@@ -1966,7 +1974,7 @@ def _build_native_tool_specs(allowed_tools: list[str]) -> list[dict[str, Any]] |
         for tool in TOOL_REGISTRY.iter_defs():
             if tool.name in native_names:
                 sub.register(tool)
-        specs.extend(sub.get_native_tool_specs(eligible_only=True))
+        specs.extend(sub.get_native_tool_specs(eligible_only=False))  # Phase 11: include deprecated when explicitly requested
 
     return specs or None
 
@@ -2211,13 +2219,15 @@ def _get_proactive_allowed_tools(turn: TurnScratchpad) -> list[str]:
 
     fact_tools = list(FACT_TOOL_NAMES)
 
+    # v4.0: schedule_wake_up removed — proactive scheduling is handled by
+    # skip_proactive.next_check_minutes / done.next_check_minutes after the turn.
     if delivered == 0:
         if trigger_mode == "required":
-            return ["wechat_reply", "schedule_wake_up"] + fact_tools
+            return ["wechat_reply"] + fact_tools
         else:
-            return ["wechat_reply", "skip_proactive", "schedule_wake_up"] + fact_tools
+            return ["wechat_reply", "skip_proactive"] + fact_tools
     else:
-        return ["wechat_reply", "done", "schedule_wake_up"] + fact_tools
+        return ["wechat_reply", "done"] + fact_tools
 
 
 def _validate_proactive_tool_constraints(
