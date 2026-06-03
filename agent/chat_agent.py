@@ -81,6 +81,8 @@ class ChatAgent:
         # ── v1.2: post-terminal callbacks injected by main.py ─────
         write_model_history: PostTerminalCallback | None = None,
         post_turn_hooks: list[PostTerminalCallback] | None = None,
+        # ── Phase 12: facade injection ────────────────────────────
+        tool_exposure_policy: Any = None,
     ):
         self.llm_gateway = llm_gateway
         self.persona = persona
@@ -103,6 +105,9 @@ class ChatAgent:
         # ── v1.2: post-terminal pipeline callbacks ───────────────
         self._write_model_history: PostTerminalCallback | None = write_model_history
         self._post_turn_hooks: list[PostTerminalCallback] = list(post_turn_hooks or [])
+
+        # ── Phase 12: facade injection ────────────────────────────
+        self._tool_exposure_policy = tool_exposure_policy
 
     def set_interrupt_checker(self, checker: InterruptChecker | None) -> None:
         """Deprecated: use chat(interrupt_checker=...) instead.
@@ -685,6 +690,40 @@ class ChatAgent:
 
         return ("flash", "daily_chat", self._flash_profile)
 
+    def _resolve_tools_via_policy(self, turn: TurnScratchpad) -> list[str]:
+        """Phase 12: Compute allowed_tools via ToolExposurePolicy facade.
+
+        For proactive turns, re-resolves per delivered_count phase.
+        For regular turns, uses policy with turn_type=USER_CHAT.
+        Falls back to instance native_allowed_tools on policy error.
+        """
+        try:
+            from agent.tool_exposure_policy import ToolExposureRequest
+            from runtime_contracts import TurnType, UserIntent
+
+            is_proactive = turn.source == SOURCE_PROACTIVE_IMPULSE
+            turn_type = TurnType.RELATIONSHIP_PROACTIVE if is_proactive else TurnType.USER_CHAT
+            trigger_source = "scheduler" if is_proactive else "user"
+
+            request = ToolExposureRequest(
+                turn_type=turn_type,
+                trigger_source=trigger_source,
+                user_intent=UserIntent.CHAT,
+                last_decision=None,
+                consecutive_skip_count=0,
+                delivered_message_count=turn.proactive_delivered_count if is_proactive else 0,
+            )
+            exposure = self._tool_exposure_policy.resolve(request)
+            logger.info("_resolve_tools_via_policy: phase=%s tools=%s",
+                       exposure.phase.value if hasattr(exposure.phase, 'value') else exposure.phase,
+                       ",".join(exposure.exposed_tool_names))
+            return list(exposure.exposed_tool_names)
+        except Exception as e:
+            logger.warning("ToolExposurePolicy failed, falling back: %s", e)
+            if turn.source == SOURCE_PROACTIVE_IMPULSE:
+                return _get_proactive_allowed_tools(turn)
+            return list(self.native_allowed_tools)
+
     async def _do_call_llm(self, turn: TurnScratchpad) -> TurnState:
         """CALL_LLM: invoke the LLM via gateway.
 
@@ -725,9 +764,12 @@ class ChatAgent:
         turn._current_attempt = attempt
 
         request_tools = None
-        # ── v3.1: Proactive dynamic allowed_tools based on delivered_count ──
+        # ── Phase 12: Tool exposure via facade when available ─────
         if self.native_tool_calls:
-            if turn.source == SOURCE_PROACTIVE_IMPULSE:
+            if self._tool_exposure_policy is not None:
+                allowed = self._resolve_tools_via_policy(turn)
+                request_tools = _build_native_tool_specs(allowed)
+            elif turn.source == SOURCE_PROACTIVE_IMPULSE:
                 allowed = _get_proactive_allowed_tools(turn)
                 request_tools = _build_native_tool_specs(allowed)
             elif turn.native_allowed_tools_override is not None:
