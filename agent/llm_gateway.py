@@ -144,6 +144,8 @@ class LLMGateway:
         """
         trace: dict[str, Any] = {
             "request_id": request_id,
+            "turn_id": getattr(request, "turn_id", ""),
+            "call_id": getattr(request, "call_id", ""),
             "task_type": request.purpose,
             "provider": self.config.provider,
             "model": model_used or request.model or self.config.default_model,

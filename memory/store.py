@@ -7,6 +7,7 @@ Portability: single .db file, easy to backup/migrate.
 import asyncio
 import json
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -90,22 +91,30 @@ class MemoryStore:
     def __init__(self, db_path: str = "./data/memory.db"):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_lock = asyncio.Lock()
         self._lock = asyncio.Lock()
         self._db: aiosqlite.Connection | None = None
         self._instances.add(self)
 
     async def _get_db(self) -> aiosqlite.Connection:
         if self._db is None:
-            self._db = await aiosqlite.connect(str(self.db_path))
-            await self._db.execute("PRAGMA journal_mode=WAL")
-            await self._db.execute("PRAGMA busy_timeout=5000")
-            await self._db.execute("PRAGMA foreign_keys=ON")
-            self._db.row_factory = aiosqlite.Row
-            await self._migrate()
+            async with self._init_lock:
+                if self._db is None:
+                    db = await aiosqlite.connect(str(self.db_path), timeout=30.0)
+                    try:
+                        await db.execute("PRAGMA journal_mode=WAL")
+                        await db.execute("PRAGMA busy_timeout=30000")
+                        await db.execute("PRAGMA foreign_keys=ON")
+                        db.row_factory = aiosqlite.Row
+                        await self._migrate(db)
+                    except Exception:
+                        await db.close()
+                        raise
+                    self._db = db
         return self._db
 
-    async def _migrate(self):
-        db = self._db
+    async def _migrate(self, db: aiosqlite.Connection | None = None):
+        db = db or self._db
         if db is None:
             return
         await db.execute("""
@@ -706,6 +715,118 @@ class MemoryStore:
         await db.commit()
         return cursor.lastrowid
 
+    # ── Phase 4: ContextSnapshot persistence ──────────────────────
+
+    async def save_context_snapshot(self, snapshot_data: dict) -> str | None:
+        """Save a context snapshot as JSON.
+
+        snapshot_data keys: snapshot_id, turn_id, call_id, created_at,
+            exposed_tool_names, history_message_ids, memory_ids,
+            turn_local_summary, block_summaries_json, token_budget_json.
+        Never stores API keys.
+        """
+        import json as _json
+        db = await self._get_db()
+        if db is None:
+            return None
+        now = time.time()
+        await db.execute(
+            """CREATE TABLE IF NOT EXISTS context_snapshots (
+                snapshot_id TEXT PRIMARY KEY,
+                turn_id TEXT NOT NULL,
+                call_id TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                exposed_tool_names TEXT NOT NULL DEFAULT '[]',
+                history_message_ids TEXT NOT NULL DEFAULT '[]',
+                memory_ids TEXT NOT NULL DEFAULT '[]',
+                turn_local_summary TEXT NOT NULL DEFAULT '{}',
+                block_summaries_json TEXT NOT NULL DEFAULT '[]',
+                token_budget_json TEXT NOT NULL DEFAULT '{}',
+                stored_at REAL NOT NULL
+            )"""
+        )
+        await db.commit()
+        await db.execute(
+            """INSERT INTO context_snapshots
+               (snapshot_id, turn_id, call_id, created_at, exposed_tool_names,
+                history_message_ids, memory_ids, turn_local_summary,
+                block_summaries_json, token_budget_json, stored_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                snapshot_data.get("snapshot_id", ""),
+                snapshot_data.get("turn_id", ""),
+                snapshot_data.get("call_id", ""),
+                snapshot_data.get("created_at", now),
+                _json.dumps(snapshot_data.get("exposed_tool_names", [])),
+                _json.dumps(snapshot_data.get("history_message_ids", [])),
+                _json.dumps(snapshot_data.get("memory_ids", [])),
+                _json.dumps(snapshot_data.get("turn_local_summary", {})),
+                _json.dumps(snapshot_data.get("block_summaries", [])),
+                _json.dumps(snapshot_data.get("token_budget", {})),
+                now,
+            ),
+        )
+        await db.commit()
+        return snapshot_data.get("snapshot_id")
+
+    async def get_snapshots_by_turn_id(self, turn_id: str) -> list[dict]:
+        """Return all snapshots for a turn, newest first."""
+        import json as _json
+        db = await self._get_db()
+        if db is None:
+            return []
+        await db.execute(
+            """CREATE TABLE IF NOT EXISTS context_snapshots (
+                snapshot_id TEXT PRIMARY KEY, turn_id TEXT NOT NULL,
+                call_id TEXT NOT NULL, created_at REAL NOT NULL,
+                exposed_tool_names TEXT NOT NULL DEFAULT '[]',
+                history_message_ids TEXT NOT NULL DEFAULT '[]',
+                memory_ids TEXT NOT NULL DEFAULT '[]',
+                turn_local_summary TEXT NOT NULL DEFAULT '{}',
+                block_summaries_json TEXT NOT NULL DEFAULT '[]',
+                token_budget_json TEXT NOT NULL DEFAULT '{}',
+                stored_at REAL NOT NULL
+            )"""
+        )
+        await db.commit()
+        cursor = await db.execute(
+            "SELECT * FROM context_snapshots WHERE turn_id = ? ORDER BY stored_at DESC",
+            (turn_id,),
+        )
+        rows = await cursor.fetchall()
+        return [_snapshot_row_to_dict(row, _json) for row in rows]
+
+    async def get_snapshot_by_call_id(self, call_id: str) -> dict | None:
+        """Return the snapshot for a specific call, or None."""
+        import json as _json
+        db = await self._get_db()
+        if db is None:
+            return None
+        await db.execute(
+            """CREATE TABLE IF NOT EXISTS context_snapshots (
+                snapshot_id TEXT PRIMARY KEY, turn_id TEXT NOT NULL,
+                call_id TEXT NOT NULL, created_at REAL NOT NULL,
+                exposed_tool_names TEXT NOT NULL DEFAULT '[]',
+                history_message_ids TEXT NOT NULL DEFAULT '[]',
+                memory_ids TEXT NOT NULL DEFAULT '[]',
+                turn_local_summary TEXT NOT NULL DEFAULT '{}',
+                block_summaries_json TEXT NOT NULL DEFAULT '[]',
+                token_budget_json TEXT NOT NULL DEFAULT '{}',
+                stored_at REAL NOT NULL
+            )"""
+        )
+        await db.commit()
+        cursor = await db.execute(
+            "SELECT * FROM context_snapshots WHERE call_id = ? LIMIT 1",
+            (call_id,),
+        )
+        rows = await cursor.fetchall()
+        if not rows:
+            return None
+        return _snapshot_row_to_dict(rows[0], _json)
+
+    # ── End Phase 4 ──────────────────────────────────────────────
+
     # ================================================================
     # Memory CRUD
     # ================================================================
@@ -1238,7 +1359,7 @@ class MemoryStore:
         error: str = "",
     ):
         """Mark a scheduled task as sent, failed, or sending."""
-        if status not in {"sent", "failed", "pending", "sending"}:
+        if status not in {"sent", "failed", "pending", "sending", "cancelled"}:
             raise ValueError(f"invalid scheduled message status: {status}")
 
         async with self._lock:
@@ -1248,6 +1369,22 @@ class MemoryStore:
                    SET status = ?, error = ?, updated_at = ?
                    WHERE id = ?""",
                 (status, error[:500], time.time(), task_id),
+            )
+            await db.commit()
+
+    async def reschedule_scheduled_message(
+        self,
+        task_id: str,
+        due_at: float,
+    ) -> None:
+        """Move a scheduled task to a future pending due time."""
+        async with self._lock:
+            db = await self._get_db()
+            await db.execute(
+                """UPDATE scheduled_messages
+                   SET status = 'pending', error = '', due_at = ?, updated_at = ?
+                   WHERE id = ?""",
+                (due_at, time.time(), task_id),
             )
             await db.commit()
 
@@ -1788,18 +1925,17 @@ class MemoryStore:
         if not turn_id:
             turn_id = f"turn_{uuid.uuid4().hex[:12]}"
         now = time.time()
-
-        db = await self._get_db()
-        row = await db.execute_fetchall(
-            """SELECT COALESCE(MAX(turn_number), 0) + 1 AS next
-               FROM turns WHERE user_id = ? AND bot_id = ?""",
-            (user_id, bot_id),
-        )
-        turn_number = int(row[0]["next"]) if row else 1
-
         session_id = f"{user_id}_{bot_id}"
+        db = await self._get_db()
 
         async with self._lock:
+            row = await db.execute_fetchall(
+                """SELECT COALESCE(MAX(turn_number), 0) + 1 AS next
+                   FROM turns WHERE user_id = ? AND bot_id = ?""",
+                (user_id, bot_id),
+            )
+            turn_number = int(row[0]["next"]) if row else 1
+
             await db.execute(
                 """INSERT OR REPLACE INTO turns
                    (id, user_id, bot_id, session_id, turn_number,
@@ -1939,19 +2075,62 @@ class MemoryStore:
         )
         return [dict(r) for r in (rows or [])]
 
+    async def get_pending_proactive_wake_up(
+        self, user_id: str, bot_id: str = "",
+    ) -> dict[str, Any] | None:
+        """v4.0: Check if a pending proactive wake-up exists for this user.
+
+        Returns the first pending task dict or None. Used by check_cold_start
+        to prevent double-triggering when a cold-start already dispatched.
+        """
+        db = await self._get_db()
+        rows = await db.execute_fetchall(
+            """SELECT id, due_at, messages_json FROM scheduled_messages
+               WHERE user_id = ? AND bot_id = ? AND status = 'pending'
+               ORDER BY due_at ASC""",
+            (user_id, bot_id),
+        )
+        for row in rows:
+            if self._scheduled_message_is_proactive(row["messages_json"]):
+                return {"id": row["id"], "due_at": row["due_at"], "messages_json": row["messages_json"]}
+        return None
+
     async def cancel_pending_proactive_wake_ups(
         self, user_id: str, bot_id: str,
     ) -> int:
         """v4.0: Cancel pending proactive wake-up tasks. Returns count cancelled."""
-        db = await self._get_db()
-        # Mark as cancelled via status column
-        cur = await db.execute(
-            """UPDATE scheduled_messages SET status = 'cancelled'
-               WHERE user_id = ? AND status = 'pending'""",
-            (user_id,),
-        )
-        await db.commit()
-        return cur.rowcount
+        async with self._lock:
+            db = await self._get_db()
+            rows = await db.execute_fetchall(
+                """SELECT id, messages_json FROM scheduled_messages
+                   WHERE user_id = ? AND bot_id = ? AND status = 'pending'""",
+                (user_id, bot_id),
+            )
+            ids = [
+                row["id"] for row in rows
+                if self._scheduled_message_is_proactive(row["messages_json"])
+            ]
+            if not ids:
+                return 0
+            placeholders = ",".join("?" for _ in ids)
+            cur = await db.execute(
+                f"""UPDATE scheduled_messages
+                    SET status = 'cancelled', updated_at = ?
+                    WHERE id IN ({placeholders}) AND status = 'pending'""",
+                (time.time(), *ids),
+            )
+            await db.commit()
+            return cur.rowcount
+
+    @staticmethod
+    def _scheduled_message_is_proactive(messages_json: str) -> bool:
+        try:
+            messages = json.loads(messages_json)
+        except (TypeError, json.JSONDecodeError):
+            return False
+        if not messages or not isinstance(messages[0], dict):
+            return False
+        return str(messages[0].get("wake_up_type", "")) == "proactive"
 
     async def get_latest_recap(
         self,
@@ -3383,4 +3562,24 @@ class MemoryStore:
                 (count, today_str, now, user_id, bot_id),
             )
             await db.commit()
-        return count
+            return count
+
+
+# ── Phase 4: snapshot row helper ───────────────────────────────────
+
+
+def _snapshot_row_to_dict(row, json_mod) -> dict:
+    """Convert a context_snapshots DB row to a dict."""
+    return {
+        "snapshot_id": row[0],
+        "turn_id": row[1],
+        "call_id": row[2],
+        "created_at": row[3],
+        "exposed_tool_names": json_mod.loads(row[4]),
+        "history_message_ids": json_mod.loads(row[5]),
+        "memory_ids": json_mod.loads(row[6]),
+        "turn_local_summary": json_mod.loads(row[7]),
+        "block_summaries": json_mod.loads(row[8]),
+        "token_budget": json_mod.loads(row[9]),
+        "stored_at": row[10],
+    }

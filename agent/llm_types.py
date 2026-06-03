@@ -38,6 +38,9 @@ class LLMRequest:
     retry: int | None = None
     extra: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Phase 4: trace linkage
+    turn_id: str = ""
+    call_id: str = ""
 
 
 @dataclass(slots=True)
