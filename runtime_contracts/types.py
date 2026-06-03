@@ -72,6 +72,8 @@ class DeliveryStatus(str, enum.Enum):
     DELIVERED = "delivered"
     FAILED = "failed"
     UNKNOWN = "unknown"
+    RATE_LIMITED = "rate_limited"       # WeChat platform rate limit (retryable)
+    BLOCKED = "blocked"                 # WeChat platform content block (retryable)
     BLOCKED_BY_GUARD = "blocked_by_guard"
     NOT_APPLICABLE = "not_applicable"
 

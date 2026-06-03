@@ -49,6 +49,7 @@ from agent.tool_exposure_policy import ToolExposurePolicy
 from agent.tools import configure_runtime, configure_tools
 from bridge.wechat_poller import WeChatBridge
 from memory.store import MemoryStore
+from memory.system import MemorySystem
 from runtime.chat_runtime import ChatRuntime, create_chat_runtime
 
 # ================================================================
@@ -369,6 +370,9 @@ chat_agent = ChatAgent(
     context_builder=_context_builder,
 )
 
+# Phase 8: MemorySystem for sent-content tracking in post-turn pipeline
+memory_system = MemorySystem(user_id="", bot_id=BOT_ID, _store=memory_store)
+
 # Phase 10: ChatRuntime as single entry point for /chat
 chat_runtime = create_chat_runtime(
     user_id="",
@@ -378,7 +382,7 @@ chat_runtime = create_chat_runtime(
     chat_agent=chat_agent,
     context_builder=_context_builder,
     tool_exposure_policy=_tool_exposure_policy,
-    memory_system=None,  # MemorySystem not yet wired; uses legacy MemoryHook
+    memory_system=memory_system,
 )
 
 # ── v3.1: ProactiveScheduler ─────────────────────────────────────
@@ -2015,6 +2019,7 @@ def _build_chatagent_post_turn_hooks(
     raw_messages: list[str],
     memory_hook: Any,
     memory_store: Any,
+    memory_system: Any = None,
 ) -> list:
     """Return a list of PostTerminalCallback hooks for ChatAgent.
 
@@ -2022,6 +2027,22 @@ def _build_chatagent_post_turn_hooks(
     Individual failures are caught inside each hook and logged.
     send_status is computed from terminal_state inside _hook_dev_logs.
     """
+
+    async def _hook_memory_system(turn: TurnScratchpad, terminal_state: TurnState) -> None:
+        if memory_system is None:
+            return
+        visible = _visible_messages_as_dicts(turn)
+        delivered_texts = [
+            m["text"] for m in visible
+            if m.get("text")
+            and (m.get("send_status") in _IS_DELIVERED
+                 or m.get("delivery_status") in _IS_DELIVERED)
+        ]
+        if delivered_texts:
+            await memory_system.write_after_turn(
+                delivered_texts=delivered_texts,
+                turn_id=turn.turn_id,
+            )
 
     async def _hook_memory(turn: TurnScratchpad, terminal_state: TurnState) -> None:
         if not memory_hook:
@@ -2137,6 +2158,7 @@ def _build_chatagent_post_turn_hooks(
             logger.warning("last_visible hook failed for turn %s", turn.turn_id, exc_info=True)
 
     return [
+        _hook_memory_system,
         _hook_memory,
         _hook_dev_logs,
         _hook_model_attempt_log,
@@ -2280,6 +2302,10 @@ async def chat(request: Request):
             # ── v1.2: Build seq-based checker (arrival already recorded outside lock) ──
             interrupt_checker = _make_interrupt_checker(user_id, input_latest_seq)
 
+            # ── Set per-request user_id on MemorySystem ──────────
+            if chat_runtime.memory_system is not None:
+                chat_runtime.memory_system.user_id = user_id
+
             # Run through ChatRuntime (Phase 10/12: target architecture)
             _wmh_cb = _build_chatagent_write_model_history(user_id, bot_id)
             _hook_cbs = _build_chatagent_post_turn_hooks(
@@ -2287,6 +2313,7 @@ async def chat(request: Request):
                 route=route, context_policy=context_policy,
                 raw_messages=raw_messages,
                 memory_hook=memory_hook, memory_store=memory_store,
+                memory_system=chat_runtime.memory_system,
             )
             result: TurnResult = await chat_runtime.handle_chat(
                 user_message=user_message,

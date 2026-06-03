@@ -38,8 +38,15 @@ from agent.state_machine import (
     TurnState,
     VisibleMessage,
 )
+from agent.delivery_service import (
+    DeliveryService,
+    DeliveryBlockedError,
+    DeliveryRateLimitedError,
+    DeliveryUnknownError,
+)
 from agent.tool_classifier import classify_single_tool_call
 from agent.tool_registry import TOOL_REGISTRY
+from runtime_contracts import DeliveryStatus as RTDeliveryStatus
 
 logger = logging.getLogger(__name__)
 
@@ -1508,39 +1515,44 @@ class ChatAgent:
         if turn.source == SOURCE_PROACTIVE_IMPULSE:
             turn.proactive_send_attempt_count += 1
 
-        # ── Send single bubble (guarded_text) ────────────────────
-        send_batch = [{"text": guarded_text, "delay": 0.0, "_vm_index": 0}]
-        try:
+        # ── Phase 12: Delegate to DeliveryService ──────────────────
+        delivery_service = DeliveryService(turn_id=turn.turn_id)
+
+        async def _wechat_send_adapter(text: str) -> None:
+            """Bridge wechat_sender (list[dict]) to DeliveryService (raises on non-delivered)."""
+            send_batch = [{"text": text, "delay": 0.0, "_vm_index": 0}]
             raw_results = await wechat_sender(send_batch)
-        except Exception as e:
-            turn.send_failure_count += 1
-            result = {"status": "error", "recoverable": False,
-                      "reason": "send_exception", "hint": str(e)[:200]}
-            _append_result(result)
-            logger.error("exec_send_one: exception=%s", e)
-            return TurnState.APPEND_SEND_RESULT
+            if not raw_results or not isinstance(raw_results, list) or not raw_results:
+                raise DeliveryUnknownError("wechat_sender returned empty result")
+            status = raw_results[0].get("send_status", "unknown")
+            if status == "delivered":
+                return
+            elif status == "failed":
+                error_detail = raw_results[0].get("send_error", "")
+                raise Exception(f"send failed: {error_detail}")
+            elif status == "rate_limited":
+                raise DeliveryRateLimitedError("rate limited by WeChat")
+            elif status == "blocked":
+                raise DeliveryBlockedError("message blocked by platform")
+            else:
+                raise DeliveryUnknownError(f"unknown send_status: {status}")
 
-        # ── Check wechat_sender return value ─────────────────────
-        if not raw_results or not isinstance(raw_results, list) or not raw_results:
-            turn.send_failure_count += 1
-            result = {"status": "error", "recoverable": False,
-                      "reason": "send_no_result", "hint": "wechat_sender returned empty"}
-            _append_result(result)
-            logger.info("exec_send_one: empty result")
-            return TurnState.APPEND_SEND_RESULT
+        receipt = await delivery_service.deliver(
+            text=guarded_text,
+            tool_call_id=tool_call_id,
+            send_fn=_wechat_send_adapter,
+        )
 
-        send_status = raw_results[0].get("send_status", "unknown") if raw_results else "unknown"
-
-        if send_status == "delivered":
+        # ── Map receipt status to existing branch logic ────────────
+        if receipt.status == RTDeliveryStatus.DELIVERED:
             turn._last_send_delivered = True
             turn.sent_message_count += 1
             turn._sent_idempotency_keys.add(idempotency_key)
 
-            # ── v3.1: Proactive turn counters ────────────────────
             if turn.source == SOURCE_PROACTIVE_IMPULSE:
                 turn.proactive_delivered_count += 1
                 turn.proactive_delivered_texts.append(guarded_text)
-                turn._proactive_fact_tool_count_since_last_reply = 0  # reset after delivery
+                turn._proactive_fact_tool_count_since_last_reply = 0
 
             vm = VisibleMessage(
                 visible_message_id=f"vm_{turn.turn_id}_{turn.sent_message_count}",
@@ -1556,7 +1568,6 @@ class ChatAgent:
             turn.visible_messages.append(vm)
             result = {"status": "ok", "delivery": "sent",
                       "message_index": turn.sent_message_count}
-            # ── Embed limit_reached in this tool result if at limit ──
             if turn.source == SOURCE_PROACTIVE_IMPULSE:
                 meta = turn.proactive_meta or {}
                 max_reply = int(meta.get("max_wechat_reply", 3))
@@ -1566,39 +1577,42 @@ class ChatAgent:
             elif turn.sent_message_count >= turn.max_reply_messages_per_turn:
                 result["limit_reached"] = True
                 result["hint"] = "本轮微信消息数量已达上限，请调用 done 结束。"
-            # v1.5: discard idempotency key so subsequent same-tool_call_id calls work (test compat)
             turn._sent_idempotency_keys.discard(idempotency_key)
             logger.info("exec_send_one: delivered reply_index=%d idempotency_key=%s",
                        turn.sent_message_count, idempotency_key)
-        elif send_status == "failed":
+
+        elif receipt.status == RTDeliveryStatus.FAILED:
             turn.send_failure_count += 1
-            error_detail = raw_results[0].get("send_error", "")
-            if "no_bridge" in str(error_detail).lower():
+            is_unrecoverable = receipt.error_code == "wechat_sender_unavailable"
+            if is_unrecoverable:
                 result = {"status": "error", "recoverable": False,
                           "reason": "wechat_sender_unavailable",
                           "hint": "发送通道不可用。请调用 done(status='failed')。"}
             else:
                 result = {"status": "error", "recoverable": True,
                           "reason": "send_failed",
-                          "hint": f"发送失败：{error_detail[:100]}。可以重试或 done。"}
-            logger.info("exec_send_one: failed error=%s", error_detail[:80])
-        elif send_status == "rate_limited":
+                          "hint": f"发送失败：{receipt.error_message or ''}。可以重试或 done。"}
+            logger.info("exec_send_one: failed error=%s", (receipt.error_message or "")[:80])
+
+        elif receipt.status == RTDeliveryStatus.RATE_LIMITED:
             result = {"status": "error", "recoverable": True,
                       "reason": "rate_limited",
                       "hint": "发送太快被微信限流，请等待几秒后重试或调用 done(status='failed')。"}
-        elif send_status == "blocked":
+
+        elif receipt.status == RTDeliveryStatus.BLOCKED:
             result = {"status": "error", "recoverable": True,
                       "reason": "send_blocked",
                       "hint": "消息被拦截（可能为空或包含敏感内容）。请修改后重试。"}
             logger.info("exec_send_one: blocked")
-        else:
+
+        else:  # UNKNOWN
             turn.send_failure_count += 1
             result = {"status": "error", "recoverable": False,
                       "reason": "send_unknown_status",
-                      "hint": f"发送状态未知：{send_status}"}
-            logger.info("exec_send_one: unknown status=%s", send_status)
+                      "hint": f"发送状态未知：{receipt.status.value}"}
+            logger.info("exec_send_one: unknown status=%s", receipt.status.value)
 
-        turn.tool_results.append({"name": turn._classified_single.tool_name if turn._classified_single else "wechat_reply", "result": send_status})
+        turn.tool_results.append({"name": turn._classified_single.tool_name, "result": receipt.status.value})
         _append_result(result)
         return TurnState.APPEND_SEND_RESULT
 
