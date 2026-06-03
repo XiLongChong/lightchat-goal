@@ -287,6 +287,12 @@ class TurnScratchpad:
     proactive_next_check_minutes: int | None = None  # v4.0: next proactive check minutes from done/skip
     scheduled_task_ids: list[str] = field(default_factory=list)
 
+    # ── v2.0: Per-turn tool list override (e.g. intent-gated schedule_wake_up) ──
+    native_allowed_tools_override: list[str] | None = None
+
+    # ── v2.0: Per-turn interrupt checker (no longer on ChatAgent singleton) ──
+    interrupt_checker: Any | None = None
+
     # ── v1.6-A: Fact tool counter for required trigger constraint ──
     _proactive_fact_tool_count_since_last_reply: int = 0
 
@@ -322,6 +328,114 @@ class TurnScratchpad:
 
     def add_fallback_event(self, event_type: str, detail: str = "") -> None:
         self.fallback_events.append({"type": event_type, "detail": detail[:500]})
+
+    # ── Phase 5: Turn-local state accessors ───────────────────────
+
+    def get_sent_messages_this_turn(self) -> list[dict[str, Any]]:
+        """Return all messages sent this turn with delivery status.
+
+        Each dict: {message_id, tool_call_id, text, status, delivered_at}.
+        Status is one of: delivered, failed, unknown.
+        """
+        result: list[dict[str, Any]] = []
+        for i, vm in enumerate(self.visible_messages, 1):
+            msg_id = vm.visible_message_id or f"tl_msg_{i}"
+            status = "delivered"
+            if vm.delivery_status in ("failed_before_send", "failed_confirmed"):
+                status = "failed"
+            elif vm.delivery_status in ("unknown_after_attempt",):
+                status = "unknown"
+            elif vm.delivery_status == "blocked_by_guard":
+                status = "blocked"
+            result.append({
+                "message_id": msg_id,
+                "tool_call_id": vm.tool_call_id,
+                "text": vm.guarded_text or vm.original_text,
+                "status": status,
+                "delivered_at": vm.sent_at_timestamp if status == "delivered" else None,
+            })
+        return result
+
+    def get_delivered_texts(self) -> list[str]:
+        """Return texts of only delivered messages this turn."""
+        return [
+            m["text"] for m in self.get_sent_messages_this_turn()
+            if m["status"] == "delivered" and m["text"]
+        ]
+
+    def get_failed_texts(self) -> list[str]:
+        """Return texts of only failed messages this turn."""
+        return [
+            m["text"] for m in self.get_sent_messages_this_turn()
+            if m["status"] in ("failed", "unknown") and m["text"]
+        ]
+
+    def to_turn_local_state(self):
+        """Map TurnScratchpad to runtime_contracts CurrentTurnLocalState.
+
+        Phase 5: provides explicit bridge between legacy and new types.
+        """
+        from runtime_contracts import (
+            CurrentTurnLocalState,
+            TurnLocalSentMessage,
+            TurnBudgetState,
+            DeliveryStatus as RTDeliveryStatus,
+        )
+
+        sent_msgs: list = []
+        for m in self.get_sent_messages_this_turn():
+            ds = RTDeliveryStatus.DELIVERED
+            if m["status"] == "failed":
+                ds = RTDeliveryStatus.FAILED
+            elif m["status"] == "unknown":
+                ds = RTDeliveryStatus.UNKNOWN
+            elif m["status"] == "blocked":
+                ds = RTDeliveryStatus.BLOCKED_BY_GUARD
+            sent_msgs.append(TurnLocalSentMessage(
+                message_id=m["message_id"],
+                tool_call_id=m["tool_call_id"],
+                text=m["text"],
+                status=ds,
+                delivered_at=(
+                    None if ds != RTDeliveryStatus.DELIVERED
+                    else None  # timestamp not tracked per-message yet
+                ),
+            ))
+
+        return CurrentTurnLocalState(
+            turn_id=self.turn_id,
+            model_call_count=self.llm_call_count,
+            tool_call_count=len(self.tool_results),
+            delivered_message_count=sum(
+                1 for m in self.get_sent_messages_this_turn()
+                if m["status"] == "delivered"
+            ),
+            send_attempt_count=self.send_attempt,
+            failed_send_attempt_count=self.send_failure_count,
+            sent_messages_this_turn=sent_msgs,
+            tool_results_this_turn=[],  # raw tool results not mapped yet
+            budget_state=TurnBudgetState(
+                model_calls_remaining=max(0, self.max_llm_steps_per_turn - self.llm_call_count),
+                delivered_messages_remaining=max(
+                    0, self.max_reply_messages_per_turn - self.sent_message_count,
+                ),
+                elapsed_seconds=max(0, self.elapsed_ms / 1000.0),
+            ),
+            diagnostics={
+                "terminal_state": self.terminal_state.value if self.terminal_state else "",
+                "fallback_events": len(self.fallback_events),
+            },
+        )
+
+    def get_history_writable_messages(self) -> list[dict[str, str]]:
+        """Return only delivered assistant messages suitable for history.
+
+        Phase 5: explicit invariant — failed/unknown NOT returned here.
+        """
+        return [
+            {"role": "assistant", "content": text, "source": "assistant_reply"}
+            for text in self.get_delivered_texts()
+        ]
 
 
 # ================================================================
