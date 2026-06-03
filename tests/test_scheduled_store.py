@@ -9,6 +9,30 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from memory.store import MemoryStore
 
 
+def test_memory_store_concurrent_first_access_initializes_once(tmp_path):
+    class SlowMigratingStore(MemoryStore):
+        def __init__(self, db_path: str):
+            super().__init__(db_path)
+            self.migrate_calls = 0
+
+        async def _migrate(self, db=None):
+            self.migrate_calls += 1
+            await asyncio.sleep(0.01)
+            await super()._migrate(db)
+
+    async def run():
+        store = SlowMigratingStore(str(tmp_path / "memory.db"))
+        try:
+            db1, db2 = await asyncio.gather(store._get_db(), store._get_db())
+
+            assert db1 is db2
+            assert store.migrate_calls == 1
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
 def test_contact_state_round_trip(tmp_path):
     async def run():
         store = MemoryStore(str(tmp_path / "memory.db"))
@@ -19,6 +43,67 @@ def test_contact_state_round_trip(tmp_path):
         assert contact["context_token"] == "ctx"
 
         await store.close()
+
+    asyncio.run(run())
+
+
+def test_create_scheduled_wake_up_uses_trigger_at(tmp_path):
+    async def run():
+        store = MemoryStore(str(tmp_path / "memory.db"))
+        try:
+            task_id = await store.create_scheduled_wake_up(
+                "wxid_me",
+                "default_bot",
+                {
+                    "message_hint": "later",
+                    "trigger_at": "2026-06-01T10:30:00+08:00",
+                    "wake_up_type": "proactive",
+                },
+            )
+
+            tasks = await store.list_scheduled_messages(status="pending")
+            task = next(item for item in tasks if item["id"] == task_id)
+
+            assert task["due_at"] == 1780281000.0
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_cancel_pending_proactive_wake_ups_keeps_user_requested_tasks(tmp_path):
+    async def run():
+        store = MemoryStore(str(tmp_path / "memory.db"))
+        try:
+            await store.create_scheduled_wake_up(
+                "wxid_me",
+                "default_bot",
+                {
+                    "message_hint": "proactive",
+                    "trigger_at": "2026-06-01T10:30:00+08:00",
+                    "wake_up_type": "proactive",
+                },
+            )
+            user_task_id = await store.create_scheduled_wake_up(
+                "wxid_me",
+                "default_bot",
+                {
+                    "message_hint": "user reminder",
+                    "trigger_at": "2026-06-01T10:30:00+08:00",
+                    "wake_up_type": "user_requested",
+                },
+            )
+
+            cancelled = await store.cancel_pending_proactive_wake_ups("wxid_me", "default_bot")
+            pending = await store.list_scheduled_messages(status="pending")
+            cancelled_rows = await store.list_scheduled_messages(status="cancelled")
+
+            assert cancelled == 1
+            assert [task["id"] for task in pending] == [user_task_id]
+            assert len(cancelled_rows) == 1
+            assert await store.get_pending_proactive_wake_up("wxid_me", "default_bot") is None
+        finally:
+            await store.close()
 
     asyncio.run(run())
 

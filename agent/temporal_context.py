@@ -12,7 +12,7 @@ from typing import Any
 
 # ── Time gap thresholds (seconds) ───────────────────────────────
 _CONTINUOUS_THRESHOLD = 10 * 60       # 10 分钟
-_SHORT_THRESHOLD = 60 * 60            # 1 小时
+_SHORT_THRESHOLD = 45 * 60            # 45 分钟（≥45 分钟升级为 same_day_resume）
 _DAY_THRESHOLD = 7 * 24 * 60 * 60     # 7 天
 
 # ── Time divider thresholds (seconds) ───────────────────────────

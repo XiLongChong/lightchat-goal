@@ -394,6 +394,14 @@ class ProactiveScheduler:
         if elapsed < self.COLD_START_SECONDS:
             return None
 
+        # v4.0: don't re-trigger cold-start if a wake-up is already pending
+        try:
+            pending = await self._store.get_pending_proactive_wake_up(user_id, bot_id)
+            if pending:
+                return None
+        except Exception:
+            pass
+
         return {
             "trigger": "proactive",
             "trigger_kind": "cold_start",
@@ -451,13 +459,14 @@ class ProactiveScheduler:
                     post_turn_hooks=post_turn_hooks or [],
                 )
 
-                await self._schedule_next_from_turn_result(
-                    user_id, bot_id, result, wake_up_context,
-                )
+                if wake_up_context.get("trigger", "proactive") == "proactive":
+                    await self._schedule_next_from_turn_result(
+                        user_id, bot_id, result, wake_up_context,
+                    )
 
                 task_id = wake_up_context.get("task_id", "")
                 if task_id:
-                    await self._mark_dynamic_scheduled_result(task_id, result)
+                    await self._mark_wake_up_result(task_id, wake_up_context, result)
 
                 return {"status": "ok", "result": result}
             except Exception as e:
@@ -466,6 +475,27 @@ class ProactiveScheduler:
                 return {"status": "error", "reason": str(e)[:500]}
             finally:
                 self._active_proactive_turn_id = None
+
+    async def _mark_wake_up_result(
+        self,
+        task_id: str,
+        wake_up_context: dict[str, Any],
+        result: Any,
+    ) -> None:
+        """Mark a claimed wake-up task complete, or requeue daily tasks."""
+        try:
+            delivered = int(getattr(result, "proactive_delivered_count", 0) or 0)
+            terminal = str(getattr(result, "terminal_state", ""))
+            if delivered <= 0:
+                await self._store.mark_scheduled_message_status(task_id, "failed", terminal[:200])
+                return
+            if str(wake_up_context.get("recurring", "")) == "daily":
+                current_due = _safe_float(wake_up_context.get("due_at"), time.time())
+                await self._store.reschedule_scheduled_message(task_id, current_due + 86400)
+                return
+            await self._store.mark_scheduled_message_status(task_id, "sent", "")
+        except Exception:
+            pass
 
     async def _build_wake_up_impulse(
         self, user_id: str, bot_id: str, wake_up_context: dict,
@@ -554,7 +584,7 @@ class ProactiveScheduler:
         trigger_at = time.time() + next_minutes * 60
 
         task = {
-            "message_hint": f"主动消息自动唤醒（上次: {wake_up_context.get('trigger_reason_summary', '')[:100]}）",
+            "message_hint": f"主动消息自动唤醒（上次: {wake_up_context.get('message_hint', '')[:100]}）",
             "trigger_at": datetime.fromtimestamp(trigger_at, tz=timezone(timedelta(hours=8))).isoformat(),
             "recurring": None,
             "skip_quiet_hours": False,
@@ -599,12 +629,13 @@ class ProactiveScheduler:
         first = messages[0] if messages and isinstance(messages[0], dict) else {}
         return {
             "task_id": str(task.get("id", "")),
-            "trigger": task.get("wake_up_type", "proactive"),
+            "trigger": first.get("wake_up_type", "proactive"),
             "trigger_kind": "wake_up",
-            "is_wake_up": task.get("is_wake_up", False),
+            "is_wake_up": bool(first.get("is_wake_up", False)),
             "message_hint": str(first.get("text", "") or first.get("message", "") or "")[:500],
-            "skip_quiet_hours": bool(task.get("skip_quiet_hours", False)),
-            "recurring": task.get("recurring"),
+            "skip_quiet_hours": bool(first.get("skip_quiet_hours", False)),
+            "recurring": first.get("recurring"),
+            "due_at": task.get("due_at", 0),
         }
 
     # ══════════════════════════════════════════════════════════════
@@ -612,7 +643,7 @@ class ProactiveScheduler:
     # ══════════════════════════════════════════════════════════════
 
     async def _check_eligibility(
-        self, user_id: str, bot_id: str,
+        self, user_id: str, bot_id: str, *, require_autonomous: bool = True,
     ) -> tuple[bool, str]:
         """Run eligibility pre-checks (no LLM).
 
@@ -628,7 +659,7 @@ class ProactiveScheduler:
             return False, ELIGIBILITY_BLOCK_PROACTIVE_DISABLED
 
         # 2. Autonomous sub-switch
-        if not settings.autonomous_enabled:
+        if require_autonomous and not settings.autonomous_enabled:
             return False, "autonomous_disabled"
 
         # 3. Bridge online
@@ -662,12 +693,13 @@ class ProactiveScheduler:
 
         # 6. Daily autonomous trigger cap (counts successful autonomous triggers)
         try:
-            intensity = settings.autonomous_intensity
-            profile = get_intensity_profile(intensity)
-            trigger_cap = int(profile.get("daily_trigger_cap", 5))
-            count, _ = await self._store.get_autonomous_trigger_count(user_id, bot_id)
-            if count >= trigger_cap:
-                return False, "autonomous_trigger_cap_reached"
+            if require_autonomous:
+                intensity = settings.autonomous_intensity
+                profile = get_intensity_profile(intensity)
+                trigger_cap = int(profile.get("daily_trigger_cap", 5))
+                count, _ = await self._store.get_autonomous_trigger_count(user_id, bot_id)
+                if count >= trigger_cap:
+                    return False, "autonomous_trigger_cap_reached"
         except Exception:
             pass
 

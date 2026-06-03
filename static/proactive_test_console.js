@@ -6,6 +6,8 @@
   var lastReport = null;
   var userId = '';
   var botId = '';
+  var deployPollTimer = null;
+  var deployQrcode = '';
 
   // ── DOM refs ───────────────────────────────────────────────────
   function $(sel) { return document.querySelector(sel); }
@@ -24,6 +26,13 @@
   var barBridge = $('#barBridge');
   var barProactive = $('#barProactive');
   var barTodaySent = $('#barTodaySent');
+  var btnDeploy = $('#btnDeploy');
+
+  // Deploy
+  var deployPanel = $('#deployPanel');
+  var deployQr = $('#deployQr');
+  var deployStatus = $('#deployStatus');
+  var btnDeployClose = $('#btnDeployClose');
 
   // Lab
   var runMode = $('#runMode');
@@ -106,6 +115,8 @@
     loginView.style.display = 'none';
     appView.style.display = '';
     loadBootstrap();
+    loadSettings();
+    loadScheduledTasks();
     loadRuns();
   }
 
@@ -126,6 +137,7 @@
   });
 
   logoutBtn.addEventListener('click', function () {
+    stopDeployPolling();
     apiPost('/admin/auth/logout').then(function () { showLogin(); }).catch(function () { showLogin(); });
   });
 
@@ -154,7 +166,125 @@
       }
     }).catch(function () {});
   }
-    loadSettings();
+
+  function setDeployStatus(cls, text) {
+    deployStatus.className = 'summary ' + cls;
+    deployStatus.textContent = text;
+  }
+
+  function clearDeployQr() {
+    deployQr.innerHTML = '';
+  }
+
+  function renderDeployQr(payload) {
+    clearDeployQr();
+    var raw = payload.qrcode_img || payload.qrcode_content || payload.qrcode_url || payload.qrcode || '';
+    if (raw && /^data:image\//.test(raw)) {
+      var img = document.createElement('img');
+      img.alt = 'WeChat deploy QR';
+      img.src = raw;
+      deployQr.appendChild(img);
+      return;
+    }
+    if (raw && /^https?:\/\//.test(raw)) {
+      var httpImg = document.createElement('img');
+      httpImg.alt = 'WeChat deploy QR';
+      httpImg.src = '/wechat/deploy/qr-image?data=' + encodeURIComponent(raw);
+      deployQr.appendChild(httpImg);
+      return;
+    }
+    if (raw && /^[A-Za-z0-9+/=]+$/.test(raw) && raw.length > 80) {
+      var b64Img = document.createElement('img');
+      b64Img.alt = 'WeChat deploy QR';
+      b64Img.src = 'data:image/png;base64,' + raw;
+      deployQr.appendChild(b64Img);
+      return;
+    }
+    if (payload.qrcode_svg) {
+      deployQr.innerHTML = payload.qrcode_svg;
+      return;
+    }
+    if (raw) {
+      var generated = document.createElement('img');
+      generated.alt = 'WeChat deploy QR';
+      generated.src = '/wechat/deploy/qr-image?data=' + encodeURIComponent(raw);
+      deployQr.appendChild(generated);
+      return;
+    }
+    var pre = document.createElement('pre');
+    pre.textContent = 'No QR content returned';
+    deployQr.appendChild(pre);
+  }
+
+  function stopDeployPolling() {
+    if (deployPollTimer) {
+      window.clearTimeout(deployPollTimer);
+      deployPollTimer = null;
+    }
+  }
+
+  function pollDeployStatus() {
+    if (!deployQrcode) return;
+    apiGet('/wechat/deploy/status?qrcode=' + encodeURIComponent(deployQrcode)).then(function (r) {
+      var st = r.status || 'wait';
+      if (st === 'confirmed') {
+        stopDeployPolling();
+        setDeployStatus('pass', '部署成功，bridge 已启动' + (r.token_masked ? ' (' + r.token_masked + ')' : ''));
+        barBridge.textContent = 'bridge online';
+        barBridge.className = 'bar-tag green';
+        btnRealSend.disabled = false;
+        btnRealSend.title = '';
+        loadBootstrap();
+        return;
+      }
+      if (st === 'expired' || st === 'cancelled' || st === 'failed') {
+        stopDeployPolling();
+        setDeployStatus('fail', '部署未完成：' + st);
+        return;
+      }
+      setDeployStatus('info', st === 'scanned' ? '已扫码，等待手机确认' : '等待扫码确认...');
+      deployPollTimer = window.setTimeout(pollDeployStatus, 2500);
+    }).catch(function (e) {
+      stopDeployPolling();
+      setDeployStatus('fail', '查询部署状态失败：' + e.message.substring(0, 120));
+    });
+  }
+
+  function startDeploy() {
+    if (btnDeploy.disabled) return;
+    stopDeployPolling();
+    deployPanel.style.display = '';
+    deployPanel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    clearDeployQr();
+    deployQrcode = '';
+    btnDeploy.disabled = true;
+    setDeployStatus('info', '正在生成二维码...');
+    apiPost('/wechat/deploy/start', {}).then(function (r) {
+      deployQrcode = r.qrcode || r.qrcode_url || '';
+      renderDeployQr(r);
+      if (!deployQrcode) {
+        setDeployStatus('fail', '二维码生成成功，但缺少可轮询的 qrcode');
+        return;
+      }
+      setDeployStatus('info', '请使用微信扫码确认部署');
+      deployPollTimer = window.setTimeout(pollDeployStatus, 1200);
+    }).catch(function (e) {
+      setDeployStatus('fail', '生成二维码失败：' + e.message.substring(0, 120));
+    }).finally(function () {
+      btnDeploy.disabled = false;
+    });
+  }
+
+  window.startWechatDeploy = startDeploy;
+  btnDeploy.addEventListener('click', startDeploy);
+  document.addEventListener('click', function (e) {
+    var target = e.target && e.target.closest ? e.target.closest('#btnDeploy') : null;
+    if (target) startDeploy();
+  });
+  btnDeployClose.addEventListener('click', function () {
+    stopDeployPolling();
+    deployPanel.style.display = 'none';
+  });
 
   // ══════════════════════════════════════════════════════════════
   // V1.6-A: Settings panel
@@ -166,6 +296,13 @@
   var settingQuietStart = $('#settingQuietStart');
   var settingQuietEnd = $('#settingQuietEnd');
   var settingDailyCap = $('#settingDailyCap');
+  var settingScheduledEnabled = $('#settingScheduledEnabled');
+  var scheduledFrequency = $('#scheduledFrequency');
+  var scheduledOnceAt = $('#scheduledOnceAt');
+  var scheduledDailyAt = $('#scheduledDailyAt');
+  var scheduledTaskText = $('#scheduledTaskText');
+  var btnAddScheduledTask = $('#btnAddScheduledTask');
+  var scheduledTasksResult = $('#scheduledTasksResult');
   var btnSaveSettings = $('#btnSaveSettings');
   var settingsSaveStatus = $('#settingsSaveStatus');
 
@@ -178,6 +315,7 @@
       settingQuietStart.value = r.quiet_hours_start || '00:00';
       settingQuietEnd.value = r.quiet_hours_end || '08:00';
       settingDailyCap.value = r.daily_active_message_cap || 50;
+      settingScheduledEnabled.checked = r.scheduled_enabled !== false;
       var intensity = r.autonomous_intensity || 'daily';
       var radio = document.querySelector('input[name="intensity"][value="' + intensity + '"]');
       if (radio) radio.checked = true;
@@ -196,6 +334,7 @@
       quiet_hours_start: settingQuietStart.value,
       quiet_hours_end: settingQuietEnd.value,
       daily_active_message_cap: parseInt(settingDailyCap.value, 10) || 50,
+      scheduled_enabled: settingScheduledEnabled.checked,
     };
     apiPost('/admin/proactive/settings', body).then(function (r) {
       if (r && r.status === 'ok') {
@@ -222,6 +361,94 @@
   }
 
   btnSaveSettings.addEventListener('click', saveSettings);
+
+  function updateScheduledTimeInput() {
+    var daily = scheduledFrequency.value === 'daily';
+    scheduledOnceAt.style.display = daily ? 'none' : '';
+    scheduledDailyAt.style.display = daily ? '' : 'none';
+  }
+
+  function loadScheduledTasks() {
+    apiGet('/admin/proactive/scheduled-tasks').then(function (r) {
+      if (!r || r.status !== 'ok') return;
+      renderScheduledTasks(r.tasks || [], r.master_enabled, r.enabled);
+    }).catch(function () {
+      if (scheduledTasksResult) scheduledTasksResult.innerHTML = '<div class="scheduled-empty">定时任务加载失败</div>';
+    });
+  }
+
+  function renderScheduledTasks(tasks, masterEnabled, scheduledEnabled) {
+    if (!scheduledTasksResult) return;
+    var hint = '';
+    if (!masterEnabled) hint = '<div class="scheduled-empty">主动消息主开关已关闭，定时任务不会触发。</div>';
+    else if (!scheduledEnabled) hint = '<div class="scheduled-empty">定时任务开关已关闭，任务会保留但不会触发。</div>';
+    if (!tasks.length) {
+      scheduledTasksResult.innerHTML = hint + '<div class="scheduled-empty">暂无待执行定时任务</div>';
+      return;
+    }
+    var html = hint;
+    for (var i = 0; i < tasks.length; i++) {
+      var t = tasks[i];
+      var freq = t.frequency === 'daily' ? '每天' : '一次';
+      html += '<div class="scheduled-item">'
+        + '<span class="scheduled-time">' + esc(t.due_at_text || '') + '</span>'
+        + '<span class="scheduled-frequency">' + freq + '</span>'
+        + '<span class="scheduled-task" title="' + esc(t.task || '') + '">' + esc(t.task || '') + '</span>'
+        + '<button class="btn btn-sm" type="button" data-cancel-scheduled="' + esc(t.id || '') + '">取消</button>'
+        + '</div>';
+    }
+    scheduledTasksResult.innerHTML = html;
+  }
+
+  function addScheduledTask() {
+    var task = scheduledTaskText.value.trim();
+    if (!task) {
+      showSaveError('请填写任务内容');
+      return;
+    }
+    var frequency = scheduledFrequency.value;
+    var body = { task: task, frequency: frequency };
+    if (frequency === 'daily') {
+      if (!scheduledDailyAt.value) {
+        showSaveError('请选择每天触发时间');
+        return;
+      }
+      body.time = scheduledDailyAt.value;
+    } else {
+      if (!scheduledOnceAt.value) {
+        showSaveError('请选择一次性任务时间');
+        return;
+      }
+      body.trigger_at = scheduledOnceAt.value + ':00+08:00';
+    }
+    btnAddScheduledTask.disabled = true;
+    apiPost('/admin/proactive/scheduled-tasks', body).then(function () {
+      scheduledTaskText.value = '';
+      scheduledOnceAt.value = '';
+      loadScheduledTasks();
+    }).catch(function (e) {
+      showSaveError(e.message || '添加定时任务失败');
+    }).finally(function () {
+      btnAddScheduledTask.disabled = false;
+    });
+  }
+
+  scheduledFrequency.addEventListener('change', updateScheduledTimeInput);
+  btnAddScheduledTask.addEventListener('click', addScheduledTask);
+  scheduledTasksResult.addEventListener('click', function (e) {
+    var btn = e.target && e.target.closest ? e.target.closest('[data-cancel-scheduled]') : null;
+    if (!btn) return;
+    var id = btn.getAttribute('data-cancel-scheduled');
+    if (!id) return;
+    btn.disabled = true;
+    api('DELETE', '/admin/proactive/scheduled-tasks/' + encodeURIComponent(id)).then(function () {
+      loadScheduledTasks();
+    }).catch(function (err) {
+      showSaveError(err.message || '取消定时任务失败');
+      btn.disabled = false;
+    });
+  });
+  updateScheduledTimeInput();
 
   // ══════════════════════════════════════════════════════════════
   // v2.3 readability: translation tables

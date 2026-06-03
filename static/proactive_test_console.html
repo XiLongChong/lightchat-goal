@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Goal Proactive Test Console</title>
-<link rel="stylesheet" href="/static/proactive_test_console.css">
+<link rel="stylesheet" href="/static/proactive_test_console.css?v=admin-only-2">
 </head>
 <body>
 
@@ -33,12 +33,28 @@
       <span id="barBridge" class="bar-tag">bridge —</span>
       <span id="barProactive" class="bar-tag">proactive —</span>
       <span id="barTodaySent" class="bar-tag">today 0</span>
+      <button id="btnDeploy" class="btn btn-sm btn-primary" type="button" onclick="window.startWechatDeploy && window.startWechatDeploy()">扫码部署</button>
       <button id="logoutBtn" class="btn btn-sm">退出</button>
     </div>
   </header>
 
   <!-- Main content -->
   <main class="content">
+
+    <!-- WeChat deploy panel -->
+    <section class="panel deploy-panel" id="deployPanel" style="display:none">
+      <div class="deploy-head">
+        <h2>微信扫码部署</h2>
+        <button id="btnDeployClose" class="btn btn-sm">关闭</button>
+      </div>
+      <div class="deploy-layout">
+        <div id="deployQr" class="deploy-qr"></div>
+        <div class="deploy-info">
+          <div id="deployStatus" class="summary info">等待生成二维码</div>
+          <p class="dim">扫码确认后会自动保存 token 并启动 bridge。</p>
+        </div>
+      </div>
+    </section>
 
     <!-- Lab panel -->
     <section class="panel">
@@ -154,6 +170,26 @@
           </div>
           <p class="settings-hint">所有主动类消息实际发送条数上限（1-200），用于防止异常情况下消息过多</p>
         </div>
+
+        <!-- 5. Scheduled tasks -->
+        <div class="settings-card">
+          <div class="settings-row">
+            <span class="settings-label">定时任务</span>
+            <label class="toggle"><input type="checkbox" id="settingScheduledEnabled"><i></i></label>
+          </div>
+          <p class="settings-hint">关闭后，已保存的定时任务会保留，但不会触发。主动消息主开关关闭时也不会触发。</p>
+          <div class="scheduled-form">
+            <select id="scheduledFrequency">
+              <option value="once">一次</option>
+              <option value="daily">每天</option>
+            </select>
+            <input type="datetime-local" id="scheduledOnceAt">
+            <input type="time" id="scheduledDailyAt" value="09:00" style="display:none">
+            <input type="text" id="scheduledTaskText" placeholder="任务内容">
+            <button id="btnAddScheduledTask" class="btn btn-sm" type="button">添加</button>
+          </div>
+          <div id="scheduledTasksResult" class="scheduled-list"></div>
+        </div>
       </div>
       <div class="btn-row">
         <button id="btnSaveSettings" class="btn btn-primary">保存设置</button>
@@ -225,6 +261,6 @@
   </main>
 </div>
 
-<script src="/static/proactive_test_console.js"></script>
+<script src="/static/proactive_test_console.js?v=admin-only-2"></script>
 </body>
 </html>

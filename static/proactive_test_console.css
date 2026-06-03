@@ -45,6 +45,15 @@ body { font-family: -apple-system, "Microsoft YaHei", sans-serif; font-size: 14p
 .summary.skip { background: #fff8e1; color: #f57f17; }
 .summary.info { background: #e3f2fd; color: #1565c0; }
 
+/* Deploy */
+.deploy-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid #f0f0f0; margin-bottom: 12px; padding-bottom: 8px; }
+.deploy-head h2 { margin: 0; padding: 0; border-bottom: 0; }
+.deploy-layout { display: grid; grid-template-columns: 220px 1fr; gap: 16px; align-items: start; }
+.deploy-qr { min-height: 220px; border: 1px solid #e0e0e0; border-radius: 8px; background: #fafafa; display: flex; align-items: center; justify-content: center; padding: 12px; overflow: auto; }
+.deploy-qr svg, .deploy-qr img { width: 196px; height: 196px; display: block; }
+.deploy-qr pre { white-space: pre-wrap; word-break: break-all; font-size: 12px; color: #666; }
+.deploy-info { display: flex; flex-direction: column; gap: 10px; }
+
 /* Checks table */
 .checks-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .checks-table th, .checks-table td { padding: 6px 8px; text-align: left; border-bottom: 1px solid #f0f0f0; }
@@ -169,10 +178,27 @@ body { font-family: -apple-system, "Microsoft YaHei", sans-serif; font-size: 14p
 
 .num-input { padding: 6px 8px; border: 1px solid #ddd; border-radius: 4px; font-size: 13px; width: 80px; text-align: center; }
 
+.scheduled-form { display: grid; grid-template-columns: 90px 180px 1fr auto; gap: 8px; margin-top: 10px; align-items: center; }
+.scheduled-form select,
+.scheduled-form input { min-width: 0; padding: 7px 8px; border: 1px solid #ddd; border-radius: 4px; font-size: 13px; background: #fff; }
+.scheduled-list { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+.scheduled-empty { color: #999; font-size: 12px; padding: 8px 0; }
+.scheduled-item { display: grid; grid-template-columns: 150px 56px 1fr auto; gap: 8px; align-items: center; padding: 8px 10px; border: 1px solid #e5e5e5; border-radius: 6px; background: #fff; font-size: 13px; }
+.scheduled-time { color: #666; white-space: nowrap; }
+.scheduled-frequency { color: #07c160; font-weight: 600; text-align: center; }
+.scheduled-task { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 .save-status { font-size: 13px; padding: 6px 12px; border-radius: 4px; }
 .save-status.ok { color: #2e7d32; background: #e8f5e9; }
 .save-status.err { color: #c62828; background: #ffebee; }
 
 @media (max-width: 480px) {
+  .deploy-layout { grid-template-columns: 1fr; }
+  .deploy-qr { min-height: 180px; }
   .intensity-select { grid-template-columns: 1fr; }
+  .scheduled-form { grid-template-columns: 1fr; }
+  .scheduled-item { grid-template-columns: 1fr auto; }
+  .scheduled-time,
+  .scheduled-frequency,
+  .scheduled-task { white-space: normal; text-align: left; }
 }
