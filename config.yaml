@@ -24,9 +24,8 @@ model:
     allowed_tools:
       - get_time
       - get_weather
-      - create_scheduled_trigger
-      - wechat_reply
-      - done
+      - send_text_message
+      - finish_turn
 
   # ── v1.3: Model routing ──────────────────────────────
   routing_mode: auto                      # auto | manual_flash | manual_pro

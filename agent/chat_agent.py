@@ -809,6 +809,7 @@ class ChatAgent:
         try:
             # v3.1: request-scoped trace handler for proactive debug dry-run
             _trace_handler = _resolve_turn_trace_handler(turn)
+            call_id = f"call_{turn.turn_id}_{turn.llm_call_count}"
             response = await self.llm_gateway.complete(
                 LLMRequest(
                     purpose="chat_turn",
@@ -822,10 +823,13 @@ class ChatAgent:
                     tools=request_tools,
                     tool_choice=tool_choice,
                     retry=_retry,
+                    turn_id=turn.turn_id,
+                    call_id=call_id,
                     metadata={
                         "turn_id": turn.turn_id,
                         "iteration": turn.iteration,
                         "model_label": model_label,
+                        "call_id": call_id,
                     },
                 ),
                 trace_handler=_trace_handler,
@@ -2364,25 +2368,25 @@ def _build_proactive_context_system_message(turn: TurnScratchpad) -> str:
     # Tool availability
     if delivered == 0 and not is_wake_up:
         stage_desc = (
-            "阶段A-optional：尚未发送任何消息。可用：wechat_reply、skip_proactive、"
-            "get_time、get_weather、schedule_wake_up。done 不可用。"
-            f"如果 skip，必须在 skip_proactive 的 next_check_minutes 参数承诺下次时间"
+            "阶段A-optional：尚未发送任何消息。可用：send_text_message、skip_initiative、"
+            "get_time、get_weather。finish_turn 不可用。"
+            f"如果 skip，必须在 skip_initiative 的 next_wake_minutes 参数承诺下次时间"
             f"（{min_minutes}-{max_minutes} 分钟之间）。"
         )
     elif delivered == 0 and is_wake_up:
         stage_desc = (
-            "阶段A-wake-up：承诺的唤醒时间已到。必须用 wechat_reply 发送至少一条消息。"
-            "skip_proactive 不可用（你上次已承诺）。可用：wechat_reply、get_time、get_weather、"
-            "schedule_wake_up。发送后用 done(next_check_minutes=N) 设定下次时间"
+            "阶段A-wake-up：承诺的唤醒时间已到。必须用 send_text_message 发送至少一条消息。"
+            "skip_initiative 不可用（你上次已承诺）。可用：send_text_message、get_time、get_weather。"
+            "发送后用 finish_turn(next_wake_minutes=N) 设定下次时间"
             f"（{min_minutes}-{max_minutes} 分钟之间）。"
         )
     elif delivered < max_reply:
         stage_desc = (
             f"阶段B：已发 {delivered} 条，最多再发 {max_reply - delivered} 条。"
-            f"done(next_check_minutes=N, {min_minutes}-{max_minutes}) 结束。"
+            f"finish_turn(next_wake_minutes=N, {min_minutes}-{max_minutes}) 结束。"
         )
     else:
-        stage_desc = f"阶段C：已达上限 {max_reply} 条。done(next_check_minutes=N) 结束。"
+        stage_desc = f"阶段C：已达上限 {max_reply} 条。finish_turn(next_wake_minutes=N) 结束。"
 
     parts.append("")
     parts.append(f"[工具阶段] {stage_desc}")

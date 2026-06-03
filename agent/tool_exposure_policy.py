@@ -174,7 +174,7 @@ class ToolExposurePolicy:
 
         elif tt == TurnType.USER_REMINDER_DUE:
             tools.add(_MARK_REMINDER_DELIVERED)
-            tools.add(_GET_TIME)
+            # get_time NOT exposed: reminder_due is scheduler-driven, model doesn't need time lookup
 
         elif tt == TurnType.RELATIONSHIP_PROACTIVE:
             if phase == TurnPhase.SKIPPABLE:
@@ -207,7 +207,7 @@ class ToolExposurePolicy:
                 return False
             return True
 
-        if request.turn_type in (TurnType.USER_REMINDER_REQUEST, TurnType.USER_REMINDER_DUE):
+        if request.turn_type == TurnType.USER_REMINDER_REQUEST:
             return True
 
         rc = request.runtime_config or {}

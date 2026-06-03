@@ -510,7 +510,7 @@ class TestProactiveContextInjection:
         system_msgs = [m["content"] for m in req.messages if m["role"] == "system"]
         proactive_ctx = next((m for m in system_msgs if "主动回合" in m), "")
         assert "阶段A-optional" in proactive_ctx
-        assert "skip_proactive" in proactive_ctx
+        assert "skip_initiative" in proactive_ctx
 
     def test_required_context_matches_exposed_tools(self):
         """Wake-up proactive stage must not expose skip_proactive."""
@@ -543,7 +543,7 @@ class TestProactiveContextInjection:
         system_msgs = [m["content"] for m in req.messages if m["role"] == "system"]
         proactive_ctx = next((m for m in system_msgs if "主动回合" in m), "")
         assert "阶段A-wake-up" in proactive_ctx
-        assert "skip_proactive 不可用" in proactive_ctx
+        assert "skip_initiative 不可用" in proactive_ctx
         assert "必须" in proactive_ctx
 
     def test_proactive_context_marks_assistant_history_as_own_messages(self):

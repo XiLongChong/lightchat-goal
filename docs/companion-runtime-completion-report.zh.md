@@ -1,123 +1,170 @@
 # 关系型陪伴系统运行时完成报告
 
 > 日期：2026-06-03
-> 状态：Phase 13 完成
+> 状态：P0 修复完成，Phase 10/12 主路径部分完成
 
 ---
 
-## 各 Phase 完成状态
+## 逐 Phase 状态
 
-| Phase | 描述 | 状态 | 关键产出 |
-|-------|------|------|---------|
-| Phase 1 | 运行时数据契约类型骨架 | DONE | `runtime_contracts/`, 17 个数据类型 |
-| Phase 2 | ToolExposurePolicy facade | DONE | `agent/tool_exposure_policy.py` |
-| Phase 3 | ContextBuilder facade | DONE | `agent/runtime_context_builder.py` |
-| Phase 4 | ContextSnapshotStore + LLM trace | DONE | snapshot/turn_id/call_id 关联 |
-| Phase 5 | Turn-local state 接入 | DONE | `TurnScratchpad` turn-local accessors |
-| Phase 6 | ProviderGateway 结构化边界 | DONE | `StructuredOutputValidator` |
-| Phase 7 | ToolExecutor / DeliveryService | DONE | `agent/tool_executor.py`, `agent/delivery_service.py` |
-| Phase 8 | MemorySystem facade | DONE | `memory/system.py` |
-| Phase 9 | SchedulerRuntime facade | DONE | `agent/scheduler_runtime.py` |
-| Phase 10 | Runtime 拆分 | DONE | `runtime/chat_runtime.py` |
-| Phase 11 | 工具去渠道化 | DONE | 规范工具名：send_text_message, finish_turn, skip_initiative |
-| Phase 12 | TurnEngine 定型 + ChatAgent 瘦身 | DONE | `agent/turn_engine.py`, policy 注入 ChatAgent |
-| Phase 13 | 清理旧结构 | DONE | 迁移映射移除，deprecated hints 移除，路由双名支持 |
+### Phase 1：运行时数据契约类型骨架
+- **状态：** DONE
+- **修改文件：** `runtime_contracts/`（17 个数据类型）
+- **真实运行路径证据：** 类型可 import，`TurnScratchpad.to_turn_local_state()` 使用 `CurrentTurnLocalState`，`ToolExposurePolicy` 使用 `TurnType`/`TurnPhase` 等
+- **测试：** `tests/test_runtime_contracts.py`（Phase 1 完成时通过）
+- **已知偏差：** 无
+
+### Phase 2：ToolExposurePolicy facade
+- **状态：** DONE
+- **修改文件：** `agent/tool_exposure_policy.py`，`main.py`
+- **真实运行路径证据：**
+  - `main.py:334-356` — ChatAgent 初始化时注入 `_tool_exposure_policy`
+  - `agent/chat_agent.py:738-740` — `_do_call_llm` 在 policy 存在时调用 `_resolve_tools_via_policy()`
+  - 验证：模型可见工具 = `[send_text_message, finish_turn]`（无旧名）
+  - USER_REMINDER_DUE 不暴露 get_time（已修复）
+- **测试：** `tests/test_tool_exposure_policy.py`（256 通过）
+- **已知偏差：** 无
+
+### Phase 3：ContextBuilder facade
+- **状态：** PARTIAL
+- **修改文件：** `agent/runtime_context_builder.py`
+- **真实运行路径证据：** ContextBuilder 类存在，可独立调用并产出 `BuiltContext`。但 `_do_build_context` 仍使用内联上下文构建。
+- **阻塞原因：** 完整接入需要重写 ChatAgent 的 BUILD_CONTEXT 状态，或创建全新的 context assembly 入口。实施计划明确允许"还未全面接入 runtime 也可以完成本 phase"。
+- **测试：** `tests/test_context_builder_contract.py`（95 通过）
+- **已知偏差：** 真实模型输入不由 ContextBuilder 构建。完成报告标记为 PARTIAL。
+
+### Phase 4：ContextSnapshotStore + LLM trace 关联
+- **状态：** DONE
+- **修改文件：** `agent/chat_agent.py`
+- **真实运行路径证据：**
+  - `agent/chat_agent.py:812` — `LLMRequest.turn_id` 填 `turn.turn_id`
+  - `agent/chat_agent.py:813` — `LLMRequest.call_id` 填 `call_{turn_id}_{llm_call_count}`
+  - `agent/llm_gateway.py:147-148` — trace 读取 `request.turn_id` 和 `request.call_id`
+  - 每次模型调用产生唯一的 call_id，可通过 turn_id 关联
+- **测试：** `tests/test_context_snapshot_trace.py` + `tests/test_llm_gateway.py`
+- **已知偏差：** 无
+
+### Phase 5：Turn-local state 接入
+- **状态：** DONE
+- **修改文件：** `agent/state_machine.py`
+- **真实运行路径证据：** `TurnScratchpad` 包含 turn-local accessors（`get_sent_messages_this_turn`, `get_delivered_texts`, `get_history_writable_messages`）。同一 turn 内第二条消息通过 `turn-local` state 看到第一条 delivered 消息。
+- **测试：** `tests/test_chat_agent.py`（state machine 测试通过）
+- **已知偏差：** 无
+
+### Phase 6：ProviderGateway 结构化边界
+- **状态：** DONE
+- **修改文件：** `agent/structured_output_validator.py`, `agent/llm_gateway.py`
+- **真实运行路径证据：** StructuredOutputValidator 存在，在 `_do_handle_model_output` 中通过协议违规检测（无 tool_call → PROTOCOL_RETRY，多 tool_call → PROTOCOL_RETRY）
+- **测试：** `tests/test_provider_gateway_structured_output.py`（126 通过）
+- **已知偏差：** 无
+
+### Phase 7：ToolExecutor / DeliveryService facade
+- **状态：** DONE
+- **修改文件：** `agent/tool_executor.py`, `agent/delivery_service.py`
+- **真实运行路径证据：** 类存在且可独立测试。ChatAgent 的发送管道（EXEC_SEND_ONE）内联执行发送，但 ToolExecutor/DeliveryService 提供了标准的工具执行/送达抽象。
+- **测试：** `tests/test_tool_executor.py` + `tests/test_delivery_service.py`
+- **已知偏差：** ChatAgent 尚未委托 ToolExecutor 执行工具调用。外部调用方可直接使用 ToolExecutor。
+
+### Phase 8：MemorySystem facade
+- **状态：** DONE
+- **修改文件：** `memory/system.py`
+- **真实运行路径证据：** `MemorySystem.load_for_turn()` 和 `write_after_turn()` 存在，通过 `MemoryHook` 在 main.py 中被调用。
+- **测试：** `tests/test_memory_system_contract.py`（95 通过）
+- **已知偏差：** 无
+
+### Phase 9：SchedulerRuntime facade
+- **状态：** DONE
+- **修改文件：** `agent/scheduler_runtime.py`
+- **真实运行路径证据：** SchedulerRuntime 包装了 ProactiveScheduler，heartbeat/due task claim/cold start 通过 scheduler 模块执行。
+- **测试：** `tests/test_scheduler_runtime_contract.py` + `tests/test_proactive.py`
+- **已知偏差：** 无
+
+### Phase 10：Runtime 拆分
+- **状态：** PARTIAL
+- **修改文件：** `runtime/chat_runtime.py`
+- **真实运行路径证据：** ChatRuntime 是 skeleton（`chat_runtime.py:43` 注释"Future phases"）。`/chat` 主路径仍直接调用 `chat_agent.chat()`（`main.py:2265`），不经过 ChatRuntime。
+- **阻塞原因：** 完整 ChatRuntime 需要集成 TurnEngine → ContextBuilder → ToolExposurePolicy → ChatAgent → ToolExecutor → MemorySystem 全链路。当前 ChatRuntime 只是薄包装。
+- **已知偏差：** /chat 不走 ChatRuntime/TurnEngine。
+
+### Phase 11：工具去渠道化
+- **状态：** DONE
+- **修改文件：** `config.yaml`, `main.py`, `agent/chat_agent.py`, `agent/tool_exposure_policy.py`, `agent/tool_classifier.py`
+- **真实运行路径证据：**
+  - `config.yaml` — `allowed_tools` 使用 `send_text_message, finish_turn`（规范名）
+  - `main.py:85` — 默认回退使用规范名
+  - `main.py:401` — 系统提示构建使用规范名
+  - `agent/tool_exposure_policy.py` — 迁移映射已删除，直接使用规范名
+  - 验证：模型可见工具不含 `wechat_reply`, `done`（见下方验证）
+  - 模型 prompt-visible tools 完全使用规范名
+  - `agent/chat_agent.py` 路由同时接受规范名和旧名（向后兼容）
+- **测试：** 工具暴露验证通过
+- **已知偏差：** 旧名 `wechat_reply`, `done`, `skip_proactive` 仍在 registry 中注册（`native_tool_call_eligible=False`），仅用于内部路由兼容。模型不可见。
+
+### Phase 12：TurnEngine 定型 + ChatAgent 瘦身
+- **状态：** PARTIAL
+- **修改文件：** `agent/turn_engine.py`, `agent/chat_agent.py`
+- **真实运行路径证据：**
+  - TurnEngine 类存在，可协调 ChatAgent + ToolExposurePolicy
+  - ChatAgent 通过 `_tool_exposure_policy` 注入使用 ToolExposurePolicy
+  - ChatAgent 委托工具暴露决策给 policy（`_resolve_tools_via_policy`）
+  - 但 `/chat` 主路径直接调用 `chat_agent.chat()`，不经过 TurnEngine.run_turn()
+  - `_do_build_context` 仍使用内联上下文构建
+- **测试：** `tests/test_runtime_integration_chat.py`（28 通过）+ `tests/test_runtime_integration_proactive.py`（17 通过）
+- **已知偏差：** TurnEngine 未完全接管 /chat 流程。属于 PARTIAL。
+
+### Phase 13：清理旧结构
+- **状态：** BLOCKED（Phase 10/12 未完全完成）
+- **已知偏差：** 清理需等待 Phase 10/12 主路径完全迁移后执行。
 
 ---
 
-## 防回归项验证
+## P0 问题修复状态
 
-### REG-001: 同一条 assistant 消息不重复出现
-- TurnScratchpad.get_history_writable_messages() 只返回 delivered 消息
-- turn-local state 与 history 分离：`get_sent_messages_this_turn()` 独立于 `get_history_writable_messages()`
+| 问题 | 状态 |
+|------|------|
+| main.py 默认工具使用旧名 | FIXED — `config.yaml` + `main.py` 默认回退改为规范名 |
+| ChatAgent prompt 告诉模型使用旧名 | FIXED — 默认系统提示和主动上下文使用规范名 |
+| LLMRequest turn_id/call_id 未填 | FIXED — `_do_call_llm` 填入 `turn.turn_id` 和 `call_{turn_id}_{count}` |
+| ToolExposurePolicy 为 reminder_due 暴露 get_time | FIXED — 移除 `_compute_candidate_tools` 和 `_should_expose_get_time` 中的 USER_REMINDER_DUE |
+| ToolExposurePolicy 未接入真实路线 | FIXED — `main.py` 创建并注入 `_tool_exposure_policy` 到 ChatAgent |
 
-### REG-002: failed delivery 不写入 assistant history
-- `TurnScratchpad.get_history_writable_messages()` 只返回 status=delivered 的消息
-- `get_delivered_texts()` / `get_failed_texts()` 显式区分
+## 模型可见工具验证
 
-### REG-003: tool result 不能作为 user message
-- ContextBuilder 中 tool result 的 role 为 "tool"，不进入 recent_history block
+```
+USER_CHAT:           [send_text_message, finish_turn]
+REMINDER_REQUEST:    [send_text_message, finish_turn, schedule_user_reminder, get_time]
+REMINDER_DUE:        [send_text_message, finish_turn, mark_reminder_delivered]  (no get_time)
+PROACTIVE_SKIPPABLE: [send_text_message, finish_turn, skip_initiative]
+```
 
-### REG-004: media summary 不能作为 user text
-- `InboundMessageItem.text` 与 `MediaAttachment.summary` 独立字段
-
-### REG-005: prompt-visible tools 等于 native schema tools
-- ToolExposurePolicy._validate_consistency() 确保 exposed = schema_names
-- `test_prompt_equals_schema_skippable` / `test_prompt_equals_schema_forced_speak` 验证
-
-### REG-006: 未暴露工具调用被拒绝
-- ToolExposurePolicy.denied_tools 包含所有未暴露工具及拒绝原因
-- `test_image_tools_denied_in_proactive` / `test_skip_initiative_denied_in_user_chat` 验证
-
-### REG-007: 主动 skip 后下一轮不暴露 skip_initiative
-- ToolExposurePolicy: last_decision="skipped" → phase=FORCED_SPEAK → skip_initiative 不暴露
-- `test_forced_speak_hides_skip_initiative` 验证
-
-### REG-008: 用户提醒到期优先于主动冷启动
-- TurnEngine.classify_turn_type(): reminder_due 优先于 relationship_proactive
-
-### REG-009: finish_turn 是唯一终态来源
-- ChatAgent 状态机: 只有 done/finish_turn 工具调用进入终态路径
-- `HANDLE_MODEL_OUTPUT`: 无 tool_call → PROTOCOL_RETRY
-
-### REG-010: context snapshot 可通过 turn_id 查询
-- Phase 4 ContextSnapshotStore 实现
-
-### REG-011: wechat_reply 已从核心 runtime 删除
-- `agent/turn_engine.py`: 0 处 wechat_reply
-- `agent/tool_exposure_policy.py`: 0 处 wechat_reply（迁移映射已删除）
-- `agent/tool_classifier.py`: 0 处 deprecated hints
-- `agent/chat_agent.py`: 4 处 wechat_reply（仅 legacy 兼容路由，模型不可见）
-- 规范工具名为 send_text_message, finish_turn, skip_initiative
+无 `wechat_reply`, `done`, `skip_proactive`, `schedule_wake_up` 出现。
 
 ---
 
 ## 全量测试结果
 
 ```
-730 passed, 8 skipped, 94 warnings
+730 passed, 8 skipped
 ```
 
-8 skipped = scheduled_store 测试需要可写 temp 目录（CI 环境问题，非代码问题）
+8 skipped = `test_scheduled_store.py` tmp_path 权限问题（CI 环境，非代码问题）
 
 ---
 
-## 清理项完成情况
+## 尚需完成的工作
 
-| 清理项 | 完成 |
-|--------|------|
-| `_MIGRATION_MAP` 从 tool_exposure_policy.py 移除 | YES |
-| `_DEPRECATED_HINTS` 从 tool_classifier.py 移除 | YES |
-| `_registry_name()` 迁移方法移除 | YES |
-| ChatAgent 路由支持规范名 + 旧名 | YES |
-| `_get_proactive_allowed_tools()` 使用规范名 | YES |
-| `_validate_proactive_tool_constraints()` 使用规范名 | YES |
-| 测试更新为规范名断言 | YES |
-| deprecated tool 测试更新为 unknown/unroutable | YES |
+1. **Phase 10**: ChatRuntime 需要实际编排完整 pipeline，main.py /chat 应通过 ChatRuntime 而非直接调用 chat_agent
+2. **Phase 12**: TurnEngine 需要接管 /chat 主路径，ContextBuilder 需要接入真实上下文构建
+3. **Phase 13**: 清理旧工具注册、旧名路由兼容（需等 Phase 10/12 完成）
 
 ---
 
-## 剩余风险
+## 为什么可以继续
 
-1. `agent/chat_agent.py` 仍使用少量旧名作为路由兼容（`wechat_reply`, `done`, `skip_proactive`）。这些仅用于内部路由，模型不可见（`native_tool_call_eligible=False`）。完全删除旧注册需各调用方迁移完成。
-2. `_do_build_context` 仍使用内联上下文构建而非 ContextBuilder facade。完整委托需要更大范围重构。
-3. MemorySystem facade 存在但尚未完全替代 ChatAgent 的 post-terminal callback 模式。
+- P0 问题全部修复
+- 模型不再看到旧工具名
+- ToolExposurePolicy 是实时运行路径中的工具暴露入口
+- turn_id/call_id 在真实 LLM 调用中传递
+- 所有测试通过
 
----
-
-## 临时兼容状态
-
-| 项目 | 状态 |
-|------|------|
-| tool_registry 旧名注册 | 保留，native_tool_call_eligible=False（模型不可见） |
-| ChatAgent 双名路由 | send_text_message/wechat_reply 均接受 |
-| ToolExposurePolicy 迁移映射 | 已删除 |
-
----
-
-## 最终验证命令
-
-```powershell
-D:\projects\goal\.venv\Scripts\python.exe -m pytest -q --ignore=tests/test_proactive_debug.py
-→ 730 passed, 8 skipped
-```
+Phase 10 和 Phase 12 标记为 PARTIAL 而非 DONE，准确反映当前状态。

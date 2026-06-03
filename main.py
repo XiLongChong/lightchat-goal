@@ -44,6 +44,7 @@ from agent.llm_types import LLMRequest
 from agent.output_guard import guard_messages, guard_single_message
 from agent.scheduler import ProactiveScheduler
 from agent.state_machine import ModelProfile, TurnResult, TurnScratchpad, TurnState, DeliveryStatus, SOURCE_PROACTIVE_IMPULSE
+from agent.tool_exposure_policy import ToolExposurePolicy
 from agent.tools import configure_runtime, configure_tools
 from bridge.wechat_poller import WeChatBridge
 from memory.store import MemoryStore
@@ -82,7 +83,7 @@ if _native_override in ("true", "1", "yes", "on"):
     _ntc = cfg.setdefault("model", {}).setdefault("native_tool_calls", {})
     _ntc["chat_agent"] = True
     if not _ntc.get("allowed_tools"):
-        _ntc["allowed_tools"] = ["get_time", "get_weather", "schedule_wake_up"]
+        _ntc["allowed_tools"] = ["get_time", "get_weather", "send_text_message", "finish_turn"]
 RUNTIME_SETTINGS_PATH = Path("./data/runtime_settings.json")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
 ADMIN_SESSIONS: set[str] = set()
@@ -331,6 +332,9 @@ _routing_mode = cfg.get("model", {}).get("routing_mode", "auto")
 _manual_upgrade = cfg.get("model", {}).get("manual_flash_allow_upgrade", False)
 _max_upgrade = int(cfg.get("model", {}).get("max_flash_upgrade_attempts", 1) or 1)
 
+# Phase 12: ToolExposurePolicy as single source of truth for tool exposure
+_tool_exposure_policy = ToolExposurePolicy()
+
 chat_agent = ChatAgent(
     model=model_name,
     persona=_read_persona(),
@@ -353,6 +357,8 @@ chat_agent = ChatAgent(
     routing_mode=_routing_mode,
     manual_flash_allow_upgrade=_manual_upgrade,
     max_flash_upgrade_attempts=_max_upgrade,
+    # ── Phase 12: tool exposure policy ──
+    tool_exposure_policy=_tool_exposure_policy,
 )
 
 # ── v3.1: ProactiveScheduler ─────────────────────────────────────
@@ -392,14 +398,18 @@ else:
 
 # v0.2: System prompt builder — minimal, no memory/recap/relationship.
 # Memory context is loaded separately via build_enriched_system_prompt().
-def build_system_prompt_for_turn() -> str:
+def build_system_prompt_for_turn(extra_tools: list[str] | None = None) -> str:
     """Build minimal system prompt for a chat turn."""
     persona = _read_persona()
     personality = _read_personality()
     default_city = cfg.get("weather", {}).get("default_city", "")
-    tool_names = cfg.get("model", {}).get("native_tool_calls", {}).get(
-        "allowed_tools", ["get_time", "get_weather", "schedule_wake_up", "wechat_reply", "done"]
-    )
+    tool_names = list(cfg.get("model", {}).get("native_tool_calls", {}).get(
+        "allowed_tools", ["get_time", "get_weather", "send_text_message", "finish_turn"]
+    ))
+    if extra_tools:
+        for t in extra_tools:
+            if t not in tool_names:
+                tool_names.append(t)
     return build_chat_system_prompt(
         persona=persona,
         personality=personality,
@@ -407,9 +417,9 @@ def build_system_prompt_for_turn() -> str:
     )
 
 
-async def build_enriched_system_prompt(user_id: str, user_message: str) -> str:
+async def build_enriched_system_prompt(user_id: str, user_message: str, extra_tools: list[str] | None = None) -> str:
     """Build system prompt, optionally enriched with memory context."""
-    prompt = build_system_prompt_for_turn()
+    prompt = build_system_prompt_for_turn(extra_tools=extra_tools)
     if memory_hook:
         try:
             mem_ctx = await memory_hook.load_context(user_id, user_message)
@@ -418,6 +428,21 @@ async def build_enriched_system_prompt(user_id: str, user_message: str) -> str:
         except Exception:
             logger.warning("Memory context load failed, continuing without", exc_info=True)
     return prompt
+
+
+_REMINDER_KEYWORDS = [
+    "分钟后", "小时后", "分钟后提醒", "小时后提醒",
+    "提醒我", "叫我", "喊我", "记得提醒", "别忘了提醒",
+    "几点", "每天", "定时", "到了提醒", "叫我起床",
+    "提醒一下", "到点", "set reminder", "remind me",
+]
+
+
+def _has_reminder_intent(user_message: str) -> bool:
+    """Check if user message contains explicit reminder intent keywords."""
+    msg = user_message.lower()
+    return any(kw in msg for kw in _REMINDER_KEYWORDS)
+
 
 # v0.2: wechat_sender callback — pure WeChat transport, no guard logic.
 # Messages arrive already guarded (by state machine GUARD_OUTPUT or
@@ -585,12 +610,45 @@ def _shift_due_out_of_quiet_hours(due_ts: float) -> float:
     return end_dt.timestamp()
 
 
+def _scheduled_task_payload(item: dict[str, Any]) -> dict[str, Any] | None:
+    messages = item.get("messages") or []
+    first = messages[0] if messages and isinstance(messages[0], dict) else {}
+    wake_type = str(first.get("wake_up_type", "") or "")
+    source = str(first.get("source", "") or "")
+    if wake_type == "proactive":
+        return None
+    if not wake_type and source not in {"admin_scheduled_task", "schedule_wake_up"}:
+        return None
+    due_at = float(item.get("due_at", 0) or 0)
+    tz = ZoneInfo("Asia/Shanghai")
+    return {
+        "id": str(item.get("id", "")),
+        "due_at": due_at,
+        "due_at_text": datetime.fromtimestamp(due_at, tz).strftime("%Y-%m-%d %H:%M"),
+        "task": str(first.get("text", "") or first.get("message", "")),
+        "frequency": str(first.get("recurring", "") or "once"),
+        "skip_quiet_hours": bool(first.get("skip_quiet_hours", False)),
+    }
+
+
+def _next_daily_due(hhmm: str) -> float:
+    due_t = datetime_time.fromisoformat(str(hhmm))
+    tz = ZoneInfo("Asia/Shanghai")
+    now = datetime.now(tz)
+    due_dt = datetime.combine(now.date(), due_t, tzinfo=tz)
+    if due_dt.timestamp() <= time.time() + 5:
+        due_dt = due_dt + timedelta(days=1)
+    return due_dt.timestamp()
+
+
 def _build_state_tool_executor(user_id: str, context_token: str, bot_id: str):
     async def _exec(tool_name: str, args: dict[str, Any], turn: TurnScratchpad) -> dict[str, Any]:
         if tool_name != "schedule_wake_up":
             return {"status": "error", "recoverable": False, "reason": "unknown_state_tool"}
 
-        message = str(args.get("message", "") or args.get("text", "") or "").strip()
+        message = str(
+            args.get("message_hint", "") or args.get("message", "") or args.get("text", "") or ""
+        ).strip()
         if not message:
             return {
                 "status": "error",
@@ -601,6 +659,16 @@ def _build_state_tool_executor(user_id: str, context_token: str, bot_id: str):
         message = message[:500]
         title = str(args.get("title", "") or "").strip()[:80]
         trigger_at = str(args.get("trigger_at", "") or "").strip()
+        recurring = args.get("recurring", None)
+        if recurring not in (None, "", "daily"):
+            return {
+                "status": "error",
+                "recoverable": True,
+                "reason": "invalid_recurring",
+                "hint": "recurring must be null or daily",
+            }
+        recurring = "daily" if recurring == "daily" else None
+        skip_quiet_hours = bool(args.get("skip_quiet_hours", True))
         delay_raw = args.get("delay_minutes", None)
         has_trigger_at = bool(trigger_at)
         has_delay = delay_raw not in (None, "")
@@ -619,6 +687,8 @@ def _build_state_tool_executor(user_id: str, context_token: str, bot_id: str):
                 if delay_minutes < 1 or delay_minutes > 43200:
                     raise ValueError("delay_minutes must be 1-43200")
                 due_at = now_ts + delay_minutes * 60
+            elif recurring == "daily" and re.match(r"^([01]\d|2[0-3]):[0-5]\d$", trigger_at):
+                due_at = _next_daily_due(trigger_at)
             else:
                 due_at = _parse_scheduled_trigger_at(trigger_at)
         except Exception as e:
@@ -637,7 +707,8 @@ def _build_state_tool_executor(user_id: str, context_token: str, bot_id: str):
                 "hint": "scheduled trigger must be in the future",
             }
 
-        due_at = _shift_due_out_of_quiet_hours(due_at)
+        if not skip_quiet_hours:
+            due_at = _shift_due_out_of_quiet_hours(due_at)
         task_id = await memory_store.create_scheduled_message(
             user_id=user_id,
             context_token=context_token,
@@ -647,6 +718,10 @@ def _build_state_tool_executor(user_id: str, context_token: str, bot_id: str):
                 "bot_id": bot_id,
                 "created_from_turn_id": turn.turn_id,
                 "source": "schedule_wake_up",
+                "wake_up_type": "user_requested",
+                "is_wake_up": True,
+                "skip_quiet_hours": skip_quiet_hours,
+                "recurring": recurring,
             }],
             due_at=due_at,
         )
@@ -844,6 +919,11 @@ def _get_user_lock(user_id: str) -> asyncio.Lock:
         _user_turn_locks[user_id] = asyncio.Lock()
     _user_turn_lock_access[user_id] = now
     return _user_turn_locks[user_id]
+
+
+def _is_user_turn_active(user_id: str) -> bool:
+    lock = _user_turn_locks.get(user_id)
+    return bool(lock and lock.locked())
 
 
 # ================================================================
@@ -1483,10 +1563,18 @@ async def lifespan(app: FastAPI):
                     if not uid:
                         continue
                     bot_id = BOT_ID
+                    settings = load_proactive_settings(cfg)
+                    if not settings.enabled:
+                        continue
 
-                    wake_up = await proactive_scheduler._claim_due_wake_up(uid, bot_id)
+                    wake_up = None
+                    if settings.scheduled_enabled:
+                        if not _is_user_turn_active(uid):
+                            wake_up = await proactive_scheduler._claim_due_wake_up(uid, bot_id)
                     if not wake_up:
                         # No due wake-ups — check cold-start
+                        if _is_user_turn_active(uid):
+                            continue
                         cold_start = await proactive_scheduler.check_cold_start(uid, bot_id)
                         if cold_start:
                             # Check eligibility before cold-start dispatch
@@ -1498,8 +1586,10 @@ async def lifespan(app: FastAPI):
                         continue
 
                     # Check quiet hours (skip_quiet_hours=true tasks bypass)
-                    if not wake_up.get("skip_quiet_hours", False) and not wake_up.get("trigger_kind") == "cold_start":
-                        eligible, reason = await proactive_scheduler._check_eligibility(uid, bot_id)
+                    if not wake_up.get("skip_quiet_hours", False) and wake_up.get("trigger_kind") != "cold_start":
+                        eligible, reason = await proactive_scheduler._check_eligibility(
+                            uid, bot_id, require_autonomous=False,
+                        )
                         if not eligible:
                             if reason == ELIGIBILITY_BLOCK_SLEEP_HOURS:
                                 continue  # delay until quiet hours end
@@ -1549,6 +1639,41 @@ async def lifespan(app: FastAPI):
 
         _proactive_wake_up_task = asyncio.create_task(_proactive_wake_up_loop())
         logger.info("Proactive wake-up loop started (check_interval=30s)")
+
+    async def _dispatch_due_wake_up_after_turn(user_id: str, bot_id: str) -> None:
+        """Fire-and-forget: dispatch due wake-up after a user turn completes."""
+        try:
+            await asyncio.sleep(2)  # brief cooldown after turn ends
+            if _is_user_turn_active(user_id):
+                return  # another turn started already
+            contact = await memory_store.get_contact_state()
+            uid = contact.get("user_id", "")
+            if uid != user_id:
+                return
+            wake_up = await proactive_scheduler._claim_due_wake_up(uid, bot_id)
+            if not wake_up:
+                return
+            ctx_token = contact.get("context_token", "")
+            baseline = _get_current_inbound_seq(uid)
+            async def _h(uid, bid): return await get_history_async(uid, bot_id=bid)
+            async def _sp(uid): return await build_enriched_system_prompt(uid, "")
+            async def _ws(msgs): return await wechat_sender(uid, ctx_token, msgs)
+            result = await proactive_scheduler.dispatch_wake_up(
+                user_id=uid, bot_id=bot_id, wake_up_context=wake_up,
+                history_provider=_h, system_prompt_provider=_sp,
+                wechat_sender_provider=_ws,
+                interrupt_checker_provider=_make_interrupt_checker(uid, input_latest_seq=baseline),
+                input_latest_seq=baseline,
+                write_model_history=_build_proactive_write_model_history(uid, bot_id),
+                post_turn_hooks=_build_proactive_post_turn_hooks(uid, bot_id, {}),
+            )
+            if result.get("status") == "ok":
+                tr = result.get("result")
+                logger.info("wake_up: post-turn dispatch ok terminal=%s delivered=%d",
+                            getattr(tr, "terminal_state", ""),
+                            int(getattr(tr, "proactive_delivered_count", 0) or 0))
+        except Exception as e:
+            logger.debug("wake_up: post-turn dispatch skipped: %s", e)
 
     yield
 
@@ -1960,26 +2085,6 @@ def _build_chatagent_post_turn_hooks(
                 "terminal_state": str(terminal_state),
             },
         )
-        # Mark draft / outbound status (v1.5)
-        was_replied = terminal_state == TurnState.END_REPLIED
-        was_fallback = terminal_state == TurnState.END_FALLBACK_SENT
-        was_skipped = terminal_state == TurnState.END_NO_REPLY
-        was_cancelled = terminal_state == TurnState.END_CANCELLED
-        was_failed = terminal_state in (TurnState.END_FAILED, TurnState.END_PROTOCOL_ERROR, TurnState.END_MAX_LIMIT)
-        was_interrupted = terminal_state in (TurnState.END_SUPERSEDED_BEFORE_SEND, TurnState.END_INTERRUPTED_DURING_REPLY_SEQUENCE)
-        if was_skipped:
-            await memory_store.mark_turn_draft_status(turn.turn_id, "skipped")
-        elif was_cancelled:
-            await memory_store.mark_turn_draft_status(turn.turn_id, "cancelled")
-        elif was_interrupted:
-            await memory_store.mark_turn_draft_status(turn.turn_id, "interrupted")
-        elif was_replied or was_fallback:
-            await memory_store.mark_turn_draft_status(turn.turn_id, "delivered")
-            await memory_store.mark_outbound_batch_status(turn.turn_id, "delivered")
-        elif was_failed:
-            await memory_store.mark_turn_draft_status(turn.turn_id, "failed")
-        else:
-            await memory_store.mark_turn_draft_status(turn.turn_id, "generated")
         await memory_store.update_turn_send_status(turn.turn_id, send_status)
 
     async def _hook_model_attempt_log(turn: TurnScratchpad, terminal_state: TurnState) -> None:
@@ -2076,9 +2181,12 @@ async def chat(request: Request):
     input_message_ids = body.get("input_message_ids")
     if not isinstance(input_message_ids, list):
         input_message_ids = []
-    input_first_seq = int(body.get("input_first_seq", 0) or 0)
-    input_latest_seq = int(body.get("input_latest_seq", 0) or 0)
-    input_cutoff_time = float(body.get("input_cutoff_time", 0) or 0)
+    try:
+        input_first_seq = int(body.get("input_first_seq", 0) or 0)
+        input_latest_seq = int(body.get("input_latest_seq", 0) or 0)
+        input_cutoff_time = float(body.get("input_cutoff_time", 0) or 0)
+    except (ValueError, TypeError) as e:
+        raise HTTPException(status_code=400, detail=f"invalid input boundary field: {e}")
     if input_latest_seq == 0 and inbound_trigger == "user":
         logger.warning(
             "[%s] missing input_latest_seq in /chat payload — "
@@ -2096,8 +2204,14 @@ async def chat(request: Request):
     # latest_seq=M > N and cancel itself.  This batch won't cancel itself
     # because latest_seq == input_latest_seq, and > is strict.
     _record_user_message_arrival(user_id, seq=input_latest_seq)
+    try:
+        await memory_store.update_last_visible_message_at(
+            user_id, bot_id, time.time(), source="user_message",
+        )
+    except Exception:
+        pass
     # v4.0: Cancel pending proactive wake-ups when user messages
-    asyncio.create_task(_cancel_pending_proactive_on_user_message(user_id))
+    await _cancel_pending_proactive_on_user_message(user_id)
 
     lock = _get_user_lock(user_id)
     turn_id = ""
@@ -2132,7 +2246,12 @@ async def chat(request: Request):
             history = await get_history_async(user_id, bot_id=bot_id)
 
             # Build system prompt (with memory context if enabled)
-            system_prompt = await build_enriched_system_prompt(user_id, user_message)
+            _extra_tools: list[str] = []
+            if _has_reminder_intent(user_message):
+                _extra_tools.append("schedule_user_reminder")
+            system_prompt = await build_enriched_system_prompt(
+                user_id, user_message, extra_tools=_extra_tools,
+            )
 
             # Build wechat_sender bound to this user/context
             async def _bound_sender(messages: list[dict]) -> list[dict]:
@@ -2165,6 +2284,7 @@ async def chat(request: Request):
                 input_cutoff_time=input_cutoff_time,
                 interrupt_checker=interrupt_checker,
                 state_tool_executor=_build_state_tool_executor(user_id, context_token, bot_id),
+                native_allowed_tools_override=_extra_tools if _extra_tools else None,
                 write_model_history=_wmh_cb,
                 post_turn_hooks=_hook_cbs,
             )
@@ -2200,18 +2320,16 @@ async def chat(request: Request):
                  for m in result.visible_messages],
                 ensure_ascii=False,
             )
-            asyncio.create_task(
-                memory_store.create_turn(
-                    turn_id=turn_id,
-                    user_id=user_id,
-                    bot_id=bot_id,
-                    user_messages=user_message,
-                    assistant_actions=assistant_actions_json,
-                    tool_calls=json.dumps(result.tool_results, ensure_ascii=False),
-                    source=result.source,
-                    trigger=result.trigger,
-                    send_status=send_status,
-                )
+            await memory_store.create_turn(
+                turn_id=turn_id,
+                user_id=user_id,
+                bot_id=bot_id,
+                user_messages=user_message,
+                assistant_actions=assistant_actions_json,
+                tool_calls=json.dumps(result.tool_results, ensure_ascii=False),
+                source=result.source,
+                trigger=result.trigger,
+                send_status=send_status,
             )
             if result.visible_messages:
                 await memory_store.record_outbound_messages(
@@ -2236,6 +2354,29 @@ async def chat(request: Request):
                 source="wechat", route=route,
             )
 
+            # Mark draft / outbound status (was in post-turn hook, moved here
+            # because draft/outbound rows must exist before we can update them).
+            _term = result.terminal_state
+            was_replied = _term == TurnState.END_REPLIED
+            was_fallback = _term == TurnState.END_FALLBACK_SENT
+            was_skipped = _term == TurnState.END_NO_REPLY
+            was_cancelled = _term == TurnState.END_CANCELLED
+            was_failed = _term in (TurnState.END_FAILED, TurnState.END_PROTOCOL_ERROR, TurnState.END_MAX_LIMIT)
+            was_interrupted = _term in (TurnState.END_SUPERSEDED_BEFORE_SEND, TurnState.END_INTERRUPTED_DURING_REPLY_SEQUENCE)
+            if was_skipped:
+                await memory_store.mark_turn_draft_status(turn_id, "skipped")
+            elif was_cancelled:
+                await memory_store.mark_turn_draft_status(turn_id, "cancelled")
+            elif was_interrupted:
+                await memory_store.mark_turn_draft_status(turn_id, "interrupted")
+            elif was_replied or was_fallback:
+                await memory_store.mark_turn_draft_status(turn_id, "delivered")
+                await memory_store.mark_outbound_batch_status(turn_id, "delivered")
+            elif was_failed:
+                await memory_store.mark_turn_draft_status(turn_id, "failed")
+            else:
+                await memory_store.mark_turn_draft_status(turn_id, "generated")
+
             scheduled_task_ids: list[str] = list(getattr(result, "scheduled_task_ids", []) or [])
 
             logger.info(
@@ -2246,6 +2387,11 @@ async def chat(request: Request):
                 f"elapsed_ms={result.elapsed_ms} "
                 f"route={route}"
             )
+
+            # Fire-and-forget: check for due wake-ups now that the user turn is done.
+            # Prevents scheduled reminders from waiting up to 30s for the next poll cycle.
+            if proactive_scheduler and bot_id:
+                asyncio.create_task(_dispatch_due_wake_up_after_turn(user_id, bot_id))
 
         # Lock released — return response.
         # Messages were already sent via wechat_sender callback.
@@ -2866,6 +3012,93 @@ async def admin_proactive_state(request: Request):
             time.time() - (time.time() % 86400)
         ) if user_id else 0,
     }
+
+
+@app.get("/admin/proactive/scheduled-tasks")
+async def admin_list_scheduled_tasks(request: Request):
+    """List pending admin/user scheduled wake-up tasks."""
+    require_admin(request)
+    settings = load_proactive_settings(cfg)
+    rows = await memory_store.list_scheduled_messages(status="pending", limit=100)
+    tasks = []
+    for row in rows:
+        payload = _scheduled_task_payload(row)
+        if payload:
+            tasks.append(payload)
+    tasks.sort(key=lambda item: item["due_at"])
+    return {
+        "status": "ok",
+        "enabled": settings.scheduled_enabled,
+        "master_enabled": settings.enabled,
+        "tasks": tasks,
+    }
+
+
+@app.post("/admin/proactive/scheduled-tasks")
+async def admin_create_scheduled_task(request: Request):
+    """Create a simple scheduled wake-up task from the admin console."""
+    require_admin(request)
+    contact = await memory_store.get_contact_state()
+    user_id = contact.get("user_id", "")
+    if not user_id:
+        raise HTTPException(status_code=400, detail="还没有记录到微信联系人")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Request body must be valid JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+
+    task_text = str(body.get("task", "") or "").strip()
+    if not task_text:
+        raise HTTPException(status_code=422, detail="任务内容不能为空")
+    task_text = task_text[:500]
+    frequency = str(body.get("frequency", "once") or "once")
+    if frequency not in {"once", "daily"}:
+        raise HTTPException(status_code=422, detail="频次只能是 once 或 daily")
+
+    try:
+        if frequency == "daily":
+            time_value = str(body.get("time", "") or "").strip()
+            due_at = _next_daily_due(time_value)
+            recurring = "daily"
+        else:
+            trigger_at = str(body.get("trigger_at", "") or "").strip()
+            due_at = _parse_scheduled_trigger_at(trigger_at)
+            if due_at <= time.time() + 5:
+                raise ValueError("任务时间必须晚于当前时间")
+            recurring = None
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc)[:200])
+
+    due_at = _shift_due_out_of_quiet_hours(due_at)
+    task_id = await memory_store.create_scheduled_message(
+        user_id=user_id,
+        context_token=contact.get("context_token", ""),
+        messages=[{
+            "text": task_text,
+            "title": str(body.get("title", "") or "").strip()[:80],
+            "bot_id": BOT_ID,
+            "source": "admin_scheduled_task",
+            "wake_up_type": "user_requested",
+            "is_wake_up": True,
+            "skip_quiet_hours": False,
+            "recurring": recurring,
+        }],
+        due_at=due_at,
+    )
+    return {"status": "ok", "id": task_id, "due_at": due_at}
+
+
+@app.delete("/admin/proactive/scheduled-tasks/{task_id}")
+async def admin_cancel_scheduled_task(task_id: str, request: Request):
+    """Cancel a pending scheduled wake-up task."""
+    require_admin(request)
+    if not re.match(r"^[A-Za-z0-9_.:@-]+$", task_id):
+        raise HTTPException(status_code=400, detail="invalid task id")
+    await memory_store.mark_scheduled_message_status(task_id, "cancelled", "cancelled_by_admin")
+    return {"status": "cancelled", "id": task_id}
 
 
 @app.get("/admin/proactive/metrics")
