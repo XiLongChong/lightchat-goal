@@ -128,6 +128,75 @@ class TestChatRuntime:
         assert rt.context_builder is ctx
         assert rt.tool_exposure_policy is policy
 
+    def test_handle_chat_reminder_request_exposes_reminder_tools(self):
+        """Reminder requests must survive ChatRuntime -> ChatAgent tool override."""
+        from runtime.chat_runtime import create_chat_runtime
+        from agent.tool_exposure_policy import ToolExposurePolicy
+        import asyncio
+
+        class FakeChatAgent:
+            async def chat(self, **kwargs):
+                return kwargs["native_allowed_tools_override"]
+
+        runtime = create_chat_runtime(
+            chat_agent=FakeChatAgent(),
+            tool_exposure_policy=ToolExposurePolicy(),
+        )
+
+        async def run():
+            return await runtime.handle_chat(
+                "十分钟后提醒我喝水",
+                extra_tools=["schedule_user_reminder"],
+            )
+
+        tools = asyncio.run(run())
+        assert "send_text_message" in tools
+        assert "finish_turn" in tools
+        assert "schedule_user_reminder" in tools
+        assert "get_time" in tools
+
+    def test_relative_reminder_delay_can_be_inferred_from_user_text(self):
+        import main
+
+        assert main._extract_delay_minutes_from_text("\u4e94\u5206\u949f\u540e\u63d0\u9192\u6211\u5403\u836f") == 5
+        assert main._extract_delay_minutes_from_text("2\u5c0f\u65f6\u540e\u53eb\u6211") == 120
+        assert main._looks_relative_time_text("5\u5206\u949f\u540e")
+
+    def test_state_tool_executor_accepts_canonical_reminder_tool(self, tmp_path):
+        import asyncio
+        import main
+        from agent.state_machine import TurnScratchpad
+        from memory.store import MemoryStore
+
+        async def run():
+            old_store = main.memory_store
+            store = MemoryStore(str(tmp_path / "memory.db"))
+            main.memory_store = store
+            try:
+                turn = TurnScratchpad(
+                    user_message="\u4e94\u5206\u949f\u540e\u63d0\u9192\u6211\u5403\u836f",
+                )
+                executor = main._build_state_tool_executor("u1", "ctx", "default_bot")
+                result = await executor(
+                    "schedule_user_reminder",
+                    {
+                        "message_hint": "\u63d0\u9192\u5403\u836f",
+                        "trigger_at": "\u4e94\u5206\u949f\u540e",
+                    },
+                    turn,
+                )
+                tasks = await store.list_scheduled_messages(status="pending")
+
+                assert result["status"] == "ok"
+                assert result["scheduled_task_id"]
+                assert len(tasks) == 1
+                assert tasks[0]["messages"][0]["source"] == "schedule_user_reminder"
+            finally:
+                await store.close()
+                main.memory_store = old_store
+
+        asyncio.run(run())
+
     def test_handle_chat_delegates_to_agent(self):
         """Phase 10: ChatRuntime.handle_chat() delegates to ChatAgent.chat()."""
         from runtime.chat_runtime import create_chat_runtime
@@ -463,3 +532,34 @@ class TestCrossModuleWiring:
         ctx = ContextBuilder(persona_text="test persona")
         engine = create_turn_engine(chat_agent=None, context_builder=ctx)
         assert engine._context_builder is ctx
+
+    def test_chat_agent_build_context_uses_injected_context_builder(self):
+        """Injected ContextBuilder must work on the real ChatAgent build path."""
+        from agent.chat_agent import ChatAgent
+        from agent.runtime_context_builder import ContextBuilder
+        from agent.state_machine import TurnScratchpad, TurnState
+
+        agent = ChatAgent(
+            model="test",
+            persona="test",
+            personality="",
+            llm_gateway=None,
+            context_builder=ContextBuilder(persona_text="test"),
+        )
+        turn = TurnScratchpad(user_message="你好", source="user_message")
+
+        next_state = agent._do_build_context(
+            turn,
+            system_prompt="system prompt",
+            history=[],
+            trigger="user",
+        )
+
+        assert next_state == TurnState.CLASSIFY_CONTEXT_ERROR
+        assert turn._context_result is not None
+        assert turn._context_result.fatal_error == ""
+        assert any(
+            m.get("role") == "user"
+            and m.get("content") == '<channel source="wechat">\n你好\n</channel>'
+            for m in turn._context_result.messages
+        )

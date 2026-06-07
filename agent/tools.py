@@ -130,8 +130,35 @@ async def execute_tool(name: str, args: dict[str, Any] | None, bot_id: str = "")
         return await _get_time(tz)
 
     if name == "get_weather":
-        city = str(args.get("city", ""))[:50]
+        city = str(args.get("location", "") or args.get("city", ""))[:50]
         return await _get_weather(city)
+
+    if name == "search_memory":
+        store = TOOL_RUNTIME_CONFIG.get("_memory_store")
+        if store is None:
+            return json.dumps({"status": "error", "reason": "memory_store_unavailable"}, ensure_ascii=False)
+        query = str(args.get("query", "") or "").strip()
+        if not query:
+            return json.dumps({"status": "ok", "matches": [], "no_match_reason": "empty query"}, ensure_ascii=False)
+        limit = int(args.get("limit", 5) or 5)
+        limit = max(1, min(limit, 8))
+        scoped_bot_id = bot_id or str(TOOL_RUNTIME_CONFIG.get("_current_bot_id", "") or "")
+        matches = await store.search_bot(query=query, bot_id=scoped_bot_id, top_k=limit, include_shared=True)
+        payload = {
+            "status": "ok",
+            "matches": [
+                {
+                    "memory_id": m.get("id", ""),
+                    "type": m.get("category", ""),
+                    "content": m.get("content", ""),
+                    "confidence": m.get("importance", 0),
+                    "updated_at": m.get("updated_at", 0),
+                }
+                for m in matches
+            ],
+            "no_match_reason": None if matches else "No relevant memory found.",
+        }
+        return json.dumps(payload, ensure_ascii=False)
 
     return f"[未知工具: {name}]"
 

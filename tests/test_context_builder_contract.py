@@ -81,6 +81,20 @@ def make_bcr(**overrides) -> BuildContextRequest:
     return BuildContextRequest(**defaults)
 
 
+def _provider_texts(result: BuiltContext, *, include_system: bool = True) -> list[str]:
+    texts = [
+        m.content for m in result.provider_messages
+        if isinstance(m.content, str)
+    ]
+    if include_system:
+        texts.extend(
+            str(item.get("text", ""))
+            for item in result.provider_system
+            if isinstance(item, dict) and item.get("type") == "text"
+        )
+    return texts
+
+
 @pytest.fixture
 def builder() -> ContextBuilder:
     return ContextBuilder()
@@ -114,9 +128,9 @@ class TestBlockOrdering:
         kinds = [b.kind for b in result.context_blocks]
         # Check relative ordering of the always-present blocks
         assert kinds.index(ContextBlockKind.PERSONA) < kinds.index(ContextBlockKind.SYSTEM_TIME)
-        assert kinds.index(ContextBlockKind.SYSTEM_TIME) < kinds.index(ContextBlockKind.TURN_LOCAL)
-        assert kinds.index(ContextBlockKind.TURN_LOCAL) < kinds.index(ContextBlockKind.CURRENT_INPUT)
-        assert kinds.index(ContextBlockKind.CURRENT_INPUT) < kinds.index(ContextBlockKind.TOOL_CONTRACT)
+        assert ContextBlockKind.TURN_LOCAL not in kinds
+        assert ContextBlockKind.CURRENT_INPUT not in kinds
+        assert kinds.index(ContextBlockKind.SYSTEM_TIME) < kinds.index(ContextBlockKind.TOOL_CONTRACT)
         assert kinds.index(ContextBlockKind.TOOL_CONTRACT) < kinds.index(ContextBlockKind.TERMINAL_POLICY)
 
     def test_all_fixed_blocks_have_fixed_or_low_frequency_cache(self, builder):
@@ -156,30 +170,31 @@ class TestSystemTimeBlock:
         bcr = make_bcr()
         result = builder.build(bcr)
         time_idx = next(i for i, b in enumerate(result.context_blocks) if b.kind == ContextBlockKind.SYSTEM_TIME)
-        turn_idx = next(i for i, b in enumerate(result.context_blocks) if b.kind == ContextBlockKind.TURN_LOCAL)
-        assert time_idx < turn_idx  # comes before turn_local (and any memory blocks)
+        tool_idx = next(i for i, b in enumerate(result.context_blocks) if b.kind == ContextBlockKind.TOOL_CONTRACT)
+        assert time_idx < tool_idx
 
     def test_system_time_contains_correct_time(self, builder):
         bcr = make_bcr(system_time=SystemTime(dt=NOW, timezone="Asia/Shanghai", weekday_cn="周三"))
         result = builder.build(bcr)
-        provider_texts = [
-            m.content for m in result.provider_messages
-            if isinstance(m.content, str)
-        ]
+        provider_texts = _provider_texts(result)
         time_text = next((t for t in provider_texts if "当前时间" in t and "2026" in t), "")
         assert "2026" in time_text
         assert "周三" in time_text
 
-    def test_degraded_mode_when_system_time_none(self, builder):
+    def test_no_time_prompt_when_system_time_none(self, builder):
         bcr = make_bcr(system_time=None)
         result = builder.build(bcr)
-        degraded = any(
-            isinstance(m.content, str) and "系统时间不可用" in m.content
-            for m in result.provider_messages
-        )
-        assert degraded
-        warns = [w for w in result.warnings if w.source == "system_time_unavailable"]
-        assert len(warns) == 1
+        time_messages = [
+            m for m in result.provider_messages
+            if isinstance(m.content, str) and (
+                '\u5f53\u524d\u65f6\u95f4' in m.content
+                or '\u7cfb\u7edf\u65f6\u95f4\u4e0d\u53ef\u7528' in m.content
+                or 'system_time_unavailable' in m.content
+            )
+        ]
+        assert time_messages == []
+        warns = [w for w in result.warnings if w.source == 'system_time_unavailable']
+        assert warns == []
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -199,10 +214,7 @@ class TestTurnLocalHistorySeparation:
         )
         bcr = make_bcr(current_turn_local_state=tls)
         result = builder.build(bcr)
-        turn_local_texts = [
-            m.content for m in result.provider_messages
-            if isinstance(m.content, str) and "辛苦了宝宝" in m.content
-        ]
+        turn_local_texts = [t for t in _provider_texts(result) if "辛苦了宝宝" in t]
         assert len(turn_local_texts) == 1
         # No assistant message in provider_messages with "辛苦了宝宝" outside turn_local
         assistant_msgs = [
@@ -219,7 +231,7 @@ class TestTurnLocalHistorySeparation:
         tls = CurrentTurnLocalState(turn_id="turn_1", model_call_count=1, sent_messages_this_turn=msgs, delivered_message_count=2)
         bcr = make_bcr(current_turn_local_state=tls)
         result = builder.build(bcr)
-        texts = [m.content for m in result.provider_messages if isinstance(m.content, str)]
+        texts = _provider_texts(result)
         combined = " ".join(texts)
         assert "你好" in combined
         assert "在吗" in combined
@@ -284,7 +296,7 @@ class TestFailedDeliveryExclusion:
         )
         bcr = make_bcr(current_turn_local_state=tls)
         result = builder.build(bcr)
-        texts = [m.content for m in result.provider_messages if isinstance(m.content, str)]
+        texts = _provider_texts(result)
         combined = " ".join(texts)
         assert "failed" in combined.lower() or "失败" in combined
 
@@ -330,11 +342,10 @@ class TestMediaSummaryNotAsUserText:
         )
         result = builder.build(bcr)
         media_msgs = [
-            m for m in result.provider_messages
-            if isinstance(m.content, str) and "白猫" in m.content
+            item for item in result.provider_system
+            if isinstance(item, dict) and "白猫" in str(item.get("text", ""))
         ]
         assert len(media_msgs) == 1
-        assert media_msgs[0].role == "system"
 
     def test_media_summary_not_in_user_input(self, builder):
         item = InboundMessageItem(item_id="txt_1", kind=MessageKind.TEXT, text="看看我的猫")
@@ -454,8 +465,7 @@ class TestColdStart:
         )
         result = builder.build(bcr)
         time_text = next(
-            (m.content for m in result.provider_messages
-             if isinstance(m.content, str) and "首次对话" in m.content),
+            (text for text in _provider_texts(result) if "首次对话" in text),
             "",
         )
         assert "首次对话" in time_text
@@ -528,12 +538,12 @@ class TestEndToEnd:
         result2 = builder.build(bcr2)
 
         # call_2 sees the sent message in turn_local
-        texts2 = [m.content for m in result2.provider_messages if isinstance(m.content, str)]
+        texts2 = _provider_texts(result2)
         combined2 = " ".join(texts2)
         assert "我挺好的～" in combined2
 
         # call_1 does NOT have it
-        texts1 = [m.content for m in result1.provider_messages if isinstance(m.content, str)]
+        texts1 = _provider_texts(result1)
         combined1 = " ".join(texts1)
         assert "我挺好的～" not in combined1
 

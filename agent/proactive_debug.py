@@ -219,7 +219,7 @@ def create_dry_run_write_history(
 ) -> Any:
     """Return a no-op write_model_history callback for dry-run.
 
-    Does NOT write conversation_history.  Instead records what would have
+    Does NOT write protocol_messages. Instead records what would have
     been written into the `capture` list (if provided).
     """
     async def _cb(turn: Any, terminal_state: Any) -> None:
@@ -695,7 +695,7 @@ async def run_dry_run(
     """Execute a complete dry-run proactive turn.
 
     v2.1: acquires scheduler lock via run_debug_turn().
-    Does NOT write conversation_history, outbound_messages, turns,
+    Does NOT write protocol_messages, outbound_messages, turns,
     turn_diagnostics, usage_events, or memories.
     Only writes proactive_debug_runs.
     """
@@ -824,6 +824,7 @@ async def run_real_send(
     input_latest_seq: int = 0,
     write_model_history: Any = None,
     post_turn_hooks: list[Any] | None = None,
+    protocol_event_writer: Any = None,
 ) -> ProactiveDebugReport:
     """Execute a complete real-send proactive turn.
 
@@ -899,6 +900,7 @@ async def run_real_send(
         input_latest_seq=input_latest_seq,
         write_model_history=write_model_history,
         post_turn_hooks=post_turn_hooks or [],
+        protocol_event_writer=protocol_event_writer,
     )
 
     if scheduler_result.get("status") == "skipped":

@@ -157,6 +157,7 @@ class ProactiveScheduler:
         input_latest_seq: int = 0,
         write_model_history: Any = None,
         post_turn_hooks: list[Any] | None = None,
+        protocol_event_writer: Any = None,
     ) -> dict[str, Any]:
         """admin 手动触发入口。内部负责锁。
 
@@ -184,6 +185,7 @@ class ProactiveScheduler:
                     input_latest_seq=input_latest_seq,
                     write_model_history=write_model_history,
                     post_turn_hooks=post_turn_hooks,
+                    protocol_event_writer=protocol_event_writer,
                 )
                 return {"status": "ok", "result": result, "interrupt_baseline": input_latest_seq}
             except Exception as e:
@@ -206,6 +208,7 @@ class ProactiveScheduler:
         input_latest_seq: int = 0,
         write_model_history: Any = None,
         post_turn_hooks: list[Any] | None = None,
+        protocol_event_writer: Any = None,
     ) -> Any:
         """Create and execute a single proactive turn via ChatAgent.
 
@@ -256,6 +259,7 @@ class ProactiveScheduler:
             interrupt_checker=interrupt_checker,
             write_model_history=write_model_history,
             post_turn_hooks=post_turn_hooks or [],
+            protocol_event_writer=protocol_event_writer,
         )
         return result
 
@@ -422,6 +426,7 @@ class ProactiveScheduler:
         input_latest_seq: int = 0,
         write_model_history=None,
         post_turn_hooks=None,
+        protocol_event_writer=None,
     ) -> dict[str, Any]:
         """Unified wake-up dispatcher. All proactive triggers enter through here.
 
@@ -457,6 +462,7 @@ class ProactiveScheduler:
                     input_latest_seq=input_latest_seq,
                     write_model_history=write_model_history,
                     post_turn_hooks=post_turn_hooks or [],
+                    protocol_event_writer=protocol_event_writer,
                 )
 
                 if wake_up_context.get("trigger", "proactive") == "proactive":
@@ -554,8 +560,8 @@ class ProactiveScheduler:
         # Enrich with conversation context
         if self._store:
             try:
-                history = await self._store.get_recent_conversation_history(
-                    user_id, limit=40, bot_id=bot_id,
+                history = await self._store.get_recent_visible_conversation(
+                    user_id, turn_limit=20, bot_id=bot_id,
                 )
                 self._enrich_impulse_with_context(impulse, history)
             except Exception:
@@ -776,9 +782,8 @@ class ProactiveScheduler:
     ) -> None:
         """Add last_user_message and assistant_messages_after_last_user to impulse.
 
-        Only uses visible conversation_history messages (role=user or role=assistant
-        with non-fallback source). Dry-run / send failed / guard blocked content
-        is not in conversation_history and therefore not included.
+        Only uses user inputs and delivered outbound messages. Dry-run,
+        failed-send, and guard-blocked content is not included.
         """
         visible = _visible_transcript_items(history)
         user_msgs = [m for m in visible if m.get("role") == "user"]

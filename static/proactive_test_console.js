@@ -27,6 +27,7 @@
   var barProactive = $('#barProactive');
   var barTodaySent = $('#barTodaySent');
   var btnDeploy = $('#btnDeploy');
+  var btnResetContext = $('#btnResetContext');
 
   // Deploy
   var deployPanel = $('#deployPanel');
@@ -284,6 +285,23 @@
   btnDeployClose.addEventListener('click', function () {
     stopDeployPolling();
     deployPanel.style.display = 'none';
+  });
+
+  btnResetContext.addEventListener('click', function () {
+    if (!window.confirm('确认清除所有记忆、对话历史、recap、日志和调度状态？微信连接 token 会保留。')) return;
+    btnResetContext.disabled = true;
+    btnResetContext.textContent = '清除中...';
+    apiPost('/admin/dev/reset-context').then(function () {
+      window.alert('上下文已清除，微信连接状态已保留。');
+      loadBootstrap();
+      loadScheduledTasks();
+      loadRuns();
+    }).catch(function (e) {
+      window.alert('清除失败：' + (e && e.message ? e.message : e));
+    }).finally(function () {
+      btnResetContext.disabled = false;
+      btnResetContext.textContent = '清除上下文';
+    });
   });
 
   // ══════════════════════════════════════════════════════════════

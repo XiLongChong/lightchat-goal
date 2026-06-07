@@ -15,6 +15,8 @@ import aiosqlite
 
 from memory.dedup import is_duplicate, compute_importance, jaccard_similarity
 
+PROTOCOL_LOG_SCHEMA_VERSION = 2
+
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     if value is None:
@@ -118,6 +120,12 @@ class MemoryStore:
         if db is None:
             return
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS schema_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT ''
+            )
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS memories (
                 id TEXT PRIMARY KEY,
                 content TEXT NOT NULL,
@@ -165,6 +173,7 @@ class MemoryStore:
             CREATE TABLE IF NOT EXISTS scheduled_messages (
                 id TEXT PRIMARY KEY,
                 user_id TEXT NOT NULL,
+                bot_id TEXT NOT NULL DEFAULT '',
                 context_token TEXT NOT NULL DEFAULT '',
                 messages_json TEXT NOT NULL,
                 due_at REAL NOT NULL,
@@ -178,6 +187,10 @@ class MemoryStore:
             CREATE INDEX IF NOT EXISTS idx_scheduled_messages_due
             ON scheduled_messages(status, due_at)
         """)
+        try:
+            await db.execute("ALTER TABLE scheduled_messages ADD COLUMN bot_id TEXT NOT NULL DEFAULT ''")
+        except Exception:
+            pass
         await db.execute("""
             CREATE TABLE IF NOT EXISTS bot_contact_state (
                 id INTEGER PRIMARY KEY DEFAULT 1,
@@ -198,20 +211,6 @@ class MemoryStore:
         # history_summaries may have old schema (user_id alone as PK)
         # on upgraded DBs. Rebuild if needed.
         await _migrate_history_summaries(db)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS conversation_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                source TEXT NOT NULL DEFAULT '',
-                ts REAL NOT NULL
-            )
-        """)
-        await db.execute("""
-            CREATE INDEX IF NOT EXISTS idx_conversation_history_user_ts
-            ON conversation_history(user_id, ts DESC)
-        """)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS usage_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -285,18 +284,54 @@ class MemoryStore:
                 bot_id TEXT NOT NULL DEFAULT '',
                 session_id TEXT NOT NULL DEFAULT '',
                 turn_number INTEGER NOT NULL DEFAULT 0,
-                user_messages TEXT NOT NULL DEFAULT '',
-                assistant_actions TEXT NOT NULL DEFAULT '',
-                tool_calls TEXT NOT NULL DEFAULT '',
                 source TEXT NOT NULL DEFAULT '',
                 trigger TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'running',
                 send_status TEXT NOT NULL DEFAULT '',
-                created_at REAL NOT NULL
+                created_at REAL NOT NULL,
+                completed_at REAL NOT NULL DEFAULT 0,
+                updated_at REAL NOT NULL DEFAULT 0
             )
         """)
+        for col_sql in [
+            "ALTER TABLE turns ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'",
+            "ALTER TABLE turns ADD COLUMN completed_at REAL NOT NULL DEFAULT 0",
+            "ALTER TABLE turns ADD COLUMN updated_at REAL NOT NULL DEFAULT 0",
+        ]:
+            try:
+                await db.execute(col_sql)
+            except Exception:
+                pass
         await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_turns_user_bot
             ON turns(user_id, bot_id, turn_number)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_turns_user_bot_status
+            ON turns(user_id, bot_id, status, turn_number DESC)
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS protocol_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                turn_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                user_id TEXT NOT NULL DEFAULT '',
+                bot_id TEXT NOT NULL DEFAULT '',
+                call_id TEXT NOT NULL DEFAULT '',
+                role TEXT NOT NULL,
+                message_kind TEXT NOT NULL DEFAULT '',
+                content_json TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                UNIQUE(turn_id, seq)
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_protocol_messages_turn_seq
+            ON protocol_messages(turn_id, seq)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_protocol_messages_user_bot
+            ON protocol_messages(user_id, bot_id, created_at DESC)
         """)
         # L3: Recap — session-stage summaries
         await db.execute("""
@@ -531,7 +566,6 @@ class MemoryStore:
         # conditional column add, so we catch the "duplicate column" error
         for col in [("memories", "bot_id", "TEXT NOT NULL DEFAULT ''"),
                      ("relationship_state", "bot_id", "TEXT NOT NULL DEFAULT ''"),
-                     ("conversation_history", "bot_id", "TEXT NOT NULL DEFAULT ''"),
                      ("bot_contact_state", "bot_id", "TEXT NOT NULL DEFAULT ''"),
                      ("proactive_candidates", "user_id", "TEXT NOT NULL DEFAULT ''"),
                      ("proactive_candidates", "bot_id", "TEXT NOT NULL DEFAULT ''"),
@@ -553,6 +587,8 @@ class MemoryStore:
             CREATE TABLE IF NOT EXISTS llm_traces (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 request_id TEXT NOT NULL DEFAULT '',
+                turn_id TEXT NOT NULL DEFAULT '',
+                call_id TEXT NOT NULL DEFAULT '',
                 task_type TEXT NOT NULL DEFAULT '',
                 provider TEXT NOT NULL DEFAULT '',
                 model TEXT NOT NULL DEFAULT '',
@@ -569,12 +605,28 @@ class MemoryStore:
                 cache_hit_tokens INTEGER NOT NULL DEFAULT 0,
                 cache_miss_tokens INTEGER NOT NULL DEFAULT 0,
                 reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+                request_json TEXT NOT NULL DEFAULT '{}',
+                response_json TEXT NOT NULL DEFAULT '{}',
                 created_at REAL NOT NULL
             )
         """)
         await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_llm_traces_created
             ON llm_traces(created_at DESC)
+        """)
+        for col_sql in [
+            "ALTER TABLE llm_traces ADD COLUMN turn_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE llm_traces ADD COLUMN call_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE llm_traces ADD COLUMN request_json TEXT NOT NULL DEFAULT '{}'",
+            "ALTER TABLE llm_traces ADD COLUMN response_json TEXT NOT NULL DEFAULT '{}'",
+        ]:
+            try:
+                await db.execute(col_sql)
+            except Exception:
+                pass
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_llm_traces_turn_call
+            ON llm_traces(turn_id, call_id)
         """)
         # v3.1: Proactive debug runs — test console records
         await db.execute("""
@@ -636,9 +688,11 @@ class MemoryStore:
             await db.execute("ALTER TABLE recaps ADD COLUMN recap_type TEXT NOT NULL DEFAULT 'recap'")
         except Exception:
             pass  # column already exists
-        # Backfill last_visible_message_at from conversation_history
+        await self._reset_for_protocol_log_v2(db)
+
+        # Backfill last_visible_message_at from the visible event sources.
         # Default 0 is unsafe — immediate required trigger after upgrade.
-        # Priority: last visible conversation_history message. Fallback: now.
+        # Priority: latest user input or delivered outbound event. Fallback: now.
         cur = await db.execute("SELECT user_id, bot_id FROM dialogue_state")
         dialogue_rows = await cur.fetchall()
         fallback_ts = time.time()
@@ -647,11 +701,16 @@ class MemoryStore:
             bid = dr["bot_id"]
             try:
                 cur2 = await db.execute(
-                    """SELECT MAX(ts) as last_ts FROM conversation_history
-                       WHERE user_id = ? AND bot_id = ?
-                         AND (role = 'user'
-                              OR (role = 'assistant' AND source != 'assistant:fallback'))""",
-                    (uid, bid),
+                    """SELECT MAX(last_ts) AS last_ts FROM (
+                           SELECT MAX(created_at) AS last_ts
+                           FROM protocol_messages
+                           WHERE user_id = ? AND bot_id = ? AND message_kind = 'user_input'
+                           UNION ALL
+                           SELECT MAX(updated_at) AS last_ts
+                           FROM outbound_messages
+                           WHERE user_id = ? AND bot_id = ? AND send_status = 'delivered'
+                       )""",
+                    (uid, bid, uid, bid),
                 )
                 row2 = await cur2.fetchone()
                 backfill_ts = row2["last_ts"] if row2 and row2["last_ts"] else fallback_ts
@@ -662,6 +721,57 @@ class MemoryStore:
                 (backfill_ts, uid, bid),
             )
         await db.commit()
+
+    async def _reset_for_protocol_log_v2(self, db: aiosqlite.Connection) -> None:
+        """One-time test-data reset for the final protocol event log schema."""
+        row = await db.execute_fetchall(
+            "SELECT value FROM schema_meta WHERE key = 'protocol_log_schema_version'"
+        )
+        current = int(row[0]["value"]) if row else 0
+        if current >= PROTOCOL_LOG_SCHEMA_VERSION:
+            return
+
+        tables = await db.execute_fetchall(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+        keep = {"bot_contact_state", "schema_meta", "sqlite_sequence"}
+        for item in tables:
+            table = str(item["name"])
+            if table in keep or table.startswith("sqlite_"):
+                continue
+            if table in {"conversation_history", "turns"}:
+                await db.execute(f'DROP TABLE "{table}"')
+                continue
+            await db.execute(f'DELETE FROM "{table}"')
+        await db.execute("""
+            CREATE TABLE turns (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                bot_id TEXT NOT NULL DEFAULT '',
+                session_id TEXT NOT NULL DEFAULT '',
+                turn_number INTEGER NOT NULL DEFAULT 0,
+                source TEXT NOT NULL DEFAULT '',
+                trigger TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'running',
+                send_status TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,
+                completed_at REAL NOT NULL DEFAULT 0,
+                updated_at REAL NOT NULL DEFAULT 0
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX idx_turns_user_bot
+            ON turns(user_id, bot_id, turn_number)
+        """)
+        await db.execute("""
+            CREATE INDEX idx_turns_user_bot_status
+            ON turns(user_id, bot_id, status, turn_number DESC)
+        """)
+        await db.execute(
+            """INSERT INTO schema_meta(key, value) VALUES('protocol_log_schema_version', ?)
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+            (str(PROTOCOL_LOG_SCHEMA_VERSION),),
+        )
 
     async def close(self):
         if self._db:
@@ -686,13 +796,16 @@ class MemoryStore:
             return None
         cursor = await db.execute(
             """INSERT INTO llm_traces
-               (request_id, task_type, provider, model, thinking, response_mode,
+               (request_id, turn_id, call_id, task_type, provider, model, thinking, response_mode,
                 latency_ms, attempt_count, success, status_code, error_type,
                 prompt_tokens, completion_tokens, total_tokens,
-                cache_hit_tokens, cache_miss_tokens, reasoning_tokens, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                cache_hit_tokens, cache_miss_tokens, reasoning_tokens,
+                request_json, response_json, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 trace.get("request_id", ""),
+                trace.get("turn_id", ""),
+                trace.get("call_id", ""),
                 trace.get("task_type", ""),
                 trace.get("provider", ""),
                 trace.get("model", ""),
@@ -709,6 +822,8 @@ class MemoryStore:
                 trace.get("cache_hit_tokens", 0),
                 trace.get("cache_miss_tokens", 0),
                 trace.get("reasoning_tokens", 0),
+                str(trace.get("request_json", "{}") or "{}"),
+                str(trace.get("response_json", "{}") or "{}"),
                 time.time(),
             ),
         )
@@ -964,34 +1079,25 @@ class MemoryStore:
             return cursor.rowcount
 
     async def clear_developer_memory_state(self) -> dict[str, int]:
-        """Clear model-visible conversation state while keeping prompts/config.
-
-        This is a developer reset, not a database wipe. It removes persisted
-        data that can affect future model context or reintroduce old content,
-        but leaves prompt files, runtime config, auth/session data, bridge
-        contact state, and usage telemetry intact.
-        """
-        tables = [
-            "memories",
-            "shared_user_facts",
-            "conversation_history",
-            "history_summaries",
-            "turns",
-            "recaps",
-            "relationship_state",
-            "active_topics",
-            "proactive_candidates",
-            "proactive_schedule_state",
-            "scheduled_messages",
-            "turn_drafts",
-            "turn_diagnostics",
-            "outbound_messages",
-        ]
+        """Clear all runtime/test data while preserving WeChat contact state."""
         counts: dict[str, int] = {}
         async with self._lock:
             db = await self._get_db()
+            rows = await db.execute_fetchall(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+            tables = sorted(
+                str(row["name"])
+                for row in rows
+                if str(row["name"]) not in {
+                    "bot_contact_state",
+                    "schema_meta",
+                    "sqlite_sequence",
+                }
+                and not str(row["name"]).startswith("sqlite_")
+            )
             for table in tables:
-                cursor = await db.execute(f"DELETE FROM {table}")
+                cursor = await db.execute(f'DELETE FROM "{table}"')
                 counts[table] = max(0, int(cursor.rowcount or 0))
             await db.commit()
         return counts
@@ -1216,15 +1322,17 @@ class MemoryStore:
         task_id = f"sch_{uuid.uuid4().hex[:12]}"
         now = time.time()
         payload = json.dumps(messages, ensure_ascii=False)
+        first = messages[0] if messages and isinstance(messages[0], dict) else {}
+        bot_id = str(first.get("bot_id", "") or "")
 
         async with self._lock:
             db = await self._get_db()
             await db.execute(
                 """INSERT INTO scheduled_messages
-                   (id, user_id, context_token, messages_json, due_at,
+                   (id, user_id, bot_id, context_token, messages_json, due_at,
                     status, error, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, 'pending', '', ?, ?)""",
-                (task_id, user_id, context_token, payload, due_at, now, now),
+                   VALUES (?, ?, ?, ?, ?, ?, 'pending', '', ?, ?)""",
+                (task_id, user_id, bot_id, context_token, payload, due_at, now, now),
             )
             await db.commit()
 
@@ -1252,6 +1360,7 @@ class MemoryStore:
 
         messages = [{
             "text": hint,
+            "bot_id": bot_id,
             "wake_up_type": task.get("wake_up_type", "proactive"),
             "is_wake_up": task.get("is_wake_up", False),
             "skip_quiet_hours": task.get("skip_quiet_hours", False),
@@ -1358,8 +1467,8 @@ class MemoryStore:
         status: str,
         error: str = "",
     ):
-        """Mark a scheduled task as sent, failed, or sending."""
-        if status not in {"sent", "failed", "pending", "sending", "cancelled"}:
+        """Mark a scheduled task as sent, failed, sending, cancelled, or expired."""
+        if status not in {"sent", "failed", "pending", "sending", "cancelled", "expired"}:
             raise ValueError(f"invalid scheduled message status: {status}")
 
         async with self._lock:
@@ -1526,67 +1635,6 @@ class MemoryStore:
             )
             await db.commit()
 
-    async def append_conversation_history(
-        self,
-        user_id: str,
-        role: str,
-        content: str,
-        source: str = "",
-        ts: float | None = None,
-        bot_id: str = "",
-    ):
-        """Persist one raw conversation message for restart recovery."""
-        if not user_id or not content:
-            return
-        now = time.time() if ts is None else float(ts)
-        async with self._lock:
-            db = await self._get_db()
-            await db.execute(
-                """INSERT INTO conversation_history(user_id, role, content, source, ts, bot_id)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (user_id, role, content, source, now, bot_id),
-            )
-            await db.commit()
-
-    async def get_recent_conversation_history(
-        self,
-        user_id: str,
-        limit: int = 40,
-        bot_id: str = "",
-    ) -> list[dict[str, Any]]:
-        """Load recent raw messages in chronological order, scoped by bot.
-
-        V7.5: ORDER BY ts DESC, id DESC ensures stable ordering when
-        multiple rows share the same ts value.
-        """
-        if not user_id:
-            return []
-        db = await self._get_db()
-        rows = await db.execute_fetchall(
-            """SELECT id, role, content, source, ts
-               FROM conversation_history
-               WHERE user_id = ? AND bot_id = ?
-               ORDER BY ts DESC, id DESC
-               LIMIT ?""",
-            (user_id, bot_id, max(1, int(limit))),
-        )
-        return [dict(r) for r in reversed(rows)]
-
-    async def clear_conversation_history(self, user_id: str, bot_id: str = "") -> int:
-        """Delete persisted raw conversation history and summary for one user+bot."""
-        async with self._lock:
-            db = await self._get_db()
-            cursor = await db.execute(
-                "DELETE FROM conversation_history WHERE user_id = ? AND bot_id = ?",
-                (user_id, bot_id),
-            )
-            await db.execute(
-                "DELETE FROM history_summaries WHERE user_id = ? AND bot_id = ?",
-                (user_id, bot_id),
-            )
-            await db.commit()
-            return cursor.rowcount
-
     # ================================================================
     # Usage telemetry
     # ================================================================
@@ -1722,9 +1770,9 @@ class MemoryStore:
         status: str,
         send_error: str = "",
     ) -> bool:
-        """Mark a turn draft as sending/delivered/failed/retry_pending/cancelled/skipped."""
+        """Mark a turn draft as sending/delivered/failed/retry_pending/cancelled/skipped/interrupted."""
         valid = {"generated", "sending", "delivered", "failed", "retry_pending",
-                 "cancelled", "skipped"}
+                 "cancelled", "skipped", "interrupted"}
         if status not in valid:
             raise ValueError(f"invalid turn draft status: {status}")
         now = time.time()
@@ -1908,46 +1956,234 @@ class MemoryStore:
     # V2.1: Turns (L2) — semantic conversation turns
     # ================================================================
 
-    async def create_turn(
+    async def begin_protocol_turn(
         self,
         turn_id: str,
         user_id: str,
         bot_id: str = "",
-        user_messages: str = "",
-        assistant_actions: str = "",
-        tool_calls: str = "",
         source: str = "",
         trigger: str = "",
-        send_status: str = "",
+        user_message: str | None = None,
     ) -> str:
-        """Record a semantic conversation turn (L2)."""
-        import uuid
-        if not turn_id:
-            turn_id = f"turn_{uuid.uuid4().hex[:12]}"
+        """Atomically create a running turn and persist its user input."""
         now = time.time()
         session_id = f"{user_id}_{bot_id}"
-        db = await self._get_db()
-
         async with self._lock:
+            db = await self._get_db()
             row = await db.execute_fetchall(
                 """SELECT COALESCE(MAX(turn_number), 0) + 1 AS next
                    FROM turns WHERE user_id = ? AND bot_id = ?""",
                 (user_id, bot_id),
             )
             turn_number = int(row[0]["next"]) if row else 1
-
             await db.execute(
-                """INSERT OR REPLACE INTO turns
+                """INSERT INTO turns
                    (id, user_id, bot_id, session_id, turn_number,
-                    user_messages, assistant_actions, tool_calls,
-                    source, trigger, send_status, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (turn_id, user_id, bot_id, session_id, turn_number,
-                 user_messages, assistant_actions, tool_calls,
-                 source, trigger, send_status, now),
+                    source, trigger, send_status, created_at,
+                    status, completed_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, 'running', 0, ?)""",
+                (
+                    turn_id, user_id, bot_id, session_id, turn_number,
+                    source, trigger, now, now,
+                ),
             )
+            if user_message is not None:
+                await db.execute(
+                    """INSERT INTO protocol_messages
+                       (turn_id, seq, user_id, bot_id, call_id, role,
+                        message_kind, content_json, created_at)
+                       VALUES (?, 0, ?, ?, '', 'user', 'user_input', ?, ?)""",
+                    (
+                        turn_id, user_id, bot_id,
+                        json.dumps(user_message, ensure_ascii=False), now,
+                    ),
+                )
             await db.commit()
         return turn_id
+
+    async def append_protocol_message(
+        self,
+        turn_id: str,
+        user_id: str,
+        bot_id: str,
+        role: str,
+        content: Any,
+        *,
+        call_id: str = "",
+        message_kind: str = "",
+    ) -> int:
+        """Append one provider message and return its turn-local sequence."""
+        if role not in {"user", "assistant"}:
+            raise ValueError(f"unsupported protocol role: {role}")
+        now = time.time()
+        async with self._lock:
+            db = await self._get_db()
+            row = await db.execute_fetchall(
+                "SELECT COALESCE(MAX(seq), -1) + 1 AS next FROM protocol_messages WHERE turn_id = ?",
+                (turn_id,),
+            )
+            seq = int(row[0]["next"]) if row else 0
+            await db.execute(
+                """INSERT INTO protocol_messages
+                   (turn_id, seq, user_id, bot_id, call_id, role,
+                    message_kind, content_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    turn_id, seq, user_id, bot_id, call_id, role,
+                    message_kind, json.dumps(content, ensure_ascii=False), now,
+                ),
+            )
+            await db.execute(
+                "UPDATE turns SET updated_at = ? WHERE id = ?",
+                (now, turn_id),
+            )
+            await db.commit()
+        return seq
+
+    async def finish_protocol_turn(
+        self,
+        turn_id: str,
+        status: str,
+        send_status: str = "",
+    ) -> None:
+        """Mark a turn terminal after all protocol messages are durable."""
+        now = time.time()
+        async with self._lock:
+            db = await self._get_db()
+            await db.execute(
+                """UPDATE turns
+                   SET status = ?, send_status = ?, completed_at = ?, updated_at = ?
+                   WHERE id = ?""",
+                (status, send_status, now, now, turn_id),
+            )
+            await db.commit()
+
+    async def get_recent_protocol_history(
+        self,
+        user_id: str,
+        bot_id: str = "",
+        turn_limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Load complete successful turns and return provider messages in order."""
+        db = await self._get_db()
+        turns = await db.execute_fetchall(
+            """SELECT id, turn_number
+               FROM turns
+               WHERE user_id = ? AND bot_id = ? AND status = 'completed'
+               ORDER BY turn_number DESC LIMIT ?""",
+            (user_id, bot_id, max(1, int(turn_limit))),
+        )
+        if not turns:
+            return []
+        ordered_turns = list(reversed(turns))
+        turn_ids = [str(row["id"]) for row in ordered_turns]
+        placeholders = ",".join("?" for _ in turn_ids)
+        rows = await db.execute_fetchall(
+            f"""SELECT id, turn_id, seq, role, content_json, call_id,
+                       message_kind, created_at
+                FROM protocol_messages
+                WHERE turn_id IN ({placeholders})""",
+            turn_ids,
+        )
+        turn_order = {turn_id: index for index, turn_id in enumerate(turn_ids)}
+        decoded: list[dict[str, Any]] = []
+        for row in sorted(
+            rows,
+            key=lambda item: (
+                turn_order.get(str(item["turn_id"]), 0),
+                int(item["seq"]),
+            ),
+        ):
+            try:
+                content = json.loads(row["content_json"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            decoded.append({
+                "id": row["id"],
+                "turn_id": row["turn_id"],
+                "seq": row["seq"],
+                "role": row["role"],
+                "content": content,
+                "call_id": row["call_id"],
+                "message_kind": row["message_kind"],
+                "source": "protocol",
+                "ts": row["created_at"],
+            })
+        return decoded
+
+    async def get_recent_visible_conversation(
+        self,
+        user_id: str,
+        bot_id: str = "",
+        turn_limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Return user inputs and delivered outbound bubbles by complete turn."""
+        db = await self._get_db()
+        turns = await db.execute_fetchall(
+            """SELECT id, turn_number FROM turns
+               WHERE user_id = ? AND bot_id = ? AND status = 'completed'
+               ORDER BY turn_number DESC LIMIT ?""",
+            (user_id, bot_id, max(1, int(turn_limit))),
+        )
+        result: list[dict[str, Any]] = []
+        for turn in reversed(turns):
+            turn_id = str(turn["id"])
+            inputs = await db.execute_fetchall(
+                """SELECT content_json, created_at FROM protocol_messages
+                   WHERE turn_id = ? AND message_kind = 'user_input' ORDER BY seq""",
+                (turn_id,),
+            )
+            for item in inputs:
+                try:
+                    text = json.loads(item["content_json"])
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                result.append({
+                    "turn_id": turn_id, "role": "user", "content": str(text),
+                    "source": "user_message", "ts": item["created_at"],
+                })
+            outbound = await db.execute_fetchall(
+                """SELECT text, source, updated_at FROM outbound_messages
+                   WHERE turn_id = ? AND visible_to_user = 1 AND send_status = 'delivered'
+                   ORDER BY position, created_at""",
+                (turn_id,),
+            )
+            for item in outbound:
+                result.append({
+                    "turn_id": turn_id, "role": "assistant", "content": item["text"],
+                    "source": item["source"], "ts": item["updated_at"],
+                })
+        return result
+
+    async def clear_protocol_history(self, user_id: str, bot_id: str = "") -> int:
+        """Delete protocol turns and outbound records for one user and bot."""
+        async with self._lock:
+            db = await self._get_db()
+            rows = await db.execute_fetchall(
+                "SELECT id FROM turns WHERE user_id = ? AND bot_id = ?",
+                (user_id, bot_id),
+            )
+            turn_ids = [str(row["id"]) for row in rows]
+            if turn_ids:
+                placeholders = ",".join("?" for _ in turn_ids)
+                await db.execute(
+                    f"DELETE FROM protocol_messages WHERE turn_id IN ({placeholders})",
+                    turn_ids,
+                )
+                await db.execute(
+                    f"DELETE FROM outbound_messages WHERE turn_id IN ({placeholders})",
+                    turn_ids,
+                )
+                await db.execute(
+                    f"DELETE FROM turns WHERE id IN ({placeholders})",
+                    turn_ids,
+                )
+            await db.execute(
+                "DELETE FROM history_summaries WHERE user_id = ? AND bot_id = ?",
+                (user_id, bot_id),
+            )
+            await db.commit()
+        return len(turn_ids)
 
     async def get_recent_turns(
         self,
@@ -1964,7 +2200,52 @@ class MemoryStore:
                LIMIT ?""",
             (user_id, bot_id, limit),
         )
-        return [dict(r) for r in reversed(rows)]
+        result: list[dict[str, Any]] = []
+        for row in reversed(rows):
+            item = dict(row)
+            turn_id = str(item["id"])
+            messages = await db.execute_fetchall(
+                """SELECT role, message_kind, content_json
+                   FROM protocol_messages WHERE turn_id = ? ORDER BY seq""",
+                (turn_id,),
+            )
+            user_texts: list[str] = []
+            tool_calls: list[dict[str, Any]] = []
+            for message in messages:
+                try:
+                    content = json.loads(message["content_json"])
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if message["message_kind"] == "user_input":
+                    user_texts.append(str(content))
+                if message["role"] == "assistant" and isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "tool_use":
+                            tool_calls.append({
+                                "id": str(part.get("id", "")),
+                                "name": str(part.get("name", "")),
+                                "input": part.get("input", {}),
+                            })
+            outbound = await db.execute_fetchall(
+                """SELECT text, delay, send_status FROM outbound_messages
+                   WHERE turn_id = ? ORDER BY position, created_at""",
+                (turn_id,),
+            )
+            item["user_messages"] = "\n".join(user_texts)
+            item["assistant_actions"] = json.dumps(
+                [
+                    {
+                        "text": message["text"],
+                        "delay": message["delay"],
+                        "send_status": message["send_status"],
+                    }
+                    for message in outbound
+                ],
+                ensure_ascii=False,
+            )
+            item["tool_calls"] = json.dumps(tool_calls, ensure_ascii=False)
+            result.append(item)
+        return result
 
     async def count_unsummarized_turns(
         self,
@@ -2086,7 +2367,7 @@ class MemoryStore:
         db = await self._get_db()
         rows = await db.execute_fetchall(
             """SELECT id, due_at, messages_json FROM scheduled_messages
-               WHERE user_id = ? AND bot_id = ? AND status = 'pending'
+               WHERE user_id = ? AND (bot_id = ? OR bot_id = '') AND status = 'pending'
                ORDER BY due_at ASC""",
             (user_id, bot_id),
         )
@@ -2103,7 +2384,7 @@ class MemoryStore:
             db = await self._get_db()
             rows = await db.execute_fetchall(
                 """SELECT id, messages_json FROM scheduled_messages
-                   WHERE user_id = ? AND bot_id = ? AND status = 'pending'""",
+                   WHERE user_id = ? AND (bot_id = ? OR bot_id = '') AND status = 'pending'""",
                 (user_id, bot_id),
             )
             ids = [
@@ -2167,81 +2448,40 @@ class MemoryStore:
     # V2.1: Outbound message tracking
     # ================================================================
 
-    async def record_outbound_messages(
+    async def record_outbound_event(
         self,
+        message_id: str,
         turn_id: str,
-        messages: list[dict[str, Any]],
+        text: str,
+        *,
         user_id: str = "",
         bot_id: str = "",
         source: str = "user_reply",
         author: str = "assistant",
         trigger: str = "user_message",
-        visible_to_user: bool = True,
         send_status: str = "created",
-        candidate_id: str = "",
-        batch_id: str = "",
-    ) -> list[str]:
-        """Record outbound messages with full V2.1 semantics."""
-        import uuid
-        now = time.time()
-        batch_id = batch_id or turn_id
-        message_ids: list[str] = []
-
-        async with self._lock:
-            db = await self._get_db()
-            for i, msg in enumerate(messages):
-                msg_id = f"om_{uuid.uuid4().hex[:12]}"
-                text = str(msg.get("text", ""))
-                delay = float(msg.get("delay", 0) or 0)
-                await db.execute(
-                    """INSERT INTO outbound_messages
-                       (id, turn_id, batch_id, candidate_id,
-                        user_id, bot_id, source, author,
-                        trigger, visible_to_user, send_status,
-                        text, delay, position, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (msg_id, turn_id, batch_id, candidate_id,
-                     user_id, bot_id, source, author,
-                     trigger, int(visible_to_user), send_status,
-                     text, delay, i, now, now),
-                )
-                message_ids.append(msg_id)
-            await db.commit()
-        return message_ids
-
-    async def update_outbound_status(
-        self,
-        message_id: str,
-        send_status: str,
         send_error: str = "",
-    ):
-        """Update status of a single outbound message."""
+        position: int = 0,
+    ) -> None:
+        """Create or update one deterministic outbound delivery event."""
         now = time.time()
         async with self._lock:
             db = await self._get_db()
             await db.execute(
-                """UPDATE outbound_messages
-                   SET send_status = ?, send_error = ?, updated_at = ?
-                   WHERE id = ?""",
-                (send_status, send_error[:500], now, message_id),
-            )
-            await db.commit()
-
-    async def mark_outbound_batch_status(
-        self,
-        turn_id: str,
-        send_status: str,
-        send_error: str = "",
-    ):
-        """Update status of all outbound messages for a turn."""
-        now = time.time()
-        async with self._lock:
-            db = await self._get_db()
-            await db.execute(
-                """UPDATE outbound_messages
-                   SET send_status = ?, send_error = ?, updated_at = ?
-                   WHERE turn_id = ?""",
-                (send_status, send_error[:500], now, turn_id),
+                """INSERT INTO outbound_messages
+                   (id, turn_id, batch_id, candidate_id, user_id, bot_id,
+                    source, author, trigger, visible_to_user, send_status,
+                    text, delay, position, send_error, created_at, updated_at)
+                   VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, 1, ?, ?, 0, ?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                       send_status = excluded.send_status,
+                       send_error = excluded.send_error,
+                       updated_at = excluded.updated_at""",
+                (
+                    message_id, turn_id, turn_id, user_id, bot_id,
+                    source, author, trigger, send_status, text, position,
+                    send_error[:500], now, now,
+                ),
             )
             await db.commit()
 
@@ -3454,11 +3694,16 @@ class MemoryStore:
             }
 
         history_rows = await db.execute_fetchall(
-            """SELECT MAX(ts) AS last_ts FROM conversation_history
-               WHERE user_id = ? AND bot_id = ?
-                 AND (role = 'user'
-                      OR (role = 'assistant' AND source != 'assistant:fallback'))""",
-            (user_id, bot_id),
+            """SELECT MAX(last_ts) AS last_ts FROM (
+                   SELECT MAX(created_at) AS last_ts
+                   FROM protocol_messages
+                   WHERE user_id = ? AND bot_id = ? AND message_kind = 'user_input'
+                   UNION ALL
+                   SELECT MAX(updated_at) AS last_ts
+                   FROM outbound_messages
+                   WHERE user_id = ? AND bot_id = ? AND send_status = 'delivered'
+               )""",
+            (user_id, bot_id, user_id, bot_id),
         )
         hist_raw = history_rows[0]["last_ts"] if history_rows else None
         try:

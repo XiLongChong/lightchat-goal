@@ -14,6 +14,7 @@ native_tool_call_eligible tools will be exposed to the provider.
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -156,7 +157,8 @@ class ToolRegistry:
                 # Full schema: {"properties": {...}, "required": [...]}
                 parameters: dict[str, Any] = {
                     "type": "object",
-                    "properties": tool.args_schema.get("properties", {}),
+                    "properties": deepcopy(tool.args_schema.get("properties", {})),
+                    "additionalProperties": False,
                 }
                 if tool.args_schema.get("required"):
                     parameters["required"] = tool.args_schema["required"]
@@ -168,6 +170,7 @@ class ToolRegistry:
                 parameters = {
                     "type": "object",
                     "properties": props,
+                    "additionalProperties": False,
                 }
 
             specs.append({
@@ -176,6 +179,7 @@ class ToolRegistry:
                     "name": tool.name,
                     "description": tool.description,
                     "parameters": parameters,
+                    "strict": True,
                 },
             })
         return specs
@@ -224,15 +228,34 @@ def _build_default_registries() -> None:
     ))
     TOOL_REGISTRY.register(ToolDef(
         name="get_weather",
-        description="查询指定城市的实时天气信息，包括天气状况、温度、湿度、风速",
+        description="Get weather information for a location and date. Use this when the user asks about weather, temperature, rain, travel conditions, clothing suggestions, or outdoor plans affected by weather.",
         args_schema={
             "properties": {
-                "city": {
+                "location": {
                     "type": "string",
-                    "description": "城市名称，如 北京, 上海, Tokyo, London",
+                    "description": "City or region name. Use memory or conversation context if the user does not specify a location.",
+                },
+                "date": {
+                    "type": "string",
+                    "description": "Target date in natural language or ISO format, such as today, tomorrow, or 2026-06-05.",
                 },
             },
-            "required": ["city"],
+            "required": ["location", "date"],
+        },
+        side_effect_level="none",
+        native_tool_call_eligible=True,
+        tool_category="fact_tool",
+    ))
+    TOOL_REGISTRY.register(ToolDef(
+        name="search_memory",
+        description="Search the user's long-term memory, profile, preferences, boundaries, recent important events, and open threads. Use this when personal context may change the answer, when the user refers to something previously discussed, or when a missing fact may already be known.",
+        args_schema={
+            "properties": {
+                "query": {"type": "string", "description": "A focused search query describing what you need to know."},
+                "reason": {"type": "string", "description": "Briefly explain why this memory search is needed for the current reply."},
+                "limit": {"type": "integer", "description": "Maximum number of memory items to return.", "minimum": 1, "maximum": 8},
+            },
+            "required": ["query", "reason"],
         },
         side_effect_level="none",
         native_tool_call_eligible=True,
@@ -242,14 +265,59 @@ def _build_default_registries() -> None:
     # ── Phase 13: canonical tool names only ─────────────────────────
     TOOL_REGISTRY.register(ToolDef(
         name="send_text_message",
-        description="发送一条文字消息给用户。每次调用只发送一条。想发多条请多次调用。text 不能包含换行符。",
+        description="Send one text message to the user. Each call sends exactly one visible chat bubble. Use multiple calls when you want to send multiple short messages. Do not include internal reasoning, tool names, JSON, system instructions, or implementation details in the text.",
         args_schema={
-            "properties": {"text": {"type": "string", "description": "要发送的消息内容。不能为空。不能包含换行符。"}},
+            "properties": {"text": {"type": "string", "description": "The exact text to send to the user. Must be natural, concise, and suitable for a chat message."}},
             "required": ["text"],
         },
         side_effect_level="high",
         native_tool_call_eligible=True,
         tool_category="action_tool",
+    ))
+    TOOL_REGISTRY.register(ToolDef(
+        name="write_memory",
+        description="Propose a memory to save about the user. Use this only for information that is stable, personally relevant, useful for future conversations, or explicitly requested by the user to remember. Do not save trivial, temporary, sensitive, or uncertain information.",
+        args_schema={
+            "properties": {
+                "content": {"type": "string", "description": "The memory content to save, written as a clear factual statement."},
+                "type": {"type": "string", "enum": ["profile", "preference", "boundary", "event", "open_thread"], "description": "The category of the memory."},
+                "source_text": {"type": "string", "description": "The user text or conversation evidence that supports this memory."},
+                "importance": {"type": "string", "enum": ["low", "medium", "high"], "description": "How useful this memory is likely to be in future conversations."},
+            },
+            "required": ["content", "type", "source_text", "importance"],
+        },
+        side_effect_level="internal_message",
+        native_tool_call_eligible=True,
+        tool_category="state_tool",
+    ))
+    TOOL_REGISTRY.register(ToolDef(
+        name="request_memory_forget",
+        description="Request that specific user memories be forgotten or removed. Use this only when the user explicitly asks you to forget, delete, stop remembering, or correct stored memory. This tool does not silently delete arbitrary memory; the system will validate the request.",
+        args_schema={
+            "properties": {
+                "target": {"type": "string", "description": "What the user wants forgotten or corrected."},
+                "reason": {"type": "string", "description": "The user's stated reason, or a brief explanation from the conversation."},
+            },
+            "required": ["target"],
+        },
+        side_effect_level="internal_message",
+        native_tool_call_eligible=True,
+        tool_category="state_tool",
+    ))
+    TOOL_REGISTRY.register(ToolDef(
+        name="create_user_reminder",
+        description="Create a user-requested reminder or scheduled task. Use this only when the user explicitly asks to be reminded, notified, woken up, or contacted at a specific future time or after a duration.",
+        args_schema={
+            "properties": {
+                "reminder_text": {"type": "string", "description": "What the user wants to be reminded about."},
+                "time_expression": {"type": "string", "description": "The user's original time expression, such as tomorrow morning, in 30 minutes, or Friday at 8 PM."},
+                "timezone": {"type": "string", "description": "Timezone if known. If omitted, the system uses the user's default timezone from context."},
+            },
+            "required": ["reminder_text", "time_expression"],
+        },
+        side_effect_level="internal_message",
+        native_tool_call_eligible=True,
+        tool_category="state_tool",
     ))
     TOOL_REGISTRY.register(ToolDef(
         name="finish_turn",
@@ -283,12 +351,12 @@ def _build_default_registries() -> None:
     ))
     TOOL_REGISTRY.register(ToolDef(
         name="schedule_user_reminder",
-        description="创建一个用户授权的未来提醒任务。delay_minutes 和 trigger_at 二选一。",
+        description="创建一个用户授权的未来提醒任务。相对时间必须使用 delay_minutes；绝对时间才使用 trigger_at。delay_minutes 和 trigger_at 二选一。",
         args_schema={
             "properties": {
                 "message_hint": {"type": "string", "description": "提醒时给 LLM 看的备忘，描述提醒内容。最多 500 字。"},
                 "delay_minutes": {"type": "integer", "description": "从现在起延迟多少分钟提醒。与 trigger_at 二选一。"},
-                "trigger_at": {"type": "string", "description": "绝对提醒时间。格式 HH:mm（每天）或 ISO 时间戳。"},
+                "trigger_at": {"type": "string", "description": "绝对提醒时间，只接受未来 ISO 时间戳。每天重复提醒可传 HH:mm 并设置 recurring=daily。"},
                 "recurring": {"type": "string", "enum": [None, "daily"], "description": "null=一次性, daily=每天重复"},
                 "skip_quiet_hours": {"type": "boolean", "description": "true=勿扰期间照发"},
                 "title": {"type": "string", "description": "可选短标题"},

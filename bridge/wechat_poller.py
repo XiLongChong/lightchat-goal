@@ -32,6 +32,7 @@ class WeChatBridge:
         max_reply_delay: float = 3.0,
         buffer_debounce_seconds: float = 5.0,
         buffer_max_wait_seconds: float = 12.0,
+        chat_request_timeout_seconds: float = 200.0,
     ):
         self.token = token
         self.base_url = base_url
@@ -42,6 +43,7 @@ class WeChatBridge:
         self.max_reply_delay = max_reply_delay
         self.buffer_debounce_seconds = buffer_debounce_seconds
         self.buffer_max_wait_seconds = buffer_max_wait_seconds
+        self.chat_request_timeout_seconds = chat_request_timeout_seconds
         self.buf = ""
         self.running = False
         self._task: asyncio.Task | None = None
@@ -195,12 +197,19 @@ class WeChatBridge:
         )
 
         # Forward to Goal Chat Agent
+        request_started_at = time.monotonic()
         try:
             headers = {}
             if self.chat_api_key:
                 headers["Authorization"] = f"Bearer {self.chat_api_key}"
 
-            async with httpx.AsyncClient(timeout=60) as client:
+            timeout = httpx.Timeout(
+                connect=10.0,
+                read=float(self.chat_request_timeout_seconds),
+                write=10.0,
+                pool=10.0,
+            )
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 resp = await client.post(
                     f"{self.goal_url}/chat",
                     json={
@@ -216,6 +225,15 @@ class WeChatBridge:
                 )
                 resp.raise_for_status()
                 data = resp.json()
+        except httpx.ReadTimeout:
+            elapsed = time.monotonic() - request_started_at
+            logger.exception(
+                "Goal chat read timeout elapsed=%.2fs budget=%.2fs",
+                elapsed,
+                self.chat_request_timeout_seconds,
+            )
+            await self._send_reply(from_user, "（信号不好，稍等）", context_token)
+            return
         except httpx.HTTPStatusError as e:
             logger.error(
                 f"Goal chat HTTP {e.response.status_code}: {e.response.text[:500]}"

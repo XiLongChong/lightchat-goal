@@ -76,6 +76,17 @@ def _make_mock_openai_response(
     return resp
 
 
+def test_from_model_config_normalizes_deepseek_root_to_anthropic_base():
+    gateway = LLMGateway.from_model_config({
+        "provider": "deepseek",
+        "api_key": "sk-test-key",
+        "base_url": "https://api.deepseek.com",
+        "default_model": "deepseek-v4-pro",
+    })
+
+    assert gateway.config.base_url == "https://api.deepseek.com/anthropic"
+
+
 # ──────────────────────────────────────────────────────────────
 # 1. DeepSeekAdapter normal response → content
 # ──────────────────────────────────────────────────────────────
@@ -292,33 +303,31 @@ class TestThinkingDefaultDisabled:
         assert req.thinking == "disabled"
 
     @pytest.mark.asyncio
-    async def test_thinking_explicitly_disabled_in_extra_body(self):
-        """When thinking is disabled, extra_body explicitly sends {"type": "disabled"}."""
+    async def test_thinking_explicitly_disabled_in_payload(self):
+        """When thinking is disabled, payload explicitly sends {"type": "disabled"}."""
         adapter = DeepSeekAdapter(_make_config())
         req = LLMRequest(purpose="test", messages=[], thinking="disabled")
         payload = adapter._build_payload(req)
 
-        assert "extra_body" in payload
-        assert payload["extra_body"]["thinking"] == {"type": "disabled"}
+        assert payload["thinking"] == {"type": "disabled"}
 
     @pytest.mark.asyncio
-    async def test_thinking_explicitly_enabled_in_extra_body(self):
-        """When thinking is enabled, extra_body sends {"type": "enabled"}."""
+    async def test_thinking_explicitly_enabled_in_payload(self):
+        """When thinking is enabled, payload sends {"type": "enabled"}."""
         adapter = DeepSeekAdapter(_make_config())
         req = LLMRequest(purpose="test", messages=[], thinking="enabled")
         payload = adapter._build_payload(req)
 
-        assert "extra_body" in payload
-        assert payload["extra_body"]["thinking"] == {"type": "enabled"}
+        assert payload["thinking"] == {"type": "enabled"}
 
     @pytest.mark.asyncio
     async def test_no_reasoning_effort_in_payload_when_none(self):
-        """reasoning_effort=None → not included in extra_body."""
+        """reasoning_effort=None → not included in payload."""
         adapter = DeepSeekAdapter(_make_config())
         req = LLMRequest(purpose="test", messages=[], thinking="disabled")
         payload = adapter._build_payload(req)
 
-        assert "reasoning_effort" not in payload["extra_body"]
+        assert "reasoning_effort" not in payload
 
     @pytest.mark.asyncio
     async def test_no_reasoning_content_dependency(self):
@@ -345,8 +354,7 @@ class TestThinkingDefaultDisabled:
 
         # The gateway.complete() method handles the override, not the adapter.
         # Adapter still sees thinking="disabled" and encodes it as such.
-        assert "extra_body" in payload
-        assert payload["extra_body"]["thinking"] == {"type": "disabled"}
+        assert payload["thinking"] == {"type": "disabled"}
 
     @pytest.mark.asyncio
     async def test_gateway_applies_config_thinking(self):
@@ -370,12 +378,12 @@ class TestThinkingDefaultDisabled:
 
 class TestResponseModeMapping:
     @pytest.mark.asyncio
-    async def test_json_object_sets_response_format(self):
+    async def test_json_object_does_not_set_openai_response_format_for_anthropic(self):
         adapter = DeepSeekAdapter(_make_config())
         req = LLMRequest(purpose="test", messages=[], response_mode="json_object")
         payload = adapter._build_payload(req)
 
-        assert payload.get("response_format") == {"type": "json_object"}
+        assert "response_format" not in payload
 
     @pytest.mark.asyncio
     async def test_text_does_not_set_response_format(self):
@@ -791,6 +799,8 @@ class TestMemoryStoreTracePersistence:
 
         trace = {
             "request_id": "req-test-001",
+            "turn_id": "turn-test-001",
+            "call_id": "call-test-001",
             "task_type": "chat",
             "provider": "deepseek",
             "model": "deepseek-v4-flash",
@@ -807,6 +817,8 @@ class TestMemoryStoreTracePersistence:
             "cache_hit_tokens": 20,
             "cache_miss_tokens": 80,
             "reasoning_tokens": 5,
+            "request_json": json.dumps({"messages": [{"role": "user", "content": "hi"}]}),
+            "response_json": json.dumps({"tool_calls": []}),
         }
         row_id = await store.save_llm_trace(trace)
         assert row_id is not None
@@ -820,12 +832,16 @@ class TestMemoryStoreTracePersistence:
         # Verify key fields
         row_dict = dict(row)
         assert row_dict["request_id"] == "req-test-001"
+        assert row_dict["turn_id"] == "turn-test-001"
+        assert row_dict["call_id"] == "call-test-001"
         assert row_dict["task_type"] == "chat"
         assert row_dict["success"] == 1
         assert row_dict["prompt_tokens"] == 100
         assert row_dict["cache_hit_tokens"] == 20
         assert row_dict["reasoning_tokens"] == 5
         assert row_dict["latency_ms"] == 1234
+        assert json.loads(row_dict["request_json"])["messages"][0]["role"] == "user"
+        assert json.loads(row_dict["response_json"])["tool_calls"] == []
 
         await store.close()
 
@@ -839,6 +855,10 @@ class TestMemoryStoreTracePersistence:
         db = await store._get_db()
         cursor = await db.execute("PRAGMA table_info('llm_traces')")
         cols = {row["name"] for row in await cursor.fetchall()}
+        assert "turn_id" in cols
+        assert "call_id" in cols
+        assert "request_json" in cols
+        assert "response_json" in cols
         assert "raw_response" not in cols
         assert "reasoning_content" not in cols
         assert "error_message" not in cols

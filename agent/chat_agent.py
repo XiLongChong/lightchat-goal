@@ -1,4 +1,4 @@
-"""ChatAgent — v1.5 strict CC causal chain state machine.
+﻿"""ChatAgent — v1.5 strict CC causal chain state machine.
 
 One tool call per LLM response.  wechat_reply = one bubble (NOT terminal).
 done = only normal terminal tool.  Tool results always fed back to model.
@@ -7,6 +7,7 @@ done = only normal terminal tool.  Tool results always fed back to model.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json as _json
 import logging
 import random
@@ -45,6 +46,7 @@ from agent.delivery_service import (
     DeliveryUnknownError,
 )
 from agent.tool_classifier import classify_single_tool_call
+from agent.context_builder import ORDINARY_CHAT_GLOBAL_PROTOCOL
 from agent.tool_registry import TOOL_REGISTRY
 from runtime_contracts import DeliveryStatus as RTDeliveryStatus
 
@@ -61,6 +63,191 @@ CTX_HOT_FULL = "hot+full_memory"
 
 # WeChat sender callback type
 WeChatSender = Callable[[list[dict[str, Any]]], Coroutine[Any, Any, list[dict[str, Any]]]]
+ProtocolEventWriter = Callable[
+    [TurnScratchpad, str, dict[str, Any]],
+    Coroutine[Any, Any, None],
+]
+
+
+def _tool_result_part(tool_call_id: str, content: str) -> dict[str, Any]:
+    return {
+        "type": "tool_result",
+        "tool_use_id": str(tool_call_id or ""),
+        "content": str(content),
+    }
+
+
+def _tool_result_message(parts: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "role": "user",
+        "content": parts,
+    }
+
+
+def _tool_call_name(tc: Any) -> str:
+    fn = getattr(tc, "function", None)
+    return str(getattr(fn, "name", "") if fn else "")
+
+
+def _tool_call_arguments(tc: Any) -> str:
+    fn = getattr(tc, "function", None)
+    return str(getattr(fn, "arguments", "") if fn else "")
+
+
+def _tool_call_id(tc: Any) -> str:
+    return str(getattr(tc, "id", "") or "")
+
+
+def _tool_use_part(tc: Any) -> dict[str, Any]:
+    raw_args = _tool_call_arguments(tc)
+    try:
+        tool_input: Any = _json.loads(raw_args) if raw_args.strip() else {}
+    except _json.JSONDecodeError:
+        tool_input = raw_args
+    return {
+        "type": "tool_use",
+        "id": _tool_call_id(tc),
+        "name": _tool_call_name(tc),
+        "input": tool_input,
+    }
+
+
+def _thinking_part(reasoning_content: str) -> dict[str, Any] | None:
+    text = str(reasoning_content or "")
+    if not text:
+        return None
+    return {"type": "thinking", "thinking": text}
+
+
+def _assistant_response_parts(
+    response: Any,
+    tool_calls: list[Any],
+) -> list[dict[str, Any]]:
+    """Preserve one model response in provider-native content-block order."""
+    parts: list[dict[str, Any]] = []
+    thinking = _thinking_part(getattr(response, "reasoning_content", "") or "")
+    if thinking is not None:
+        parts.append(thinking)
+    text = str(getattr(response, "content", "") or "")
+    if text:
+        parts.append({"type": "text", "text": text})
+    parts.extend(_tool_use_part(item) for item in tool_calls)
+    return parts
+
+
+def _buffer_tool_result(turn: TurnScratchpad, tool_call_id: str, content: str) -> None:
+    turn._pending_tool_result_parts.append(_tool_result_part(tool_call_id, content))
+
+
+def _flush_tool_results(turn: TurnScratchpad) -> None:
+    if not turn._pending_tool_result_parts:
+        return
+    turn.messages.append(_tool_result_message(list(turn._pending_tool_result_parts)))
+    turn._pending_tool_result_parts.clear()
+
+
+async def _write_protocol_event(
+    turn: TurnScratchpad,
+    event_type: str,
+    payload: dict[str, Any],
+) -> None:
+    writer = turn._protocol_event_writer
+    if writer is not None:
+        await writer(turn, event_type, payload)
+
+
+async def _persist_unwritten_protocol_messages(turn: TurnScratchpad) -> None:
+    start = max(0, int(turn._current_turn_message_start))
+    current = list(turn.messages[start:])
+    persisted = max(0, int(turn._protocol_persisted_message_count))
+    for message in current[persisted:]:
+        role = str(message.get("role", ""))
+        if role not in {"user", "assistant"}:
+            continue
+        kind = "tool_result" if (
+            role == "user"
+            and isinstance(message.get("content"), list)
+            and any(
+                isinstance(part, dict) and part.get("type") == "tool_result"
+                for part in message["content"]
+            )
+        ) else "protocol_note"
+        await _write_protocol_event(
+            turn,
+            "message",
+            {"message": copy.deepcopy(message), "message_kind": kind},
+        )
+    turn._protocol_persisted_message_count = len(current)
+
+
+def _tool_use_ids_from_message(message: dict[str, Any]) -> list[str]:
+    if message.get("role") != "assistant":
+        return []
+    ids: list[str] = []
+    content = message.get("content")
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "tool_use":
+                tid = str(part.get("id", "") or "")
+                if tid:
+                    ids.append(tid)
+    for tc in message.get("tool_calls") or []:
+        tid = str(tc.get("id", "") if isinstance(tc, dict) else getattr(tc, "id", "") or "")
+        if tid:
+            ids.append(tid)
+    return ids
+
+
+def _tool_result_ids_from_message(message: dict[str, Any]) -> set[str]:
+    if message.get("role") not in ("user", "tool"):
+        return set()
+    ids: set[str] = set()
+    content = message.get("content")
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "tool_result":
+                tid = str(part.get("tool_use_id", "") or "")
+                if tid:
+                    ids.add(tid)
+    tool_call_id = str(message.get("tool_call_id", "") or "")
+    if tool_call_id:
+        ids.add(tool_call_id)
+    return ids
+
+
+def _latest_unmatched_tool_use_ids(messages: list[dict[str, Any]]) -> list[str]:
+    for idx in range(len(messages) - 1, -1, -1):
+        tool_use_ids = _tool_use_ids_from_message(messages[idx])
+        if not tool_use_ids:
+            continue
+        result_ids: set[str] = set()
+        for following in messages[idx + 1:]:
+            result_ids.update(_tool_result_ids_from_message(following))
+        return [tid for tid in tool_use_ids if tid not in result_ids]
+    return []
+
+
+def _append_user_retry_note(messages: list[dict[str, Any]], text: str) -> None:
+    if messages and messages[-1].get("role") == "user":
+        content = messages[-1].get("content")
+        if isinstance(content, list):
+            content.append({"type": "text", "text": text})
+            return
+        if isinstance(content, str):
+            messages[-1]["content"] = f"{content}\n\n{text}" if content else text
+            return
+    messages.append({"role": "user", "content": text})
+
+
+def _system_reminder(text: str) -> str:
+    return f"<system-reminder>\n{text.strip()}\n</system-reminder>"
+
+
+def _channel_message(text: str) -> str:
+    content = str(text or "").strip()
+    if not content or content.startswith("<channel "):
+        return content
+    return f'<channel source="wechat">\n{content}\n</channel>'
 
 
 class ChatAgent:
@@ -105,7 +292,7 @@ class ChatAgent:
 
         # ── v1.3: model routing ──────────────────────────────────
         self._flash_profile = flash_profile or ModelProfile()
-        self._pro_profile = pro_profile or ModelProfile(model_name="deepseek-v4-pro", max_tokens=1200, timeout_seconds=40)
+        self._pro_profile = pro_profile or ModelProfile(model_name="deepseek-v4-pro", max_tokens=4096, timeout_seconds=40)
         self._routing_mode = routing_mode
         self._manual_flash_allow_upgrade = manual_flash_allow_upgrade
         self._max_flash_upgrade_attempts = max_flash_upgrade_attempts
@@ -178,6 +365,7 @@ class ChatAgent:
         # ── v1.2 Phase 5C: per-request post-terminal callbacks ──
         write_model_history: PostTerminalCallback | None = None,
         post_turn_hooks: list[PostTerminalCallback] | None = None,
+        protocol_event_writer: ProtocolEventWriter | None = None,
     ) -> TurnResult:
         """Process a user message through the v1.2 state machine.
 
@@ -213,6 +401,12 @@ class ChatAgent:
             max_reply_messages_per_turn=MAX_REPLY_MESSAGES_PER_TURN,
             max_protocol_retries=MAX_PROTOCOL_RETRIES_PER_TURN,
             max_send_failures_per_turn=MAX_SEND_FAILURES_PER_TURN,
+            _protocol_event_writer=protocol_event_writer,
+        )
+        await _write_protocol_event(
+            turn,
+            "turn_started",
+            {"user_message": user_message, "bot_id": bot_id},
         )
         state = TurnState.RECEIVE_EVENT
 
@@ -254,6 +448,8 @@ class ChatAgent:
                 wechat_sender=wechat_sender,
                 state_tool_executor=state_tool_executor,
             )
+            if state == TurnState.CALL_LLM:
+                await _persist_unwritten_protocol_messages(turn)
             turn.iteration += 1
 
         # ── v1.2: Post-terminal pipeline (inside ChatAgent) ─────
@@ -264,6 +460,12 @@ class ChatAgent:
         _pth = post_turn_hooks if post_turn_hooks is not None else self._post_turn_hooks
         _has_callbacks = bool(_wmh or _pth)
         turn.terminal_state = state
+        await _persist_unwritten_protocol_messages(turn)
+        await _write_protocol_event(
+            turn,
+            "turn_finished",
+            {"terminal_state": state.value},
+        )
         if _has_callbacks:
             await self._run_post_terminal_pipeline(turn, state, _wmh, _pth)
 
@@ -352,7 +554,7 @@ class ChatAgent:
             return await self._do_call_llm(turn)
 
         elif state == TurnState.HANDLE_MODEL_OUTPUT:
-            return self._do_handle_model_output(turn)
+            return await self._do_handle_model_output(turn)
 
         elif state == TurnState.CLASSIFY_ONE_TOOL_CALL:
             return self._do_classify_one_tool_call(turn)
@@ -474,6 +676,9 @@ class ChatAgent:
 
         turn.messages = result.messages
         turn.context_warnings = list(result.warnings)
+        turn._protocol_persisted_message_count = (
+            0 if turn.source == SOURCE_PROACTIVE_IMPULSE else 1
+        )
 
         # ── Check ContextBuildResult fatal_error ──────────────────
         if result.fatal_error:
@@ -602,6 +807,7 @@ class ChatAgent:
         from agent.temporal_context import TemporalContextBuilder
         _tz = timezone(timedelta(hours=8))
         now_dt = datetime.now(tz=_tz)
+        weekday_cn = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][now_dt.weekday()]
         current_user_ts = turn.input_cutoff_time if turn.input_cutoff_time > 0 else now_dt.timestamp()
 
         temporal_builder = TemporalContextBuilder(timezone_offset_hours=8)
@@ -638,14 +844,18 @@ class ChatAgent:
                 role = "user"
             content = _format_history_entry(h)
             if content.strip():
+                if role == "user" and not content.lstrip().startswith("<system-reminder>"):
+                    content = _channel_message(content)
                 messages.append({"role": role, "content": content})
 
         # Current user message (v3.1: skipped for proactive turns)
         if turn.source == SOURCE_PROACTIVE_IMPULSE:
-            pass
+            turn._current_turn_message_start = len(messages)
         elif trigger == "user":
-            messages.append({"role": "user", "content": turn.user_message})
+            turn._current_turn_message_start = len(messages)
+            messages.append({"role": "user", "content": _channel_message(turn.user_message)})
         else:
+            turn._current_turn_message_start = len(messages)
             messages.append({"role": "system", "content": turn.user_message})
 
         # ── v3.1: Proactive context as independent system message ──
@@ -692,29 +902,39 @@ class ChatAgent:
         # ── Build simplified BuildContextRequest ──────────────────
         _tz = timezone(timedelta(hours=8))
         now_dt = datetime.now(tz=_tz)
+        weekday_cn = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][now_dt.weekday()]
         current_user_ts = turn.input_cutoff_time if turn.input_cutoff_time > 0 else now_dt.timestamp()
 
         # Determine turn_type
         is_proactive = turn.source == SOURCE_PROACTIVE_IMPULSE
         req_turn_type = RTTurnType.RELATIONSHIP_PROACTIVE if is_proactive else RTTurnType.USER_CHAT
 
-        # Build ConversationHistoryMessage list from history
+        # Build ConversationHistoryMessage list from history. Recent ordinary
+        # chat turns may carry provider:* entries with Anthropic content blocks;
+        # prefer those over flattened assistant-visible text for the same turn.
+        history_items = list(history or [])
         conv_history: list = []
-        for h in (history or [])[-48:]:
+        for h in history_items:
             role = str(h.get("role", ""))
             if role not in ("user", "assistant"):
                 continue
-            content = str(h.get("content", ""))
-            if not content.strip():
+            content = h.get("content")
+            if content is None or (isinstance(content, str) and not content.strip()):
                 continue
+            if role == "user" and isinstance(content, str) and not content.lstrip().startswith("<system-reminder>"):
+                content = _channel_message(content)
+            try:
+                created_at = datetime.fromtimestamp(float(h.get("ts", 0)), tz=_tz)
+            except (TypeError, ValueError, OSError):
+                created_at = now_dt
             conv_history.append(ConversationHistoryMessage(
                 message_id=str(h.get("id", "")),
                 turn_id=str(h.get("turn_id", "")),
                 role=role,
-                content=content,
-                source=str(h.get("source", "user_message") if role == "user" else "assistant_reply"),
+                content=copy.deepcopy(content),
+                source="protocol",
                 delivery_status="delivered",
-                created_at=now_dt,
+                created_at=created_at,
             ))
 
         request = BuildContextRequest(
@@ -725,13 +945,12 @@ class ChatAgent:
             bot_id="default",
             persona=prompt,
             system_time=SystemTime(
-                iso=now_dt.isoformat(),
-                weekday=now_dt.strftime("%A"),
+                dt=now_dt,
                 timezone="Asia/Shanghai",
-                timestamp=now_dt.timestamp(),
+                weekday_cn=weekday_cn,
             ),
             recent_history=conv_history,
-            fixed_system_protocol="",
+            fixed_system_protocol=ORDINARY_CHAT_GLOBAL_PROTOCOL,
             fixed_output_protocol="",
             fixed_tool_protocol="",
         )
@@ -743,16 +962,34 @@ class ChatAgent:
             messages: list[dict[str, Any]] = []
             for pm in built.provider_messages:
                 role = str(pm.role) if hasattr(pm, 'role') else "system"
-                content = str(pm.content) if hasattr(pm, 'content') else ""
-                if content.strip():
+                content = copy.deepcopy(pm.content) if hasattr(pm, 'content') else ""
+                if isinstance(content, str):
+                    if content.strip():
+                        messages.append({"role": role, "content": content})
+                elif content is not None:
                     messages.append({"role": role, "content": content})
+            system_messages = list(getattr(built, "provider_system", []) or [])
 
             # Add user message (or proactive context) at the end
             if turn.source == SOURCE_PROACTIVE_IMPULSE:
+                turn._current_turn_message_start = len(messages)
                 proactive_ctx = _build_proactive_context_system_message(turn)
                 messages.append({"role": "system", "content": proactive_ctx})
             elif turn.user_message:
-                messages.append({"role": "user", "content": turn.user_message})
+                channel_message = _channel_message(turn.user_message)
+                if not any(
+                    m.get("role") == "user" and m.get("content") == channel_message
+                    for m in messages
+                ):
+                    messages.append({"role": "user", "content": channel_message})
+            if turn.source != SOURCE_PROACTIVE_IMPULSE:
+                turn._current_turn_message_start = 0
+            if turn.user_message:
+                channel_message = _channel_message(turn.user_message)
+                for idx in range(len(messages) - 1, -1, -1):
+                    if messages[idx].get("role") == "user" and messages[idx].get("content") == channel_message:
+                        turn._current_turn_message_start = idx
+                        break
 
             # Collect warnings from BuiltContext
             for w in built.warnings:
@@ -762,15 +999,21 @@ class ChatAgent:
                 })
 
             turn.add_fallback_event("context_builder", f"built via facade, {len(messages)} messages")
-            logger.info("_build_context_via_facade: %d messages, %d blocks", len(messages), len(built.blocks))
+            logger.info(
+                "_build_context_via_facade: %d messages, %d blocks",
+                len(messages),
+                len(getattr(built, "context_blocks", []) or []),
+            )
 
         except Exception as e:
             logger.error("ContextBuilder.build() failed: %s, falling back to inline", e)
             fatal_error = f"context_builder_failed: {e}"
-            messages = [{"role": "system", "content": prompt}]
+            messages = []
+            system_messages = [{"type": "text", "text": prompt}]
 
         result = ContextBuildResult(
             messages=messages,
+            system=system_messages,
             warnings=warnings,
             fatal_error=fatal_error,
         )
@@ -854,6 +1097,7 @@ class ChatAgent:
         """
         from agent.llm_types import LLMRequest
 
+        await _persist_unwritten_protocol_messages(turn)
         turn.llm_call_count += 1
 
         # ── v3.1: Proactive max_llm_steps check ──────────────────
@@ -890,6 +1134,7 @@ class ChatAgent:
         if self.native_tool_calls:
             if self._tool_exposure_policy is not None:
                 allowed = self._resolve_tools_via_policy(turn)
+                turn.native_allowed_tools_override = allowed
                 request_tools = _build_native_tool_specs(allowed)
             elif turn.source == SOURCE_PROACTIVE_IMPULSE:
                 allowed = _get_proactive_allowed_tools(turn)
@@ -906,7 +1151,10 @@ class ChatAgent:
                     len(_tool_names), ",".join(_tool_names),
                 )
 
-        tool_choice = "required" if request_tools else None
+        if request_tools:
+            tool_choice = "required" if turn.source == SOURCE_PROACTIVE_IMPULSE else None
+        else:
+            tool_choice = None
         _last_roles = [m.get("role", "?") for m in turn.messages[-3:]]
 
         # v1.3: upgrade attempts → no gateway-level retry (state machine controls it)
@@ -936,14 +1184,20 @@ class ChatAgent:
                 LLMRequest(
                     purpose="chat_turn",
                     model=profile.model_name,
-                    messages=turn.messages,
-                    temperature=profile.temperature,
+                    messages=copy.deepcopy(turn.messages),
+                    system=copy.deepcopy(
+                        turn._context_result.system if turn._context_result else []
+                    ),
+                    temperature=(profile.temperature if turn.source == SOURCE_PROACTIVE_IMPULSE else None),
                     max_tokens=profile.max_tokens,
                     timeout_s=profile.timeout_seconds,
                     response_mode="text",
-                    thinking="disabled",
+                    thinking=("disabled" if turn.source == SOURCE_PROACTIVE_IMPULSE else "enabled"),
                     tools=request_tools,
                     tool_choice=tool_choice,
+                    context_management=None,
+                    output_config={"effort": "high"},
+                    stream=True,
                     retry=_retry,
                     turn_id=turn.turn_id,
                     call_id=call_id,
@@ -983,7 +1237,7 @@ class ChatAgent:
                     return TurnState.FLASH_TO_PRO_UPGRADE
             return TurnState.HARD_FALLBACK
 
-    def _do_handle_model_output(self, turn: TurnScratchpad) -> TurnState:
+    async def _do_handle_model_output(self, turn: TurnScratchpad) -> TurnState:
         """HANDLE_MODEL_OUTPUT: inspect what the model returned.
 
         v1.5: exactly 1 tool call required.
@@ -1003,6 +1257,23 @@ class ChatAgent:
         native_tool_calls = getattr(response, "tool_calls", None) or []
         assistant_content = (response.content or "").strip()
         finish_reason = getattr(response, "finish_reason", "") or ""
+        assistant_parts = _assistant_response_parts(response, native_tool_calls)
+        if assistant_parts:
+            message = {
+                "role": "assistant",
+                "content": assistant_parts,
+            }
+            turn.messages.append(message)
+            await _write_protocol_event(
+                turn,
+                "message",
+                {
+                    "message": copy.deepcopy(message),
+                    "message_kind": "model_response",
+                    "call_id": f"call_{turn.turn_id}_{turn.llm_call_count}",
+                },
+            )
+            turn._protocol_persisted_message_count += 1
 
         logger.info(
             "handle_model_output: finish_reason=%s has_content=%s content_preview=%s "
@@ -1017,6 +1288,13 @@ class ChatAgent:
 
         # ── v1.5: exactly 1 tool call required ───────────────────
         if not native_tool_calls:
+            if turn.sent_message_count > 0:
+                logger.info(
+                    "handle_model_output: implicit_end sent_count=%d iter=%d",
+                    turn.sent_message_count,
+                    turn.iteration,
+                )
+                return TurnState.END_REPLIED
             if assistant_content:
                 if '"actions"' in assistant_content.lower():
                     violation = "old_json_actions"
@@ -1036,46 +1314,17 @@ class ChatAgent:
             logger.info("handle_model_output: violation=%s iter=%d", violation, turn.iteration)
             return TurnState.PROTOCOL_RETRY
 
-        if len(native_tool_calls) > 1:
-            tc_names = []
-            for tc in native_tool_calls:
-                fn = getattr(tc, "function", None)
-                tc_names.append(str(getattr(fn, "name", "") if fn else ""))
-            turn.add_fallback_event("multiple_tool_calls",
-                f"expected exactly 1 tool call, got {len(native_tool_calls)}: {','.join(tc_names)}")
-            logger.info("handle_model_output: violation=multiple_tool_calls count=%d iter=%d",
-                       len(native_tool_calls), turn.iteration)
-            if turn._current_attempt:
-                turn._current_attempt.result_type = "protocol_violation"
-                turn._current_attempt.error_type = "multiple_tool_calls"
-            return TurnState.PROTOCOL_RETRY
-
-        # ── Exactly 1 tool call — serialize and append ───────────
         tc = native_tool_calls[0]
-        fn = getattr(tc, "function", None)
-        tool_name = str(getattr(fn, "name", "") if fn else "")
-        tool_args = str(getattr(fn, "arguments", "") if fn else "")
-        tool_call_id = str(getattr(tc, "id", ""))
-
-        serialized = {
-            "id": tool_call_id,
-            "type": "function",
-            "function": {"name": tool_name, "arguments": tool_args},
-        }
-
-        assistant_msg: dict[str, Any] = {
-            "role": "assistant",
-            "content": assistant_content or "",
-            "tool_calls": [serialized],
-        }
-        turn.messages.append(assistant_msg)
+        tool_name = _tool_call_name(tc)
+        tool_call_id = _tool_call_id(tc)
 
         turn._tool_calls = [tc]
+        turn._pending_tool_calls = list(native_tool_calls[1:])
         turn._current_tool_call_id = tool_call_id
 
         logger.info(
-            "native_tools: 1 tool_call iter=%d name=%s call_id=%s",
-            turn.iteration, tool_name, tool_call_id,
+            "native_tools: %d tool_call(s) iter=%d first=%s call_id=%s",
+            len(native_tool_calls), turn.iteration, tool_name, tool_call_id,
         )
 
         # ── Flag pending send_text_message for interrupt differentiation ──
@@ -1083,6 +1332,23 @@ class ChatAgent:
             turn._has_pending_wechat_reply = True
 
         return TurnState.CLASSIFY_ONE_TOOL_CALL
+
+    def _advance_pending_tool_call(self, turn: TurnScratchpad) -> bool:
+        if not turn._pending_tool_calls:
+            return False
+        tc = turn._pending_tool_calls.pop(0)
+        tool_name = _tool_call_name(tc)
+        turn._tool_calls = [tc]
+        turn._current_tool_call_id = _tool_call_id(tc)
+        if tool_name == "send_text_message":
+            turn._has_pending_wechat_reply = True
+        logger.info(
+            "native_tools: advance_pending name=%s call_id=%s remaining=%d",
+            tool_name,
+            turn._current_tool_call_id,
+            len(turn._pending_tool_calls),
+        )
+        return True
 
     def _do_classify_one_tool_call(self, turn: TurnScratchpad) -> TurnState:
         """CLASSIFY_ONE_TOOL_CALL: classify single tool call, route by tool_name.
@@ -1104,7 +1370,6 @@ class ChatAgent:
         if classified.is_deprecated:
             logger.info("classify_one_tool_call: deprecated=%s iter=%d", classified.tool_name, turn.iteration)
             turn.add_fallback_event("deprecated_tool", classified.tool_name)
-            turn.messages.append({"role": "system", "content": classified.deprecated_hint})
             return TurnState.PROTOCOL_RETRY
 
         if not classified.is_legal:
@@ -1121,15 +1386,15 @@ class ChatAgent:
             if constraint_err is not None:
                 turn.add_fallback_event("proactive_disallowed_tool", constraint_err)
                 turn.messages.append({
-                    "role": "system",
+                    "role": "user",
                     "content": constraint_err,
                 })
                 return TurnState.PROTOCOL_RETRY
 
         # ── Name-based routing (canonical names only) ────────────
-        if name in ("get_time", "get_weather"):
+        if name in ("get_time", "get_weather", "search_memory"):
             return TurnState.EXEC_FACT_TOOLS
-        elif name == "schedule_user_reminder":
+        elif name in ("schedule_user_reminder", "create_user_reminder", "write_memory", "request_memory_forget"):
             return TurnState.EXEC_STATE_TOOL
         elif name == "send_text_message":
             # ── v3.1: Proactive attempt counter (LLM behavior audit) ──
@@ -1156,7 +1421,7 @@ class ChatAgent:
                 turn.add_fallback_event("skip_in_non_proactive",
                     f"source={turn.source}")
                 turn.messages.append({
-                    "role": "system",
+                    "role": "user",
                     "content": "skip_initiative 只能在主动回合中使用。当前是普通回合，请用 send_text_message 或 finish_turn。",
                 })
                 return TurnState.PROTOCOL_RETRY
@@ -1164,7 +1429,7 @@ class ChatAgent:
                 turn.add_fallback_event("skip_after_delivery",
                     f"delivered_count={turn.proactive_delivered_count}")
                 turn.messages.append({
-                    "role": "system",
+                    "role": "user",
                     "content": "已发送过消息后不能调用 skip_initiative。如果说完请调用 finish_turn。",
                 })
                 return TurnState.PROTOCOL_RETRY
@@ -1186,7 +1451,7 @@ class ChatAgent:
         fact_tcs = [
             tc for tc in tool_calls
             if str(getattr(getattr(tc, "function", None), "name", "") if getattr(tc, "function", None) else "")
-            in ("get_time", "get_weather")
+            in ("get_time", "get_weather", "search_memory")
         ]
 
         if not fact_tcs:
@@ -1208,7 +1473,7 @@ class ChatAgent:
                     "tool_name": tool_name,
                     "call_id": call_id,
                     "result": result_text[:500],
-                    "success": not result_text.startswith("错误"),
+                    "success": not result_text.startswith("错误") and not result_text.startswith("Error:"),
                     "error_type": _classify_tool_result(result_text),
                 }
             except Exception as e:
@@ -1216,7 +1481,7 @@ class ChatAgent:
                 return {
                     "tool_name": tool_name,
                     "call_id": call_id,
-                    "result": f"错误：工具执行异常：{e}",
+                    "result": f"Error: tool execution failed: {e}",
                     "success": False,
                     "error_type": "tool_execution_error",
                 }
@@ -1227,11 +1492,7 @@ class ChatAgent:
         # Merge results in original order
         for r in results:
             turn.tool_results.append({"name": r["tool_name"], "result": r["result"]})
-            turn.messages.append({
-                "role": "tool",
-                "tool_call_id": r["call_id"],
-                "content": r["result"],
-            })
+            _buffer_tool_result(turn, r["call_id"], r["result"])
             logger.info(
                 "native_tools: fact tool %s executed, result=%s",
                 r["tool_name"], r["error_type"],
@@ -1243,6 +1504,9 @@ class ChatAgent:
                 if r["success"]:
                     turn._proactive_fact_tool_count_since_last_reply += 1
 
+        if self._advance_pending_tool_call(turn):
+            return TurnState.CLASSIFY_ONE_TOOL_CALL
+        _flush_tool_results(turn)
         turn._resume_state = TurnState.CALL_LLM
         return TurnState.INTERRUPT_CHECK
 
@@ -1268,11 +1532,8 @@ class ChatAgent:
                 "reason": "invalid_json",
                 "hint": f"state tool arguments JSON parse failed: {e}",
             }
-            turn.messages.append({
-                "role": "tool",
-                "tool_call_id": call_id,
-                "content": _json.dumps(result, ensure_ascii=False),
-            })
+            _buffer_tool_result(turn, call_id, _json.dumps(result, ensure_ascii=False))
+            _flush_tool_results(turn)
             return TurnState.CALL_LLM
 
         if not isinstance(args, dict):
@@ -1313,13 +1574,12 @@ class ChatAgent:
             "result": str(result.get("status", "")),
             "scheduled_task_id": task_id,
         })
-        turn.messages.append({
-            "role": "tool",
-            "tool_call_id": call_id,
-            "content": _json.dumps(result, ensure_ascii=False),
-        })
+        _buffer_tool_result(turn, call_id, _json.dumps(result, ensure_ascii=False))
         logger.info("state_tool: %s executed status=%s task_id=%s", tool_name, result.get("status"), task_id)
 
+        if self._advance_pending_tool_call(turn):
+            return TurnState.CLASSIFY_ONE_TOOL_CALL
+        _flush_tool_results(turn)
         turn._resume_state = TurnState.CALL_LLM
         return TurnState.INTERRUPT_CHECK
 
@@ -1369,10 +1629,12 @@ class ChatAgent:
         except _json.JSONDecodeError as e:
             result = {"status": "error", "recoverable": True,
                       "reason": "invalid_json", "hint": f"参数 JSON 解析失败：{e}"}
-            turn.messages.append({
-                "role": "tool", "tool_call_id": turn._current_tool_call_id,
-                "content": _json.dumps(result, ensure_ascii=False),
-            })
+            _buffer_tool_result(
+                turn,
+                turn._current_tool_call_id,
+                _json.dumps(result, ensure_ascii=False),
+            )
+            _flush_tool_results(turn)
             logger.info("validate_reply_args: invalid_json")
             return TurnState.CALL_LLM
 
@@ -1389,10 +1651,12 @@ class ChatAgent:
             result = {"status": "error", "recoverable": True,
                       "reason": error_reason,
                       "hint": hint_map.get(error_reason, "请修正后重新调用 wechat_reply。")}
-            turn.messages.append({
-                "role": "tool", "tool_call_id": turn._current_tool_call_id,
-                "content": _json.dumps(result, ensure_ascii=False),
-            })
+            _buffer_tool_result(
+                turn,
+                turn._current_tool_call_id,
+                _json.dumps(result, ensure_ascii=False),
+            )
+            _flush_tool_results(turn)
             logger.info("validate_reply_args: invalid reason=%s len=%d",
                        error_reason, len(text))
             return TurnState.CALL_LLM
@@ -1424,10 +1688,12 @@ class ChatAgent:
                               "或系统味/通知味/任务味表达。请改成自然微信短句，像真人聊天一样。"
                               "不要假装你有视觉或传感器。"
                           )}
-                turn.messages.append({
-                    "role": "tool", "tool_call_id": turn._current_tool_call_id,
-                    "content": _json.dumps(result, ensure_ascii=False),
-                })
+                _buffer_tool_result(
+                    turn,
+                    turn._current_tool_call_id,
+                    _json.dumps(result, ensure_ascii=False),
+                )
+                _flush_tool_results(turn)
                 logger.info("guard_output: proactive RETRY preview=%s", text[:60])
                 return TurnState.CALL_LLM
             if pro_result == "BLOCK":
@@ -1444,10 +1710,12 @@ class ChatAgent:
             result = {"status": "error", "recoverable": True,
                       "reason": "guard_blocked",
                       "hint": "消息被输出保护拦截（可能包含敏感内容或协议泄露）。请修改后重新调用 wechat_reply。"}
-            turn.messages.append({
-                "role": "tool", "tool_call_id": turn._current_tool_call_id,
-                "content": _json.dumps(result, ensure_ascii=False),
-            })
+            _buffer_tool_result(
+                turn,
+                turn._current_tool_call_id,
+                _json.dumps(result, ensure_ascii=False),
+            )
+            _flush_tool_results(turn)
             logger.info("guard_output: blocked preview=%s", text[:60])
             return TurnState.CALL_LLM
 
@@ -1484,19 +1752,31 @@ class ChatAgent:
         tool_call_id = turn._current_tool_call_id
         idempotency_key = f"{turn.turn_id}_{tool_call_id}"
 
-        def _append_result(result: dict) -> None:
-            turn.messages.append({
-                "role": "tool", "tool_call_id": tool_call_id,
-                "content": _json.dumps(result, ensure_ascii=False),
-            })
+        def _append_result(result: Any) -> None:
+            content = result if isinstance(result, str) else _json.dumps(result, ensure_ascii=False)
+            _buffer_tool_result(
+                turn,
+                tool_call_id,
+                content,
+            )
 
         # ── Idempotency check ────────────────────────────────────
         if idempotency_key in turn._sent_idempotency_keys:
-            result = {"status": "ok", "delivery": "already_sent",
-                      "message_index": turn.sent_message_count}
-            _append_result(result)
+            _append_result("sent")
             logger.info("exec_send_one: idempotent already_sent key=%s", idempotency_key)
             return TurnState.APPEND_SEND_RESULT
+
+        outbound_message_id = f"om_{turn.turn_id}_{tool_call_id or turn.sent_message_count + 1}"
+        await _write_protocol_event(
+            turn,
+            "outbound_created",
+            {
+                "message_id": outbound_message_id,
+                "text": guarded_text,
+                "send_status": "created",
+                "position": turn.sent_message_count,
+            },
+        )
 
         # ── Clear pending flag (we're about to send) ─────────────
         turn._has_pending_wechat_reply = False
@@ -1508,6 +1788,17 @@ class ChatAgent:
                       "hint": "发送通道不可用。请调用 done(status='failed')。"}
             _append_result(result)
             turn.send_failure_count += 1
+            await _write_protocol_event(
+                turn,
+                "outbound_result",
+                {
+                    "message_id": outbound_message_id,
+                    "text": guarded_text,
+                    "send_status": "failed",
+                    "send_error": "wechat_sender_unavailable",
+                    "position": turn.sent_message_count,
+                },
+            )
             logger.info("exec_send_one: no wechat_sender")
             return TurnState.APPEND_SEND_RESULT
 
@@ -1542,6 +1833,17 @@ class ChatAgent:
             tool_call_id=tool_call_id,
             send_fn=_wechat_send_adapter,
         )
+        await _write_protocol_event(
+            turn,
+            "outbound_result",
+            {
+                "message_id": outbound_message_id,
+                "text": guarded_text,
+                "send_status": receipt.status.value,
+                "send_error": receipt.error_message or "",
+                "position": turn.sent_message_count,
+            },
+        )
 
         # ── Map receipt status to existing branch logic ────────────
         if receipt.status == RTDeliveryStatus.DELIVERED:
@@ -1566,17 +1868,24 @@ class ChatAgent:
                 sent_at_timestamp=time.time(),
             )
             turn.visible_messages.append(vm)
-            result = {"status": "ok", "delivery": "sent",
-                      "message_index": turn.sent_message_count}
+            result: Any = "sent"
             if turn.source == SOURCE_PROACTIVE_IMPULSE:
                 meta = turn.proactive_meta or {}
                 max_reply = int(meta.get("max_wechat_reply", 3))
                 if turn.proactive_delivered_count >= max_reply:
-                    result["limit_reached"] = True
-                    result["hint"] = "本轮主动消息已达上限，请调用 done 结束。"
+                    result = {
+                        "status": "ok",
+                        "delivery": "sent",
+                        "limit_reached": True,
+                        "hint": "本轮主动消息已达上限，请调用 done 结束。",
+                    }
             elif turn.sent_message_count >= turn.max_reply_messages_per_turn:
-                result["limit_reached"] = True
-                result["hint"] = "本轮微信消息数量已达上限，请调用 done 结束。"
+                result = {
+                    "status": "ok",
+                    "delivery": "sent",
+                    "limit_reached": True,
+                    "hint": "本轮微信消息数量已达上限，请调用 done 结束。",
+                }
             turn._sent_idempotency_keys.discard(idempotency_key)
             logger.info("exec_send_one: delivered reply_index=%d idempotency_key=%s",
                        turn.sent_message_count, idempotency_key)
@@ -1623,6 +1932,10 @@ class ChatAgent:
         (interruptible delay before next CALL_LLM to avoid rate limits).
         Otherwise → POST_SEND_INTERRUPT_CHECK (immediate re-decision).
         """
+        if self._advance_pending_tool_call(turn):
+            turn._last_send_delivered = False
+            return TurnState.CLASSIFY_ONE_TOOL_CALL
+        _flush_tool_results(turn)
         if turn._last_send_delivered:
             turn._last_send_delivered = False
             return TurnState.POST_SEND_THINKING_DELAY
@@ -1955,40 +2268,31 @@ class ChatAgent:
         logger.info("protocol_retry: attempt=%d/%d",
                    turn.protocol_retry_count, turn.max_protocol_retries)
 
-        # ── v1.5: if any assistant tool_calls message in recent history lacks
-        # a matching tool result, the LLM API will reject the next request
-        # ("insufficient tool messages following tool_calls message").
-        # Search backward from end for unmatched assistant tool_calls.
-        # (The caller may have already appended a system message before PROTOCOL_RETRY,
-        # so we check the last few messages, not just messages[-1].)
-        for _scan_offset in range(min(3, len(turn.messages)), 0, -1):
-            _candidate = turn.messages[-_scan_offset]
-            if _candidate.get("role") == "assistant" and _candidate.get("tool_calls"):
-                # Check if any matching tool message already follows it
-                _tcs = _candidate["tool_calls"]
-                _has_match = False
-                for _j in range(len(turn.messages) - _scan_offset + 1, len(turn.messages)):
-                    if turn.messages[_j].get("role") == "tool":
-                        _has_match = True
-                        break
-                if not _has_match:
-                    _insert_at = len(turn.messages) - _scan_offset + 1
-                    for tc in _tcs:
-                        cid = tc.get("id", "") if isinstance(tc, dict) else ""
-                        turn.messages.insert(_insert_at, {
-                            "role": "tool",
-                            "tool_call_id": cid,
-                            "content": _json.dumps({
-                                "status": "error", "recoverable": True,
-                                "reason": "protocol_retry",
-                                "hint": "上一个工具调用因协议违规被拒绝，请按提示重新调用正确的工具。",
-                            }, ensure_ascii=False),
-                        })
-                        _insert_at += 1
-                    break
-
-        retry_note = "必须调用 wechat_reply 或 done。每次只能调用一个工具。"
-        turn.messages.append({"role": "system", "content": retry_note})
+        retry_note = _system_reminder(
+            """
+This is a runtime protocol correction, not a user message or a new user intent.
+Do not reply to, quote, or mention this reminder.
+Continue the current turn from the latest real user message and existing tool results.
+Use an available tool. Use send_text_message for user-visible replies.
+If a user-visible reply was already delivered and no further action is needed, stop without calling another tool.
+"""
+        )
+        unmatched_tool_use_ids = _latest_unmatched_tool_use_ids(turn.messages)
+        if unmatched_tool_use_ids:
+            turn.messages.append(_tool_result_message([
+                _tool_result_part(
+                    tool_use_id,
+                    _json.dumps({
+                        "status": "error",
+                        "recoverable": True,
+                        "reason": "protocol_retry",
+                        "hint": retry_note,
+                    }, ensure_ascii=False),
+                )
+                for tool_use_id in unmatched_tool_use_ids
+            ]))
+        else:
+            _append_user_retry_note(turn.messages, retry_note)
 
         # v1.3: flash → pro upgrade logic
         last = turn.model_attempts[-1] if turn.model_attempts else None

@@ -29,8 +29,8 @@ def create_proactive_test_router(
     wechat_sender: Any,                              # Callable[[str, str, list], Coroutine]
     make_interrupt_checker: Any,                     # Callable[[str, int], InterruptChecker]
     bot_id: str,
-    build_proactive_write_model_history: Any,         # Callable[[str, str], PostTerminalCallback]
     build_proactive_post_turn_hooks: Any,             # Callable[[str, str, dict], list]
+    build_protocol_event_writer: Any = None,
     get_current_inbound_seq: Any = None,             # Callable[[str], int]
 ) -> APIRouter:
     """Build and return a router for /admin/proactive-test/* endpoints."""
@@ -234,8 +234,12 @@ def create_proactive_test_router(
 
             baseline = _interrupt_baseline(user_id)
 
-            wmh = build_proactive_write_model_history(user_id, bot)
             hooks = build_proactive_post_turn_hooks(user_id, bot, {})
+            protocol_writer = (
+                build_protocol_event_writer(user_id, bot)
+                if callable(build_protocol_event_writer)
+                else None
+            )
 
             report = await run_real_send(
                 ctx,
@@ -246,8 +250,8 @@ def create_proactive_test_router(
                 wechat_sender_provider=_ws_provider,
                 interrupt_checker_provider=_int_checker_provider(user_id),
                 input_latest_seq=baseline,
-                write_model_history=wmh,
                 post_turn_hooks=hooks,
+                protocol_event_writer=protocol_writer,
             )
 
         return {"ok": True, **report.to_dict()}

@@ -115,11 +115,12 @@ class TestNativeToolSpecs:
         assert "required" in params
         assert "city" in params["required"]
 
-    def test_no_strict_true_in_specs(self):
+    def test_strict_true_in_specs(self):
         specs = _build_native_tool_specs(["get_time", "get_weather"])
         for spec in specs:
             fn = spec["function"]
-            assert not fn.get("strict")
+            assert fn.get("strict") is True
+            assert fn["parameters"]["additionalProperties"] is False
 
 
 # 3. Phase 1: ChatAgent native tool call integration
@@ -293,12 +294,16 @@ class TestDeepSeekAdapterPayload:
             base_url="https://api.deepseek.com",
             default_model="deepseek-v4-flash",
         ))
-        tools = [{"type": "function", "function": {"name": "get_time", "parameters": {}}}]
+        tools = [{"type": "function", "function": {"name": "get_time", "parameters": {}, "strict": True}}]
         payload = adapter._build_payload(LLMRequest(
             purpose="test", messages=[], tools=tools,
         ))
         assert "tools" in payload
-        assert payload["tools"] == tools
+        assert payload["tools"] == [{
+            "name": "get_time",
+            "description": "",
+            "input_schema": {},
+        }]
 
     def test_no_tools_when_none(self):
         from agent.providers.deepseek import DeepSeekAdapter
@@ -323,11 +328,11 @@ class TestDeepSeekAdapterPayload:
             base_url="https://api.deepseek.com",
             default_model="deepseek-v4-flash",
         ))
-        tools = [{"type": "function", "function": {"name": "get_time", "parameters": {}}}]
+        tools = [{"type": "function", "function": {"name": "get_time", "parameters": {}, "strict": True}}]
         payload = adapter._build_payload(LLMRequest(
             purpose="test", messages=[], tools=tools, tool_choice="auto",
         ))
-        assert payload["tool_choice"] == "auto"
+        assert payload["tool_choice"] == {"type": "auto"}
 
     def test_tool_choice_not_passed_when_none(self):
         from agent.providers.deepseek import DeepSeekAdapter
@@ -338,13 +343,13 @@ class TestDeepSeekAdapterPayload:
             base_url="https://api.deepseek.com",
             default_model="deepseek-v4-flash",
         ))
-        tools = [{"type": "function", "function": {"name": "get_time", "parameters": {}}}]
+        tools = [{"type": "function", "function": {"name": "get_time", "parameters": {}, "strict": True}}]
         payload = adapter._build_payload(LLMRequest(
             purpose="test", messages=[], tools=tools, tool_choice=None,
         ))
         assert "tool_choice" not in payload
 
-    def test_no_strict_true_in_payload(self):
+    def test_openai_tool_specs_are_converted_to_anthropic_tools(self):
         from agent.providers.deepseek import DeepSeekAdapter
         from agent.providers.base import ProviderConfig
 
@@ -353,12 +358,26 @@ class TestDeepSeekAdapterPayload:
             base_url="https://api.deepseek.com",
             default_model="deepseek-v4-flash",
         ))
-        tools = [{"type": "function", "function": {"name": "get_time", "parameters": {}}}]
+        tools = [{"type": "function", "function": {"name": "get_time", "parameters": {}, "strict": True}}]
         payload = adapter._build_payload(LLMRequest(
             purpose="test", messages=[], tools=tools, tool_choice="auto",
         ))
-        for t in payload.get("tools", []):
-            assert not t.get("function", {}).get("strict")
+        assert payload["tools"] == [{
+            "name": "get_time",
+            "description": "",
+            "input_schema": {},
+        }]
+
+    def test_anthropic_messages_url(self):
+        from agent.providers.deepseek import DeepSeekAdapter
+        from agent.providers.base import ProviderConfig
+
+        adapter = DeepSeekAdapter(ProviderConfig(
+            provider="deepseek", api_key="test_key",
+            base_url="https://api.deepseek.com/anthropic",
+            default_model="deepseek-v4-flash",
+        ))
+        assert adapter._messages_url() == "https://api.deepseek.com/anthropic/v1/messages"
 
     def test_no_beta_base_url(self):
         from agent.providers.deepseek import DeepSeekAdapter
@@ -383,8 +402,7 @@ class TestDeepSeekAdapterPayload:
         payload = adapter._build_payload(LLMRequest(
             purpose="test", messages=[], thinking="disabled",
         ))
-        extra_body = payload.get("extra_body", {})
-        assert extra_body.get("thinking") == {"type": "disabled"}
+        assert payload.get("thinking") == {"type": "disabled"}
 
 
 # 6. ToolRegistry native specs tests

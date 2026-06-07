@@ -348,7 +348,7 @@ class ContentPart:
 @dataclass(slots=True)
 class ProviderMessage:
     role: str  # "system" | "user" | "assistant" | "tool"
-    content: str | list[ContentPart]
+    content: Any
     name: str | None = None  # tool name when role=tool
     tool_call_id: str | None = None  # required when role=tool
 
@@ -464,6 +464,7 @@ class BuiltContext:
     turn_id: str
     call_id: str
     provider_messages: list[ProviderMessage] = field(default_factory=list)
+    provider_system: list[dict[str, Any]] = field(default_factory=list)
     exposed_tool_schemas: list[NativeToolSchema] = field(default_factory=list)
     tool_contract_block: ProviderMessage | None = None
     context_blocks: list[ContextBlock] = field(default_factory=list)
@@ -558,7 +559,7 @@ class ConversationHistoryMessage:
     message_id: str
     turn_id: str
     role: str  # "user" | "assistant"
-    content: str
+    content: Any
     source: str  # "user_message" | "assistant_reply" | "assistant_proactive" | "reminder_reply"
     delivery_status: DeliveryStatus = DeliveryStatus.NOT_APPLICABLE
     created_at: datetime | None = None

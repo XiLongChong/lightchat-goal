@@ -26,6 +26,7 @@ LLMErrorKind = Literal[
 class LLMRequest:
     purpose: str
     messages: list[dict[str, Any]]
+    system: list[dict[str, Any]] | None = None
     model: str | None = None
     temperature: float | None = None
     max_tokens: int | None = None
@@ -34,6 +35,9 @@ class LLMRequest:
     reasoning_effort: ReasoningEffort | None = None
     tools: list[dict[str, Any]] | None = None
     tool_choice: Any | None = None
+    context_management: dict[str, Any] | None = None
+    output_config: dict[str, Any] | None = None
+    stream: bool = True
     timeout_s: float | None = None
     retry: int | None = None
     extra: dict[str, Any] = field(default_factory=dict)

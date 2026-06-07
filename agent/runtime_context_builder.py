@@ -102,8 +102,9 @@ class ContextBuilder:
             ))
 
         # 6. system_time_block (before memory/history)
-        msg, blk = self._make_system_time_block(request, warnings)
-        messages.append(msg); blocks.append(blk)
+        if request.system_time is not None:
+            msg, blk = self._make_system_time_block(request, warnings)
+            messages.append(msg); blocks.append(blk)
 
         # ── Phase 2: Memory blocks ────────────────────────────────
         mem_msgs, mem_blks = self._make_all_memory_blocks(request)
@@ -126,8 +127,10 @@ class ContextBuilder:
             ))
 
         # 12. current_turn_local_state
-        msg, blk = self._make_turn_local_block(request)
-        messages.append(msg); blocks.append(blk)
+        turn_local = self._make_turn_local_block(request)
+        if turn_local is not None:
+            msg, blk = turn_local
+            messages.append(msg); blocks.append(blk)
 
         # 13. media_context (optional)
         if request.media_context:
@@ -135,8 +138,10 @@ class ContextBuilder:
             messages.append(msg); blocks.append(blk)
 
         # 14. current_input
-        msg, blk = self._make_current_input_block(request)
-        messages.append(msg); blocks.append(blk)
+        current_input = self._make_current_input_block(request)
+        if current_input is not None:
+            msg, blk = current_input
+            messages.append(msg); blocks.append(blk)
 
         # ── Phase 4: Tool contract and terminal policy ────────────
         # 15. exposed_tools_contract
@@ -157,12 +162,14 @@ class ContextBuilder:
         self._verify_media_not_user_text(blocks, warnings)
 
         # ── Token budget (simple estimate) ────────────────────────
+        provider_system, provider_messages = self._split_provider_payload(messages)
         budget_report = self._estimate_token_budget(messages, request.token_budget)
 
         return BuiltContext(
             turn_id=request.turn_id,
             call_id=request.call_id,
-            provider_messages=messages,
+            provider_messages=provider_messages,
+            provider_system=provider_system,
             exposed_tool_schemas=(
                 request.tool_exposure.native_tool_schemas
                 if request.tool_exposure else []
@@ -175,6 +182,21 @@ class ContextBuilder:
         )
 
     # ── Validation ─────────────────────────────────────────────────
+
+    def _split_provider_payload(
+        self, messages: list[ProviderMessage],
+    ) -> tuple[list[dict[str, Any]], list[ProviderMessage]]:
+        provider_system: list[dict[str, Any]] = []
+        provider_messages: list[ProviderMessage] = []
+        for msg in messages:
+            if msg.role == "system":
+                text = _provider_content_to_text(msg.content)
+                if text.strip():
+                    provider_system.append({"type": "text", "text": text})
+                continue
+            if msg.role in ("user", "assistant"):
+                provider_messages.append(msg)
+        return provider_system, provider_messages
 
     def _validate_request(self, request: BuildContextRequest) -> None:
         missing: list[str] = []
@@ -432,31 +454,37 @@ class ContextBuilder:
 
     def _make_turn_local_block(
         self, request: BuildContextRequest,
-    ) -> tuple[ProviderMessage, ContextBlock]:
+    ) -> tuple[ProviderMessage, ContextBlock] | None:
         tls = request.current_turn_local_state
+        if (
+            tls is None
+            or (
+                tls.model_call_count == 0
+                and not tls.sent_messages_this_turn
+                and not tls.tool_results_this_turn
+            )
+        ):
+            return None
         lines: list[str] = ["[本轮状态]"]
 
-        if tls is None or tls.model_call_count == 0:
-            lines.append("首次模型调用。暂无已发送消息。")
-        else:
-            lines.append(f"模型调用次数: {tls.model_call_count}")
-            if tls.sent_messages_this_turn:
-                lines.append("")
-                lines.append("[本轮已发送消息]")
-                for i, m in enumerate(tls.sent_messages_this_turn, 1):
-                    if m.status == DeliveryStatus.DELIVERED:
-                        lines.append(f"{i}. [delivered] \"{m.text}\"")
-                    elif m.status == DeliveryStatus.FAILED:
-                        lines.append(f"{i}. [failed - 用户未看到] \"{m.text}\"")
-                    else:
-                        lines.append(f"{i}. [{m.status.value}] \"{m.text}\"")
-            if tls.tool_results_this_turn:
-                lines.append("")
-                lines.append("[本轮工具结果]")
-                for r in tls.tool_results_this_turn:
-                    lines.append(f"- {r.tool_name}: {r.result_payload}")
+        lines.append(f"模型调用次数: {tls.model_call_count}")
+        if tls.sent_messages_this_turn:
             lines.append("")
-            lines.append(f"已发送: {tls.delivered_message_count} (送达), {tls.failed_send_attempt_count} (失败)")
+            lines.append("[本轮已发送消息]")
+            for i, m in enumerate(tls.sent_messages_this_turn, 1):
+                if m.status == DeliveryStatus.DELIVERED:
+                    lines.append(f"{i}. [delivered] \"{m.text}\"")
+                elif m.status == DeliveryStatus.FAILED:
+                    lines.append(f"{i}. [failed - 用户未看到] \"{m.text}\"")
+                else:
+                    lines.append(f"{i}. [{m.status.value}] \"{m.text}\"")
+        if tls.tool_results_this_turn:
+            lines.append("")
+            lines.append("[本轮工具结果]")
+            for r in tls.tool_results_this_turn:
+                lines.append(f"- {r.tool_name}: {r.result_payload}")
+        lines.append("")
+        lines.append(f"已发送: {tls.delivered_message_count} (送达), {tls.failed_send_attempt_count} (失败)")
 
         content = "\n".join(lines)
         return (
@@ -498,7 +526,7 @@ class ContextBuilder:
 
     def _make_current_input_block(
         self, request: BuildContextRequest,
-    ) -> tuple[ProviderMessage, ContextBlock]:
+    ) -> tuple[ProviderMessage, ContextBlock] | None:
         # Non-user triggers: system role
         if request.inbound_batch is None and request.trigger is not None:
             trigger_text = request.trigger.reason or "后台触发"
@@ -519,8 +547,7 @@ class ContextBuilder:
                 TurnType.USER_REMINDER_REQUEST, TurnType.MEMORY_MANAGEMENT,
             ) else "system"
         else:
-            content = "[继续本轮对话]"
-            role = "system"
+            return None
 
         return (
             ProviderMessage(role=role, content=content),
@@ -728,6 +755,19 @@ def _format_memory_list(title: str, memories: list[Any]) -> str:
         text = getattr(m, "content", str(m))
         lines.append(f"{i}. {text}")
     return "\n".join(lines)
+
+
+def _provider_content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        out: list[str] = []
+        for part in content:
+            text = getattr(part, "text", None)
+            if text:
+                out.append(str(text))
+        return "\n".join(out)
+    return str(content)
 
 
 def _serialize_history(msgs: list[ProviderMessage]) -> str:

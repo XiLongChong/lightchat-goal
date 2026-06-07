@@ -67,7 +67,26 @@ def test_safe_parse_trailing_comma_fix():
 # Phase 1: ChatAgent native tool call tests
 # ================================================================
 from agent.llm_types import LLMRequest, LLMResponse, LLMUsage, LLMError
-from agent.chat_agent import ChatAgent, _build_context_sample, _build_visible_transcript
+from agent.chat_agent import (
+    ChatAgent,
+    _build_context_sample,
+    _build_visible_transcript,
+    _latest_unmatched_tool_use_ids,
+    _persist_unwritten_protocol_messages,
+)
+from agent.state_machine import SOURCE_PROACTIVE_IMPULSE, TurnScratchpad, TurnState
+
+
+def test_ordinary_chat_protocol_guides_sequential_message_decisions():
+    from agent.context_builder import ORDINARY_CHAT_GLOBAL_PROTOCOL
+
+    assert not ORDINARY_CHAT_GLOBAL_PROTOCOL.startswith("LightChat Ordinary Chat Protocol")
+    assert "reading its result, and then deciding whether another message is genuinely needed" in ORDINARY_CHAT_GLOBAL_PROTOCOL
+    assert "After the result returns, think again." in ORDINARY_CHAT_GLOBAL_PROTOCOL
+    assert "Each new `<channel>` message starts one user interaction turn." in ORDINARY_CHAT_GLOBAL_PROTOCOL
+    assert "stop because you have finished speaking" in ORDINARY_CHAT_GLOBAL_PROTOCOL
+    assert 'Never use "the user has not replied yet" as the reason to continue or stop' in ORDINARY_CHAT_GLOBAL_PROTOCOL
+    assert "You may call multiple tools in one response" not in ORDINARY_CHAT_GLOBAL_PROTOCOL
 
 
 def _make_response(content="", tool_calls=None, **kw):
@@ -86,6 +105,7 @@ def _make_response(content="", tool_calls=None, **kw):
         ),
         latency_ms=kw.get("latency_ms", 100),
         finish_reason=kw.get("finish_reason", "stop"),
+        reasoning_content=kw.get("reasoning_content", ""),
         tool_calls=tool_calls or [],
     )
 
@@ -155,6 +175,130 @@ class TestWechatReplyV15:
         assert result.sent_message_count == 1
         assert result.reply_sequence_status == "completed"
         assert len(sent_msgs) == 1
+
+
+@pytest.mark.asyncio
+async def test_protocol_events_are_written_during_turn_in_causal_order():
+    responses = [
+        _make_response(
+            "",
+            tool_calls=[_make_tc("send_text_message", '{"text":"OK"}', "call_send")],
+            reasoning_content="reply",
+        ),
+        _make_response(
+            "",
+            tool_calls=[_make_tc("finish_turn", '{"status":"replied"}', "call_done")],
+            reasoning_content="finish",
+        ),
+    ]
+
+    requests = []
+
+    class Gateway:
+        async def complete(self, request, **kwargs):
+            requests.append(request)
+            return responses.pop(0)
+
+    async def sender(messages):
+        return [{**message, "send_status": "delivered"} for message in messages]
+
+    events = []
+
+    async def writer(turn, event_type, payload):
+        events.append((event_type, payload))
+
+    agent = ChatAgent(
+        model="test",
+        persona="p",
+        personality="",
+        llm_gateway=Gateway(),
+        native_tool_calls=True,
+        native_allowed_tools=["send_text_message", "finish_turn"],
+        test_mode=True,
+    )
+    result = await agent.chat(
+        user_message="hello",
+        history=[],
+        trigger="user",
+        wechat_sender=sender,
+        protocol_event_writer=writer,
+    )
+
+    assert result.terminal_state == TurnState.END_REPLIED
+    event_types = [event_type for event_type, _ in events]
+    assert event_types == [
+        "turn_started",
+        "message",
+        "outbound_created",
+        "outbound_result",
+        "message",
+        "message",
+        "turn_finished",
+    ]
+    assert events[1][1]["message_kind"] == "model_response"
+    assert events[4][1]["message_kind"] == "tool_result"
+    assert events[5][1]["message_kind"] == "model_response"
+    assert events[6][1]["terminal_state"] == TurnState.END_REPLIED.value
+    tool_results = [
+        part
+        for message in requests[1].messages
+        if message.get("role") == "user" and isinstance(message.get("content"), list)
+        for part in message["content"]
+        if part.get("type") == "tool_result"
+    ]
+    assert tool_results == [{
+        "type": "tool_result",
+        "tool_use_id": "call_send",
+        "content": "sent",
+    }]
+
+
+@pytest.mark.asyncio
+async def test_proactive_protocol_writer_does_not_rewrite_loaded_history():
+    from agent.runtime_context_builder import ContextBuilder
+
+    captured = []
+
+    async def writer(turn, event_type, payload):
+        captured.append((event_type, payload))
+
+    turn = TurnScratchpad(
+        source=SOURCE_PROACTIVE_IMPULSE,
+        trigger="proactive",
+        proactive_meta={"trigger_reason_summary": "test"},
+        _protocol_event_writer=writer,
+    )
+    history = [
+        {
+            "id": 1,
+            "turn_id": "old_turn",
+            "role": "user",
+            "content": "old user message",
+            "source": "protocol",
+        },
+        {
+            "id": 2,
+            "turn_id": "old_turn",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "old assistant message"}],
+            "source": "protocol",
+        },
+    ]
+    agent = ChatAgent(
+        model="test",
+        persona="p",
+        personality="",
+        llm_gateway=object(),
+        context_builder=ContextBuilder(),
+        test_mode=True,
+    )
+
+    state = agent._build_context_via_facade(turn, "persona", history, "proactive")
+    assert state == TurnState.CLASSIFY_CONTEXT_ERROR
+    assert agent._do_classify_context_error(turn) == TurnState.OPTIONAL_PREPROCESS
+    await _persist_unwritten_protocol_messages(turn)
+
+    assert captured == []
 
     def test_three_wechat_reply_then_done(self):
         call_count = [0]
@@ -1113,7 +1257,11 @@ class TestCanonicalTranscript:
             m for m in req.messages
             if m["role"] in ("user", "assistant") and str(m.get("content", "")).strip()
         ]
-        assert [m["content"] for m in transcript] == ["你好", "你好啊", "ok"]
+        assert [m["content"] for m in transcript] == [
+            '<channel source="wechat">\n你好\n</channel>',
+            "你好啊",
+            '<channel source="wechat">\nok\n</channel>',
+        ]
         assert not any(m["role"] == "system" and m.get("_temporal_divider") for m in req.messages)
 
 
@@ -1364,8 +1512,8 @@ class TestTurnLifecycle:
         ))
         assert result.turn_id, "turn_id must be non-empty"
 
-    def test_optional_preprocess_injects_time(self):
-        """v1.5: OPTIONAL_PREPROCESS merges current time into messages[0] system content."""
+    def test_optional_preprocess_does_not_inject_time(self):
+        """OPTIONAL_PREPROCESS must not mutate model-visible context."""
         call_count = [0]
         responses = [
             _make_response("", tool_calls=[_make_tc("send_text_message", '{"text":"ok"}')]),
@@ -1399,10 +1547,10 @@ class TestTurnLifecycle:
         req = gw.requests[0]
         msgs = req.messages
         assert msgs[0]["role"] == "system"
-        assert "当前时间" in msgs[1]["content"], "time should be in second system message (after main prompt)"
-        tail_roles = [m["role"] for m in msgs]
-        system_count = sum(1 for r in tail_roles if r == "system")
-        assert system_count >= 2, f"expected >=2 system msgs (prompt + time), got {system_count}: roles={tail_roles}"
+        assert not any(
+            isinstance(m.get("content"), str) and "当前时间" in m["content"]
+            for m in msgs
+        )
 
 
 class TestToolChoice:
@@ -1434,7 +1582,7 @@ class TestToolChoice:
         asyncio.run(agent.chat(
             user_message="hello", history=[], trigger="user",
         ))
-        assert gw.requests[0].tool_choice == "required"
+        assert gw.requests[0].tool_choice is None
 
     def test_tool_choice_none_when_no_tools(self):
         """No tools → tool_choice is None."""
@@ -1492,8 +1640,170 @@ class TestToolChoice:
             user_message="hello", history=[], trigger="user",
         ))
         for req in gw.requests:
-            assert req.tool_choice == "required", \
-                f"expected 'required', got {req.tool_choice}"
+            assert req.tool_choice is None, \
+                f"expected None, got {req.tool_choice}"
+
+
+def test_protocol_retry_does_not_duplicate_completed_tool_result():
+    turn = TurnScratchpad()
+    turn.messages = [
+        {"role": "user", "content": "你好"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "need memory"},
+                {"type": "tool_use", "id": "call_x", "name": "search_memory", "input": {"query": "你好"}},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "call_x", "content": "{\"status\":\"ok\"}"},
+            ],
+        },
+    ]
+    turn._current_tool_call_id = "call_x"
+
+    agent = ChatAgent(model="test", persona="p", personality="", llm_gateway=object(), test_mode=True)
+    state = agent._do_protocol_retry(turn)
+
+    assert state == TurnState.CALL_LLM
+    tool_result_messages = [
+        m for m in turn.messages
+        if m.get("role") == "user"
+        and isinstance(m.get("content"), list)
+        and any(p.get("type") == "tool_result" for p in m["content"])
+    ]
+    assert len(tool_result_messages) == 1
+    assert turn.messages[-1] is tool_result_messages[0]
+    assert turn.messages[-1]["content"][-1]["type"] == "text"
+    retry_text = turn.messages[-1]["content"][-1]["text"]
+    assert retry_text.startswith("<system-reminder>")
+    assert retry_text.endswith("</system-reminder>")
+    assert "not a user message or a new user intent" in retry_text
+    assert "send_text_message" in retry_text
+    assert _latest_unmatched_tool_use_ids(turn.messages) == []
+
+
+def test_protocol_retry_adds_single_result_for_unmatched_tool_use():
+    turn = TurnScratchpad()
+    turn.messages = [
+        {"role": "user", "content": "你好"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "reply"},
+                {"type": "tool_use", "id": "call_y", "name": "unknown_tool", "input": {}},
+            ],
+        },
+    ]
+
+    agent = ChatAgent(model="test", persona="p", personality="", llm_gateway=object(), test_mode=True)
+    state = agent._do_protocol_retry(turn)
+
+    assert state == TurnState.CALL_LLM
+    assert turn.messages[-1]["role"] == "user"
+    assert turn.messages[-1]["content"][0]["type"] == "tool_result"
+    assert turn.messages[-1]["content"][0]["tool_use_id"] == "call_y"
+    result_payload = json.loads(turn.messages[-1]["content"][0]["content"])
+    assert result_payload["hint"].startswith("<system-reminder>")
+    assert result_payload["hint"].endswith("</system-reminder>")
+    assert "not a user message or a new user intent" in result_payload["hint"]
+
+
+def test_protocol_history_preserves_anthropic_tool_trajectory():
+    from agent.runtime_context_builder import ContextBuilder
+
+    prior_assistant = {
+        "role": "assistant",
+        "content": [
+            {"type": "thinking", "thinking": "send greeting"},
+            {"type": "tool_use", "id": "call_s", "name": "send_text_message", "input": {"text": "哟，来了啊。"}},
+        ],
+    }
+    prior_result = {
+        "role": "user",
+        "content": [
+            {"type": "tool_result", "tool_use_id": "call_s", "content": "{\"status\":\"sent\"}"},
+        ],
+    }
+    history = [
+        {"role": "user", "content": "你好", "source": "protocol", "turn_id": "turn_1"},
+        {"role": "assistant", "content": prior_assistant["content"], "source": "protocol", "turn_id": "turn_1"},
+        {"role": "user", "content": prior_result["content"], "source": "protocol", "turn_id": "turn_1"},
+    ]
+    turn = TurnScratchpad()
+    turn.turn_id = "turn_2"
+    turn.user_message = "你可不可以给我讲个故事"
+
+    agent = ChatAgent(
+        model="test",
+        persona="p",
+        personality="",
+        llm_gateway=object(),
+        context_builder=ContextBuilder(),
+        test_mode=True,
+    )
+    state = agent._build_context_via_facade(turn, "persona", history, "user")
+
+    assert state == TurnState.CLASSIFY_CONTEXT_ERROR
+    messages = turn._context_result.messages
+    assistant_messages = [m for m in messages if m.get("role") == "assistant"]
+    assert any(
+        isinstance(m.get("content"), list)
+        and any(p.get("type") == "tool_use" for p in m["content"])
+        for m in assistant_messages
+    )
+    assert any(
+        m.get("role") == "user"
+        and isinstance(m.get("content"), list)
+        and any(p.get("type") == "tool_result" for p in m["content"])
+        for m in messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_implicit_end_preserves_final_model_response_after_tool_result():
+    turn = TurnScratchpad()
+    turn.sent_message_count = 1
+    turn.messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "call_send",
+                    "content": '{"status":"sent"}',
+                },
+            ],
+        },
+    ]
+    turn._llm_response = _make_response(
+        "已经回复完成。",
+        reasoning_content="The message was delivered, so this turn can end.",
+        finish_reason="end_turn",
+    )
+
+    agent = ChatAgent(
+        model="test",
+        persona="p",
+        personality="",
+        llm_gateway=object(),
+        test_mode=True,
+    )
+    state = await agent._do_handle_model_output(turn)
+
+    assert state == TurnState.END_REPLIED
+    assert turn.messages[-1] == {
+        "role": "assistant",
+        "content": [
+            {
+                "type": "thinking",
+                "thinking": "The message was delivered, so this turn can end.",
+            },
+            {"type": "text", "text": "已经回复完成。"},
+        ],
+    }
 
 
 class TestInterruptCheck:
@@ -1799,14 +2109,22 @@ class TestClassifyToolError:
         assert result.terminal_state == TurnState.END_REPLIED, f"got {result.terminal_state}"
         assert len(result.tool_results) >= 1
 
-    def test_parallel_tool_calls_rejected(self):
-        """v1.5: multiple tool calls in one response → PROTOCOL_RETRY."""
+    def test_parallel_tool_calls_are_processed_in_order(self):
+        """Multiple tool calls in one response are processed and fed back in order."""
         call_count = [0]
         responses = [
+            _make_response(
+                "",
+                reasoning_content="I need time and weather.",
+                tool_calls=[
+                    _make_tc("get_time", '{}', call_id="call_t"),
+                    _make_tc("get_weather", '{"city":"Beijing"}', call_id="call_w"),
+                ],
+            ),
             _make_response("", tool_calls=[
-                _make_tc("get_time", '{}', call_id="call_t"),
-                _make_tc("get_weather", '{"city":"Beijing"}', call_id="call_w"),
+                _make_tc("send_text_message", '{"text":"done"}', call_id="call_s"),
             ]),
+            _make_response("", tool_calls=[]),
         ]
         class MGW:
             def __init__(self): self.requests = []
@@ -1815,18 +2133,45 @@ class TestClassifyToolError:
                 idx = min(call_count[0], len(responses)-1); call_count[0] += 1
                 return responses[idx]
 
+        sent = []
+        async def fake_sender(messages):
+            sent.extend(messages)
+            return [{"send_status": "delivered"} for _ in messages]
+
+        gateway = MGW()
         agent = ChatAgent(
             model="test", persona="p", personality="",
-            llm_gateway=MGW(), native_tool_calls=True,
+            llm_gateway=gateway, native_tool_calls=True,
             native_allowed_tools=["get_time", "get_weather", "send_text_message", "finish_turn"],
             test_mode=True, routing_mode="manual_flash",
         )
         import asyncio
         result = asyncio.run(agent.chat(
             user_message="time and weather?", history=[], trigger="user",
+            wechat_sender=fake_sender,
         ))
-        events = [e.get("type") for e in result.fallback_events]
-        assert "multiple_tool_calls" in events or "protocol_retry" in events
+        assert result.terminal_state == TurnState.END_REPLIED
+        assert [r["name"] for r in result.tool_results[:2]] == ["get_time", "get_weather"]
+        assert sent and sent[0]["text"] == "done"
+        second_request_messages = gateway.requests[1].messages
+        assistant_msg = next(
+            m for m in second_request_messages
+            if m.get("role") == "assistant"
+            and isinstance(m.get("content"), list)
+            and any(p.get("type") == "tool_use" for p in m["content"])
+        )
+        assert assistant_msg["content"][0] == {
+            "type": "thinking",
+            "thinking": "I need time and weather.",
+        }
+        assert [p.get("id") for p in assistant_msg["content"] if p.get("type") == "tool_use"] == ["call_t", "call_w"]
+        user_tool_results = next(
+            m for m in second_request_messages
+            if m.get("role") == "user"
+            and isinstance(m.get("content"), list)
+            and all(p.get("type") == "tool_result" for p in m["content"])
+        )
+        assert [p.get("tool_use_id") for p in user_tool_results["content"]] == ["call_t", "call_w"]
 
     def test_invalid_tool_args_classified_as_protocol_error(self):
         """Invalid tool args → CLASSIFY_TOOL_ERROR → PROTOCOL_RETRY."""
@@ -2806,6 +3151,32 @@ class TestModelRouting:
         ))
         assert result.llm_status == "ok"
         assert result.terminal_state == TurnState.END_REPLIED
+
+
+def test_failed_reminder_tool_is_unresolved_until_success():
+    from agent.chat_agent import (
+        _has_unresolved_failed_reminder_tool,
+        _is_explicit_reminder_failure_reply,
+    )
+    from agent.state_machine import TurnScratchpad
+
+    turn = TurnScratchpad()
+    turn.tool_results.append({
+        "name": "schedule_user_reminder",
+        "result": "error",
+        "scheduled_task_id": "",
+    })
+
+    assert _has_unresolved_failed_reminder_tool(turn)
+    assert not _is_explicit_reminder_failure_reply("\u884c\uff0c\u8bb0\u4f4f\u4e86")
+    assert _is_explicit_reminder_failure_reply("\u6ca1\u8bbe\u7f6e\u6210\u529f")
+
+    turn.tool_results.append({
+        "name": "schedule_user_reminder",
+        "result": "ok",
+        "scheduled_task_id": "sch_1",
+    })
+    assert not _has_unresolved_failed_reminder_tool(turn)
 
 
 if __name__ == "__main__":

@@ -164,7 +164,7 @@ class VisibleMessage:
 @dataclass(slots=True)
 class ModelProfile:
     """v1.3: flash 或 pro 的模型级参数。不含 provider/api_key/base_url。"""
-    model_name: str = "deepseek-v4-flash"
+    model_name: str = "deepseek-v4-pro"
     temperature: float = 0.7
     max_tokens: int = 800
     timeout_seconds: float = 20.0
@@ -201,6 +201,8 @@ class ContextBuildResult:
     messages: list[dict[str, Any]]
     warnings: list[dict[str, str]]     # [{"source": "summary_loader", "detail": "..."}, ...]
     fatal_error: str = ""              # non-empty means fatal — route to HARD_FALLBACK
+    system: list[dict[str, Any]] = field(default_factory=list)
+    tools: list[dict[str, Any]] = field(default_factory=list)
 
 
 # ================================================================
@@ -237,6 +239,9 @@ class TurnScratchpad:
 
     # LLM message array (grows through the turn)
     messages: list[dict[str, Any]] = field(default_factory=list)
+    _current_turn_message_start: int = 0
+    _protocol_event_writer: Any = field(default=None, repr=False)
+    _protocol_persisted_message_count: int = field(default=0, repr=False)
 
     # Tool results (diagnostic only)
     tool_results: list[dict[str, Any]] = field(default_factory=list)
@@ -257,6 +262,8 @@ class TurnScratchpad:
     _guarded_text: str = ""              # guarded text for current wechat_reply
     _current_reply_text: str = ""        # original text for current wechat_reply
     _current_tool_call_id: str = ""      # tool_call_id for current wechat_reply
+    _pending_tool_calls: list[Any] = field(default_factory=list)
+    _pending_tool_result_parts: list[dict[str, Any]] = field(default_factory=list)
 
     # ── v1.5: Reply sequence counters ──────────────────────────
     reply_sequence_status: str = "in_progress"  # in_progress | completed | no_reply | failed | interrupted_by_user | max_limit_reached | protocol_error

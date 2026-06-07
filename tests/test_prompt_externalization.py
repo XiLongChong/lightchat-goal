@@ -43,7 +43,7 @@ def test_memory_worker_loads_external_extraction_prompt():
 
 
 def test_context_builder_produces_reasonable_prompt():
-    """v0.2: build_chat_system_prompt produces a reasonably sized prompt."""
+    """build_chat_system_prompt produces a persona-only prompt."""
     from agent.context_builder import build_chat_system_prompt
 
     prompt = build_chat_system_prompt(
@@ -53,4 +53,9 @@ def test_context_builder_produces_reasonable_prompt():
     )
 
     assert "test persona" in prompt
-    assert len(prompt) < 6000  # v1.5: base_protocol + tool_policy with wechat_reply/done
+    assert "wechat_reply" not in prompt
+    assert "done" not in prompt
+    assert "finish_turn" not in prompt
+    assert "get_time" not in prompt
+    assert "可用工具" not in prompt
+    assert len(prompt) < 1000

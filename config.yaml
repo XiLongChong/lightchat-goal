@@ -6,17 +6,17 @@ version: "3.0"
 
 model:
   provider: deepseek
-  default_model: "${DEEPSEEK_MODEL:-deepseek-v4-flash}"
+  default_model: "${DEEPSEEK_MODEL:-deepseek-v4-pro}"
   smart_model: "${DEEPSEEK_SMART_MODEL:-deepseek-v4-pro}"
-  name: "${DEEPSEEK_MODEL:-deepseek-v4-flash}"
+  name: "${DEEPSEEK_MODEL:-deepseek-v4-pro}"
   api_key: "${DEEPSEEK_API_KEY}"
-  base_url: "${DEEPSEEK_BASE_URL:-https://api.deepseek.com}"
+  base_url: "${DEEPSEEK_BASE_URL:-https://api.deepseek.com/anthropic}"
   temperature: 0.7
-  max_tokens: 2048
+  max_tokens: 4096
   timeout_s: "${LLM_TIMEOUT_S:-60}"
   max_retries: "${LLM_MAX_RETRIES:-1}"
   thinking:
-    default: disabled
+    default: enabled
   json_output:
     chat_agent: false                     # Phase 1: JSON actions disabled
   native_tool_calls:
@@ -28,7 +28,7 @@ model:
       - finish_turn
 
   # ── v1.3: Model routing ──────────────────────────────
-  routing_mode: auto                      # auto | manual_flash | manual_pro
+  routing_mode: manual_pro                # auto | manual_flash | manual_pro
   max_flash_upgrade_attempts: 1           # flash → pro 最大升级次数
   manual_flash_allow_upgrade: false       # manual_flash 下是否允许升级 pro
 
@@ -41,7 +41,7 @@ model:
   pro_profile:
     model_name: deepseek-v4-pro
     temperature: 0.7
-    max_tokens: 1200
+    max_tokens: 4096
     timeout_seconds: 40
 
   streaming:
@@ -126,6 +126,7 @@ wechat:
   max_reply_delay: 3.0
   buffer_debounce_seconds: 2.0
   buffer_max_wait_seconds: 8.0
+  chat_request_timeout_seconds: 200.0
   # Phase 1: send delay config
   send_delay:
     enabled: true

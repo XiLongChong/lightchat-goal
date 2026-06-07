@@ -143,7 +143,7 @@ class _FakeStore:
     async def get_last_visible_message_at(self, user_id, bot_id):
         return self._last_visible
 
-    async def get_recent_conversation_history(self, user_id, limit=40, bot_id=""):
+    async def get_recent_visible_conversation(self, user_id, turn_limit=20, bot_id=""):
         return self.history_rows
 
     async def count_today_proactive_sent(self, today_start):

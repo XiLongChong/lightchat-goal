@@ -33,9 +33,13 @@ _FINISH_TURN = "finish_turn"
 _SKIP_INITIATIVE = "skip_initiative"
 _GET_TIME = "get_time"
 _GET_WEATHER = "get_weather"
+_SEARCH_MEMORY = "search_memory"
+_WRITE_MEMORY = "write_memory"
+_REQUEST_MEMORY_FORGET = "request_memory_forget"
 _GENERATE_IMAGE = "generate_image_message"
 _SEND_IMAGE = "send_image_message"
 _SEND_STICKER = "send_sticker"
+_CREATE_USER_REMINDER = "create_user_reminder"
 _SCHEDULE_REMINDER = "schedule_user_reminder"
 _MARK_REMINDER_DELIVERED = "mark_reminder_delivered"
 _APPLY_FORGET = "apply_forget_directive"
@@ -153,18 +157,18 @@ class ToolExposurePolicy:
         self, request: ToolExposureRequest, phase: TurnPhase,
     ) -> set[str]:
         tt = request.turn_type
-        tools: set[str] = {_SEND_TEXT, _FINISH_TURN}
+        tools: set[str] = {_SEND_TEXT}
+        if tt not in (TurnType.USER_CHAT, TurnType.USER_MEDIA_CHAT):
+            tools.add(_FINISH_TURN)
 
         if tt in (TurnType.USER_CHAT, TurnType.USER_MEDIA_CHAT):
-            if request.user_intent == UserIntent.REQUEST_REMINDER:
-                tools.add(_SCHEDULE_REMINDER)
-            if request.user_intent == UserIntent.REQUEST_IMAGE and request.trigger_source == "user":
-                tools.add(_GENERATE_IMAGE)
-                tools.add(_SEND_IMAGE)
-                tools.add(_SEND_STICKER)
-            if request.user_intent == UserIntent.FORGET_DIRECTIVE:
-                tools.add(_APPLY_FORGET)
-            tools.add(_GET_TIME)
+            tools.update({
+                _GET_WEATHER,
+                _SEARCH_MEMORY,
+                _WRITE_MEMORY,
+                _REQUEST_MEMORY_FORGET,
+                _CREATE_USER_REMINDER,
+            })
             tools.add(_GET_WEATHER)
 
         elif tt == TurnType.USER_REMINDER_REQUEST:
@@ -280,6 +284,7 @@ class ToolExposurePolicy:
             parameters: dict[str, Any] = {
                 "type": "object",
                 "properties": args.get("properties", {}),
+                "additionalProperties": False,
             }
             if args.get("required"):
                 parameters["required"] = args["required"]
@@ -287,7 +292,7 @@ class ToolExposurePolicy:
         props: dict[str, Any] = {}
         for arg in args:
             props[arg] = {"type": "string", "description": arg}
-        return {"type": "object", "properties": props}
+        return {"type": "object", "properties": props, "additionalProperties": False}
 
     @staticmethod
     def _classify_side_effect(tool_def: ToolDef) -> ToolSideEffect:

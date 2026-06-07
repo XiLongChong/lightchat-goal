@@ -6,6 +6,25 @@
 
 本文件只说明如何在本仓库里工作。具体系统架构、模块边界、运行时状态机、工具暴露规则、上下文构建规则、记忆系统规则，可能会随设计推进而变化，不以本文件为准。
 
+## 重要协议决策：DeepSeek 使用 Anthropic Messages 格式
+
+普通聊天的 DeepSeek 请求按 Anthropic 兼容协议构建，不按 OpenAI Chat Completions 协议构建。
+
+- `base_url` 固定目标形态为 `https://api.deepseek.com/anthropic`。
+- 实际请求地址必须是 `https://api.deepseek.com/anthropic/v1/messages`。
+- 不要把 Anthropic base URL 拼接成 `/chat/completions`。
+- 使用 claude-tap 反向代理抓包时，tap target 也必须是 `https://api.deepseek.com/anthropic`；否则代理会把 `/v1/messages` 转发到 OpenAI 根路径下，导致 404。
+- 顶层请求字段按 Claude Code 抓包便于阅读的顺序组织：`model`, `messages`, `system`, `tools`, `max_tokens`, `thinking`, `output_config`, `stream`。
+- 工具定义必须使用 Anthropic 格式：
+  - `name`
+  - `description`
+  - `input_schema`
+- 不要在 Anthropic payload 中发送 OpenAI `{"type":"function","function":{...}}` 工具定义。
+- assistant 工具回灌必须使用 Anthropic content block：`thinking` 后接一个或多个 `tool_use`。
+- thinking 模式下，只要 assistant 返回 tool use，就必须在后续请求中回传该 assistant 的 thinking 内容。
+- 工具结果必须是单条 `role="user"` 消息内的 `tool_result` content block。
+- 如果一次 assistant 返回多个 `tool_use`，必须把全部对应结果放进同一条 user 消息中；每个 `tool_use.id` 必须有对应的 `tool_result.tool_use_id`。
+
 ## 当前开发入口
 
 开始任何运行时重构或功能实现前，先读：
@@ -142,4 +161,3 @@ D:\projects\goal\.venv\Scripts\python.exe -m py_compile main.py
 建议下一步：
 - ...
 ```
-

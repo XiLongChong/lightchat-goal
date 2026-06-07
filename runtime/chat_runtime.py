@@ -61,6 +61,7 @@ class ChatRuntime:
         extra_tools: list[str] | None = None,
         write_model_history: Any = None,
         post_turn_hooks: list | None = None,
+        protocol_event_writer: Any = None,
     ) -> TurnResult:
         """Process a chat message through the full runtime pipeline.
 
@@ -83,13 +84,22 @@ class ChatRuntime:
                 from runtime_contracts import TurnType, UserIntent
 
                 is_proactive = source == SOURCE_PROACTIVE_IMPULSE
-                turn_type = TurnType.RELATIONSHIP_PROACTIVE if is_proactive else TurnType.USER_CHAT
+                is_reminder_request = bool(extra_tools and "schedule_user_reminder" in extra_tools)
+                if is_proactive:
+                    turn_type = TurnType.RELATIONSHIP_PROACTIVE
+                    user_intent = UserIntent.CHAT
+                elif is_reminder_request:
+                    turn_type = TurnType.USER_REMINDER_REQUEST
+                    user_intent = UserIntent.REQUEST_REMINDER
+                else:
+                    turn_type = TurnType.USER_CHAT
+                    user_intent = UserIntent.CHAT
                 trigger_source = "scheduler" if is_proactive else "user"
 
                 request = ToolExposureRequest(
                     turn_type=turn_type,
                     trigger_source=trigger_source,
-                    user_intent=UserIntent.CHAT,
+                    user_intent=user_intent,
                 )
                 exposure = self.tool_exposure_policy.resolve(request)
                 allowed_tools_override = list(exposure.exposed_tool_names)
@@ -121,6 +131,7 @@ class ChatRuntime:
             native_allowed_tools_override=allowed_tools_override,
             write_model_history=write_model_history,
             post_turn_hooks=post_turn_hooks,
+            protocol_event_writer=protocol_event_writer,
         )
 
     def build_turn_request(self, user_message: str) -> TurnScratchpad:

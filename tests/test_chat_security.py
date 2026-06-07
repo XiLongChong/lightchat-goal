@@ -312,7 +312,6 @@ def test_chat_auth_disabled_allows_request_without_key(monkeypatch):
         "done": True,
         "iterations": 1,
     }))
-    monkeypatch.setattr(main, "append_history_async", AsyncMock())
     monkeypatch.setattr(main, "get_history_async", AsyncMock(return_value=[]))
     monkeypatch.setattr(main, "handle_pending_persona_confirmation", AsyncMock(return_value=None))
 
@@ -341,7 +340,6 @@ def test_chat_auth_correct_key_passes_auth_gate(monkeypatch):
         "done": True,
         "iterations": 1,
     }))
-    monkeypatch.setattr(main, "append_history_async", AsyncMock())
     monkeypatch.setattr(main, "get_history_async", AsyncMock(return_value=[]))
     monkeypatch.setattr(main, "handle_pending_persona_confirmation", AsyncMock(return_value=None))
 
@@ -369,7 +367,6 @@ def test_chat_auth_x_api_key_header_also_works(monkeypatch):
         "done": True,
         "iterations": 1,
     }))
-    monkeypatch.setattr(main, "append_history_async", AsyncMock())
     monkeypatch.setattr(main, "get_history_async", AsyncMock(return_value=[]))
     monkeypatch.setattr(main, "handle_pending_persona_confirmation", AsyncMock(return_value=None))
 
