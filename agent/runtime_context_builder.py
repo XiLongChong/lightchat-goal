@@ -114,15 +114,18 @@ class ContextBuilder:
         now = datetime.now(timezone_info)
 
         if prebuilt_messages is not None:
-            # Messages are already in [{role, content}] format from ConversationContext.
-            # Only convert to ConversationHistoryMessage for ContextBuilder.build().
             recent_history: list[ConversationHistoryMessage] = []
             for i, item in enumerate(prebuilt_messages):
+                role = str(item.get("role", ""))
+                content = copy.deepcopy(item.get("content"))
+                # Channel-wrap plain-text user messages (same as history path).
+                if role == "user" and isinstance(content, str):
+                    content = self._channel_message(content)
                 recent_history.append(ConversationHistoryMessage(
                     message_id=f"pre_{i}",
                     turn_id="",
-                    role=str(item.get("role", "")),
-                    content=copy.deepcopy(item.get("content")),
+                    role=role,
+                    content=content,
                     source="protocol",
                     delivery_status="delivered",
                 ))
