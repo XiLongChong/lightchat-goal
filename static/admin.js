@@ -1,10 +1,12 @@
 const loginPanel = document.querySelector("#login-panel");
 const consolePanel = document.querySelector("#console");
+const clearPanel = document.querySelector("#clear-panel");
 const loginError = document.querySelector("#login-error");
 const details = document.querySelector("#details");
 const qrPanel = document.querySelector("#qr-panel");
 const qrImage = document.querySelector("#qr-image");
 const qrStatus = document.querySelector("#qr-status");
+const clearResult = document.querySelector("#clear-result");
 let deployPoll = null;
 
 async function request(path, options = {}) {
@@ -21,6 +23,7 @@ async function request(path, options = {}) {
 function showConsole(authenticated) {
   loginPanel.hidden = authenticated;
   consolePanel.hidden = !authenticated;
+  clearPanel.hidden = !authenticated;
   if (authenticated) refreshStatus();
 }
 
@@ -86,6 +89,26 @@ document.querySelector("#deploy").addEventListener("click", async () => {
       clearInterval(deployPoll);
     }
   }, 1800);
+});
+
+document.querySelector("#clear-all").addEventListener("click", async () => {
+  const button = document.querySelector("#clear-all");
+  button.disabled = true;
+  button.textContent = "清除中...";
+  clearResult.hidden = true;
+  try {
+    const result = await request("/admin/dev/reset-context", { method: "POST", body: "{}" });
+    const lines = [];
+    for (const [table, count] of Object.entries(result.cleared || {})) {
+      lines.push(`${table}: ${count} 条`);
+    }
+    clearResult.textContent = "已清除:\n" + lines.join("\n");
+  } catch (error) {
+    clearResult.textContent = "清除失败: " + error.message;
+  }
+  clearResult.hidden = false;
+  button.textContent = "一键清除";
+  button.disabled = false;
 });
 
 checkAuth().catch((error) => {

@@ -957,7 +957,10 @@ async def admin_page():
     html_path = STATIC_DIR / "admin.html"
     if not html_path.exists():
         raise HTTPException(status_code=404, detail="admin console not found")
-    return HTMLResponse(html_path.read_text(encoding="utf-8"))
+    return HTMLResponse(
+        html_path.read_text(encoding="utf-8"),
+        headers={"Cache-Control": "no-store, must-revalidate"},
+    )
 
 
 @app.get("/admin/auth/status")
