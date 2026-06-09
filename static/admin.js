@@ -111,6 +111,26 @@ document.querySelector("#clear-all").addEventListener("click", async () => {
   button.disabled = false;
 });
 
+document.querySelector("#compress-now").addEventListener("click", async () => {
+  const button = document.querySelector("#compress-now");
+  button.disabled = true;
+  button.textContent = "压缩中...";
+  clearResult.hidden = true;
+  try {
+    const result = await request("/admin/dev/compress", { method: "POST", body: "{}" });
+    if (result.status === "compressed") {
+      clearResult.textContent = "压缩完成 (" + result.user_id + ")";
+    } else {
+      clearResult.textContent = "跳过: " + (result.reason || "无事件");
+    }
+  } catch (error) {
+    clearResult.textContent = "压缩失败: " + error.message;
+  }
+  clearResult.hidden = false;
+  button.textContent = "立即压缩";
+  button.disabled = false;
+});
+
 checkAuth().catch((error) => {
   loginError.textContent = error.message;
   loginError.hidden = false;

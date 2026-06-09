@@ -11,7 +11,7 @@ from typing import Any
 
 import aiosqlite
 
-_SCHEMA_ID = "v2_incremental_array"
+_SCHEMA_ID = "v3_daily_compression"
 
 
 class MemoryStore:
@@ -87,6 +87,7 @@ class MemoryStore:
                 bot_id TEXT NOT NULL DEFAULT '',
                 trim_marker_turn INTEGER NOT NULL DEFAULT 0,
                 context_snapshot_id TEXT NOT NULL DEFAULT '',
+                last_compressed_at REAL NOT NULL DEFAULT 0,
                 created_at REAL NOT NULL
             );
 
@@ -108,6 +109,7 @@ class MemoryStore:
                 role TEXT NOT NULL,
                 content_json TEXT NOT NULL,
                 call_id TEXT NOT NULL DEFAULT '',
+                active INTEGER NOT NULL DEFAULT 1,
                 created_at REAL NOT NULL,
                 UNIQUE(turn_id, seq)
             );
@@ -324,25 +326,18 @@ class MemoryStore:
     async def get_recent_events(
         self, conversation_id: str, turn_limit: int = 20
     ) -> list[dict[str, Any]]:
-        """Return raw_events for the last N completed turns, ordered for context."""
+        """Return active raw_events ordered for context rebuild."""
+        del turn_limit  # No longer used — active=1 is the implicit limit
         db = await self._get_db()
-        turns = await db.execute_fetchall(
-            """SELECT id, turn_number FROM turns
-               WHERE conversation_id=? AND status='completed'
-               ORDER BY turn_number DESC LIMIT ?""",
-            (conversation_id, max(1, int(turn_limit))),
-        )
-        turn_ids = [str(row["id"]) for row in reversed(turns)]
-        if not turn_ids:
-            return []
-        placeholders = ",".join("?" for _ in turn_ids)
         rows = await db.execute_fetchall(
-            f"""SELECT * FROM raw_events WHERE turn_id IN ({placeholders})""",
-            turn_ids,
+            """SELECT re.*, t.turn_number FROM raw_events re
+               JOIN turns t ON re.turn_id = t.id
+               WHERE t.conversation_id = ? AND re.active = 1
+               ORDER BY t.turn_number, re.seq""",
+            (conversation_id,),
         )
-        order = {tid: idx for idx, tid in enumerate(turn_ids)}
         result: list[dict[str, Any]] = []
-        for row in sorted(rows, key=lambda r: (order[str(r["turn_id"])], int(r["seq"]))):
+        for row in rows:
             try:
                 content = json.loads(row["content_json"])
             except (TypeError, json.JSONDecodeError):
@@ -356,6 +351,126 @@ class MemoryStore:
                 "ts": row["created_at"],
             })
         return result
+
+    # ── compress ────────────────────────────────────────────────────
+
+    async def get_all_events_for_compress(
+        self, conversation_id: str
+    ) -> list[dict[str, Any]]:
+        """Read all raw_events for compression — full history, all active states."""
+        db = await self._get_db()
+        rows = await db.execute_fetchall(
+            """SELECT re.id, re.role, re.content_json, re.turn_id, re.seq,
+                      t.turn_number
+               FROM raw_events re
+               JOIN turns t ON re.turn_id = t.id
+               WHERE t.conversation_id = ?
+               ORDER BY t.turn_number, re.seq""",
+            (conversation_id,),
+        )
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                content = json.loads(str(row["content_json"]))
+            except (TypeError, json.JSONDecodeError):
+                continue
+            result.append({
+                "id": row["id"],
+                "role": str(row["role"]),
+                "content": content,
+                "turn_id": row["turn_id"],
+                "seq": row["seq"],
+                "turn_number": row["turn_number"],
+            })
+        return result
+
+    async def apply_compression(
+        self,
+        conversation_id: str,
+        summary_text: str,
+    ) -> bool:
+        """Soft-delete all events, append summary to last user with tool_result."""
+        db = await self._get_db()
+        async with self._write_lock:
+            rows = await db.execute_fetchall(
+                """SELECT re.id, re.role, re.content_json, re.turn_id, re.seq,
+                          t.turn_number
+                   FROM raw_events re
+                   JOIN turns t ON re.turn_id = t.id
+                   WHERE t.conversation_id = ?
+                   ORDER BY t.turn_number, re.seq""",
+                (conversation_id,),
+            )
+
+            # Parse all rows
+            events: list[dict[str, Any]] = []
+            for row in rows:
+                try:
+                    content = json.loads(str(row["content_json"]))
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                events.append({
+                    "id": row["id"],
+                    "role": str(row["role"]),
+                    "content": content,
+                })
+
+            # Find last user with tool_result
+            last_user_idx: int | None = None
+            for i, ev in enumerate(events):
+                if ev["role"] == "user" and isinstance(ev["content"], list):
+                    has_tool = any(
+                        isinstance(b, dict) and b.get("type") == "tool_result"
+                        for b in ev["content"]
+                    )
+                    if has_tool:
+                        last_user_idx = i
+
+            if last_user_idx is None:
+                return False  # Nothing to attach summary to
+
+            # Find next assistant after target user
+            next_assistant: dict[str, Any] | None = None
+            for i in range(last_user_idx + 1, len(events)):
+                if events[i]["role"] == "assistant":
+                    next_assistant = events[i]
+                    break
+            if next_assistant is None:
+                return False  # Can't maintain alternation
+
+            target = events[last_user_idx]
+
+            # Soft-delete all events
+            await db.execute(
+                """UPDATE raw_events SET active = 0
+                   WHERE turn_id IN (
+                       SELECT id FROM turns WHERE conversation_id = ?
+                   )""",
+                (conversation_id,),
+            )
+
+            # Append summary to target user's content
+            new_content = list(target["content"]) if isinstance(target["content"], list) else [target["content"]]
+            new_content.append({"type": "text", "text": summary_text})
+            await db.execute(
+                "UPDATE raw_events SET content_json = ?, active = 1 WHERE id = ?",
+                (json.dumps(new_content, ensure_ascii=False), target["id"]),
+            )
+
+            # Keep next assistant active
+            await db.execute(
+                "UPDATE raw_events SET active = 1 WHERE id = ?",
+                (next_assistant["id"],),
+            )
+
+            # Update last_compressed_at
+            await db.execute(
+                "UPDATE conversations SET last_compressed_at = ? WHERE id = ?",
+                (time.time(), conversation_id),
+            )
+
+            await db.commit()
+        return True
 
     # ── clear ───────────────────────────────────────────────────────
 

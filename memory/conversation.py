@@ -42,9 +42,13 @@ class ConversationContext:
         return len(self._messages) == 0
 
     async def rebuild(self, store: MemoryStore, turn_limit: int = 20) -> None:
-        """Rebuild messages array from database (restart / clear)."""
+        """Rebuild messages array from database (restart / clear).
+
+        Only active events are loaded — the DB already handles compression filtering.
+        """
+        del turn_limit
         cid = f"{self.user_id}:{self.bot_id}"
-        events = await store.get_recent_events(cid, turn_limit=turn_limit)
+        events = await store.get_recent_events(cid)
         self._messages = [
             {"role": e["role"], "content": copy.deepcopy(e["content"])}
             for e in events

@@ -11,6 +11,7 @@ llm_gateway.py             — 供应商无关的 LLM 网关：DeepSeek 适配�
 llm_types.py               — LLM 请求/响应数据类：LLMRequest, LLMResponse, LLMUsage, LLMError
 providers/base.py          — ProviderAdapter 协议 + ProviderConfig
 providers/deepseek.py      — DeepSeek 适配器（通过 OpenAI SDK 调用 Anthropic 兼容端点）
+compressor.py              — 每日对话压缩：调用 pro 模型生成摘要，注入 raw_events
 context_builder.py         — 全局协议文案 + build_chat_system_prompt 工具函数
 runtime_context_builder.py — ContextBuilder：build_for_chat() 统一入口，收拢全部 context 构造逻辑
 tool_registry.py           — ToolDef 注册表 + native tool call spec 生成
