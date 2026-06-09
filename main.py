@@ -1,20 +1,8 @@
-﻿"""Goal Chat Agent — main entry point.
-
-A lightweight, privacy-preserving chat agent with:
-  - Multi-message output (JSON format, DeepSeek-compatible)
-  - Simple tool calling (weather, time)
-  - Long-term memory (SQLite + CJK bigram retrieval)
-  - WeChat integration (emoRebot iLink bridge)
-
-All 10 production safeguards built in from day one.
-Single process, single SQLite file, zero cloud dependencies.
-"""
+﻿"""Goal text-chat agent and WeChat bridge entry point."""
 
 import asyncio
-import io
 import secrets
 import uuid
-import zipfile
 import json
 import logging
 import os
@@ -22,7 +10,7 @@ import re
 import sys
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, time as datetime_time, timedelta
+from datetime import datetime, time as datetime_time
 from typing import Any
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -30,26 +18,22 @@ from zoneinfo import ZoneInfo
 import yaml
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from agent.chat_agent import ChatAgent, ROUTE_SYSTEM_FAST, ROUTE_CHAT_LITE, ROUTE_CHAT_FULL
-from agent.chat_agent import CTX_HOT_ONLY, CTX_HOT_CHEAP, CTX_HOT_FULL
+from agent.chat_agent import ChatAgent
 from agent.context_builder import build_chat_system_prompt
 from agent.llm_gateway import LLMGateway
-from agent.llm_types import LLMRequest
 from agent.output_guard import guard_messages, guard_single_message
 from agent.runtime_context_builder import ContextBuilder
-from agent.scheduler import ProactiveScheduler
-from agent.state_machine import ModelProfile, TurnResult, TurnScratchpad, TurnState, DeliveryStatus, SOURCE_PROACTIVE_IMPULSE
+from agent.state_machine import ModelProfile, TurnResult, TurnScratchpad, TurnState, DeliveryStatus
 from agent.tool_exposure_policy import ToolExposurePolicy
 from agent.tools import configure_runtime, configure_tools
 from bridge.wechat_poller import WeChatBridge
 from memory.store import MemoryStore
-from memory.system import MemorySystem
 from runtime.chat_runtime import ChatRuntime, create_chat_runtime
 
 # ================================================================
@@ -79,7 +63,6 @@ def load_config(path: str = "config.yaml") -> dict:
 
 cfg = load_config()
 
-# Phase 6A: Env-var override for native_tool_calls gray-release.
 # GOAL_NATIVE_TOOL_CALLS=true overrides config.yaml without editing the file.
 _native_override = os.getenv("GOAL_NATIVE_TOOL_CALLS", "").strip().lower()
 if _native_override in ("true", "1", "yes", "on"):
@@ -89,10 +72,7 @@ if _native_override in ("true", "1", "yes", "on"):
         _ntc["allowed_tools"] = [
             "send_text_message",
             "get_weather",
-            "search_memory",
-            "write_memory",
-            "request_memory_forget",
-            "create_user_reminder",
+            "get_time",
         ]
 
 # Development-only LLM tap/proxy override. This lets local tools such as
@@ -108,7 +88,7 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
 ADMIN_SESSIONS: set[str] = set()
 ADMIN_COOKIE = "goal_admin_session"
 PROCESS_STARTED_AT = time.time()
-BOT_ID = "default"  # Phase 1: single persona, no multi-bot
+BOT_ID = "default"
 
 
 def _deep_update(base: dict, updates: dict) -> dict:
@@ -144,71 +124,6 @@ def read_persona_file() -> str:
     if path.exists():
         return path.read_text(encoding="utf-8")
     return cfg["agent"].get("personality", "")
-
-
-CONFIRM_WORDS = {"确认", "可以", "保存", "写入", "改吧", "同意", "好", "行", "yes", "ok", "okay"}
-CANCEL_WORDS = {"取消", "不要", "不用", "别改", "先别", "不保存", "no", "cancel"}
-
-
-def _has_any_word(text: str, words: set[str]) -> bool:
-    lowered = text.lower()
-    return any(word in lowered for word in words)
-
-
-async def handle_pending_persona_confirmation(user_message: str) -> dict | None:
-    pending = await memory_store.get_pending_persona_change()
-    if not pending:
-        return None
-
-    if _has_any_word(user_message, CANCEL_WORDS):
-        await memory_store.clear_pending_persona_change()
-        return {
-            "messages": [{"text": "好 我先不改", "delay": 0}],
-            "tool_calls": [{"name": "pending_persona_change", "result": "cancelled"}],
-            "scheduled_task_ids": [],
-            "iterations": 0,
-            "elapsed_ms": 0,
-        }
-
-    if not _has_any_word(user_message, CONFIRM_WORDS):
-        return None
-
-    content = str(pending.get("content", "")).strip()
-    if not content:
-        await memory_store.clear_pending_persona_change()
-        return {
-            "messages": [{"text": "草案是空的 我丢掉了", "delay": 0}],
-            "tool_calls": [{"name": "pending_persona_change", "result": "empty"}],
-            "scheduled_task_ids": [],
-            "iterations": 0,
-            "elapsed_ms": 0,
-        }
-
-    path = Path(cfg.get("agent", {}).get("persona_file", "./prompts/persona.md"))
-    root = Path.cwd().resolve()
-    path = (root / path).resolve() if not path.is_absolute() else path.resolve()
-    if root not in path.parents and path != root:
-        await memory_store.clear_pending_persona_change()
-        return {
-            "messages": [{"text": "这个路径不安全 我没改", "delay": 0}],
-            "tool_calls": [{"name": "pending_persona_change", "result": "unsafe_path"}],
-            "scheduled_task_ids": [],
-            "iterations": 0,
-            "elapsed_ms": 0,
-        }
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content + "\n", encoding="utf-8")
-    chat_agent.personality = content
-    # Phase 1: force re-read persona.md on next turn
-    await memory_store.clear_pending_persona_change()
-    return {
-        "messages": [{"text": "好 已经写进人设了", "delay": 0}],
-        "tool_calls": [{"name": "pending_persona_change", "result": "committed"}],
-        "scheduled_task_ids": [],
-        "iterations": 0,
-        "elapsed_ms": 0,
-    }
 
 
 def require_admin(request: Request):
@@ -305,7 +220,7 @@ model_name = cfg["model"].get("default_model") or cfg["model"]["name"]
 temperature = cfg["model"].get("temperature", 0.7)
 
 memory_store = MemoryStore(
-    db_path=cfg["memory"].get("db_path", "./data/memory.db"),
+    db_path=cfg.get("storage", {}).get("db_path", "./data/memory.db"),
 )
 configure_runtime(memory_store=memory_store)
 
@@ -318,7 +233,6 @@ async def _on_llm_trace(trace: dict):
 
 llm_gateway.on_trace(_on_llm_trace)
 
-# Phase 1: Single persona (no multi-bot, no memory_worker)
 def _read_persona() -> str:
     path = Path(cfg.get("agent", {}).get("persona_file", "./prompts/persona.md"))
     if path.exists():
@@ -328,11 +242,6 @@ def _read_persona() -> str:
 def _read_personality() -> str:
     return cfg["agent"].get("personality", "")
 
-_feature_on = lambda name: (
-    (cfg.get("features") or {}).get(name, False) is True
-)
-
-# ── v1.3: Model routing profiles ────────────────────────────────
 _flash_cfg = cfg.get("model", {}).get("flash_profile", {})
 _pro_cfg = cfg.get("model", {}).get("pro_profile", {})
 flash_profile = ModelProfile(
@@ -351,10 +260,8 @@ _routing_mode = cfg.get("model", {}).get("routing_mode", "auto")
 _manual_upgrade = cfg.get("model", {}).get("manual_flash_allow_upgrade", False)
 _max_upgrade = int(cfg.get("model", {}).get("max_flash_upgrade_attempts", 1) or 1)
 
-# Phase 12: ToolExposurePolicy as single source of truth for tool exposure
 _tool_exposure_policy = ToolExposurePolicy()
 
-# Phase 3+12: ContextBuilder for real context assembly
 _context_builder = ContextBuilder(
     persona_text=f"{_read_persona()}\n\n{_read_personality()}",
 )
@@ -375,21 +282,15 @@ chat_agent = ChatAgent(
     native_allowed_tools=cfg.get("model", {}).get("native_tool_calls", {}).get("allowed_tools", []),
     json_output_enabled=False,
     test_mode=cfg.get("wechat", {}).get("send_delay", {}).get("test_mode_zero_delay", False),
-    # ── v1.3 model routing ──
     flash_profile=flash_profile,
     pro_profile=pro_profile,
     routing_mode=_routing_mode,
     manual_flash_allow_upgrade=_manual_upgrade,
     max_flash_upgrade_attempts=_max_upgrade,
-    # ── Phase 12: facade injection ──
     tool_exposure_policy=_tool_exposure_policy,
     context_builder=_context_builder,
 )
 
-# Phase 8: MemorySystem for sent-content tracking in post-turn pipeline
-memory_system = MemorySystem(user_id="", bot_id=BOT_ID, _store=memory_store)
-
-# Phase 10: ChatRuntime as single entry point for /chat
 chat_runtime = create_chat_runtime(
     user_id="",
     bot_id=BOT_ID,
@@ -398,66 +299,15 @@ chat_runtime = create_chat_runtime(
     chat_agent=chat_agent,
     context_builder=_context_builder,
     tool_exposure_policy=_tool_exposure_policy,
-    memory_system=memory_system,
 )
 
-# ── v3.1: ProactiveScheduler ─────────────────────────────────────
-proactive_scheduler = ProactiveScheduler(
-    chat_agent=chat_agent,
-    config=cfg,
-    store=memory_store,
-    bridge_online_check=lambda: _bridge is not None and _bridge.running,
-)
-logger.info("ProactiveScheduler: initialized (Phase 5 heartbeat + eligibility)")
-
-# v0.2 Phase 5: Memory hook — wires MemoryStore + MemoryWorker into
-# LOAD_MEMORY_CONTEXT and UPDATE_MEMORY positions.
-# Controlled by features.memory flag (default false).
-memory_hook = None
-if _feature_on("memory"):
-    from agent.memory_worker import MemoryWorker
-    from agent.memory_hook import MemoryHook
-
-    memory_worker = MemoryWorker(
-        store=memory_store,
-        model=model_name,
-        min_importance=cfg["memory"].get("min_importance_save", 0.4),
-        prompts_dir=cfg.get("prompt_pack", {}).get("directory", "./prompts"),
-        llm_gateway=llm_gateway,
-    )
-    memory_hook = MemoryHook(
-        store=memory_store,
-        worker=memory_worker,
-        bot_id=BOT_ID,
-        max_context_memories=cfg["memory"].get("max_context_memories", 3),
-    )
-    logger.info("Memory hook: enabled (LOAD_MEMORY_CONTEXT + UPDATE_MEMORY)")
-else:
-    memory_worker = None
-    memory_hook = None
-
-# v0.2: System prompt builder — minimal, no memory/recap/relationship.
 # Memory context is loaded separately via build_enriched_system_prompt().
-def build_system_prompt_for_turn(extra_tools: list[str] | None = None) -> str:
+def build_system_prompt_for_turn() -> str:
     """Build minimal system prompt for a chat turn."""
     persona = _read_persona()
     personality = _read_personality()
     default_city = cfg.get("weather", {}).get("default_city", "")
-    tool_names = list(cfg.get("model", {}).get("native_tool_calls", {}).get(
-        "allowed_tools",
-        [
-            "send_text_message",
-            "get_weather",
-            "search_memory",
-            "write_memory",
-            "request_memory_forget",
-            "create_user_reminder",
-        ],
-    ))
-    if extra_tools:
-        for t in extra_tools:
-            if t not in tool_names:
-                tool_names.append(t)
+    tool_names = ["send_text_message", "get_time", "get_weather"]
     return build_chat_system_prompt(
         persona=persona,
         personality=personality,
@@ -465,37 +315,6 @@ def build_system_prompt_for_turn(extra_tools: list[str] | None = None) -> str:
     )
 
 
-async def build_enriched_system_prompt(user_id: str, user_message: str, extra_tools: list[str] | None = None) -> str:
-    """Build system prompt, optionally enriched with memory context."""
-    prompt = build_system_prompt_for_turn(extra_tools=extra_tools)
-    if memory_hook:
-        try:
-            mem_ctx = await memory_hook.load_context(user_id, user_message)
-            if mem_ctx:
-                prompt = prompt + "\n\n" + mem_ctx
-        except Exception:
-            logger.warning("Memory context load failed, continuing without", exc_info=True)
-    return prompt
-
-
-_REMINDER_KEYWORDS = [
-    "分钟后", "小时后", "分钟后提醒", "小时后提醒",
-    "提醒我", "叫我", "喊我", "记得提醒", "别忘了提醒",
-    "几点", "每天", "定时", "到了提醒", "叫我起床",
-    "提醒一下", "到点", "set reminder", "remind me",
-]
-
-
-def _has_reminder_intent(user_message: str) -> bool:
-    """Check if user message contains explicit reminder intent keywords."""
-    msg = user_message.lower()
-    return any(kw in msg for kw in _REMINDER_KEYWORDS)
-
-
-# v0.2: wechat_sender callback — pure WeChat transport, no guard logic.
-# Messages arrive already guarded (by state machine GUARD_OUTPUT or
-# _send_message_batch guard_messages).  This callback only handles
-# transport: delay, send, status tracking.
 async def wechat_sender(user_id: str, context_token: str, messages: list[dict]) -> list[dict]:
     """Send messages through the WeChat bridge with delivery tracking.
 
@@ -566,7 +385,6 @@ if cfg.get("wechat", {}).get("enabled"):
     )
 
 # ================================================================
-# V2: Per-user turn lock (Phase 4)
 # TODO: single-process only; multi-process / multi-replica needs a distributed lock
 # ================================================================
 
@@ -575,36 +393,20 @@ _user_turn_lock_access: dict[str, float] = {}
 _MAX_USER_TURN_LOCKS = 512
 _USER_ID_RE = re.compile(r"^[A-Za-z0-9_.:@-]+$")
 
-# ── v1.2: Interrupt checker — seq-based per user ────────────
 # Maps user_id → latest inbound seq seen globally.
 _user_latest_inbound_seq: dict[str, int] = {}
 
 
 def _record_user_message_arrival(user_id: str, seq: int = 0) -> None:
-    """Record the latest inbound seq for a user. Called inside the lock."""
+    """Record the latest inbound sequence for a user."""
     if seq > 0:
         current = _user_latest_inbound_seq.get(user_id, 0)
         if seq > current:
             _user_latest_inbound_seq[user_id] = seq
 
 
-async def _cancel_pending_proactive_on_user_message(user_id: str) -> None:
-    """Cancel pending proactive wake-ups when user sends a message."""
-    try:
-        cancelled = await memory_store.cancel_pending_proactive_wake_ups(user_id, BOT_ID)
-        if cancelled > 0:
-            logger.info("cancelled %d pending proactive wake-ups for user=%s", cancelled, user_id)
-    except Exception:
-        pass
-
-
 def _make_interrupt_checker(user_id: str, input_latest_seq: int):
-    """Return an InterruptChecker for the given user.
-
-    v1.2 seq-based: interrupt only when a message with seq strictly
-    greater than the current turn's input_latest_seq has arrived.
-    This prevents the current batch from cancelling itself.
-    """
+    """Return a checker that detects a newer inbound message."""
     def _check(_interrupt_token: str) -> bool:
         latest_seq = _user_latest_inbound_seq.get(user_id, 0)
         interrupted = latest_seq > input_latest_seq
@@ -616,396 +418,6 @@ def _make_interrupt_checker(user_id: str, input_latest_seq: int):
         return interrupted
 
     return _check
-
-
-def _get_current_inbound_seq(user_id: str) -> int:
-    return int(_user_latest_inbound_seq.get(user_id, 0) or 0)
-
-
-async def _dispatch_due_wake_up_after_turn(user_id: str, bot_id: str) -> None:
-    """Fire-and-forget: dispatch one due wake-up after a user turn."""
-    try:
-        await asyncio.sleep(2)
-        if not user_id or not bot_id or proactive_scheduler is None:
-            return
-        if _is_user_turn_active(user_id):
-            return
-        settings = load_proactive_settings(cfg)
-        if not settings.enabled or not settings.scheduled_enabled:
-            return
-        contact = await memory_store.get_contact_state()
-        uid = contact.get("user_id", "")
-        if uid != user_id:
-            return
-        wake_up = await proactive_scheduler._claim_due_wake_up(uid, bot_id)
-        if not wake_up:
-            return
-        ctx_token = contact.get("context_token", "")
-        baseline = _get_current_inbound_seq(uid)
-
-        async def _history_provider(uid: str, bid: str) -> list:
-            return await get_history_async(uid, bot_id=bid)
-
-        async def _system_prompt_provider(uid: str) -> str:
-            return await build_enriched_system_prompt(uid, "")
-
-        async def _wechat_sender_provider(messages: list) -> list:
-            return await wechat_sender(uid, ctx_token, messages)
-
-        result = await proactive_scheduler.dispatch_wake_up(
-            user_id=uid,
-            bot_id=bot_id,
-            wake_up_context=wake_up,
-            history_provider=_history_provider,
-            system_prompt_provider=_system_prompt_provider,
-            wechat_sender_provider=_wechat_sender_provider,
-            interrupt_checker_provider=_make_interrupt_checker(uid, input_latest_seq=baseline),
-            input_latest_seq=baseline,
-            post_turn_hooks=_build_proactive_post_turn_hooks(uid, bot_id, {}),
-            protocol_event_writer=_build_protocol_event_writer(uid, bot_id),
-        )
-        if result.get("status") == "ok":
-            tr = result.get("result")
-            logger.info(
-                "wake_up: post-turn dispatch ok trigger=%s terminal=%s delivered=%d",
-                wake_up.get("trigger", ""),
-                getattr(tr, "terminal_state", ""),
-                int(getattr(tr, "proactive_delivered_count", 0) or 0),
-            )
-    except Exception as e:
-        logger.debug("wake_up: post-turn dispatch skipped: %s", e)
-
-
-def _parse_scheduled_trigger_at(value: str) -> float:
-    raw = str(value or "").strip()
-    if not raw:
-        raise ValueError("trigger_at is required")
-    if raw.endswith("Z"):
-        raw = raw[:-1] + "+00:00"
-    dt = datetime.fromisoformat(raw)
-    tz = ZoneInfo("Asia/Shanghai")
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=tz)
-    return dt.timestamp()
-
-
-def _shift_due_out_of_quiet_hours(due_ts: float) -> float:
-    from agent.proactive_settings import load_proactive_settings
-
-    settings = load_proactive_settings(cfg)
-    if not settings.quiet_hours_enabled:
-        return due_ts
-    tz = ZoneInfo("Asia/Shanghai")
-    due_dt = datetime.fromtimestamp(due_ts, tz)
-    sleep_cfg = {
-        "start": settings.quiet_hours_start,
-        "end": settings.quiet_hours_end,
-    }
-    if not proactive_scheduler._in_sleep_hours(sleep_cfg, debug_now=due_dt):
-        return due_ts
-    try:
-        end_t = datetime_time.fromisoformat(settings.quiet_hours_end)
-    except Exception:
-        end_t = datetime_time(hour=8)
-    end_dt = datetime.combine(due_dt.date(), end_t, tzinfo=tz)
-    if end_dt <= due_dt:
-        end_dt = end_dt + timedelta(days=1)
-    return end_dt.timestamp()
-
-
-_CN_NUMERAL = {
-    "零": 0,
-    "一": 1,
-    "二": 2,
-    "两": 2,
-    "三": 3,
-    "四": 4,
-    "五": 5,
-    "六": 6,
-    "七": 7,
-    "八": 8,
-    "九": 9,
-    "十": 10,
-}
-
-
-def _parse_small_cn_number(text: str) -> int | None:
-    text = str(text or "").strip()
-    if not text:
-        return None
-    if text.isdigit():
-        return int(text)
-    if text == "半":
-        return None
-    if text in _CN_NUMERAL:
-        return _CN_NUMERAL[text]
-    if "十" in text:
-        left, _, right = text.partition("十")
-        tens = _CN_NUMERAL.get(left, 1) if left else 1
-        ones = _CN_NUMERAL.get(right, 0) if right else 0
-        return tens * 10 + ones
-    total = 0
-    for ch in text:
-        if ch not in _CN_NUMERAL:
-            return None
-        total = total * 10 + _CN_NUMERAL[ch]
-    return total
-
-
-def _extract_delay_minutes_from_text(text: str) -> int | None:
-    text = str(text or "")
-    patterns = [
-        (r"(\d{1,4})\s*(?:分钟|分)\s*(?:后|以后|之后)", 1),
-        (r"([一二两三四五六七八九十]{1,4})\s*(?:分钟|分)\s*(?:后|以后|之后)", 1),
-        (r"(\d{1,3})\s*(?:小时|个小时)\s*(?:后|以后|之后)", 60),
-        (r"([一二两三四五六七八九十]{1,4})\s*(?:小时|个小时)\s*(?:后|以后|之后)", 60),
-    ]
-    for pattern, multiplier in patterns:
-        m = re.search(pattern, text)
-        if not m:
-            continue
-        value = _parse_small_cn_number(m.group(1))
-        if value is None:
-            continue
-        minutes = value * multiplier
-        if 1 <= minutes <= 43200:
-            return minutes
-    return None
-
-
-def _looks_relative_time_text(value: str) -> bool:
-    return bool(re.search(r"(后|以后|之后|分钟|小时|半小时)", str(value or "")))
-
-
-def _scheduled_task_payload(item: dict[str, Any]) -> dict[str, Any] | None:
-    messages = item.get("messages") or []
-    first = messages[0] if messages and isinstance(messages[0], dict) else {}
-    wake_type = str(first.get("wake_up_type", "") or "")
-    source = str(first.get("source", "") or "")
-    if wake_type == "proactive":
-        return None
-    if not wake_type and source not in {"admin_scheduled_task", "schedule_wake_up"}:
-        return None
-    due_at = float(item.get("due_at", 0) or 0)
-    tz = ZoneInfo("Asia/Shanghai")
-    return {
-        "id": str(item.get("id", "")),
-        "due_at": due_at,
-        "due_at_text": datetime.fromtimestamp(due_at, tz).strftime("%Y-%m-%d %H:%M"),
-        "task": str(first.get("text", "") or first.get("message", "")),
-        "frequency": str(first.get("recurring", "") or "once"),
-        "skip_quiet_hours": bool(first.get("skip_quiet_hours", False)),
-    }
-
-
-def _next_daily_due(hhmm: str) -> float:
-    due_t = datetime_time.fromisoformat(str(hhmm))
-    tz = ZoneInfo("Asia/Shanghai")
-    now = datetime.now(tz)
-    due_dt = datetime.combine(now.date(), due_t, tzinfo=tz)
-    if due_dt.timestamp() <= time.time() + 5:
-        due_dt = due_dt + timedelta(days=1)
-    return due_dt.timestamp()
-
-
-def _build_state_tool_executor(user_id: str, context_token: str, bot_id: str):
-    async def _exec(tool_name: str, args: dict[str, Any], turn: TurnScratchpad) -> dict[str, Any]:
-        if tool_name == "write_memory":
-            content = str(args.get("content", "") or "").strip()
-            if not content:
-                return {
-                    "status": "error",
-                    "recoverable": True,
-                    "reason": "missing_content",
-                    "hint": "content is required",
-                }
-            category = str(args.get("type", "") or args.get("category", "") or "preference").strip()[:50]
-            source_text = str(args.get("source_text", "") or "").strip()[:500]
-            mem_id = await memory_store.save_memory_bot(
-                content=content[:1800],
-                bot_id=bot_id,
-                category=category,
-                keywords=source_text[:500],
-                source_turn_id=turn.turn_id,
-                min_importance=0.0,
-            )
-            if not mem_id:
-                return {
-                    "status": "skipped",
-                    "recoverable": False,
-                    "reason": "duplicate_or_empty",
-                }
-            return {
-                "status": "ok",
-                "memory_id": mem_id,
-                "category": category,
-            }
-
-        if tool_name == "request_memory_forget":
-            target = str(args.get("target", "") or args.get("query", "") or "").strip()
-            if not target:
-                return {
-                    "status": "error",
-                    "recoverable": True,
-                    "reason": "missing_target",
-                    "hint": "target is required",
-                }
-            matches = await memory_store.search_bot(
-                query=target,
-                bot_id=bot_id,
-                top_k=5,
-                include_shared=False,
-            )
-            exact = [
-                item for item in matches
-                if target in str(item.get("content", ""))
-            ]
-            candidates = exact or matches[:1]
-            if not candidates:
-                return {
-                    "status": "ok",
-                    "deleted": 0,
-                    "reason": "no_matching_memory",
-                }
-            if len(matches) > 1 and not exact:
-                return {
-                    "status": "needs_clarification",
-                    "recoverable": True,
-                    "reason": "ambiguous_memory",
-                    "candidates": [
-                        {
-                            "id": str(item.get("id", "")),
-                            "content_preview": str(item.get("content", ""))[:120],
-                        }
-                        for item in matches[:3]
-                    ],
-                }
-            deleted = 0
-            deleted_ids: list[str] = []
-            for item in candidates:
-                mem_id = str(item.get("id", "") or "")
-                if mem_id and await memory_store.delete_memory(mem_id):
-                    deleted += 1
-                    deleted_ids.append(mem_id)
-            return {
-                "status": "ok",
-                "deleted": deleted,
-                "deleted_ids": deleted_ids,
-            }
-
-        if tool_name not in {"schedule_user_reminder", "schedule_wake_up", "create_user_reminder"}:
-            return {"status": "error", "recoverable": False, "reason": "unknown_state_tool"}
-
-        message = str(
-            args.get("message_hint", "")
-            or args.get("reminder_text", "")
-            or args.get("message", "")
-            or args.get("text", "")
-            or ""
-        ).strip()
-        if not message:
-            return {
-                "status": "error",
-                "recoverable": True,
-                "reason": "missing_message",
-                "hint": "message is required",
-            }
-        message = message[:500]
-        title = str(args.get("title", "") or "").strip()[:80]
-        trigger_at = str(args.get("trigger_at", "") or args.get("time_expression", "") or "").strip()
-        recurring = args.get("recurring", None)
-        if recurring not in (None, "", "daily"):
-            return {
-                "status": "error",
-                "recoverable": True,
-                "reason": "invalid_recurring",
-                "hint": "recurring must be null or daily",
-            }
-        recurring = "daily" if recurring == "daily" else None
-        skip_quiet_hours = bool(args.get("skip_quiet_hours", True))
-        delay_raw = args.get("delay_minutes", None)
-        has_trigger_at = bool(trigger_at)
-        has_delay = delay_raw not in (None, "")
-        inferred_delay = _extract_delay_minutes_from_text(
-            "\n".join([
-                trigger_at,
-                message,
-                title,
-                str(getattr(turn, "user_message", "") or ""),
-            ])
-        )
-        if not has_delay and inferred_delay and (not has_trigger_at or _looks_relative_time_text(trigger_at)):
-            delay_raw = inferred_delay
-            has_delay = True
-            trigger_at = ""
-            has_trigger_at = False
-        if has_trigger_at == has_delay:
-            return {
-                "status": "error",
-                "recoverable": True,
-                "reason": "invalid_time_selector",
-                "hint": "trigger_at and delay_minutes are mutually exclusive; provide exactly one",
-            }
-
-        now_ts = time.time()
-        try:
-            if has_delay:
-                delay_minutes = int(delay_raw)
-                if delay_minutes < 1 or delay_minutes > 43200:
-                    raise ValueError("delay_minutes must be 1-43200")
-                due_at = now_ts + delay_minutes * 60
-            elif recurring == "daily" and re.match(r"^([01]\d|2[0-3]):[0-5]\d$", trigger_at):
-                due_at = _next_daily_due(trigger_at)
-            else:
-                due_at = _parse_scheduled_trigger_at(trigger_at)
-        except Exception as e:
-            if inferred_delay:
-                due_at = now_ts + inferred_delay * 60
-            else:
-                return {
-                    "status": "error",
-                    "recoverable": True,
-                    "reason": "invalid_due_time",
-                    "hint": str(e)[:200],
-                }
-
-        if due_at <= now_ts + 5 and inferred_delay:
-            due_at = now_ts + inferred_delay * 60
-
-        if due_at <= now_ts + 5:
-            return {
-                "status": "error",
-                "recoverable": True,
-                "reason": "due_time_in_past",
-                "hint": "scheduled trigger must be in the future",
-            }
-
-        if not skip_quiet_hours:
-            due_at = _shift_due_out_of_quiet_hours(due_at)
-        task_id = await memory_store.create_scheduled_message(
-            user_id=user_id,
-            context_token=context_token,
-            messages=[{
-                "text": message,
-                "title": title,
-                "bot_id": bot_id,
-                "created_from_turn_id": turn.turn_id,
-                "source": "schedule_user_reminder",
-                "wake_up_type": "user_requested",
-                "is_wake_up": True,
-                "skip_quiet_hours": skip_quiet_hours,
-                "recurring": recurring,
-            }],
-            due_at=due_at,
-        )
-        return {
-            "status": "ok",
-            "scheduled_task_id": task_id,
-            "due_at": due_at,
-            "message_preview": message[:80],
-        }
-
-    return _exec
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -1084,7 +496,7 @@ def _startup_validate() -> None:
         logger.info("LLM API key: configured")
 
     # 5. data dir must be writable
-    db_path = cfg.get("memory", {}).get("db_path", "./data/memory.db")
+    db_path = cfg.get("storage", {}).get("db_path", "./data/memory.db")
     data_dir = str(Path(db_path).parent)
     try:
         Path(data_dir).mkdir(parents=True, exist_ok=True)
@@ -1194,63 +606,6 @@ def _get_user_lock(user_id: str) -> asyncio.Lock:
     return _user_turn_locks[user_id]
 
 
-def _is_user_turn_active(user_id: str) -> bool:
-    lock = _user_turn_locks.get(user_id)
-    return bool(lock and lock.locked())
-
-
-# ================================================================
-# V2: Route selection (Phase 5 — Conservative Routing)
-# ================================================================
-
-def _select_route(user_message: str, trigger: str, tool_likely: bool = False) -> str:
-    """Select the conversation route for this turn.
-
-    Conservative rules per V2 design:
-    - SystemFastPath: empty input, duplicate confirmation, pure system-level
-    - ChatLite: short user message that depends on context
-    - ChatFull: complex input or tool likely
-    """
-    if trigger != "user":
-        return ROUTE_CHAT_FULL
-
-    stripped = user_message.strip()
-
-    # SystemFastPath: empty or trivial system-level
-    if not stripped:
-        return ROUTE_SYSTEM_FAST
-
-    # ChatLite: short message, no obvious tool/complexity signal
-    # (includes continuation confirmations like "继续", "嗯", "好" —
-    #  these depend on context so they must not be routed to SystemFastPath)
-    if len(stripped) <= 30 and not tool_likely:
-        return ROUTE_CHAT_LITE
-
-    # ChatFull: everything else
-    return ROUTE_CHAT_FULL
-
-
-# ================================================================
-# V2: Context policy selection (Phase 6)
-# ================================================================
-
-def _select_context_policy(route: str, memories_count: int) -> str:
-    """Select context loading policy.
-
-    - hot_only: relationship, current time, recent messages
-    - hot+cheap_memory: lightweight keyword/category search
-    - hot+full_memory: broader SQLite search
-    """
-    if route == ROUTE_SYSTEM_FAST:
-        return CTX_HOT_ONLY
-    if route == ROUTE_CHAT_LITE:
-        return CTX_HOT_CHEAP if memories_count > 0 else CTX_HOT_ONLY
-    return CTX_HOT_FULL
-
-# ================================================================
-# Conversation history (in-memory, per session)
-# ================================================================
-
 MAX_HISTORY_TURNS = cfg["conversation"].get("max_history_turns", 20)
 
 
@@ -1318,17 +673,13 @@ def _admin_time(ts: Any) -> str:
 
 def _route_label(route: str) -> str:
     return {
-        "SystemFast": "快速系统",
-        "ChatLite": "轻量聊天",
-        "ChatFull": "完整聊天",
+        "ordinary_chat": "普通聊天",
     }.get(route or "", route or "未知")
 
 
 def _policy_label(policy: str) -> str:
     return {
-        "hot_only": "短上下文",
-        "hot+cheap_memory": "短上下文 + 轻量记忆",
-        "hot+full_memory": "短上下文 + 完整记忆",
+        "short_term_history": "短期对话历史",
     }.get(policy or "", policy or "无")
 
 
@@ -1351,7 +702,7 @@ def _source_label(source: str) -> str:
 
 
 async def build_admin_event_dashboard(limit: int = 20) -> dict[str, Any]:
-    """Build a compact admin dashboard without proactive/emotion state."""
+    """Build the admin event dashboard."""
     limit = max(5, min(int(limit or 20), 80))
     contact = await memory_store.get_contact_state()
     user_id = contact.get("user_id", "")
@@ -1360,8 +711,6 @@ async def build_admin_event_dashboard(limit: int = 20) -> dict[str, Any]:
     turns = await memory_store.get_recent_turns(user_id, bot_id, limit=limit) if user_id else []
     diagnostics = await memory_store.get_recent_turn_diagnostics(limit=limit, user_id=user_id) if user_id else []
     diag_by_turn = {d.get("turn_id"): d for d in diagnostics}
-    recaps = await memory_store.get_recaps(user_id, bot_id, limit=5) if user_id else []
-    shared_facts = await memory_store.get_shared_facts(limit=8)
     outbound = await memory_store.get_outbound_messages(user_id=user_id, limit=limit) if user_id else []
     outbound_by_turn: dict[str, list[dict[str, Any]]] = {}
     for item in outbound:
@@ -1387,7 +736,6 @@ async def build_admin_event_dashboard(limit: int = 20) -> dict[str, Any]:
             "title": "chat turn",
             "user_text": turn.get("user_messages", ""),
             "intent": "",
-            "is_proactive": False,
             "reply_texts": replies,
             "tool_calls": tools,
             "source": _source_label(turn.get("source", "")),
@@ -1395,11 +743,6 @@ async def build_admin_event_dashboard(limit: int = 20) -> dict[str, Any]:
             "trigger": turn.get("trigger", ""),
             "batch_id": turn_id,
             "candidate_id": "",
-            "skip_reply": (
-                bool(diag_meta.get("skip_reply"))
-                or diag_meta.get("terminal_state") in ("end_skipped", "TurnState.END_SKIPPED")
-            ),
-            "skip_reason": diag_meta.get("skip_reason", ""),
             "terminal_state": diag_meta.get("terminal_state", ""),
             "context_sample": diag_meta.get("context_sample", []),
             "outbound_messages": outbound_by_turn.get(turn_id, []),
@@ -1408,7 +751,6 @@ async def build_admin_event_dashboard(limit: int = 20) -> dict[str, Any]:
             "elapsed_ms": diag.get("elapsed_ms", 0),
             "token_count": diag.get("token_count", 0),
             "send_status": _send_status_label(diag.get("send_status") or turn.get("send_status", "")),
-            "memory_enqueued": bool(diag.get("memory_enqueued", 0)),
         })
 
     events.sort(key=lambda item: float(item.get("created_at") or 0), reverse=True)
@@ -1422,10 +764,6 @@ async def build_admin_event_dashboard(limit: int = 20) -> dict[str, Any]:
         "events": events[:limit],
         "turns": turns[-limit:],
         "outbound_messages": outbound,
-        "memory": {
-            "recaps": recaps,
-            "shared_facts": shared_facts,
-        },
     }
 
 def apply_runtime_settings(updates: dict):
@@ -1566,175 +904,6 @@ def make_qr_png(content: str) -> bytes:
     return buf.getvalue()
 
 
-def parse_memory_upload(filename: str, data: bytes) -> list[dict]:
-    """Parse zip/json/md/txt memory exports into normalized entries."""
-    suffix = Path(filename or "").suffix.lower()
-    if suffix == ".zip" or zipfile.is_zipfile(io.BytesIO(data)):
-        return parse_memory_zip(data)
-
-    text = decode_text(data)
-    if suffix == ".json":
-        return parse_memory_json(text)
-    return parse_memory_text(filename or "memory.txt", text)
-
-
-def parse_memory_zip(data: bytes) -> list[dict]:
-    entries: list[dict] = []
-    with zipfile.ZipFile(io.BytesIO(data)) as zf:
-        for info in zf.infolist():
-            if info.is_dir():
-                continue
-            name = info.filename.replace("\\", "/")
-            lower = name.lower()
-            if not lower.endswith((".md", ".txt", ".json")):
-                continue
-            if lower.endswith("/memory.md") or lower == "memory/memory.md":
-                # MEMORY.md is usually an index pointing to the real memories.
-                continue
-            raw = zf.read(info)
-            text = decode_text(raw)
-            if lower.endswith(".json"):
-                entries.extend(parse_memory_json(text, source=name))
-            else:
-                entries.extend(parse_memory_text(name, text))
-    return entries
-
-
-def decode_text(data: bytes) -> str:
-    for enc in ["utf-8-sig", "utf-8", "gb18030"]:
-        try:
-            return data.decode(enc)
-        except UnicodeDecodeError:
-            continue
-    return data.decode("utf-8", errors="replace")
-
-
-def parse_memory_json(text: str, source: str = "memory.json") -> list[dict]:
-    payload = json.loads(text)
-    if isinstance(payload, dict):
-        items = payload.get("memories", payload.get("items", []))
-    else:
-        items = payload
-    if not isinstance(items, list):
-        return []
-
-    entries = []
-    for item in items:
-        if isinstance(item, str):
-            entries.extend(parse_memory_text(source, item))
-        elif isinstance(item, dict):
-            content = str(item.get("content", item.get("text", ""))).strip()
-            if content:
-                entries.append({
-                    "content": content,
-                    "category": item.get("category", "imported"),
-                    "importance": item.get("importance", 0.72),
-                    "keywords": item.get("keywords", ""),
-                    "source_turn_id": item.get("source_turn_id", source),
-                })
-    return entries
-
-
-def parse_memory_text(source: str, text: str) -> list[dict]:
-    meta, body = split_front_matter(text)
-    body = body.strip()
-    if not body:
-        return []
-
-    title = str(meta.get("name") or Path(source).stem)
-    desc = str(meta.get("description") or "")
-    category = str(meta.get("type") or infer_memory_category(source))
-    session_id = str(meta.get("originSessionId") or meta.get("origin_session_id") or source)
-
-    header = f"{title}\n{desc}".strip()
-    base = f"{header}\n\n{body}" if header else body
-    chunks = chunk_memory_text(base)
-    return [
-        {
-            "content": chunk,
-            "category": category,
-            "importance": 0.78 if category in {"feedback", "user"} else 0.70,
-            "keywords": title,
-            "source_turn_id": session_id,
-        }
-        for chunk in chunks
-    ]
-
-
-def split_front_matter(text: str) -> tuple[dict, str]:
-    if not text.startswith("---"):
-        return {}, text
-    match = re.match(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", text, re.S)
-    if not match:
-        return {}, text
-    raw_meta, body = match.groups()
-    try:
-        meta = yaml.safe_load(raw_meta) or {}
-        if not isinstance(meta, dict):
-            meta = {}
-    except Exception:
-        meta = {}
-    return meta, body
-
-
-def infer_memory_category(source: str) -> str:
-    lower = source.lower()
-    if "feedback" in lower or "style" in lower or "persona" in lower:
-        return "preference"
-    if "summary" in lower or "chat" in lower:
-        return "summary"
-    return "imported"
-
-
-def chunk_memory_text(text: str, max_chars: int = 1800) -> list[str]:
-    text = text.strip()
-    if len(text) <= max_chars:
-        return [text]
-
-    parts = re.split(r"\n(?=##? |\d+\. |- )", text)
-    chunks: list[str] = []
-    current = ""
-    for part in parts:
-        part = part.strip()
-        if not part:
-            continue
-        if current and len(current) + len(part) + 2 > max_chars:
-            chunks.append(current)
-            current = part
-        else:
-            current = f"{current}\n\n{part}".strip() if current else part
-    if current:
-        chunks.append(current)
-
-    if not chunks:
-        chunks = [text[i:i + max_chars] for i in range(0, len(text), max_chars)]
-    return chunks
-
-
-def build_memory_export_zip(memories: list[dict]) -> bytes:
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        payload = {
-            "exported_at": time.time(),
-            "format": "goal-memory-v1",
-            "memories": memories,
-        }
-        zf.writestr(
-            "memory/memories.json",
-            json.dumps(payload, ensure_ascii=False, indent=2),
-        )
-        lines = ["# Goal Memory Export", ""]
-        for m in memories:
-            lines.append(f"## {m.get('id', '')}")
-            lines.append(f"- category: {m.get('category', '')}")
-            lines.append(f"- importance: {m.get('importance', '')}")
-            lines.append("")
-            lines.append(str(m.get("content", "")))
-            lines.append("")
-        zf.writestr("memory/memories.md", "\n".join(lines))
-    return buf.getvalue()
-
-
 # ================================================================
 # FastAPI app
 # ================================================================
@@ -1742,151 +911,13 @@ def build_memory_export_zip(memories: list[dict]) -> bytes:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown."""
+    del app
     logger.info(f"Starting Goal Chat Agent (model={model_name})")
-
-    # ── Startup validation ───────────────────────────────────────
     _startup_validate()
-
-    # Start WeChat bridge if configured
     if _bridge is not None and _bridge.token:
         await _bridge.start()
-
-    # ── v4.0: Proactive wake-up dispatch loop ────────────────────
-    _proactive_wake_up_task: asyncio.Task | None = None
-    _proactive_enabled = (cfg.get("features") or {}).get("proactive", False)
-    if _proactive_enabled:
-        async def _proactive_wake_up_loop():
-            """Check for due scheduled wake-ups every 30 seconds.
-
-            Unlike the old heartbeat (which ran eligibility + LLM every tick),
-            this only checks if a scheduled_task is due. No LLM calls here.
-            """
-            check_interval = 30
-            while True:
-                await asyncio.sleep(check_interval)
-                try:
-                    contact = await memory_store.get_contact_state()
-                    uid = contact.get("user_id", "")
-                    if not uid:
-                        continue
-                    bot_id = BOT_ID
-                    settings = load_proactive_settings(cfg)
-                    if not settings.enabled:
-                        continue
-
-                    wake_up = None
-                    if settings.scheduled_enabled:
-                        if not _is_user_turn_active(uid):
-                            wake_up = await proactive_scheduler._claim_due_wake_up(uid, bot_id)
-                    if not wake_up:
-                        # No due wake-ups — check cold-start
-                        if _is_user_turn_active(uid):
-                            continue
-                        cold_start = await proactive_scheduler.check_cold_start(uid, bot_id)
-                        if cold_start:
-                            # Check eligibility before cold-start dispatch
-                            eligible, reason = await proactive_scheduler._check_eligibility(uid, bot_id)
-                            if eligible:
-                                wake_up = cold_start
-
-                    if not wake_up:
-                        continue
-
-                    # Check quiet hours (skip_quiet_hours=true tasks bypass)
-                    if not wake_up.get("skip_quiet_hours", False) and wake_up.get("trigger_kind") != "cold_start":
-                        eligible, reason = await proactive_scheduler._check_eligibility(
-                            uid, bot_id, require_autonomous=False,
-                        )
-                        if not eligible:
-                            if reason == ELIGIBILITY_BLOCK_SLEEP_HOURS:
-                                continue  # delay until quiet hours end
-                            logger.info("wake_up: eligibility failed reason=%s", reason)
-                            continue
-
-                    ctx_token = contact.get("context_token", "")
-                    _wu_baseline = _get_current_inbound_seq(uid)
-
-                    async def _wu_history_provider(uid: str, bid: str) -> list:
-                        return await get_history_async(uid, bot_id=bid)
-
-                    async def _wu_system_prompt_provider(uid: str) -> str:
-                        return await build_enriched_system_prompt(uid, "")
-
-                    async def _wu_wechat_sender(messages: list) -> list:
-                        return await wechat_sender(uid, ctx_token, messages)
-
-                    _wu_int_checker = _make_interrupt_checker(uid, input_latest_seq=_wu_baseline)
-                    _wu_hooks = _build_proactive_post_turn_hooks(uid, bot_id, {})
-
-                    result = await proactive_scheduler.dispatch_wake_up(
-                        user_id=uid,
-                        bot_id=bot_id,
-                        wake_up_context=wake_up,
-                        history_provider=_wu_history_provider,
-                        system_prompt_provider=_wu_system_prompt_provider,
-                        wechat_sender_provider=_wu_wechat_sender,
-                        interrupt_checker_provider=_wu_int_checker,
-                        input_latest_seq=_wu_baseline,
-                        post_turn_hooks=_wu_hooks,
-                        protocol_event_writer=_build_protocol_event_writer(uid, bot_id),
-                    )
-                    if result.get("status") == "ok":
-                        turn_result = result.get("result")
-                        terminal = getattr(turn_result, "terminal_state", "")
-                        delivered = int(getattr(turn_result, "proactive_delivered_count", 0) or 0)
-                        logger.info(
-                            "wake_up: dispatched trigger=%s terminal=%s delivered=%d",
-                            wake_up.get("trigger", ""), terminal, delivered,
-                        )
-                    elif result.get("status") == "error":
-                        logger.warning("wake_up: error: %s", result.get("reason", ""))
-                except Exception as e:
-                    logger.warning("wake_up: loop error: %s", e)
-
-        _proactive_wake_up_task = asyncio.create_task(_proactive_wake_up_loop())
-        logger.info("Proactive wake-up loop started (check_interval=30s)")
-
-    async def _dispatch_due_wake_up_after_turn(user_id: str, bot_id: str) -> None:
-        """Fire-and-forget: dispatch due wake-up after a user turn completes."""
-        try:
-            await asyncio.sleep(2)  # brief cooldown after turn ends
-            if _is_user_turn_active(user_id):
-                return  # another turn started already
-            contact = await memory_store.get_contact_state()
-            uid = contact.get("user_id", "")
-            if uid != user_id:
-                return
-            wake_up = await proactive_scheduler._claim_due_wake_up(uid, bot_id)
-            if not wake_up:
-                return
-            ctx_token = contact.get("context_token", "")
-            baseline = _get_current_inbound_seq(uid)
-            async def _h(uid, bid): return await get_history_async(uid, bot_id=bid)
-            async def _sp(uid): return await build_enriched_system_prompt(uid, "")
-            async def _ws(msgs): return await wechat_sender(uid, ctx_token, msgs)
-            result = await proactive_scheduler.dispatch_wake_up(
-                user_id=uid, bot_id=bot_id, wake_up_context=wake_up,
-                history_provider=_h, system_prompt_provider=_sp,
-                wechat_sender_provider=_ws,
-                interrupt_checker_provider=_make_interrupt_checker(uid, input_latest_seq=baseline),
-                input_latest_seq=baseline,
-                post_turn_hooks=_build_proactive_post_turn_hooks(uid, bot_id, {}),
-                protocol_event_writer=_build_protocol_event_writer(uid, bot_id),
-            )
-            if result.get("status") == "ok":
-                tr = result.get("result")
-                logger.info("wake_up: post-turn dispatch ok terminal=%s delivered=%d",
-                            getattr(tr, "terminal_state", ""),
-                            int(getattr(tr, "proactive_delivered_count", 0) or 0))
-        except Exception as e:
-            logger.debug("wake_up: post-turn dispatch skipped: %s", e)
-
     yield
-
-    # Shutdown
     logger.info("Shutting down...")
-    if _proactive_wake_up_task:
-        _proactive_wake_up_task.cancel()
     if _bridge is not None:
         await _bridge.stop()
     await memory_store.close()
@@ -1922,17 +953,11 @@ async def landing_page():
 
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_page():
-    """v3.1: Proactive test console — main entry point."""
-    html_path = STATIC_DIR / "proactive_test_console.html"
+    """Serve the administration console."""
+    html_path = STATIC_DIR / "admin.html"
     if not html_path.exists():
-        raise HTTPException(status_code=404, detail="test console not found")
+        raise HTTPException(status_code=404, detail="admin console not found")
     return HTMLResponse(html_path.read_text(encoding="utf-8"))
-
-
-@app.get("/admin/proactive-test-console")
-async def proactive_test_console_page():
-    """Legacy console path kept as a redirect to the single admin UI."""
-    return RedirectResponse(url="/admin", status_code=307)
 
 
 @app.get("/admin/auth/status")
@@ -2032,7 +1057,6 @@ async def admin_save_persona(request: Request):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content + "\n", encoding="utf-8")
     chat_agent.personality = content
-    # Phase 1: force re-read persona.md on next turn
     return {"status": "saved", "path": str(path)}
 
 
@@ -2113,14 +1137,12 @@ async def admin_send_message(request: Request):
 
 
 # ================================================================
-# v1.2 Phase 5A: Extracted model-history writer
 # ================================================================
 
 _IS_DELIVERED = {"delivered", "sent_confirmed"}
 
 
 # ================================================================
-# v1.2 Phase 5C: Build ChatAgent-compatible callbacks
 # ================================================================
 
 def _visible_messages_as_dicts(turn: TurnScratchpad) -> list[dict[str, Any]]:
@@ -2175,7 +1197,7 @@ def _build_protocol_event_writer(user_id: str, bot_id: str):
                 text=str(payload.get("text", "")),
                 user_id=user_id,
                 bot_id=bot_id,
-                source="proactive" if turn.source == SOURCE_PROACTIVE_IMPULSE else "user_reply",
+                source="user_reply",
                 author="assistant",
                 trigger=turn.trigger,
                 send_status=str(payload.get("send_status", "created")),
@@ -2186,11 +1208,7 @@ def _build_protocol_event_writer(user_id: str, bot_id: str):
 
         if event_type == "turn_finished":
             terminal = str(payload.get("terminal_state", ""))
-            successful = {
-                TurnState.END_REPLIED.value,
-                TurnState.END_NO_REPLY.value,
-                TurnState.END_SKIPPED_PROACTIVE.value,
-            }
+            successful = {TurnState.END_REPLIED.value}
             await memory_store.finish_protocol_turn(
                 turn_id=turn.turn_id,
                 status="completed" if terminal in successful else terminal,
@@ -2206,9 +1224,7 @@ def _build_chatagent_post_turn_hooks(
     route: str,
     context_policy: str,
     raw_messages: list[str],
-    memory_hook: Any,
     memory_store: Any,
-    memory_system: Any = None,
 ) -> list:
     """Return a list of PostTerminalCallback hooks for ChatAgent.
 
@@ -2216,39 +1232,6 @@ def _build_chatagent_post_turn_hooks(
     Individual failures are caught inside each hook and logged.
     send_status is computed from terminal_state inside _hook_dev_logs.
     """
-
-    async def _hook_memory_system(turn: TurnScratchpad, terminal_state: TurnState) -> None:
-        if memory_system is None:
-            return
-        visible = _visible_messages_as_dicts(turn)
-        delivered_texts = [
-            m["text"] for m in visible
-            if m.get("text")
-            and (m.get("send_status") in _IS_DELIVERED
-                 or m.get("delivery_status") in _IS_DELIVERED)
-        ]
-        if delivered_texts:
-            await memory_system.write_after_turn(
-                delivered_texts=delivered_texts,
-                turn_id=turn.turn_id,
-            )
-
-    async def _hook_memory(turn: TurnScratchpad, terminal_state: TurnState) -> None:
-        if not memory_hook:
-            return
-        visible = _visible_messages_as_dicts(turn)
-        assistant_text = "\n".join(
-            m["text"] for m in visible
-            if m.get("text")
-            and (m.get("send_status") in _IS_DELIVERED
-                 or m.get("delivery_status") in _IS_DELIVERED)
-        )
-        if assistant_text:
-            await memory_hook.update(
-                user_message=turn.user_message,
-                assistant_text=assistant_text,
-                user_id=user_id,
-            )
 
     async def _hook_dev_logs(turn: TurnScratchpad, terminal_state: TurnState) -> None:
         visible = _visible_messages_as_dicts(turn)
@@ -2262,11 +1245,8 @@ def _build_chatagent_post_turn_hooks(
         ) if turn.fallback_events else ""
         token_count = turn.token_usage.get("total_tokens", 0)
 
-        # Compute send_status from terminal_state (v1.5)
         _ss_map = {
             TurnState.END_REPLIED: "delivered",
-            TurnState.END_NO_REPLY: "skipped",
-            TurnState.END_FALLBACK_SENT: "fallback_sent",
             TurnState.END_FAILED: "failed",
             TurnState.END_CANCELLED: "cancelled",
             TurnState.END_SUPERSEDED_BEFORE_SEND: "superseded_before_send",
@@ -2287,7 +1267,6 @@ def _build_chatagent_post_turn_hooks(
             elapsed_ms=turn.elapsed_ms,
             fallback_type=diag_fallback,
             send_status=send_status,
-            memory_enqueued=0,
             input_chars=len(turn.user_message),
             output_messages=delivered_count,
             tool_calls=len(turn.tool_results),
@@ -2318,7 +1297,7 @@ def _build_chatagent_post_turn_hooks(
         await memory_store.update_turn_send_status(turn.turn_id, send_status)
 
     async def _hook_model_attempt_log(turn: TurnScratchpad, terminal_state: TurnState) -> None:
-        """v1.3 WRITE_MODEL_ATTEMPT_LOG: log all model attempts for this turn."""
+        """Log all model attempts for this turn."""
         for attempt in turn.model_attempts:
             logger.info(
                 "model_attempt: index=%d model=%s/%s mode=%s reason=%s "
@@ -2335,7 +1314,7 @@ def _build_chatagent_post_turn_hooks(
             )
 
     async def _hook_update_last_visible(turn: TurnScratchpad, terminal_state: TurnState) -> None:
-        """v1.6-A: Update last_visible_message_at for confirmed-delivered messages."""
+        """Update the last visible time for confirmed deliveries."""
         try:
             for vm in turn.visible_messages:
                 if vm.delivery_status == DeliveryStatus.SENT_CONFIRMED:
@@ -2347,8 +1326,6 @@ def _build_chatagent_post_turn_hooks(
             logger.warning("last_visible hook failed for turn %s", turn.turn_id, exc_info=True)
 
     return [
-        _hook_memory_system,
-        _hook_memory,
         _hook_dev_logs,
         _hook_model_attempt_log,
         _hook_update_last_visible,
@@ -2357,16 +1334,9 @@ def _build_chatagent_post_turn_hooks(
 
 @app.post("/chat")
 async def chat(request: Request):
-    """Phase 1 chat endpoint — native tool calls primary.
-
-    Compatible with emoRebot bridge:
-      POST /chat {"messages": ["你好"], "user_id": "wxid_xxx"}
-
-    Returns:
-      {"messages": [{"text": "...", "delay": 1.0}, ...], "done": true}
-    """
+    """Handle one ordinary text-chat turn."""
     api_cfg = _api_config()
-    bot_id = "default"  # Phase 1: single persona, no multi-bot
+    bot_id = "default"
 
     # ── readiness / auth gate logging ──────────────────────────
     chat_api_key_set = bool(os.getenv(api_cfg["chat_api_key_env"], ""))
@@ -2406,9 +1376,6 @@ async def chat(request: Request):
     user_id = _validate_chat_user_id(str(body.get("user_id", "default")), api_cfg)
     context_token = str(body.get("context_token", ""))
     inbound_trigger = str(body.get("trigger") or "user")
-    inbound_source = str(body.get("source") or "wechat")
-
-    # ── v1.2: Input boundary fields from bridge ──────────────────
     input_message_ids = body.get("input_message_ids")
     if not isinstance(input_message_ids, list):
         input_message_ids = []
@@ -2429,11 +1396,6 @@ async def chat(request: Request):
         f"seq={input_first_seq}-{input_latest_seq} count={len(input_message_ids)}"
     )
 
-    # ── v1.2: update inbound registry OUTSIDE lock ──────────────
-    # Seq-based checking is safe here: input_latest_seq is this batch's
-    # boundary.  A concurrent old turn with input_latest_seq=N will see
-    # latest_seq=M > N and cancel itself.  This batch won't cancel itself
-    # because latest_seq == input_latest_seq, and > is strict.
     _record_user_message_arrival(user_id, seq=input_latest_seq)
     try:
         await memory_store.update_last_visible_message_at(
@@ -2441,82 +1403,27 @@ async def chat(request: Request):
         )
     except Exception:
         pass
-    # v4.0: Cancel pending proactive wake-ups when user messages
-    await _cancel_pending_proactive_on_user_message(user_id)
-
     lock = _get_user_lock(user_id)
     turn_id = ""
     send_status = ""
-    memory_enqueued = 0
-
     try:
         async with lock:
-            # Phase 1: pending persona confirmation (single persona)
-            confirmation_result = await handle_pending_persona_confirmation(user_message)
-            if confirmation_result:
-                confirmation_turn_id = f"confirm_{uuid.uuid4().hex[:12]}"
-                await memory_store.begin_protocol_turn(
-                    turn_id=confirmation_turn_id,
-                    user_id=user_id,
-                    bot_id=bot_id,
-                    source="persona_confirmation",
-                    trigger="user",
-                    user_message=user_message,
-                )
-                confirm_visible = "\n".join(
-                    m["text"] for m in confirmation_result.get("messages", []) if m.get("text")
-                )
-                await memory_store.append_protocol_message(
-                    turn_id=confirmation_turn_id,
-                    user_id=user_id,
-                    bot_id=bot_id,
-                    role="assistant",
-                    content=confirm_visible,
-                    message_kind="model_response",
-                )
-                await memory_store.finish_protocol_turn(
-                    confirmation_turn_id, status="completed", send_status="delivered",
-                )
-                await memory_store.record_usage_event(
-                    event_type="chat_turn", user_id=user_id, source="wechat",
-                    message_count=len(raw_messages) + len(confirmation_result.get("messages", [])),
-                    elapsed_ms=int(confirmation_result.get("elapsed_ms", 0) or 0),
-                    metadata={"handled_by": "pending_persona_confirmation"},
-                )
-                return confirmation_result
-
-            route = _select_route(user_message, trigger="user")
-            context_policy = CTX_HOT_ONLY  # Phase 1: no memory, hot context only
-
-            # Short-term history only (Phase 1: no memory search, no recap, no relationship)
+            route = "ordinary_chat"
+            context_policy = "short_term_history"
             history = await get_history_async(user_id, bot_id=bot_id)
 
-            # Build system prompt (with memory context if enabled)
-            _extra_tools: list[str] = []
-            if _has_reminder_intent(user_message):
-                _extra_tools.append("schedule_user_reminder")
-            system_prompt = await build_enriched_system_prompt(
-                user_id, user_message, extra_tools=_extra_tools,
-            )
+            system_prompt = build_system_prompt_for_turn()
 
-            # Build wechat_sender bound to this user/context
             async def _bound_sender(messages: list[dict]) -> list[dict]:
                 return await wechat_sender(user_id, context_token, messages)
 
-            # ── v1.2: Build seq-based checker (arrival already recorded outside lock) ──
             interrupt_checker = _make_interrupt_checker(user_id, input_latest_seq)
 
-            # ── Set per-request user_id on MemorySystem ──────────
-            if chat_runtime.memory_system is not None:
-                chat_runtime.memory_system.user_id = user_id
-
-            # Run through ChatRuntime (Phase 10/12: target architecture)
             _hook_cbs = _build_chatagent_post_turn_hooks(
                 user_id=user_id, bot_id=bot_id,
                 route=route, context_policy=context_policy,
                 raw_messages=raw_messages,
-                memory_hook=memory_hook, memory_store=memory_store,
-                memory_system=chat_runtime.memory_system,
+                memory_store=memory_store,
             )
             result: TurnResult = await chat_runtime.handle_chat(
                 user_message=user_message,
@@ -2530,22 +1437,15 @@ async def chat(request: Request):
                 input_latest_seq=input_latest_seq,
                 input_cutoff_time=input_cutoff_time,
                 interrupt_checker=interrupt_checker,
-                state_tool_executor=_build_state_tool_executor(user_id, context_token, bot_id),
-                extra_tools=_extra_tools if _extra_tools else None,
                 post_turn_hooks=_hook_cbs,
                 protocol_event_writer=_build_protocol_event_writer(user_id, bot_id),
             )
 
             turn_id = result.turn_id
 
-            # ── Determine send_status from terminal_state (v1.5) ──
             match result.terminal_state:
                 case TurnState.END_REPLIED:
                     send_status = "delivered"
-                case TurnState.END_NO_REPLY:
-                    send_status = "skipped"
-                case TurnState.END_FALLBACK_SENT:
-                    send_status = "fallback_sent"
                 case TurnState.END_FAILED:
                     send_status = "failed" if result.sent_message_count == 0 else "failed_after_partial_reply"
                 case TurnState.END_CANCELLED:
@@ -2577,25 +1477,19 @@ async def chat(request: Request):
             # because draft/outbound rows must exist before we can update them).
             _term = result.terminal_state
             was_replied = _term == TurnState.END_REPLIED
-            was_fallback = _term == TurnState.END_FALLBACK_SENT
-            was_skipped = _term == TurnState.END_NO_REPLY
             was_cancelled = _term == TurnState.END_CANCELLED
             was_failed = _term in (TurnState.END_FAILED, TurnState.END_PROTOCOL_ERROR, TurnState.END_MAX_LIMIT)
             was_interrupted = _term in (TurnState.END_SUPERSEDED_BEFORE_SEND, TurnState.END_INTERRUPTED_DURING_REPLY_SEQUENCE)
-            if was_skipped:
-                await memory_store.mark_turn_draft_status(turn_id, "skipped")
-            elif was_cancelled:
+            if was_cancelled:
                 await memory_store.mark_turn_draft_status(turn_id, "cancelled")
             elif was_interrupted:
                 await memory_store.mark_turn_draft_status(turn_id, "interrupted")
-            elif was_replied or was_fallback:
+            elif was_replied:
                 await memory_store.mark_turn_draft_status(turn_id, "delivered")
             elif was_failed:
                 await memory_store.mark_turn_draft_status(turn_id, "failed")
             else:
                 await memory_store.mark_turn_draft_status(turn_id, "generated")
-
-            scheduled_task_ids: list[str] = list(getattr(result, "scheduled_task_ids", []) or [])
 
             logger.info(
                 f"[{user_id}] terminal_state={result.terminal_state} "
@@ -2606,11 +1500,6 @@ async def chat(request: Request):
                 f"route={route}"
             )
 
-            # Fire-and-forget: check for due wake-ups now that the user turn is done.
-            # Prevents scheduled reminders from waiting up to 30s for the next poll cycle.
-            if proactive_scheduler and bot_id:
-                asyncio.create_task(_dispatch_due_wake_up_after_turn(user_id, bot_id))
-
         # Lock released — return response.
         # Messages were already sent via wechat_sender callback.
         # Return empty messages so the bridge poller doesn't double-send.
@@ -2619,7 +1508,6 @@ async def chat(request: Request):
             "messages": [],
             "delivered_count": result.delivered_count,
             "tool_calls": result.tool_results,
-            "scheduled_task_ids": scheduled_task_ids,
             "iterations": result.iterations,
             "elapsed_ms": result.elapsed_ms,
             "turn_id": turn_id,
@@ -2639,7 +1527,6 @@ async def chat(request: Request):
         return {
             "messages": [],
             "tool_calls": [],
-            "scheduled_task_ids": [],
             "iterations": 0,
             "elapsed_ms": 0,
             "turn_id": error_turn_id,
@@ -2648,64 +1535,9 @@ async def chat(request: Request):
         }
 
 
-@app.get("/memories")
-async def list_memories(request: Request, category: str = "", limit: int = 20):
-    """List memories, optionally filtered by category."""
-    require_admin(request)
-    memories = await memory_store.list_all()
-    if category:
-        memories = [m for m in memories if m.get("category") == category]
-    return {"memories": memories[:limit]}
-
-
-@app.get("/memories/export")
-async def export_memories(request: Request):
-    """Export current memories as a portable zip."""
-    require_admin(request)
-    memories = await memory_store.list_all()
-    data = build_memory_export_zip(memories)
-    filename = f"goal-memory-{time.strftime('%Y%m%d-%H%M%S')}.zip"
-    return StreamingResponse(
-        io.BytesIO(data),
-        media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
-
-
-@app.post("/memories/import")
-async def import_memories(request: Request, clear_existing: bool = False):
-    """Import memories from zip/json/md/txt uploaded by the admin UI."""
-    require_admin(request)
-    data = await request.body()
-    if not data:
-        raise HTTPException(status_code=400, detail="上传文件为空")
-    filename = request.headers.get("X-Filename", "memory.zip")
-    try:
-        entries = parse_memory_upload(filename, data)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"解析失败：{e}")
-    if not entries:
-        raise HTTPException(status_code=400, detail="没有解析到可导入的记忆")
-    result = await memory_store.import_memories(
-        entries,
-        clear_existing=clear_existing,
-    )
-    return {"status": "ok", **result, "parsed": len(entries)}
-
-
-@app.delete("/memories/{mem_id}")
-async def delete_memory(mem_id: str, request: Request):
-    """Delete a single memory entry."""
-    require_admin(request)
-    deleted = await memory_store.delete_memory(mem_id)
-    if not deleted:
-        raise HTTPException(status_code=404, detail="Memory not found")
-    return {"status": "deleted", "id": mem_id}
-
-
 @app.post("/admin/dev/forget")
 async def developer_forget_all(request: Request):
-    """Compatibility alias for the developer context reset."""
+    """Clear test conversation state while preserving the WeChat contact."""
     return await developer_reset_context(request)
 
 
@@ -2720,22 +1552,6 @@ async def developer_reset_context(request: Request):
         "cleared": counts,
         "kept": ["bot_contact_state"],
     }
-
-
-@app.get("/relationship")
-async def get_relationship(request: Request):
-    """Get current relationship state."""
-    require_admin(request)
-    return await memory_store.get_relationship()
-
-
-@app.post("/relationship")
-async def update_relationship(request: Request):
-    """Update relationship state fields."""
-    require_admin(request)
-    body = await request.json()
-    await memory_store.update_relationship(body)
-    return {"status": "updated"}
 
 
 @app.get("/history/{user_id}")
@@ -2869,13 +1685,12 @@ async def wechat_status(request: Request):
 
 
 # ================================================================
-# V2: Turn diagnostics and drafts (Phase 2+3 admin routes)
 # ================================================================
 
 
 @app.get("/admin/diagnostics")
 async def admin_diagnostics(request: Request, limit: int = 20, fallback_only: bool = False):
-    """View recent turn diagnostics. V2 observability endpoint."""
+    """View recent turn diagnostics."""
     require_admin(request)
     rows = await memory_store.get_recent_turn_diagnostics(
         limit=limit,
@@ -2886,7 +1701,7 @@ async def admin_diagnostics(request: Request, limit: int = 20, fallback_only: bo
 
 @app.get("/admin/drafts")
 async def admin_drafts(request: Request, status: str = "", limit: int = 20):
-    """View turn drafts. V2 delivery state endpoint."""
+    """View turn drafts."""
     require_admin(request)
     drafts = await memory_store.list_turn_drafts(
         status=status or None,
@@ -2922,357 +1737,6 @@ async def admin_events(request: Request, limit: int = 30):
 
 
 # ================================================================
-# v3.1: Proactive callbacks + admin trigger
-# ================================================================
-
-def _build_test_impulse_meta(body: dict[str, Any]) -> dict[str, Any]:
-    """Build a minimal impulse_meta from admin trigger request body.
-
-    v3.1 §4.2: Provides defaults for all required proactive_meta fields.
-    """
-    return {
-        "impulse_id": str(body.get("impulse_id") or f"admin_{int(time.time() * 1000)}"),
-        "impulse_type": str(body.get("impulse_type") or "ADMIN_MANUAL"),
-        "proactive_chain_id": str(body.get("proactive_chain_id") or f"chain_{int(time.time() * 1000)}"),
-        "trigger_reason_summary": str(body.get("trigger_reason_summary") or "管理员手动触发"),
-        "evidence_pack": {
-            "source_topic_id": str(body.get("topic_id") or ""),
-            "source_message_ids": [],
-            "recent_proactive_messages": [],  # only confirmed delivered
-            "relationship_temperature": None,
-            "topic_snapshot": str(body.get("topic_snapshot") or ""),
-        },
-        "dedupe_key": str(body.get("dedupe_key") or f"admin_dedup_{int(time.time())}"),
-        "reply_window_seconds": int(body.get("reply_window_seconds", 14400)),
-        "max_wechat_reply": int(body.get("max_wechat_reply", 3)),
-    }
-
-
-def _build_proactive_post_turn_hooks(
-    user_id: str, bot_id: str, impulse_meta: dict[str, Any],
-) -> list:
-    """Return post_turn_hooks for proactive turns.
-
-    v3.1 §4.5: Hooks record diagnostics, update impulse status, and write
-    recent_proactive_messages.delivered_texts (Phase 4 minimum).
-    Phase 7 will complete full four-state tracking.
-    """
-
-    async def _hook_proactive_dev_logs(turn: TurnScratchpad, terminal_state: TurnState) -> None:
-        _logger = logging.getLogger("goal")
-        _logger.info(
-            "proactive_turn_complete: turn_id=%s terminal=%s "
-            "attempts=%d send_attempts=%d delivered=%d "
-            "delivered_texts=%s",
-            turn.turn_id, str(terminal_state),
-            turn.proactive_attempt_count,
-            turn.proactive_send_attempt_count,
-            turn.proactive_delivered_count,
-            [t[:60] for t in turn.proactive_delivered_texts],
-        )
-
-        # Record usage event
-        await memory_store.record_usage_event(
-            event_type="proactive_turn",
-            user_id=user_id,
-            source="proactive",
-            message_count=turn.proactive_delivered_count,
-            elapsed_ms=turn.elapsed_ms,
-            metadata={
-                "turn_id": turn.turn_id,
-                "terminal_state": str(terminal_state),
-                "impulse_id": str(impulse_meta.get("impulse_id", "")),
-                "impulse_type": str(impulse_meta.get("impulse_type", "")),
-                "proactive_attempt_count": turn.proactive_attempt_count,
-                "proactive_send_attempt_count": turn.proactive_send_attempt_count,
-                "proactive_delivered_count": turn.proactive_delivered_count,
-                "proactive_delivered_texts": [
-                    t[:120] for t in turn.proactive_delivered_texts
-                ],
-                "skip_status": getattr(turn, "_skip_status", ""),
-            },
-        )
-
-    async def _hook_update_last_visible(turn: TurnScratchpad, terminal_state: TurnState) -> None:
-        """v1.6-A: Update last_visible_message_at for confirmed-delivered messages."""
-        try:
-            for vm in turn.visible_messages:
-                if vm.delivery_status == DeliveryStatus.SENT_CONFIRMED:
-                    await memory_store.update_last_visible_message_at(
-                        user_id, bot_id, vm.sent_at_timestamp or time.time(),
-                        source="assistant_sent_confirmed",
-                    )
-        except Exception:
-            logging.getLogger("goal").warning("last_visible hook failed for turn %s", turn.turn_id, exc_info=True)
-
-    async def _hook_bump_autonomous_trigger_count(turn: TurnScratchpad, terminal_state: TurnState) -> None:
-        """v1.6-A: Bump daily autonomous trigger count on successful completion.
-
-        Only increments when: source=PROACTIVE_IMPULSE, trigger_kind=autonomous,
-        terminal_state=END_REPLIED, proactive_delivered_count > 0.
-        """
-        try:
-            meta = turn.proactive_meta or {}
-            if turn.source != SOURCE_PROACTIVE_IMPULSE:
-                return
-            if str(meta.get("trigger_kind", "")) != "autonomous":
-                return
-            if terminal_state != TurnState.END_REPLIED:
-                return
-            if turn.proactive_delivered_count == 0:
-                return
-            await memory_store.bump_autonomous_trigger_count(user_id, bot_id)
-            logging.getLogger("goal").info(
-                "autonomous_trigger_count: bumped for %s/%s turn=%s",
-                user_id, bot_id, turn.turn_id,
-            )
-        except Exception:
-            logging.getLogger("goal").warning(
-                "bump_autonomous_trigger_count failed for turn %s", turn.turn_id, exc_info=True,
-            )
-
-    return [
-        _hook_proactive_dev_logs,
-        _hook_update_last_visible,
-        _hook_bump_autonomous_trigger_count,
-    ]
-
-
-# ── v1.6: Proactive settings routes ────────────────────────────
-from agent.proactive_settings import set_runtime_settings_path
-set_runtime_settings_path(RUNTIME_SETTINGS_PATH)
-from agent.proactive_settings import load_proactive_settings
-
-proactive_scheduler._settings_provider = lambda: load_proactive_settings(cfg)
-
-from admin_proactive_settings_routes import create_proactive_settings_router
-
-_proactive_settings_router = create_proactive_settings_router(
-    require_admin=require_admin,
-    config=cfg,
-)
-app.include_router(_proactive_settings_router)
-
-# ── v3.1 Phase 2: Proactive test console routes ──────────────────
-from admin_proactive_test_routes import create_proactive_test_router
-
-_proactive_test_router = create_proactive_test_router(
-    require_admin=require_admin,
-    proactive_scheduler=proactive_scheduler,
-    chat_agent=chat_agent,
-    memory_store=memory_store,
-    get_history_async=get_history_async,
-    build_enriched_system_prompt=build_enriched_system_prompt,
-    wechat_sender=wechat_sender,
-    make_interrupt_checker=_make_interrupt_checker,
-    bot_id=BOT_ID,
-    build_proactive_post_turn_hooks=_build_proactive_post_turn_hooks,
-    build_protocol_event_writer=_build_protocol_event_writer,
-    get_current_inbound_seq=_get_current_inbound_seq,
-)
-app.include_router(_proactive_test_router)
-logger.info("Proactive test routes mounted: /admin/proactive-test/*")
-
-
-@app.post("/admin/proactive/trigger")
-async def admin_trigger_proactive(request: Request):
-    """v3.1 Phase 4: Manual proactive turn trigger (admin UI).
-
-    Accepts optional impulse_meta overrides. Delegates to ProactiveScheduler.
-    main.py does NOT acquire the scheduler lock directly.
-    """
-    require_admin(request)
-
-    contact = await memory_store.get_contact_state()
-    user_id = contact.get("user_id", "")
-    if not user_id:
-        raise HTTPException(status_code=400, detail="还没有记录到微信联系人")
-
-    bot_id = BOT_ID
-    context_token = contact.get("context_token", "")
-
-    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
-    if not isinstance(body, dict):
-        body = {}
-
-    impulse_meta = _build_test_impulse_meta(body)
-
-    # ── Build wechat_sender bound to this user/context ──
-    async def _bound_wechat_sender(messages: list[dict]) -> list[dict]:
-        return await wechat_sender(user_id, context_token, messages)
-
-    # ── Providers ──
-    async def _history_provider(uid: str, bid: str) -> list[dict]:
-        return await get_history_async(uid, bot_id=bid)
-
-    async def _system_prompt_provider(uid: str) -> str:
-        return await build_enriched_system_prompt(uid, "")
-
-    interrupt_baseline = _get_current_inbound_seq(user_id)
-    interrupt_checker = _make_interrupt_checker(user_id, input_latest_seq=interrupt_baseline)
-
-    # ── Proactive callbacks ──
-    hook_cbs = _build_proactive_post_turn_hooks(user_id, bot_id, impulse_meta)
-
-    result = await proactive_scheduler.run_manual_trigger(
-        user_id=user_id,
-        impulse_meta=impulse_meta,
-        bot_id=bot_id,
-        history_provider=_history_provider,
-        system_prompt_provider=_system_prompt_provider,
-        wechat_sender_provider=_bound_wechat_sender,
-        interrupt_checker_provider=interrupt_checker,
-        input_latest_seq=interrupt_baseline,
-        post_turn_hooks=hook_cbs,
-        protocol_event_writer=_build_protocol_event_writer(user_id, bot_id),
-    )
-
-    return result
-
-
-@app.get("/admin/proactive/state")
-async def admin_proactive_state(request: Request):
-    """v3.1 Phase 7: View proactive scheduler state."""
-    require_admin(request)
-    contact = await memory_store.get_contact_state()
-    user_id = contact.get("user_id", "")
-    bot_id = BOT_ID
-
-    ds = await memory_store.get_dialogue_state(user_id, bot_id) if user_id else {}
-    ps = await memory_store.get_proactive_schedule_state(user_id, bot_id) if user_id else {}
-
-    return {
-        "scheduler": proactive_scheduler.get_metrics(),
-        "dialogue_state": {
-            "last_user_message_at": ds.get("last_user_message_at", 0),
-            "last_assistant_message_at": ds.get("last_assistant_message_at", 0),
-            "proactive_paused_until": ds.get("proactive_paused_until", 0),
-            "last_proactive_id": ds.get("last_proactive_id", ""),
-        } if ds else {},
-        "schedule_state": {
-            "last_sent_ts": ps.get("last_sent_ts", 0),
-            "next_due_ts": ps.get("next_due_ts", 0),
-        } if ps else {},
-        "today_sent": await memory_store.count_today_proactive_sent(
-            time.time() - (time.time() % 86400)
-        ) if user_id else 0,
-    }
-
-
-@app.get("/admin/proactive/scheduled-tasks")
-async def admin_list_scheduled_tasks(request: Request):
-    """List pending admin/user scheduled wake-up tasks."""
-    require_admin(request)
-    settings = load_proactive_settings(cfg)
-    rows = await memory_store.list_scheduled_messages(status="pending", limit=100)
-    tasks = []
-    now_ts = time.time()
-    for row in rows:
-        payload = _scheduled_task_payload(row)
-        if payload:
-            if payload["frequency"] == "once" and payload["due_at"] <= now_ts - 5:
-                await memory_store.mark_scheduled_message_status(
-                    payload["id"], "expired", "expired_before_admin_list"
-                )
-                continue
-            tasks.append(payload)
-    tasks.sort(key=lambda item: item["due_at"])
-    return {
-        "status": "ok",
-        "enabled": settings.scheduled_enabled,
-        "master_enabled": settings.enabled,
-        "tasks": tasks,
-    }
-
-
-@app.post("/admin/proactive/scheduled-tasks")
-async def admin_create_scheduled_task(request: Request):
-    """Create a simple scheduled wake-up task from the admin console."""
-    require_admin(request)
-    contact = await memory_store.get_contact_state()
-    user_id = contact.get("user_id", "")
-    if not user_id:
-        raise HTTPException(status_code=400, detail="还没有记录到微信联系人")
-
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Request body must be valid JSON")
-    if not isinstance(body, dict):
-        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
-
-    task_text = str(body.get("task", "") or "").strip()
-    if not task_text:
-        raise HTTPException(status_code=422, detail="任务内容不能为空")
-    task_text = task_text[:500]
-    frequency = str(body.get("frequency", "once") or "once")
-    if frequency not in {"once", "daily"}:
-        raise HTTPException(status_code=422, detail="频次只能是 once 或 daily")
-
-    try:
-        if frequency == "daily":
-            time_value = str(body.get("time", "") or "").strip()
-            due_at = _next_daily_due(time_value)
-            recurring = "daily"
-        else:
-            trigger_at = str(body.get("trigger_at", "") or "").strip()
-            due_at = _parse_scheduled_trigger_at(trigger_at)
-            if due_at <= time.time() + 5:
-                raise ValueError("任务时间必须晚于当前时间")
-            recurring = None
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail=str(exc)[:200])
-
-    due_at = _shift_due_out_of_quiet_hours(due_at)
-    task_id = await memory_store.create_scheduled_message(
-        user_id=user_id,
-        context_token=contact.get("context_token", ""),
-        messages=[{
-            "text": task_text,
-            "title": str(body.get("title", "") or "").strip()[:80],
-            "bot_id": BOT_ID,
-            "source": "admin_scheduled_task",
-            "wake_up_type": "user_requested",
-            "is_wake_up": True,
-            "skip_quiet_hours": False,
-            "recurring": recurring,
-        }],
-        due_at=due_at,
-    )
-    return {"status": "ok", "id": task_id, "due_at": due_at}
-
-
-@app.delete("/admin/proactive/scheduled-tasks/{task_id}")
-async def admin_cancel_scheduled_task(task_id: str, request: Request):
-    """Cancel a pending scheduled wake-up task."""
-    require_admin(request)
-    if not re.match(r"^[A-Za-z0-9_.:@-]+$", task_id):
-        raise HTTPException(status_code=400, detail="invalid task id")
-    await memory_store.mark_scheduled_message_status(task_id, "cancelled", "cancelled_by_admin")
-    return {"status": "cancelled", "id": task_id}
-
-
-@app.get("/admin/proactive/metrics")
-async def admin_proactive_metrics(request: Request):
-    """v3.1 Phase 7: Proactive pipeline metrics."""
-    require_admin(request)
-    contact = await memory_store.get_contact_state()
-    user_id = contact.get("user_id", "")
-    bot_id = BOT_ID
-
-    rel = await memory_store.get_relationship() if user_id else {}
-    candidates = await memory_store.get_recent_proactive_candidates(limit=20) if user_id else []
-
-    return {
-        "scheduler_metrics": proactive_scheduler.get_metrics(),
-        "relationship": {
-            "temperature": rel.get("relationship_temperature", 0),
-        } if rel else {},
-        "recent_candidates": candidates[:10],
-    }
-
-
-# ================================================================
 # Background tasks
 # ================================================================
 
@@ -3282,17 +1746,12 @@ async def _send_message_batch(
     context_token: str,
     messages: list[dict],
 ):
-    """Send a normalized message list through the active WeChat bridge.
-
-    V2.1.1: empty messages are filtered before send.
-    If the final batch is empty, does not call WeChat at all.
-    """
+    """Send a normalized message list through the active WeChat bridge."""
     if _bridge is None:
         raise RuntimeError("WeChat bridge is not configured")
     if not context_token:
         raise RuntimeError("missing iLink context_token")
 
-    # V2.1.1: Filter empty messages before even touching guard
     non_empty = [
         m for m in messages
         if isinstance(m, dict) and str(m.get("text", "")).strip()
@@ -3307,7 +1766,6 @@ async def _send_message_batch(
         )
         return
 
-    # V2: guard all messages before sending
     guarded = guard_messages(non_empty)
 
     if not guarded:
@@ -3336,160 +1794,6 @@ async def _send_message_batch(
         await _bridge.send_text(user_id, text, context_token)
 
 
-async def _generate_recap(
-    user_id: str,
-    bot_id: str,
-    recap_cfg: dict,
-) -> str | None:
-    """V2.1: Background recap generation from recent turns.
-
-    Uses LLM to summarize conversation stage between the last recap
-    and the current turn.
-    """
-    try:
-        latest = await memory_store.get_latest_recap(user_id, bot_id)
-        since_turn_id = latest.get("end_turn_id", "") if latest else ""
-
-        turns = await memory_store.get_recent_turns(user_id, bot_id, limit=50)
-        if not turns or len(turns) < 2:
-            return None
-
-        # Find the turn number of the last summarized turn
-        since_number = 0
-        if since_turn_id:
-            for t in turns:
-                if t.get("id") == since_turn_id:
-                    since_number = t.get("turn_number", 0)
-                    break
-
-        # Only include turns after the last recap
-        new_turns = [
-            t for t in turns
-            if t.get("turn_number", 0) > since_number
-        ]
-        if len(new_turns) < 3:
-            return None
-
-        start_id = new_turns[0]["id"] if new_turns else ""
-        end_id = new_turns[-1]["id"] if new_turns else ""
-
-        # Build summary text from turns
-        turn_texts = []
-        for t in new_turns:
-            user_msg = str(t.get("user_messages", ""))[:200]
-            assistant_action = str(t.get("assistant_actions", ""))[:200]
-            turn_texts.append(f"User: {user_msg}\nBot: {assistant_action}")
-
-        turns_summary = "\n---\n".join(turn_texts[-20:])  # last 20 turns
-
-        prompt = (
-            "你是一个对话摘要助手。基于以下对话回合，生成一个会话阶段摘要(recap)。"
-            "recap应该包括：对话刚才到了哪里、未完成的话题、当前的语气/氛围、"
-            "这个阶段用户表达的关切或偏好、最自然的下一步继续方向。"
-            "不要包含：永久用户事实、推测性心理标签、原始历史细节。"
-            "200字以内。只输出摘要文本，不要JSON。\n\n"
-            f"对话记录：\n{turns_summary}"
-        )
-
-        llm_response = await llm_gateway.complete(
-            LLMRequest(
-                purpose="recap",
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": "你是一个简洁的对话摘要助手。"},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=float(recap_cfg.get("generation", {}).get("temperature", 0.5)),
-                max_tokens=int(recap_cfg.get("generation", {}).get("max_chars", 500)),
-            )
-        )
-
-        recap_text = llm_response.content.strip()
-        if not recap_text:
-            return None
-
-        recap_id = await memory_store.save_recap(
-            user_id=user_id,
-            bot_id=bot_id,
-            recap_text=recap_text,
-            start_turn_id=start_id,
-            end_turn_id=end_id,
-            turn_count=len(new_turns),
-        )
-        logger.info(
-            f"Recap generated: {recap_id} "
-            f"({len(new_turns)} turns, bot={bot_id})"
-        )
-        return recap_id
-
-    except Exception as e:
-        logger.error(f"Recap generation failed: {e}", exc_info=True)
-        return None
-
-
-@app.get("/admin/bots")
-async def admin_list_bots(request: Request):
-    """Phase 1: Single persona only."""
-    require_admin(request)
-    persona = read_persona_file()
-    return {
-        "current_bot_id": BOT_ID,
-        "bots": {
-            BOT_ID: {
-                "display_name": "bot",
-                "identity_file": str(cfg.get("agent", {}).get("persona_file", "./prompts/persona.md")),
-                "enabled_tools": cfg.get("model", {}).get("native_tool_calls", {}).get("allowed_tools", []),
-                "is_current": True,
-                "recap": "",
-            }
-        },
-    }
-
-
-@app.post("/admin/bots/switch")
-async def admin_switch_bot(request: Request):
-    """Phase 1: No-op — single persona only."""
-    require_admin(request)
-    body = await request.json()
-    bot_id = str(body.get("bot_id", "")).strip()
-    if bot_id and bot_id != BOT_ID:
-        raise HTTPException(status_code=400, detail=f"Phase 1: only '{BOT_ID}' persona is available")
-    return {
-        "status": "ok",
-        "current_bot_id": BOT_ID,
-        "bot": {"display_name": "bot"},
-    }
-
-
-@app.get("/admin/recaps")
-async def admin_list_recaps(request: Request, limit: int = 10):
-    """List recent recaps for the current bot and known contact."""
-    require_admin(request)
-    contact = await memory_store.get_contact_state()
-    user_id = contact.get("user_id", "")
-    recaps = await memory_store.get_recaps(
-        user_id, BOT_ID, limit=limit
-    )
-    return {"recaps": recaps}
-
-
-@app.post("/admin/recaps/generate")
-async def admin_trigger_recap(request: Request):
-    """Manually trigger recap generation."""
-    require_admin(request)
-    contact = await memory_store.get_contact_state()
-    user_id = contact.get("user_id", "")
-    if not user_id:
-        raise HTTPException(status_code=400, detail="没有联系人")
-    recap_cfg = cfg.get("recap", {})
-    recap_id = await _generate_recap(
-        user_id, BOT_ID, recap_cfg
-    )
-    if recap_id:
-        return {"status": "generated", "recap_id": recap_id}
-    return {"status": "skipped", "reason": "not enough turns or error"}
-
-
 @app.get("/admin/outbound")
 async def admin_list_outbound(
     request: Request,
@@ -3497,7 +1801,7 @@ async def admin_list_outbound(
     status: str = "",
     limit: int = 50,
 ):
-    """List outbound messages with V2.1 semantics."""
+    """List outbound messages."""
     require_admin(request)
     messages = await memory_store.get_outbound_messages(
         turn_id=turn_id,
@@ -3509,7 +1813,7 @@ async def admin_list_outbound(
 
 @app.get("/admin/turns")
 async def admin_list_turns(request: Request, limit: int = 20):
-    """List recent turns (L2) for the current bot."""
+    """List recent turns for the current bot."""
     require_admin(request)
     contact = await memory_store.get_contact_state()
     user_id = contact.get("user_id", "")
@@ -3519,30 +1823,9 @@ async def admin_list_turns(request: Request, limit: int = 20):
     return {"turns": turns}
 
 
-@app.get("/admin/shared-facts")
-async def admin_list_shared_facts(request: Request, limit: int = 20):
-    """List shared user facts."""
-    require_admin(request)
-    facts = await memory_store.get_shared_facts(limit=limit)
-    return {"shared_facts": facts}
-
-
 # ================================================================
 # Contact send helpers
 # ================================================================
-
-
-def _is_real_user_inbound(user_id: str, text: str, trigger: str, source: str) -> bool:
-    """Return whether an inbound event is a real user message."""
-    if not user_id or user_id == "default":
-        return False
-    if not text or not text.strip():
-        return False
-    if trigger not in ("user",):
-        return False
-    if source not in ("wechat", "wechat_inbound", "user", ""):
-        return False
-    return True
 
 
 def _contact_send_block_reason(contact: dict[str, Any], bot_id: str) -> str:

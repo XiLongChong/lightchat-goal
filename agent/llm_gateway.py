@@ -1,4 +1,4 @@
-"""Provider-neutral LLM gateway."""
+﻿"""Provider-neutral LLM gateway."""
 
 from __future__ import annotations
 
@@ -69,13 +69,7 @@ class LLMGateway:
 
     async def complete(self, request: LLMRequest, *,
                        trace_handler: Any | None = None) -> LLMResponse:
-        """Execute an LLM request.
-
-        v3.1: trace_handler (optional) overrides global trace callbacks for
-        this request only.  Used by proactive debug dry-run to intercept
-        LLM traces without mutating global state.  When None, global
-        _on_trace_callbacks are used as before.
-        """
+        """Execute an LLM request and optionally override trace callbacks."""
         if request.model is None:
             request.model = self.config.default_model
         if request.timeout_s is None:

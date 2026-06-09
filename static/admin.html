@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Goal 管理</title>
+  <link rel="stylesheet" href="/static/admin.css">
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Goal</h1>
+      <p>微信聊天服务</p>
+    </div>
+    <span id="health" class="status">检查中</span>
+  </header>
+
+  <main>
+    <section id="login-panel">
+      <h2>管理员登录</h2>
+      <form id="login-form">
+        <label for="password">密码</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required>
+        <button type="submit">登录</button>
+      </form>
+      <p id="login-error" class="error" hidden></p>
+    </section>
+
+    <section id="console" hidden>
+      <div class="section-heading">
+        <div>
+          <h2>微信连接</h2>
+          <p id="wechat-summary">正在读取状态</p>
+        </div>
+        <button id="refresh" type="button" class="secondary">刷新</button>
+      </div>
+
+      <div class="actions">
+        <button id="deploy" type="button">启动部署</button>
+        <button id="start" type="button" class="secondary">启动连接</button>
+        <button id="stop" type="button" class="danger">停止连接</button>
+      </div>
+
+      <div id="qr-panel" hidden>
+        <h3>微信扫码</h3>
+        <img id="qr-image" alt="微信登录二维码">
+        <p id="qr-status">等待扫码</p>
+      </div>
+
+      <pre id="details"></pre>
+    </section>
+  </main>
+
+  <script src="/static/admin.js"></script>
+</body>
+</html>

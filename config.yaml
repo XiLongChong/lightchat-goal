@@ -1,10 +1,4 @@
-# ============================================================
-# Goal Chat Agent — Configuration (Phase 1: native tool calls)
-# ============================================================
-
-version: "3.0"
-
-model:
+﻿model:
   provider: deepseek
   default_model: "${DEEPSEEK_MODEL:-deepseek-v4-pro}"
   smart_model: "${DEEPSEEK_SMART_MODEL:-deepseek-v4-pro}"
@@ -17,41 +11,30 @@ model:
   max_retries: "${LLM_MAX_RETRIES:-1}"
   thinking:
     default: enabled
-  json_output:
-    chat_agent: false                     # Phase 1: JSON actions disabled
   native_tool_calls:
-    chat_agent: true                      # v0.2: native tool calls exclusively
+    chat_agent: true
     allowed_tools:
+      - send_text_message
       - get_time
       - get_weather
-      - send_text_message
-      - finish_turn
-
-  # ── v1.3: Model routing ──────────────────────────────
-  routing_mode: manual_pro                # auto | manual_flash | manual_pro
-  max_flash_upgrade_attempts: 1           # flash → pro 最大升级次数
-  manual_flash_allow_upgrade: false       # manual_flash 下是否允许升级 pro
-
+  routing_mode: manual_pro
+  max_flash_upgrade_attempts: 1
+  manual_flash_allow_upgrade: false
   flash_profile:
     model_name: deepseek-v4-flash
     temperature: 0.8
     max_tokens: 800
     timeout_seconds: 20
-
   pro_profile:
     model_name: deepseek-v4-pro
     temperature: 0.7
     max_tokens: 4096
     timeout_seconds: 40
 
-  streaming:
-    chat_agent: false                     # Phase 1: start with non-streaming
-
 server:
   host: "${HOST:-127.0.0.1}"
   port: "${PORT:-8899}"
 
-# ---- Public API safety ------------------------------------------------
 api:
   chat_auth_enabled: "${CHAT_AUTH_ENABLED:-true}"
   chat_api_key_env: "${CHAT_API_KEY_ENV:-CHAT_API_KEY}"
@@ -60,62 +43,11 @@ api:
   max_message_chars: 1000
   max_messages_per_request: 8
 
-# ---- Agent Identity (single persona) ----------------------------------
 agent:
   name: "${AGENT_NAME:-bot}"
   persona_file: "./prompts/persona.md"
-  persona: |
-    你是一个长期陪用户聊天的 AI 聊天对象，不是客服、不是老师、不是心理咨询师，也不是单纯的工具助手。
-    你的核心任务是：自然地陪用户聊天。
-    使用中文回复，语气自然、简洁、像真人聊天。
   personality: ""
 
-# ---- Feature toggles (Phase 1) ----------------------------------------
-features:
-  memory: false         # long-term memory & search_memory tool
-  recap: false          # background recap generation
-  relationship: false   # relationship state tracking
-  multi_bot: false      # multiple bot profiles
-  emotion: false        # bot emotion state machine
-  proactive: true        # v3.1: proactive / scheduled messages
-  email: false          # send_email tool in chat
-
-# ---- v4.0: Proactive messages (scheduled wake-up) -----------------
-proactive:
-  cold_start_seconds: 120        # hardcoded, config for override in dev
-
-  eligibility:
-    daily_cap: 10
-    sleep_hours:
-      start: "23:00"
-      end: "08:00"
-
-  turn:
-    default_max_wechat_reply_per_turn: 3
-    hard_max_wechat_reply_per_turn: 5    # limits send_attempt_count (prevents infinite retry loop)
-    max_llm_steps_per_proactive_turn: 8  # LLM call count limit
-    post_send_delay_seconds: 1.5
-    fallback_send_enabled: false
-
-  relationship:
-    temperature_decay_hours: 6
-    temperature_max: 10
-    temperature_min: -10
-
-  attribution:
-    reply_window_seconds:
-      PROACTIVE_WAKE: 14400
-      MORNING_GREETING: 7200
-      NIGHT_SUMMARY: 7200
-      USER_REQUESTED: 14400
-    topic_switch_keyword_overlap_threshold: 3
-
-  snapshot:
-    trigger_every_n_turns: 8
-    max_chars: 500
-    temperature: 0.5
-
-# ---- WeChat iLink Bridge -----------------------------------------------
 wechat:
   enabled: false
   token: ""
@@ -127,7 +59,6 @@ wechat:
   buffer_debounce_seconds: 2.0
   buffer_max_wait_seconds: 8.0
   chat_request_timeout_seconds: 200.0
-  # Phase 1: send delay config
   send_delay:
     enabled: true
     test_mode_zero_delay: false
@@ -141,106 +72,29 @@ wechat:
     subsequent_long_max: 3.5
     short_threshold_chars: 60
     jitter_enabled: true
-  # Phase 1: message limits
   messages:
     max_count: 12
     soft_normal_count: 4
     max_single_chars: 500
     max_total_chars: 2000
 
-# ---- History (short-term only in Phase 1) -----------------------------
 history:
   short_term_turns: 12
   max_history_turns: 20
-  compact_at_turns: 40
 
-# ---- Memory (disabled in Phase 1, schema kept for compat) -------------
-memory:
+storage:
   db_path: "./data/memory.db"
-  max_context_memories: 5
-  min_importance_save: 0.4
-  dedup_threshold: 0.75
-  decay:
-    enabled: true
-    week_factor: 0.95
-    month_factor: 0.90
 
-# ---- Conversation (kept for compat, limits still applied) -------------
 conversation:
-  max_history_turns: 20
-  compact_at_turns: 40
   max_llm_steps: 20
   max_message_chars: 500
   max_total_chars: 2000
 
-# ---- Weather ----
 weather:
   default_city: "成都"
   timeout_seconds: 4
   cache_ttl_seconds: 600
 
-# ---- Email (disabled in chat, SMTP config kept for admin) -------------
-email:
-  enabled: "${EMAIL_ENABLED:-false}"
-  smtp_host: "${EMAIL_SMTP_HOST:-}"
-  smtp_port: "${EMAIL_SMTP_PORT:-465}"
-  username: "${EMAIL_USERNAME:-}"
-  password: "${EMAIL_PASSWORD:-}"
-  from_addr: "${EMAIL_FROM:-}"
-  default_to: "${EMAIL_DEFAULT_TO:-}"
-  use_ssl: true
-  use_starttls: false
-
-# ---- Logging ----
 logging:
   level: "${LOG_LEVEL:-INFO}"
   file: "./data/agent.log"
-
-# ---- Legacy sections (kept for backward compat, not in main path) -----
-bots:
-  _current_bot_id: "default_bot"
-  default_bot:
-    display_name: "bot"
-    identity_file: "./prompts/persona.md"
-    persona_file: "./prompts/persona.md"
-    enabled_tools:
-      - wechat_reply
-      - get_time
-      - get_weather
-      - search_memory
-      - read_persona_file
-      - propose_persona_change
-      - send_email
-
-prompt_pack:
-  directory: "./prompts"
-  components:
-    - base_protocol
-    - relationship_context
-    - memory_policy
-    - tool_policy
-    - trigger_context
-
-outbound:
-  track_all: true
-  visible_only_after_delivered: true
-  sources:
-    - user_reply
-    - admin
-  authors:
-    - assistant
-    - system
-
-recap:
-  enabled: false
-  trigger:
-    every_n_turns: 8
-    raw_messages_threshold: 200
-    on_restart: true
-  generation:
-    max_chars: 500
-    temperature: 0.5
-  exclude_from_recap:
-    - permanent_user_facts
-    - speculative_psychology
-    - raw_history_details

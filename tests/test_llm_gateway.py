@@ -1,4 +1,4 @@
-"""Tests for LLMGateway, DeepSeekAdapter, and trace infrastructure."""
+﻿"""Tests for LLMGateway, DeepSeekAdapter, and trace infrastructure."""
 
 import asyncio
 import json
@@ -22,9 +22,9 @@ from agent.providers.base import ProviderConfig
 from agent.providers.deepseek import DeepSeekAdapter
 
 
-# ──────────────────────────────────────────────────────────────
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 # Helpers
-# ──────────────────────────────────────────────────────────────
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 def _make_config(**overrides):
     return ProviderConfig(
@@ -87,21 +87,21 @@ def test_from_model_config_normalizes_deepseek_root_to_anthropic_base():
     assert gateway.config.base_url == "https://api.deepseek.com/anthropic"
 
 
-# ──────────────────────────────────────────────────────────────
-# 1. DeepSeekAdapter normal response → content
-# ──────────────────────────────────────────────────────────────
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# 1. DeepSeekAdapter normal response 鈫?content
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 class TestDeepSeekAdapterContent:
     @pytest.mark.asyncio
     async def test_adapter_returns_content(self):
         adapter = DeepSeekAdapter(_make_config())
-        mock_resp = _make_mock_openai_response(content="你好世界")
+        mock_resp = _make_mock_openai_response(content="浣犲ソ涓栫晫")
         adapter.client.chat.completions.create = AsyncMock(return_value=mock_resp)
 
         req = LLMRequest(purpose="test", messages=[{"role": "user", "content": "hi"}])
         resp = await adapter.complete(req)
 
-        assert resp.content == "你好世界"
+        assert resp.content == "浣犲ソ涓栫晫"
         assert resp.provider == "deepseek"
         assert resp.model == "deepseek-v4-flash"
         assert resp.finish_reason == "stop"
@@ -132,9 +132,9 @@ class TestDeepSeekAdapterContent:
         assert resp.request_id == "resp-abc123"
 
 
-# ──────────────────────────────────────────────────────────────
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 # 2. Usage field extraction
-# ──────────────────────────────────────────────────────────────
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 class TestUsageExtraction:
     @pytest.mark.asyncio
@@ -204,9 +204,9 @@ class TestUsageExtraction:
         assert "completion_tokens_details" in resp.usage.provider_details
 
 
-# ──────────────────────────────────────────────────────────────
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 # 3. Error mapping
-# ──────────────────────────────────────────────────────────────
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 class TestErrorMapping:
     """Each error type maps to the correct LLMErrorKind and retryable flag."""
@@ -291,9 +291,9 @@ class TestErrorMapping:
         assert mapped.retryable is False  # 418 < 500
 
 
-# ──────────────────────────────────────────────────────────────
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 # 4. Thinking default disabled
-# ──────────────────────────────────────────────────────────────
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 class TestThinkingDefaultDisabled:
     @pytest.mark.asyncio
@@ -322,7 +322,7 @@ class TestThinkingDefaultDisabled:
 
     @pytest.mark.asyncio
     async def test_no_reasoning_effort_in_payload_when_none(self):
-        """reasoning_effort=None → not included in payload."""
+        """reasoning_effort=None 鈫?not included in payload."""
         adapter = DeepSeekAdapter(_make_config())
         req = LLMRequest(purpose="test", messages=[], thinking="disabled")
         payload = adapter._build_payload(req)
@@ -372,9 +372,9 @@ class TestThinkingDefaultDisabled:
         assert req.thinking == "enabled"
 
 
-# ──────────────────────────────────────────────────────────────
-# 5. response_mode=json_object → response_format
-# ──────────────────────────────────────────────────────────────
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# 5. response_mode=json_object 鈫?response_format
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 class TestResponseModeMapping:
     @pytest.mark.asyncio
@@ -394,165 +394,10 @@ class TestResponseModeMapping:
         assert "response_format" not in payload
 
 
-# ──────────────────────────────────────────────────────────────
-# 6. MemoryWorker goes through gateway
-# ──────────────────────────────────────────────────────────────
 
-class TestMemoryWorkerGateway:
-    @pytest.mark.asyncio
-    async def test_memory_worker_uses_gateway_json_request(self):
-        payload = {
-            "memories": [
-                {
-                    "content": "用户喜欢冰美式",
-                    "category": "preference",
-                    "importance": 0.8,
-                    "keywords": "咖啡",
-                }
-            ]
-        }
-
-        class FakeGateway:
-            def __init__(self):
-                self.requests: list[LLMRequest] = []
-
-            async def complete(self, request: LLMRequest) -> LLMResponse:
-                self.requests.append(request)
-                return LLMResponse(
-                    content=json.dumps(payload, ensure_ascii=False),
-                    provider="fake",
-                    model=request.model or "fake-model",
-                    usage=LLMUsage(),
-                    latency_ms=1,
-                    finish_reason="stop",
-                )
-
-        class FakeStore:
-            def __init__(self):
-                self.saved: list[dict] = []
-
-            async def list_all(self):
-                return []
-
-            async def save_memory_bot(self, **kwargs):
-                self.saved.append(kwargs)
-                return f"mem_{len(self.saved)}"
-
-        from agent.memory_worker import MemoryWorker
-
-        gateway = FakeGateway()
-        store = FakeStore()
-        worker = MemoryWorker(
-            store=store,  # type: ignore[arg-type]
-            model="deepseek-v4-flash",
-            llm_gateway=gateway,
-        )
-
-        await worker._do_extract("我喜欢冰美式", "记住了", [], bot_id="default_bot")
-
-        assert len(gateway.requests) == 1
-        request = gateway.requests[0]
-        assert request.purpose == "memory_extract"
-        assert request.response_mode == "json_object"
-        assert request.thinking == "disabled"
-        assert request.tools is None
-        assert store.saved[0]["content"] == "用户喜欢冰美式"
-
-    @pytest.mark.asyncio
-    async def test_memory_worker_gateway_error_is_non_blocking(self):
-        class FakeGateway:
-            def __init__(self):
-                self.requests: list[LLMRequest] = []
-
-            async def complete(self, request: LLMRequest) -> LLMResponse:
-                self.requests.append(request)
-                raise LLMError(
-                    kind="provider_overloaded",
-                    message="busy",
-                    provider="fake",
-                    retryable=True,
-                )
-
-        class FakeStore:
-            def __init__(self):
-                self.saved: list[dict] = []
-
-            async def list_all(self):
-                return []
-
-            async def save_memory_bot(self, **kwargs):
-                self.saved.append(kwargs)
-                return "mem"
-
-        from agent.memory_worker import MemoryWorker
-
-        gateway = FakeGateway()
-        store = FakeStore()
-        worker = MemoryWorker(
-            store=store,  # type: ignore[arg-type]
-            model="deepseek-v4-flash",
-            llm_gateway=gateway,
-        )
-
-        await worker._do_extract("hello", "hi", [], bot_id="default_bot")
-
-        assert len(gateway.requests) == 1
-        assert store.saved == []
-
-
-# ──────────────────────────────────────────────────────────────
-# 7. Recap gateway usage
-# ──────────────────────────────────────────────────────────────
-
-class TestRecapGateway:
-    @pytest.mark.asyncio
-    async def test_recap_purpose_and_response_mode(self):
-        """Recap uses gateway with purpose='recap' and text mode."""
-        class FakeGateway:
-            def __init__(self):
-                self.requests: list[LLMRequest] = []
-
-            async def complete(self, request: LLMRequest) -> LLMResponse:
-                self.requests.append(request)
-                return LLMResponse(
-                    content="用户最近在讨论技术方案架构。",
-                    provider="fake",
-                    model=request.model or "fake-model",
-                    usage=LLMUsage(prompt_tokens=50, completion_tokens=20, total_tokens=70),
-                    latency_ms=100,
-                    finish_reason="stop",
-                )
-
-        gateway = FakeGateway()
-        model_name = "deepseek-v4-flash"
-
-        # This mirrors main._generate_recap() logic
-        prompt = "你是一个对话摘要助手。总结对话..."
-        response = await gateway.complete(
-            LLMRequest(
-                purpose="recap",
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": "你是一个简洁的对话摘要助手。"},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.5,
-                max_tokens=500,
-            )
-        )
-
-        assert len(gateway.requests) == 1
-        req = gateway.requests[0]
-        assert req.purpose == "recap"
-        assert req.response_mode == "text"  # Recap uses default text mode
-        assert response.content == "用户最近在讨论技术方案架构。"
-        assert response.usage.prompt_tokens == 50
-        assert response.usage.completion_tokens == 20
-
-
-# ──────────────────────────────────────────────────────────────
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 # 8. raw_response not persisted in traces
-# ──────────────────────────────────────────────────────────────
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 class TestRawResponseNotPersisted:
     @pytest.mark.asyncio
@@ -650,9 +495,9 @@ class TestRawResponseNotPersisted:
         assert "raw_response" not in traces[0]
 
 
-# ──────────────────────────────────────────────────────────────
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 # 9. Trace callback infrastructure
-# ──────────────────────────────────────────────────────────────
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 class TestTraceInfrastructure:
     @pytest.mark.asyncio
@@ -785,9 +630,9 @@ class TestTraceInfrastructure:
         assert trace["latency_ms"] >= 0
 
 
-# ──────────────────────────────────────────────────────────────
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 # 10. MemoryStore trace persistence (in-memory DB)
-# ──────────────────────────────────────────────────────────────
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 class TestMemoryStoreTracePersistence:
     @pytest.mark.asyncio
@@ -865,9 +710,9 @@ class TestMemoryStoreTracePersistence:
         await store.close()
 
 
-# ──────────────────────────────────────────────────────────────
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 # 11. LLMGateway.from_model_config
-# ──────────────────────────────────────────────────────────────
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 class TestGatewayFactory:
     def test_from_model_config_deepseek(self):
@@ -904,9 +749,9 @@ class TestGatewayFactory:
         assert gateway.config.timeout_s == 120.0
 
 
-# ──────────────────────────────────────────────────────────────
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 # 12. LLMRequest fields
-# ──────────────────────────────────────────────────────────────
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 class TestLLMRequestFields:
     def test_all_fields_present(self):
@@ -945,9 +790,9 @@ class TestLLMRequestFields:
         assert payload.get("top_p") == 0.9
 
 
-# ──────────────────────────────────────────────────────────────
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 # 13. LLMResponse / LLMUsage / LLMError data classes
-# ──────────────────────────────────────────────────────────────
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 class TestDataClasses:
     def test_llm_usage_defaults(self):

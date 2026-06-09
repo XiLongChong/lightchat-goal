@@ -1,0 +1,137 @@
+:root {
+  color-scheme: light;
+  font-family: Inter, "Segoe UI", "Microsoft YaHei", sans-serif;
+  color: #17211b;
+  background: #f4f6f5;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}
+
+header {
+  height: 72px;
+  padding: 0 32px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: #fff;
+  background: #17211b;
+}
+
+h1, h2, h3, p { margin: 0; }
+h1 { font-size: 22px; }
+header p { margin-top: 2px; color: #b9c5be; font-size: 13px; }
+
+main {
+  width: min(720px, calc(100% - 32px));
+  margin: 40px auto;
+}
+
+section {
+  padding: 24px;
+  background: #fff;
+  border: 1px solid #dce2de;
+  border-radius: 8px;
+}
+
+h2 { font-size: 18px; margin-bottom: 18px; }
+h3 { font-size: 15px; margin-bottom: 12px; }
+
+form {
+  display: grid;
+  gap: 10px;
+}
+
+label { font-size: 13px; color: #526159; }
+
+input {
+  width: 100%;
+  height: 42px;
+  padding: 0 12px;
+  border: 1px solid #bfc9c3;
+  border-radius: 6px;
+  font: inherit;
+}
+
+button {
+  min-height: 40px;
+  padding: 0 16px;
+  border: 0;
+  border-radius: 6px;
+  font: inherit;
+  font-weight: 600;
+  color: #fff;
+  background: #16794a;
+  cursor: pointer;
+}
+
+button.secondary { color: #24352b; background: #e6ece8; }
+button.danger { background: #a63838; }
+button:disabled { opacity: .55; cursor: wait; }
+
+.status {
+  padding: 5px 9px;
+  border: 1px solid #526159;
+  border-radius: 999px;
+  font-size: 12px;
+}
+
+.section-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: flex-start;
+}
+
+.section-heading h2 { margin-bottom: 4px; }
+.section-heading p { color: #66756d; font-size: 13px; }
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 24px 0;
+}
+
+#qr-panel {
+  padding-top: 20px;
+  border-top: 1px solid #e2e7e4;
+  text-align: center;
+}
+
+#qr-image {
+  display: block;
+  width: 240px;
+  height: 240px;
+  margin: 0 auto 12px;
+  object-fit: contain;
+  background: #fff;
+}
+
+#qr-status { color: #526159; font-size: 13px; }
+
+pre {
+  max-height: 240px;
+  overflow: auto;
+  padding: 14px;
+  color: #dce7e0;
+  background: #202a24;
+  border-radius: 6px;
+  font-size: 12px;
+  white-space: pre-wrap;
+}
+
+.error { margin-top: 12px; color: #a63838; font-size: 13px; }
+
+@media (max-width: 560px) {
+  header { padding: 0 18px; }
+  main { margin: 24px auto; }
+  section { padding: 18px; }
+  .section-heading { align-items: stretch; }
+  .section-heading button { min-width: 76px; }
+  .actions button { flex: 1 1 140px; }
+}
