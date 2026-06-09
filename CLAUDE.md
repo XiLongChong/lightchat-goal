@@ -51,6 +51,36 @@ python scripts/reset_runtime_data.py --confirm  # 确认清除
   → 释放锁 → 返回响应
 ```
 
+## 关键概念
+
+- **用户交互轮 (turn)**：从用户发送一条消息开始 → 模型完成回复（发送完毕或异常结束）为止。一次用户消息 = 一个 turn。
+- **模型调用 (call/step)**：一次 turn 内可能多次调用 LLM（最大 20 次）。每次收到 `send_text_message` 的 `sent` 结果后，模型判断是否还需要再发一条消息——如需则再调一次 LLM。不能提前预编多条回复。
+- **对话历史加载**：每次 `/chat` 请求从 SQLite 实时加载最近 **20 个已完成 turn** 的 protocol_messages（`conversation.max_history_turns` 控制）。
+
+## LLM 原始事件日志
+
+每次 LLM 调用写入 SQLite `llm_traces` 表一条记录，字段如下：
+
+| 字段 | 说明 |
+|------|------|
+| `request_id` | 请求 UUID |
+| `turn_id` / `call_id` | 归属的 turn 和本次调用标识 |
+| `task_type` | `chat` |
+| `provider` / `model` | deepseek / 模型名 |
+| `thinking` / `response_mode` | disabled / text |
+| `latency_ms` | 延迟（毫秒） |
+| `attempt_count` | 重试次数 |
+| `success` | 是否成功 |
+| `prompt_tokens` / `completion_tokens` / `total_tokens` | token 用量 |
+| `cache_hit_tokens` / `cache_miss_tokens` | 缓存命中/未命中 |
+| `reasoning_tokens` | 推理 token |
+| `tools_exposed_count` / `tools_exposed_names` | 开放的工具 |
+| `tool_calls_returned_count` / `tool_calls_returned_names` | 模型调用的工具 |
+| `request_json` | **完整请求体 JSON**（含 messages、system、tools） |
+| `response_json` | **完整响应体 JSON**（含 content、tool_calls、usage） |
+
+`request_json` 和 `response_json` 包含发给 provider 和从 provider 收到的原始 JSON。通过 claude-tap 可以看到相同内容（HTTP 层抓包）。
+
 ## 关键机制
 
 - **用户级锁**：每 user_id 一个 asyncio.Lock，同用户串行、跨用户并发

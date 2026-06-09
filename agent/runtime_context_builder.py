@@ -98,6 +98,7 @@ class ContextBuilder:
         persona: str = "",
         personality: str = "",
         history: list[dict[str, Any]] | None = None,
+        prebuilt_messages: list[dict[str, Any]] | None = None,
         user_message: str = "",
         bot_id: str = "default",
         system_prompt: str = "",
@@ -106,43 +107,54 @@ class ContextBuilder:
     ) -> BuiltContextForTurn:
         """Build complete model input for an ordinary chat turn.
 
-        This is the high-level entry point.  It handles persona assembly,
-        history conversion, channel wrapping, and system prompt construction
-        so that ChatAgent only needs to assign ``turn.messages`` and
-        ``turn._provider_system`` from the result.
+        When ``prebuilt_messages`` is provided (from ConversationContext),
+        history conversion is skipped — the messages are used directly.
         """
-        history = list(history or [])
+        timezone_info = timezone(timedelta(hours=8))
+        now = datetime.now(timezone_info)
+
+        if prebuilt_messages is not None:
+            # Messages are already in [{role, content}] format from ConversationContext.
+            # Only convert to ConversationHistoryMessage for ContextBuilder.build().
+            recent_history: list[ConversationHistoryMessage] = []
+            for i, item in enumerate(prebuilt_messages):
+                recent_history.append(ConversationHistoryMessage(
+                    message_id=f"pre_{i}",
+                    turn_id="",
+                    role=str(item.get("role", "")),
+                    content=copy.deepcopy(item.get("content")),
+                    source="protocol",
+                    delivery_status="delivered",
+                ))
+        else:
+            history = list(history or [])
+            recent_history = []
+            for item in history:
+                role = str(item.get("role", ""))
+                content = item.get("content")
+                if role not in {"user", "assistant"} or content in (None, ""):
+                    continue
+                if role == "user" and isinstance(content, str):
+                    content = self._channel_message(content)
+                timestamp = float(item.get("ts", 0) or 0)
+                created_at = datetime.fromtimestamp(timestamp, timezone_info) if timestamp else now
+                recent_history.append(ConversationHistoryMessage(
+                    message_id=str(item.get("id", "")),
+                    turn_id=str(item.get("turn_id", "")),
+                    role=role,
+                    content=copy.deepcopy(content),
+                    source="protocol",
+                    delivery_status="delivered",
+                    created_at=created_at,
+                ))
 
         prompt = system_prompt.strip() or "\n\n".join(
             part for part in (persona, personality) if part.strip()
         )
 
-        timezone_info = timezone(timedelta(hours=8))
-        now = datetime.now(timezone_info)
-
-        recent_history: list[ConversationHistoryMessage] = []
-        for item in history:
-            role = str(item.get("role", ""))
-            content = item.get("content")
-            if role not in {"user", "assistant"} or content in (None, ""):
-                continue
-            if role == "user" and isinstance(content, str):
-                content = self._channel_message(content)
-            timestamp = float(item.get("ts", 0) or 0)
-            created_at = datetime.fromtimestamp(timestamp, timezone_info) if timestamp else now
-            recent_history.append(ConversationHistoryMessage(
-                message_id=str(item.get("id", "")),
-                turn_id=str(item.get("turn_id", "")),
-                role=role,
-                content=copy.deepcopy(content),
-                source="protocol",
-                delivery_status="delivered",
-                created_at=created_at,
-            ))
-
         request = BuildContextRequest(
-            turn_id=turn_id or f"ctx_{id(history)}",
-            call_id=f"ctx_{turn_id or id(history)}",
+            turn_id=turn_id or f"ctx_{abs(hash(user_message))}",
+            call_id=f"ctx_{turn_id or abs(hash(user_message))}",
             turn_type=TurnType.USER_CHAT,
             user_id="default",
             bot_id=bot_id,

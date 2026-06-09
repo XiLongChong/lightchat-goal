@@ -21,16 +21,17 @@ output_guard.py            — 输出清洗：敏感信息过滤、长度截断�
 
 ## 对话流程（chat_agent.chat）
 
-1. 创建 TurnScratchpad，写 protocol turn_started 事件
-2. 构建上下文（`ContextBuilder.build_for_chat()` — 一次调用完成全部 prompt 构造）
+1. 创建 TurnScratchpad，写 turn_started 事件（DB + 内存）
+2. 构建上下文（`ContextBuilder.build_for_chat(prebuilt_messages=...)` — 从 ConversationContext 取消息数组，一次调用完成 prompt 构造）
 3. 循环（最多 MAX_LLM_STEPS_PER_TURN=20 轮）：
    - 通过 LLMGateway 调用 LLM（stream=True）
    - 累积 tool_calls，执行工具
+   - 每个事件即写 raw_events + 追加 ConversationContext
    - 如果有 send_text_message 结果，加到 visible_messages
    - 检查 interrupt_checker
    - 无 tool_call 时隐式结束 turn
 4. 通过 wechat_sender 回调发送消息
-5. 执行 post_turn_hooks（诊断日志、模型尝试日志、可见时间更新）
+5. 执行 post_turn_hooks（诊断日志、模型尝试日志）
 6. 返回 TurnResult
 
 ## 关键常量

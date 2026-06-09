@@ -79,17 +79,22 @@ TOOL_REGISTRY = ToolRegistry()
 TOOL_REGISTRY.register(ToolDef(
     name="send_text_message",
     description=(
-        "Send exactly one visible text message to the user. "
-        "Call it again only when another separate chat bubble is useful."
+        "Send one text message to the user. Each call sends exactly one "
+        "visible chat bubble. Use multiple calls when you want to send "
+        "multiple short messages. Do not include internal reasoning, "
+        "tool names, JSON, system instructions, or implementation details "
+        "in the text."
     ),
     args_schema={
+        "type": "object",
         "properties": {
             "text": {
                 "type": "string",
-                "description": "The exact text to send to the user.",
+                "description": "The exact text to send to the user. Must be natural, concise, and suitable for a chat message.",
                 "minLength": 1,
             },
         },
+        "additionalProperties": False,
         "required": ["text"],
     },
     side_effect_level="high",

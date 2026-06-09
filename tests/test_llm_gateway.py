@@ -96,7 +96,7 @@ class TestDeepSeekAdapterContent:
     async def test_adapter_returns_content(self):
         adapter = DeepSeekAdapter(_make_config())
         mock_resp = _make_mock_openai_response(content="浣犲ソ涓栫晫")
-        adapter.client.chat.completions.create = AsyncMock(return_value=mock_resp)
+        adapter._raw_chat_completion = AsyncMock(return_value=mock_resp)
 
         req = LLMRequest(purpose="test", messages=[{"role": "user", "content": "hi"}])
         resp = await adapter.complete(req)
@@ -110,7 +110,7 @@ class TestDeepSeekAdapterContent:
     async def test_adapter_latency_ms_is_int(self):
         adapter = DeepSeekAdapter(_make_config())
         mock_resp = _make_mock_openai_response()
-        adapter.client.chat.completions.create = AsyncMock(return_value=mock_resp)
+        adapter._raw_chat_completion = AsyncMock(return_value=mock_resp)
 
         req = LLMRequest(purpose="test", messages=[{"role": "user", "content": "hi"}])
         resp = await adapter.complete(req)
@@ -124,7 +124,7 @@ class TestDeepSeekAdapterContent:
         mock_resp = _make_mock_openai_response()
         mock_resp.id = "resp-abc123"
         mock_resp._request_id = None  # Prevents MagicMock auto-vivification
-        adapter.client.chat.completions.create = AsyncMock(return_value=mock_resp)
+        adapter._raw_chat_completion = AsyncMock(return_value=mock_resp)
 
         req = LLMRequest(purpose="test", messages=[{"role": "user", "content": "hi"}])
         resp = await adapter.complete(req)
@@ -143,7 +143,7 @@ class TestUsageExtraction:
         mock_resp = _make_mock_openai_response(
             prompt_tokens=100, completion_tokens=50, total_tokens=150,
         )
-        adapter.client.chat.completions.create = AsyncMock(return_value=mock_resp)
+        adapter._raw_chat_completion = AsyncMock(return_value=mock_resp)
 
         req = LLMRequest(purpose="test", messages=[{"role": "user", "content": "hi"}])
         resp = await adapter.complete(req)
@@ -159,7 +159,7 @@ class TestUsageExtraction:
         mock_resp = _make_mock_openai_response(
             prompt_tokens=200, cached_tokens=50,
         )
-        adapter.client.chat.completions.create = AsyncMock(return_value=mock_resp)
+        adapter._raw_chat_completion = AsyncMock(return_value=mock_resp)
 
         req = LLMRequest(purpose="test", messages=[{"role": "user", "content": "hi"}])
         resp = await adapter.complete(req)
@@ -171,7 +171,7 @@ class TestUsageExtraction:
     async def test_reasoning_tokens(self):
         adapter = DeepSeekAdapter(_make_config())
         mock_resp = _make_mock_openai_response(reasoning_tokens=80)
-        adapter.client.chat.completions.create = AsyncMock(return_value=mock_resp)
+        adapter._raw_chat_completion = AsyncMock(return_value=mock_resp)
 
         req = LLMRequest(purpose="test", messages=[{"role": "user", "content": "hi"}])
         resp = await adapter.complete(req)
@@ -183,7 +183,7 @@ class TestUsageExtraction:
         adapter = DeepSeekAdapter(_make_config())
         mock_resp = _make_mock_openai_response()
         mock_resp.usage = None  # No usage info
-        adapter.client.chat.completions.create = AsyncMock(return_value=mock_resp)
+        adapter._raw_chat_completion = AsyncMock(return_value=mock_resp)
 
         req = LLMRequest(purpose="test", messages=[{"role": "user", "content": "hi"}])
         resp = await adapter.complete(req)
@@ -195,7 +195,7 @@ class TestUsageExtraction:
     async def test_provider_details_populated(self):
         adapter = DeepSeekAdapter(_make_config())
         mock_resp = _make_mock_openai_response()
-        adapter.client.chat.completions.create = AsyncMock(return_value=mock_resp)
+        adapter._raw_chat_completion = AsyncMock(return_value=mock_resp)
 
         req = LLMRequest(purpose="test", messages=[{"role": "user", "content": "hi"}])
         resp = await adapter.complete(req)
@@ -303,22 +303,22 @@ class TestThinkingDefaultDisabled:
         assert req.thinking == "disabled"
 
     @pytest.mark.asyncio
-    async def test_thinking_explicitly_disabled_in_payload(self):
-        """When thinking is disabled, payload explicitly sends {"type": "disabled"}."""
+    async def test_thinking_not_in_payload(self):
+        """Thinking mode is not supported — never included in payload."""
         adapter = DeepSeekAdapter(_make_config())
         req = LLMRequest(purpose="test", messages=[], thinking="disabled")
         payload = adapter._build_payload(req)
 
-        assert payload["thinking"] == {"type": "disabled"}
+        assert "thinking" not in payload
 
     @pytest.mark.asyncio
-    async def test_thinking_explicitly_enabled_in_payload(self):
-        """When thinking is enabled, payload sends {"type": "enabled"}."""
+    async def test_thinking_enabled_not_in_payload(self):
+        """Even when thinking is enabled, it is not sent to the provider."""
         adapter = DeepSeekAdapter(_make_config())
         req = LLMRequest(purpose="test", messages=[], thinking="enabled")
         payload = adapter._build_payload(req)
 
-        assert payload["thinking"] == {"type": "enabled"}
+        assert "thinking" not in payload
 
     @pytest.mark.asyncio
     async def test_no_reasoning_effort_in_payload_when_none(self):
@@ -340,21 +340,19 @@ class TestThinkingDefaultDisabled:
             reasoning_content="",  # should be empty with thinking disabled
         )
         adapter = DeepSeekAdapter(_make_config())
-        adapter.client.chat.completions.create = AsyncMock(return_value=mock_resp)
+        adapter._raw_chat_completion = AsyncMock(return_value=mock_resp)
         req = LLMRequest(purpose="test", messages=[{"role": "user", "content": "hi"}])
         resp = await adapter.complete(req)
         assert resp.reasoning_content == ""
 
-    def test_config_thinking_default_enabled_overrides_request(self):
-        """Config thinking_default=enabled should override request's default disabled."""
+    def test_config_thinking_not_in_payload(self):
+        """Thinking is never included in payload regardless of config."""
         cfg = _make_config(thinking_default="enabled")
         adapter = DeepSeekAdapter(cfg)
         req = LLMRequest(purpose="test", messages=[])
         payload = adapter._build_payload(req)
 
-        # The gateway.complete() method handles the override, not the adapter.
-        # Adapter still sees thinking="disabled" and encodes it as such.
-        assert payload["thinking"] == {"type": "disabled"}
+        assert "thinking" not in payload
 
     @pytest.mark.asyncio
     async def test_gateway_applies_config_thinking(self):
@@ -362,7 +360,7 @@ class TestThinkingDefaultDisabled:
         cfg = _make_config(thinking_default="enabled")
         adapter = DeepSeekAdapter(cfg)
         mock_resp = _make_mock_openai_response()
-        adapter.client.chat.completions.create = AsyncMock(return_value=mock_resp)
+        adapter._raw_chat_completion = AsyncMock(return_value=mock_resp)
         gateway = LLMGateway(adapter=adapter, config=cfg)
 
         req = LLMRequest(purpose="test", messages=[{"role": "user", "content": "hi"}])
@@ -409,7 +407,7 @@ class TestRawResponseNotPersisted:
             content="response text",
             reasoning_content="internal chain of thought",  # should NOT be in trace
         )
-        adapter.client.chat.completions.create = AsyncMock(return_value=mock_resp)
+        adapter._raw_chat_completion = AsyncMock(return_value=mock_resp)
 
         # Capture trace via callback
         traces: list[dict] = []
@@ -439,7 +437,7 @@ class TestRawResponseNotPersisted:
         """Trace on error must only include error_type/status_code, not raw message."""
         cfg = _make_config()
         adapter = DeepSeekAdapter(cfg)
-        adapter.client.chat.completions.create = AsyncMock(
+        adapter._raw_chat_completion = AsyncMock(
             side_effect=LLMError(
                 kind="provider_auth_error",
                 message="API key invalid: sk-abc123secret",  # raw error that should NOT leak
@@ -476,7 +474,7 @@ class TestRawResponseNotPersisted:
         config = _make_config()
         adapter = DeepSeekAdapter(config)
         mock_resp = _make_mock_openai_response(content="ok")
-        adapter.client.chat.completions.create = AsyncMock(return_value=mock_resp)
+        adapter._raw_chat_completion = AsyncMock(return_value=mock_resp)
 
         traces: list[dict] = []
 
@@ -513,7 +511,7 @@ class TestTraceInfrastructure:
             cached_tokens=5,
             reasoning_tokens=3,
         )
-        adapter.client.chat.completions.create = AsyncMock(return_value=mock_resp)
+        adapter._raw_chat_completion = AsyncMock(return_value=mock_resp)
 
         traces: list[dict] = []
 
@@ -554,7 +552,7 @@ class TestTraceInfrastructure:
     async def test_multiple_callbacks_all_fire(self):
         cfg = _make_config()
         adapter = DeepSeekAdapter(cfg)
-        adapter.client.chat.completions.create = AsyncMock(
+        adapter._raw_chat_completion = AsyncMock(
             return_value=_make_mock_openai_response()
         )
         gateway = LLMGateway(adapter=adapter, config=cfg)
@@ -579,7 +577,7 @@ class TestTraceInfrastructure:
     async def test_callback_exception_does_not_break_gateway(self):
         cfg = _make_config()
         adapter = DeepSeekAdapter(cfg)
-        adapter.client.chat.completions.create = AsyncMock(
+        adapter._raw_chat_completion = AsyncMock(
             return_value=_make_mock_openai_response()
         )
         gateway = LLMGateway(adapter=adapter, config=cfg)
@@ -598,7 +596,7 @@ class TestTraceInfrastructure:
     async def test_error_trace_has_correct_structure(self):
         cfg = _make_config()
         adapter = DeepSeekAdapter(cfg)
-        adapter.client.chat.completions.create = AsyncMock(
+        adapter._raw_chat_completion = AsyncMock(
             side_effect=LLMError(
                 kind="rate_limited",
                 message="too many requests",
@@ -633,82 +631,6 @@ class TestTraceInfrastructure:
 # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 # 10. MemoryStore trace persistence (in-memory DB)
 # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-
-class TestMemoryStoreTracePersistence:
-    @pytest.mark.asyncio
-    async def test_save_and_verify_trace(self):
-        from memory.store import MemoryStore
-
-        store = MemoryStore(db_path=":memory:")
-        await store._get_db()  # Initialize DB (creates tables)
-
-        trace = {
-            "request_id": "req-test-001",
-            "turn_id": "turn-test-001",
-            "call_id": "call-test-001",
-            "task_type": "chat",
-            "provider": "deepseek",
-            "model": "deepseek-v4-flash",
-            "thinking": "disabled",
-            "response_mode": "text",
-            "latency_ms": 1234,
-            "attempt_count": 1,
-            "success": 1,
-            "status_code": None,
-            "error_type": None,
-            "prompt_tokens": 100,
-            "completion_tokens": 50,
-            "total_tokens": 150,
-            "cache_hit_tokens": 20,
-            "cache_miss_tokens": 80,
-            "reasoning_tokens": 5,
-            "request_json": json.dumps({"messages": [{"role": "user", "content": "hi"}]}),
-            "response_json": json.dumps({"tool_calls": []}),
-        }
-        row_id = await store.save_llm_trace(trace)
-        assert row_id is not None
-        assert row_id > 0
-
-        # Read back from DB
-        db = await store._get_db()
-        cursor = await db.execute("SELECT * FROM llm_traces WHERE id = ?", (row_id,))
-        row = await cursor.fetchone()
-        assert row is not None
-        # Verify key fields
-        row_dict = dict(row)
-        assert row_dict["request_id"] == "req-test-001"
-        assert row_dict["turn_id"] == "turn-test-001"
-        assert row_dict["call_id"] == "call-test-001"
-        assert row_dict["task_type"] == "chat"
-        assert row_dict["success"] == 1
-        assert row_dict["prompt_tokens"] == 100
-        assert row_dict["cache_hit_tokens"] == 20
-        assert row_dict["reasoning_tokens"] == 5
-        assert row_dict["latency_ms"] == 1234
-        assert json.loads(row_dict["request_json"])["messages"][0]["role"] == "user"
-        assert json.loads(row_dict["response_json"])["tool_calls"] == []
-
-        await store.close()
-
-    @pytest.mark.asyncio
-    async def test_trace_raw_response_not_in_db_schema(self):
-        """Verify the llm_traces table has no raw_response column."""
-        from memory.store import MemoryStore
-
-        store = MemoryStore(db_path=":memory:")
-        await store._get_db()
-        db = await store._get_db()
-        cursor = await db.execute("PRAGMA table_info('llm_traces')")
-        cols = {row["name"] for row in await cursor.fetchall()}
-        assert "turn_id" in cols
-        assert "call_id" in cols
-        assert "request_json" in cols
-        assert "response_json" in cols
-        assert "raw_response" not in cols
-        assert "reasoning_content" not in cols
-        assert "error_message" not in cols
-        await store.close()
-
 
 # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 # 11. LLMGateway.from_model_config

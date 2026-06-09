@@ -171,6 +171,7 @@ class ChatAgent:
         protocol_event_writer: ProtocolEventWriter | None = None,
         **unused: Any,
     ) -> TurnResult:
+        prebuilt_messages = unused.get("prebuilt_messages") if unused else None
         del context_policy, unused
         if source != SOURCE_USER_MESSAGE:
             raise ValueError("only ordinary user-message turns are supported")
@@ -193,7 +194,8 @@ class ChatAgent:
             "user_message": turn.user_message,
             "bot_id": bot_id,
         })
-        self._build_context(turn, history, system_prompt, bot_id)
+        self._build_context(turn, history, system_prompt, bot_id,
+                           prebuilt_messages=prebuilt_messages)
 
         allowed = native_allowed_tools_override or self.native_allowed_tools
         allowed = [
@@ -332,6 +334,8 @@ class ChatAgent:
         history: list[dict[str, Any]],
         system_prompt: str,
         bot_id: str,
+        *,
+        prebuilt_messages: list[dict[str, Any]] | None = None,
     ) -> None:
         builder = self._context_builder
         if builder is None:
@@ -340,7 +344,8 @@ class ChatAgent:
         built = builder.build_for_chat(
             persona=self.persona,
             personality=self.personality,
-            history=history,
+            history=history if prebuilt_messages is None else None,
+            prebuilt_messages=prebuilt_messages,
             user_message=turn.user_message,
             bot_id=bot_id,
             system_prompt=system_prompt,

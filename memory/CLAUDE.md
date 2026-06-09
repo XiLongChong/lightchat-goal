@@ -1,11 +1,12 @@
 # CLAUDE.md
 
-SQLite 持久化层——存储联系人状态、对话历史、turn 诊断、用量统计。
+持久化层——纯 SQLite 存储（只写不读，重启时重建）+ 内存常驻消息数组。
 
 ## 文件
 
 ```
-store.py  — MemoryStore 类：aiosqlite 封装，包含全部建表迁移和 CRUD 操作
+store.py         — MemoryStore：纯持久化（事件落盘、DB 迁移、联系人状态）
+conversation.py  — ConversationContext：内存常驻消息数组（追加、裁剪、重建）
 ```
 
 ## 数据表
@@ -13,31 +14,21 @@ store.py  — MemoryStore 类：aiosqlite 封装，包含全部建表迁移和 C
 | 表名 | 用途 |
 |------|------|
 | `bot_contact_state` | 微信联系人绑定（user_id, context_token, bot_id），单行 |
-| `turns` | turn 记录（用户消息、assistant actions、tool calls） |
-| `protocol_messages` | 模型协议消息（provider transcript，按 turn 组织） |
-| `outbound_messages` | 外发消息及其发送状态 |
-| `turn_diagnostics` | turn 诊断（耗时、token 数、fallback 类型、terminal_state） |
-| `turn_drafts` | turn 草稿（生成但未发送的消息） |
-| `usage_events` | 用量事件（chat_turn, manual_send, empty_message_batch 等） |
-| `visible_activity` | 最后可见消息时间（用于上线检测） |
-| `llm_traces` | LLM 请求/响应完整记录（通过 trace 回调写入） |
-| `runtime_meta` | schema 版本号（`chat_only_1`），迁移时比较 |
+| `conversations` | 会话元数据（trim_marker, context_snapshot_id） |
+| `turns` | turn 记录（turn_number 自增永回收，status, token_count, elapsed_ms） |
+| `raw_events` | **唯一消息表**（role, content_json 完整未加工，含 thinking/tool_call/tool_result） |
+| `context_snapshots` | 静态 system prompt 去重（protocol + persona + tool_version_id） |
+| `tool_versions` | 工具定义去重（tools_json hash） |
+| `runtime_meta` | schema 版本号（`v2_incremental_array`） |
 
-## 迁移策略
+## 设计原则
 
-- schema 版本存储在 `runtime_meta` 表
-- 版本不匹配时，删除除 `bot_contact_state` 外的所有表重建
-- `bot_contact_state` 在重置和迁移中始终保留（保持微信连接不中断）
+- **raw_events 是唯一事实来源**：所有事件写入此表，不做加工，不过滤
+- **内存常驻**：ConversationContext 持完整 messages 数组，/chat 不查 DB
+- **DB 只做两件事**：事件落盘（每条即写）+ 重启重建（一次 SELECT）
+- **动静分离**：snapshot hash 不含时间块（时间每轮实时注入）
+- **迁移**：schema 版本不匹配时删除除 `bot_contact_state` 和 `runtime_meta` 外的所有表重建
 
-## 关键设计
+## 清除
 
-- 使用 `aiosqlite.row_factory = aiosqlite.Row` 返回字典式行
-- WAL 模式（非 :memory: 时）
-- `_write_lock` 保护写操作串行化
-- `close_all()` 类方法用于测试清理（见 conftest.py）
-- `_instances` 类属性追踪所有实例
-
-## 注意事项
-
-- `db_path` 默认 `./data/memory.db`，在 `main.py` 启动时配置
-- LLM trace 回调是异步的，写入失败会被静默忽略
+`clear_all()` 删除 conversations/turns/raw_events/context_snapshots/tool_versions，保留 bot_contact_state。管理后台一键清除调用此方法。

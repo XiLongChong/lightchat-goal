@@ -11,7 +11,7 @@ __init__.py      — 导出 ChatRuntime, create_chat_runtime
 
 ## ChatRuntime
 
-数据类，持有对 chat_agent、context_builder、tool_exposure_policy 的引用。`handle_chat()` 方法直接委托给 `chat_agent.chat()`，只做参数透传。
+数据类，持有对 chat_agent、context_builder、tool_exposure_policy 的引用。`handle_chat()` 方法直接委托给 `chat_agent.chat()`，只做参数透传。支持 `prebuilt_messages` 参数——从 ConversationContext 传入预构建消息数组，跳过 DB 读取。
 
 ## 与 main.py 的关系
 

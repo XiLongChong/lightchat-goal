@@ -34,6 +34,7 @@ class ChatRuntime:
         write_model_history: Any = None,
         post_turn_hooks: list | None = None,
         protocol_event_writer: Any = None,
+        prebuilt_messages: list[dict[str, Any]] | None = None,
     ) -> TurnResult:
         if self.chat_agent is None:
             raise RuntimeError("chat_agent not configured")
@@ -58,6 +59,7 @@ class ChatRuntime:
             write_model_history=write_model_history,
             post_turn_hooks=post_turn_hooks,
             protocol_event_writer=protocol_event_writer,
+            prebuilt_messages=prebuilt_messages,
         )
 
     def build_turn_request(self, user_message: str) -> TurnScratchpad:

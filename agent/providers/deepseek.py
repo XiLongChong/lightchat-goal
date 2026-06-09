@@ -12,7 +12,6 @@ from openai import (
     APIConnectionError,
     APIError,
     APITimeoutError,
-    AsyncOpenAI,
     AuthenticationError,
     BadRequestError,
     RateLimitError,
@@ -27,41 +26,18 @@ class DeepSeekAdapter:
 
     def __init__(self, config: ProviderConfig):
         self.config = config
-        self._client: AsyncOpenAI | None = None
-
-    @property
-    def client(self) -> AsyncOpenAI:
-        if self._client is None:
-            self._client = AsyncOpenAI(
-                api_key=self.config.api_key,
-                base_url=self.config.base_url,
-                timeout=self.config.timeout_s,
-                max_retries=0,
-            )
-        return self._client
-
-    async def aclose(self) -> None:
-        if self._client is not None:
-            await self._client.close()
-            self._client = None
 
     async def complete(self, request: LLMRequest) -> LLMResponse:
         started = time.perf_counter()
         payload = self._build_payload(request)
         try:
-            create_fn = self.client.chat.completions.create if self._client is not None else None
-            if create_fn is not None and create_fn.__class__.__module__.startswith("unittest.mock"):
-                response = await create_fn(**self._build_openai_payload(request))
-            else:
-                response = await self._raw_chat_completion(payload, request)
+            response = await self._raw_chat_completion(payload, request)
         except LLMError:
-            raise  # Already a gateway error, don't remap
+            raise
         except Exception as exc:
             raise self._map_error(exc) from exc
 
         latency_ms = int((time.perf_counter() - started) * 1000)
-        if request.stream and not hasattr(response, "choices") and hasattr(response, "__aiter__"):
-            response = await self._consume_stream(response)
         return self._to_response(response, request, latency_ms)
 
     def _build_payload(self, request: LLMRequest) -> dict[str, Any]:
@@ -76,51 +52,9 @@ class DeepSeekAdapter:
             payload["tools"] = _to_anthropic_tools(request.tools)
         if request.max_tokens is not None:
             payload["max_tokens"] = request.max_tokens
-        # Always explicitly communicate thinking state to the provider.
-        payload["thinking"] = {"type": request.thinking}
         if request.output_config is not None:
             payload["output_config"] = request.output_config
         payload["stream"] = bool(request.stream)
-        if request.temperature is not None:
-            payload["temperature"] = request.temperature
-        if request.tool_choice is not None:
-            payload["tool_choice"] = _to_anthropic_tool_choice(request.tool_choice)
-        request_extra = dict(request.extra)
-        request_extra.pop("extra_body", None)
-
-        for key, value in request_extra.items():
-            if key != "extra_body":
-                payload[key] = value
-        return payload
-
-    def _build_openai_payload(self, request: LLMRequest) -> dict[str, Any]:
-        """Build legacy Chat Completions payload for tests and non-Anthropic bases."""
-        model = request.model or self.config.default_model
-        payload: dict[str, Any] = {
-            "model": model,
-            "messages": request.messages,
-        }
-        if request.system is not None:
-            payload["system"] = request.system
-        if request.tools is not None:
-            payload["tools"] = request.tools
-        if request.max_tokens is not None:
-            payload["max_tokens"] = request.max_tokens
-
-        # Always explicitly communicate thinking state to the provider.
-        # DeepSeek expects {"type": "enabled"} / {"type": "disabled"}.
-        payload["thinking"] = {"type": request.thinking}
-        if request.output_config is not None:
-            payload["output_config"] = request.output_config
-        payload["stream"] = bool(request.stream)
-        if request.temperature is not None:
-            payload["temperature"] = request.temperature
-        if request.response_mode == "json_object":
-            payload["response_format"] = {"type": "json_object"}
-        if request.reasoning_effort:
-            payload["reasoning_effort"] = request.reasoning_effort
-        if request.tool_choice is not None:
-            payload["tool_choice"] = request.tool_choice
         request_extra = dict(request.extra)
         request_extra.pop("extra_body", None)
 
@@ -276,78 +210,6 @@ class DeepSeekAdapter:
             retryable=resp.status_code >= 500,
         )
 
-    async def _consume_stream(self, stream: Any) -> Any:
-        content_parts: list[str] = []
-        reasoning_parts: list[str] = []
-        tool_parts: dict[int, dict[str, Any]] = {}
-        finish_reason = ""
-        usage = None
-        model = None
-        response_id = ""
-
-        async for chunk in stream:
-            model = getattr(chunk, "model", None) or model
-            response_id = getattr(chunk, "id", None) or response_id
-            usage = getattr(chunk, "usage", None) or usage
-            choices = getattr(chunk, "choices", None) or []
-            if not choices:
-                continue
-            choice = choices[0]
-            finish_reason = getattr(choice, "finish_reason", None) or finish_reason
-            delta = getattr(choice, "delta", None)
-            if delta is None:
-                continue
-            content = getattr(delta, "content", None)
-            if content:
-                content_parts.append(str(content))
-            reasoning = getattr(delta, "reasoning_content", None)
-            if reasoning:
-                reasoning_parts.append(str(reasoning))
-            for tc in (getattr(delta, "tool_calls", None) or []):
-                idx = int(getattr(tc, "index", 0) or 0)
-                slot = tool_parts.setdefault(idx, {
-                    "id": "",
-                    "type": "function",
-                    "name": "",
-                    "arguments": "",
-                })
-                if getattr(tc, "id", None):
-                    slot["id"] = str(getattr(tc, "id"))
-                if getattr(tc, "type", None):
-                    slot["type"] = str(getattr(tc, "type"))
-                fn = getattr(tc, "function", None)
-                if fn is not None:
-                    if getattr(fn, "name", None):
-                        slot["name"] += str(getattr(fn, "name"))
-                    if getattr(fn, "arguments", None):
-                        slot["arguments"] += str(getattr(fn, "arguments"))
-
-        tool_calls = [
-            SimpleNamespace(
-                id=part["id"],
-                type=part["type"],
-                function=SimpleNamespace(
-                    name=part["name"],
-                    arguments=part["arguments"],
-                ),
-            )
-            for _, part in sorted(tool_parts.items())
-            if part["name"] or part["id"]
-        ]
-        message = SimpleNamespace(
-            content="".join(content_parts),
-            reasoning_content="".join(reasoning_parts),
-            tool_calls=tool_calls or None,
-        )
-        choice = SimpleNamespace(message=message, finish_reason=finish_reason)
-        return SimpleNamespace(
-            choices=[choice],
-            usage=usage,
-            model=model,
-            id=response_id,
-            _request_id=response_id,
-        )
-
     def _to_response(self, response: Any, request: LLMRequest, latency_ms: int) -> LLMResponse:
         choices = getattr(response, "choices", None) or []
         if not choices:
@@ -487,19 +349,6 @@ def _to_anthropic_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         }
         result.append(item)
     return result
-
-
-def _to_anthropic_tool_choice(tool_choice: Any) -> Any:
-    if tool_choice in (None, "auto"):
-        return {"type": "auto"}
-    if tool_choice == "required":
-        return {"type": "any"}
-    if isinstance(tool_choice, dict):
-        if tool_choice.get("type") == "function":
-            fn = tool_choice.get("function") or {}
-            return {"type": "tool", "name": fn.get("name", "")}
-        return tool_choice
-    return tool_choice
 
 
 def _anthropic_message_to_response(message: dict[str, Any]) -> Any:

@@ -33,6 +33,7 @@ from agent.state_machine import ModelProfile, TurnResult, TurnScratchpad, TurnSt
 from agent.tool_exposure_policy import ToolExposurePolicy
 from agent.tools import configure_runtime, configure_tools
 from bridge.wechat_poller import WeChatBridge
+from memory.conversation import ConversationContext
 from memory.store import MemoryStore
 from runtime.chat_runtime import ChatRuntime, create_chat_runtime
 
@@ -224,12 +225,11 @@ memory_store = MemoryStore(
 )
 configure_runtime(memory_store=memory_store)
 
-# Register LLM trace callback
+conversation_ctx = ConversationContext(user_id="", bot_id=BOT_ID)
+
+# LLM trace callback (simplified — no longer persisted separately)
 async def _on_llm_trace(trace: dict):
-    try:
-        await memory_store.save_llm_trace(trace)
-    except Exception:
-        pass
+    pass
 
 llm_gateway.on_trace(_on_llm_trace)
 
@@ -609,15 +609,6 @@ def _get_user_lock(user_id: str) -> asyncio.Lock:
 MAX_HISTORY_TURNS = cfg["conversation"].get("max_history_turns", 20)
 
 
-async def get_history_async(user_id: str, bot_id: str = "") -> list[dict]:
-    """Return complete protocol turns for context construction."""
-    return await memory_store.get_recent_protocol_history(
-        user_id,
-        bot_id=bot_id,
-        turn_limit=MAX_HISTORY_TURNS,
-    )
-
-
 def public_settings() -> dict:
     """Settings safe to show/edit in the local admin UI."""
     email_cfg = cfg.get("email", {})
@@ -700,71 +691,6 @@ def _source_label(source: str) -> str:
         "admin": "后台手动",
     }.get(source or "", source or "未知")
 
-
-async def build_admin_event_dashboard(limit: int = 20) -> dict[str, Any]:
-    """Build the admin event dashboard."""
-    limit = max(5, min(int(limit or 20), 80))
-    contact = await memory_store.get_contact_state()
-    user_id = contact.get("user_id", "")
-    bot_id = BOT_ID
-
-    turns = await memory_store.get_recent_turns(user_id, bot_id, limit=limit) if user_id else []
-    diagnostics = await memory_store.get_recent_turn_diagnostics(limit=limit, user_id=user_id) if user_id else []
-    diag_by_turn = {d.get("turn_id"): d for d in diagnostics}
-    outbound = await memory_store.get_outbound_messages(user_id=user_id, limit=limit) if user_id else []
-    outbound_by_turn: dict[str, list[dict[str, Any]]] = {}
-    for item in outbound:
-        outbound_by_turn.setdefault(str(item.get("turn_id", "")), []).append(item)
-
-    events: list[dict[str, Any]] = []
-    for turn in turns:
-        turn_id = turn.get("id", "")
-        diag = diag_by_turn.get(turn_id, {})
-        diag_meta = diag.get("metadata") if isinstance(diag.get("metadata"), dict) else {}
-        actions = _safe_json_list(turn.get("assistant_actions"))
-        tools = _safe_json_list(turn.get("tool_calls"))
-        replies = [
-            str(a.get("text", "")).strip()
-            for a in actions
-            if isinstance(a, dict) and str(a.get("text", "")).strip()
-        ]
-        events.append({
-            "id": turn_id,
-            "kind": "turn",
-            "time": _admin_time(turn.get("created_at")),
-            "created_at": turn.get("created_at", 0),
-            "title": "chat turn",
-            "user_text": turn.get("user_messages", ""),
-            "intent": "",
-            "reply_texts": replies,
-            "tool_calls": tools,
-            "source": _source_label(turn.get("source", "")),
-            "raw_source": turn.get("source", ""),
-            "trigger": turn.get("trigger", ""),
-            "batch_id": turn_id,
-            "candidate_id": "",
-            "terminal_state": diag_meta.get("terminal_state", ""),
-            "context_sample": diag_meta.get("context_sample", []),
-            "outbound_messages": outbound_by_turn.get(turn_id, []),
-            "route": _route_label(diag.get("route", "")),
-            "context_policy": _policy_label(diag.get("context_policy", "")),
-            "elapsed_ms": diag.get("elapsed_ms", 0),
-            "token_count": diag.get("token_count", 0),
-            "send_status": _send_status_label(diag.get("send_status") or turn.get("send_status", "")),
-        })
-
-    events.sort(key=lambda item: float(item.get("created_at") or 0), reverse=True)
-
-    return {
-        "contact": contact,
-        "bot": {
-            "current_bot_id": bot_id,
-            "display_name": "bot",
-        },
-        "events": events[:limit],
-        "turns": turns[-limit:],
-        "outbound_messages": outbound,
-    }
 
 def apply_runtime_settings(updates: dict):
     """Persist and apply runtime-editable settings."""
@@ -1006,14 +932,12 @@ async def admin_auth_logout(request: Request):
 async def admin_config(request: Request):
     require_admin(request)
     contact = await memory_store.get_contact_state()
-    usage = await build_usage_dashboard()
     outbound_available = _bridge is not None and bool(_bridge.token)
     token = str(cfg.get("wechat", {}).get("token", ""))
     current_bot_id = BOT_ID
     return {
         "persona": read_persona_file(),
         "settings": public_settings(),
-        "usage": usage,
         "wechat": {
             "running": _bridge is not None and _bridge.running,
             "configured": bool(cfg.get("wechat", {}).get("token", "")),
@@ -1029,23 +953,6 @@ async def admin_config(request: Request):
             and _contact_can_send_for_bot(contact, current_bot_id)
         ),
     }
-
-
-async def build_usage_dashboard() -> dict:
-    tz = ZoneInfo("Asia/Shanghai")
-    now = datetime.now(tz)
-    today_start = datetime.combine(
-        now.date(),
-        datetime_time.min,
-        tzinfo=tz,
-    ).timestamp()
-    summary = await memory_store.get_usage_summary(today_start)
-    summary["runtime"] = {
-        "started_at": PROCESS_STARTED_AT,
-        "uptime_seconds": max(0, int(time.time() - PROCESS_STARTED_AT)),
-        "bridge_running": _bridge is not None and _bridge.running,
-    }
-    return summary
 
 
 @app.post("/admin/persona")
@@ -1130,12 +1037,6 @@ async def admin_send_message(request: Request):
         context_token=contact.get("context_token", ""),
         messages=messages,
     )
-    await memory_store.record_usage_event(
-        event_type="manual_send",
-        user_id=contact["user_id"],
-        source="admin",
-        message_count=len(messages),
-    )
     return {"status": "sent", "count": len(messages)}
 
 
@@ -1162,60 +1063,44 @@ def _visible_messages_as_dicts(turn: TurnScratchpad) -> list[dict[str, Any]]:
 
 
 def _build_protocol_event_writer(user_id: str, bot_id: str):
-    """Persist the provider transcript incrementally during a turn."""
+    """Persist raw events incrementally and update ConversationContext."""
     async def _writer(
         turn: TurnScratchpad,
         event_type: str,
         payload: dict[str, Any],
     ) -> None:
+        cid = f"{user_id}:{bot_id}"
         if event_type == "turn_started":
             user_message = payload.get("user_message")
-            await memory_store.begin_protocol_turn(
+            await memory_store.begin_turn(
                 turn_id=turn.turn_id,
-                user_id=user_id,
-                bot_id=bot_id,
-                source=turn.source,
-                trigger=turn.trigger,
+                conversation_id=cid,
                 user_message=None if user_message is None else str(user_message),
             )
             return
 
         if event_type == "message":
             message = payload.get("message") or {}
-            await memory_store.append_protocol_message(
+            role = str(message.get("role", ""))
+            content = message.get("content")
+            await memory_store.append_event(
                 turn_id=turn.turn_id,
-                user_id=user_id,
-                bot_id=bot_id,
-                role=str(message.get("role", "")),
-                content=message.get("content"),
+                role=role,
+                content=content,
                 call_id=str(payload.get("call_id", "")),
-                message_kind=str(payload.get("message_kind", "")),
             )
-            return
-
-        if event_type in {"outbound_created", "outbound_result"}:
-            await memory_store.record_outbound_event(
-                message_id=str(payload.get("message_id", "")),
-                turn_id=turn.turn_id,
-                text=str(payload.get("text", "")),
-                user_id=user_id,
-                bot_id=bot_id,
-                source="user_reply",
-                author="assistant",
-                trigger=turn.trigger,
-                send_status=str(payload.get("send_status", "created")),
-                send_error=str(payload.get("send_error", "")),
-                position=int(payload.get("position", 0) or 0),
-            )
+            # Also append to in-memory context
+            conversation_ctx.add_event(role, content)
             return
 
         if event_type == "turn_finished":
             terminal = str(payload.get("terminal_state", ""))
-            successful = {TurnState.END_REPLIED.value}
-            await memory_store.finish_protocol_turn(
+            status = "completed" if terminal in {TurnState.END_REPLIED.value} else terminal
+            await memory_store.finish_turn(
                 turn_id=turn.turn_id,
-                status="completed" if terminal in successful else terminal,
-                send_status=terminal,
+                status=status,
+                token_count=turn.token_usage.get("total_tokens", 0),
+                elapsed_ms=turn.elapsed_ms,
             )
 
     return _writer
@@ -1243,64 +1128,16 @@ def _build_chatagent_post_turn_hooks(
             if (m.get("send_status") in _IS_DELIVERED
                 or m.get("delivery_status") in _IS_DELIVERED)
         )
-        diag_fallback = ",".join(
-            e.get("type", "") for e in (turn.fallback_events or [])[:3]
-        ) if turn.fallback_events else ""
         token_count = turn.token_usage.get("total_tokens", 0)
-
-        _ss_map = {
-            TurnState.END_REPLIED: "delivered",
-            TurnState.END_FAILED: "failed",
-            TurnState.END_CANCELLED: "cancelled",
-            TurnState.END_SUPERSEDED_BEFORE_SEND: "superseded_before_send",
-            TurnState.END_INTERRUPTED_DURING_REPLY_SEQUENCE: "interrupted_during_reply",
-            TurnState.END_MAX_LIMIT: "max_limit",
-            TurnState.END_PROTOCOL_ERROR: "protocol_error",
-        }
-        send_status = _ss_map.get(terminal_state, "generated")
-
-        await memory_store.record_turn_diagnostics(
-            turn_id=turn.turn_id,
-            user_id=user_id,
-            source="wechat",
-            route=route,
-            context_policy=context_policy,
-            llm_status=turn.llm_status,
-            token_count=token_count,
-            elapsed_ms=turn.elapsed_ms,
-            fallback_type=diag_fallback,
-            send_status=send_status,
-            input_chars=len(turn.user_message),
-            output_messages=delivered_count,
-            tool_calls=len(turn.tool_results),
-            metadata={
-                "terminal_state": str(terminal_state),
-                "context_sample": [],
-            },
+        logger.info(
+            "[%s] turn=%s terminal=%s delivered=%d "
+            "tool_results=%d iterations=%d elapsed_ms=%d tokens=%d",
+            user_id, turn.turn_id, terminal_state.value,
+            delivered_count, len(turn.tool_results),
+            turn.llm_call_count, turn.elapsed_ms, token_count,
         )
-        await memory_store.record_usage_event(
-            event_type="chat_turn",
-            user_id=user_id,
-            source="wechat",
-            message_count=len(raw_messages) + delivered_count,
-            token_count=token_count,
-            elapsed_ms=turn.elapsed_ms,
-            fallback_type=diag_fallback,
-            metadata={
-                "input_chars": len(turn.user_message),
-                "output_messages": delivered_count,
-                "tool_calls": len(turn.tool_results),
-                "token_estimated": bool(turn.token_usage.get("estimated")),
-                "turn_id": turn.turn_id,
-                "route": route,
-                "context_policy": context_policy,
-                "terminal_state": str(terminal_state),
-            },
-        )
-        await memory_store.update_turn_send_status(turn.turn_id, send_status)
 
     async def _hook_model_attempt_log(turn: TurnScratchpad, terminal_state: TurnState) -> None:
-        """Log all model attempts for this turn."""
         for attempt in turn.model_attempts:
             logger.info(
                 "model_attempt: index=%d model=%s/%s mode=%s reason=%s "
@@ -1316,22 +1153,9 @@ def _build_chatagent_post_turn_hooks(
                 attempt.upgraded_from,
             )
 
-    async def _hook_update_last_visible(turn: TurnScratchpad, terminal_state: TurnState) -> None:
-        """Update the last visible time for confirmed deliveries."""
-        try:
-            for vm in turn.visible_messages:
-                if vm.delivery_status == DeliveryStatus.SENT_CONFIRMED:
-                    await memory_store.update_last_visible_message_at(
-                        user_id, bot_id, vm.sent_at_timestamp or time.time(),
-                        source="assistant_sent_confirmed",
-                    )
-        except Exception:
-            logger.warning("last_visible hook failed for turn %s", turn.turn_id, exc_info=True)
-
     return [
         _hook_dev_logs,
         _hook_model_attempt_log,
-        _hook_update_last_visible,
     ]
 
 
@@ -1400,12 +1224,6 @@ async def chat(request: Request):
     )
 
     _record_user_message_arrival(user_id, seq=input_latest_seq)
-    try:
-        await memory_store.update_last_visible_message_at(
-            user_id, bot_id, time.time(), source="user_message",
-        )
-    except Exception:
-        pass
     lock = _get_user_lock(user_id)
     turn_id = ""
     send_status = ""
@@ -1413,7 +1231,15 @@ async def chat(request: Request):
         async with lock:
             route = "ordinary_chat"
             context_policy = "short_term_history"
-            history = await get_history_async(user_id, bot_id=bot_id)
+
+            # Rebuild context if user changed or first use
+            if conversation_ctx.user_id != user_id:
+                conversation_ctx.user_id = user_id
+                conversation_ctx.bot_id = bot_id
+                await memory_store.ensure_conversation(user_id, bot_id)
+                await conversation_ctx.rebuild(memory_store)
+
+            prebuilt_messages = conversation_ctx.messages
 
             system_prompt = build_system_prompt_for_turn()
 
@@ -1430,8 +1256,9 @@ async def chat(request: Request):
             )
             result: TurnResult = await chat_runtime.handle_chat(
                 user_message=user_message,
-                history=history,
+                history=prebuilt_messages,
                 system_prompt=system_prompt,
+                prebuilt_messages=prebuilt_messages,
                 trigger="user",
                 source="user_message",
                 wechat_sender=_bound_sender,
@@ -1470,30 +1297,6 @@ async def chat(request: Request):
                     user_id, context_token, bot_id=bot_id,
                 )
 
-            await memory_store.create_turn_draft(
-                turn_id=turn_id, user_id=user_id,
-                messages=result.visible_messages,
-                source="wechat", route=route,
-            )
-
-            # Mark draft / outbound status (was in post-turn hook, moved here
-            # because draft/outbound rows must exist before we can update them).
-            _term = result.terminal_state
-            was_replied = _term == TurnState.END_REPLIED
-            was_cancelled = _term == TurnState.END_CANCELLED
-            was_failed = _term in (TurnState.END_FAILED, TurnState.END_PROTOCOL_ERROR, TurnState.END_MAX_LIMIT)
-            was_interrupted = _term in (TurnState.END_SUPERSEDED_BEFORE_SEND, TurnState.END_INTERRUPTED_DURING_REPLY_SEQUENCE)
-            if was_cancelled:
-                await memory_store.mark_turn_draft_status(turn_id, "cancelled")
-            elif was_interrupted:
-                await memory_store.mark_turn_draft_status(turn_id, "interrupted")
-            elif was_replied:
-                await memory_store.mark_turn_draft_status(turn_id, "delivered")
-            elif was_failed:
-                await memory_store.mark_turn_draft_status(turn_id, "failed")
-            else:
-                await memory_store.mark_turn_draft_status(turn_id, "generated")
-
             logger.info(
                 f"[{user_id}] terminal_state={result.terminal_state} "
                 f"delivered={result.delivered_count} "
@@ -1520,12 +1323,6 @@ async def chat(request: Request):
 
     except Exception as exc:
         logger.exception(f"[{user_id}] Chat handler internal error: {exc}")
-        # Mark turn as failed so admin UI doesn't show "已生成"
-        if turn_id:
-            try:
-                await memory_store.update_turn_send_status(turn_id, "failed", error=str(exc)[:500])
-            except Exception:
-                pass
         error_turn_id = turn_id or f"error_{uuid.uuid4().hex[:8]}"
         return {
             "messages": [],
@@ -1548,29 +1345,14 @@ async def developer_forget_all(request: Request):
 async def developer_reset_context(request: Request):
     """Developer reset: clear context/test state while keeping WeChat contact state."""
     require_admin(request)
-    counts = await memory_store.clear_developer_memory_state()
+    counts = await memory_store.clear_all()
+    conversation_ctx._messages = []
     return {
         "status": "reset",
         "mode": "context_only_keep_connection",
         "cleared": counts,
         "kept": ["bot_contact_state"],
     }
-
-
-@app.get("/history/{user_id}")
-async def get_history_route(user_id: str, request: Request):
-    """Get conversation history for a user and current bot."""
-    require_admin(request)
-    history = await get_history_async(user_id, bot_id=BOT_ID)
-    return {"history": history[-20:]}  # Last 20 messages
-
-
-@app.delete("/history/{user_id}")
-async def clear_history(user_id: str, request: Request):
-    """Clear conversation history for a user and current bot."""
-    require_admin(request)
-    deleted = await memory_store.clear_protocol_history(user_id, bot_id=BOT_ID)
-    return {"status": "cleared", "deleted": deleted}
 
 
 # ================================================================
@@ -1691,28 +1473,6 @@ async def wechat_status(request: Request):
 # ================================================================
 
 
-@app.get("/admin/diagnostics")
-async def admin_diagnostics(request: Request, limit: int = 20, fallback_only: bool = False):
-    """View recent turn diagnostics."""
-    require_admin(request)
-    rows = await memory_store.get_recent_turn_diagnostics(
-        limit=limit,
-        fallback_only=fallback_only,
-    )
-    return {"diagnostics": rows}
-
-
-@app.get("/admin/drafts")
-async def admin_drafts(request: Request, status: str = "", limit: int = 20):
-    """View turn drafts."""
-    require_admin(request)
-    drafts = await memory_store.list_turn_drafts(
-        status=status or None,
-        limit=limit,
-    )
-    return {"drafts": drafts}
-
-
 @app.get("/admin/logs")
 async def admin_logs(
     request: Request,
@@ -1730,13 +1490,6 @@ async def admin_logs(
         level=level,
         contains=contains,
     )
-
-
-@app.get("/admin/events")
-async def admin_events(request: Request, limit: int = 30):
-    """Aggregated Chinese admin dashboard events for the browser UI."""
-    require_admin(request)
-    return await build_admin_event_dashboard(limit=limit)
 
 
 # ================================================================
@@ -1761,24 +1514,12 @@ async def _send_message_batch(
     ]
     if not non_empty:
         logger.warning("Empty message batch, skipping WeChat send entirely")
-        await memory_store.record_usage_event(
-            event_type="empty_message_batch",
-            user_id=user_id,
-            source="send_guard",
-            metadata={"reason": "all messages empty"},
-        )
         return
 
     guarded = guard_messages(non_empty)
 
     if not guarded:
         logger.warning("All messages filtered by guard, skipping WeChat send")
-        await memory_store.record_usage_event(
-            event_type="empty_message_batch",
-            user_id=user_id,
-            source="send_guard",
-            metadata={"reason": "all messages filtered by guard"},
-        )
         return
 
     min_gap = float(cfg.get("wechat", {}).get("message_delay", 1.2) or 1.2)
@@ -1795,35 +1536,6 @@ async def _send_message_batch(
         else:
             await asyncio.sleep(max(delay, min_gap))
         await _bridge.send_text(user_id, text, context_token)
-
-
-@app.get("/admin/outbound")
-async def admin_list_outbound(
-    request: Request,
-    turn_id: str = "",
-    status: str = "",
-    limit: int = 50,
-):
-    """List outbound messages."""
-    require_admin(request)
-    messages = await memory_store.get_outbound_messages(
-        turn_id=turn_id,
-        send_status=status or "",
-        limit=limit,
-    )
-    return {"outbound_messages": messages}
-
-
-@app.get("/admin/turns")
-async def admin_list_turns(request: Request, limit: int = 20):
-    """List recent turns for the current bot."""
-    require_admin(request)
-    contact = await memory_store.get_contact_state()
-    user_id = contact.get("user_id", "")
-    turns = await memory_store.get_recent_turns(
-        user_id, BOT_ID, limit=limit
-    )
-    return {"turns": turns}
 
 
 # ================================================================
