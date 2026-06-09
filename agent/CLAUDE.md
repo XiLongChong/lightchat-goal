@@ -5,14 +5,14 @@
 ## 文件职责
 
 ```
-chat_agent.py              — 核心对话循环：构建上下文 → LLM 调用 → 工具执行 → guard → 发送
+chat_agent.py              — 核心对话循环：委托 ContextBuilder → LLM 调用 → 工具执行 → guard → 发送
 state_machine.py           — Turn 状态类型：TurnScratchpad, TurnResult, TurnState, ModelProfile, ModelAttempt, VisibleMessage, DeliveryStatus
 llm_gateway.py             — 供应商无关的 LLM 网关：DeepSeek 适配器 + trace 回调
 llm_types.py               — LLM 请求/响应数据类：LLMRequest, LLMResponse, LLMUsage, LLMError
 providers/base.py          — ProviderAdapter 协议 + ProviderConfig
 providers/deepseek.py      — DeepSeek 适配器（通过 OpenAI SDK 调用 Anthropic 兼容端点）
-context_builder.py         — 系统 prompt 组装（persona + 全局协议）
-runtime_context_builder.py — 完整模型输入构建（persona + 历史 + 工具契约 + 时间块）
+context_builder.py         — 全局协议文案 + build_chat_system_prompt 工具函数
+runtime_context_builder.py — ContextBuilder：build_for_chat() 统一入口，收拢全部 context 构造逻辑
 tool_registry.py           — ToolDef 注册表 + native tool call spec 生成
 tool_exposure_policy.py    — 每 turn 暴露哪些工具（当前固定 3 个）
 tools.py                   — 工具实现（get_time → wttr.in, get_weather → pytz）
@@ -22,7 +22,7 @@ output_guard.py            — 输出清洗：敏感信息过滤、长度截断�
 ## 对话流程（chat_agent.chat）
 
 1. 创建 TurnScratchpad，写 protocol turn_started 事件
-2. 构建上下文（ContextBuilder.build）
+2. 构建上下文（`ContextBuilder.build_for_chat()` — 一次调用完成全部 prompt 构造）
 3. 循环（最多 MAX_LLM_STEPS_PER_TURN=20 轮）：
    - 通过 LLMGateway 调用 LLM（stream=True）
    - 累积 tool_calls，执行工具

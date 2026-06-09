@@ -6,10 +6,9 @@ import copy
 import json
 import logging
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from typing import Any, Callable, Coroutine
 
-from agent.context_builder import ORDINARY_CHAT_GLOBAL_PROTOCOL
 from agent.llm_types import LLMRequest
 from agent.output_guard import guard_single_message
 from agent.state_machine import (
@@ -29,7 +28,6 @@ from agent.state_machine import (
 )
 from agent.tool_registry import TOOL_REGISTRY
 from agent.tools import execute_tool
-from runtime_contracts import BuildContextRequest, ConversationHistoryMessage, SystemTime, TurnType
 
 logger = logging.getLogger(__name__)
 
@@ -335,64 +333,21 @@ class ChatAgent:
         system_prompt: str,
         bot_id: str,
     ) -> None:
-        prompt = system_prompt.strip() or "\n\n".join(
-            part for part in (self.persona, self.personality) if part.strip()
-        )
-        if self._context_builder is None:
-            turn.messages = [
-                {"role": "system", "content": ORDINARY_CHAT_GLOBAL_PROTOCOL},
-                {"role": "system", "content": prompt},
-                *copy.deepcopy(history),
-                {"role": "user", "content": self._channel_message(turn.user_message)},
-            ]
-            return
-
-        timezone_info = timezone(timedelta(hours=8))
-        now = datetime.now(timezone_info)
-        recent_history: list[ConversationHistoryMessage] = []
-        for item in history:
-            role = str(item.get("role", ""))
-            content = item.get("content")
-            if role not in {"user", "assistant"} or content in (None, ""):
-                continue
-            if role == "user" and isinstance(content, str):
-                content = self._channel_message(content)
-            timestamp = float(item.get("ts", 0) or 0)
-            created_at = datetime.fromtimestamp(timestamp, timezone_info) if timestamp else now
-            recent_history.append(ConversationHistoryMessage(
-                message_id=str(item.get("id", "")),
-                turn_id=str(item.get("turn_id", "")),
-                role=role,
-                content=copy.deepcopy(content),
-                source="protocol",
-                delivery_status="delivered",
-                created_at=created_at,
-            ))
-        request = BuildContextRequest(
-            turn_id=turn.turn_id,
-            call_id=f"ctx_{turn.turn_id}",
-            turn_type=TurnType.USER_CHAT,
-            user_id="default",
+        builder = self._context_builder
+        if builder is None:
+            from agent.runtime_context_builder import ContextBuilder as _CB
+            builder = _CB()
+        built = builder.build_for_chat(
+            persona=self.persona,
+            personality=self.personality,
+            history=history,
+            user_message=turn.user_message,
             bot_id=bot_id,
-            persona=prompt,
-            fixed_system_protocol=ORDINARY_CHAT_GLOBAL_PROTOCOL,
-            system_time=SystemTime(
-                dt=now,
-                timezone="Asia/Shanghai",
-                weekday_cn=["周一", "周二", "周三", "周四", "周五", "周六", "周日"][now.weekday()],
-            ),
-            recent_history=recent_history,
+            system_prompt=system_prompt,
+            turn_id=turn.turn_id,
         )
-        built = self._context_builder.build(request)
-        turn.messages = [
-            {"role": item.role, "content": copy.deepcopy(item.content)}
-            for item in built.provider_messages
-        ]
-        turn.messages.append({
-            "role": "user",
-            "content": self._channel_message(turn.user_message),
-        })
-        turn._provider_system = copy.deepcopy(built.provider_system)
+        turn.messages = built.messages
+        turn._provider_system = built.system
 
     async def _call_model(
         self,
@@ -520,9 +475,3 @@ class ChatAgent:
         if turn._protocol_event_writer is not None:
             await turn._protocol_event_writer(turn, event_type, payload)
 
-    @staticmethod
-    def _channel_message(text: str) -> str:
-        content = str(text or "").strip()
-        if content.startswith("<channel "):
-            return content
-        return f'<channel source="wechat">\n{content}\n</channel>'
