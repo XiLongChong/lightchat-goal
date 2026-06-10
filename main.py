@@ -1,6 +1,7 @@
 ﻿"""Goal text-chat agent and WeChat bridge entry point."""
 
 import asyncio
+import io
 import secrets
 import uuid
 import json
@@ -25,7 +26,7 @@ from fastapi.staticfiles import StaticFiles
 sys.path.insert(0, str(Path(__file__).parent))
 
 from agent.chat_agent import ChatAgent
-from agent.compressor import compress_conversation
+from agent.compressor import compress_conversation, maybe_compress_daily, compute_summary_date
 from agent.context_builder import build_chat_system_prompt
 from agent.llm_gateway import LLMGateway
 from agent.output_guard import guard_messages, guard_single_message
@@ -1063,39 +1064,7 @@ def _visible_messages_as_dicts(turn: TurnScratchpad) -> list[dict[str, Any]]:
     ]
 
 
-async def _maybe_compress(user_id: str, bot_id: str) -> None:
-    """Daily compression: if past 4am and not compressed today, compress now."""
-    from datetime import datetime, timedelta, timezone
-
-    tz = timezone(timedelta(hours=8))
-    now = datetime.now(tz)
-    today_4am = now.replace(hour=4, minute=0, second=0, microsecond=0)
-
-    if now < today_4am:
-        return  # Before 4am — check later
-
-    conv = await memory_store.get_conversation(user_id, bot_id)
-    last_compressed = float(conv.get("last_compressed_at", 0)) if conv else 0
-
-    if last_compressed >= today_4am.timestamp():
-        return  # Already compressed today
-
-    logger.info("[%s] Starting daily compression (last=%s, today_4am=%s)",
-                user_id, last_compressed, today_4am)
-    cid = f"{user_id}:{bot_id}"
-
-    model = cfg["model"].get("default_model") or cfg["model"]["name"]
-    ok = await compress_conversation(
-        store=memory_store,
-        gateway=llm_gateway,
-        conversation_id=cid,
-        model_name=model,
-    )
-    if ok:
-        await conversation_ctx.rebuild(memory_store)
-        logger.info("[%s] Compression complete, context rebuilt", user_id)
-    else:
-        logger.info("[%s] Compression skipped or failed", user_id)
+# Compression logic lives in agent/compressor.py (maybe_compress_daily, compress_conversation).
 
 
 def _build_protocol_event_writer(user_id: str, bot_id: str):
@@ -1113,6 +1082,8 @@ def _build_protocol_event_writer(user_id: str, bot_id: str):
                 conversation_id=cid,
                 user_message=None if user_message is None else str(user_message),
             )
+            if user_message:
+                conversation_ctx.add_event("user", str(user_message))
             return
 
         if event_type == "message":
@@ -1275,7 +1246,26 @@ async def chat(request: Request):
                 await memory_store.ensure_conversation(user_id, bot_id)
                 await conversation_ctx.rebuild(memory_store)
 
-            await _maybe_compress(user_id, bot_id)
+            # ── daily compression ──────────────────────────────────
+            conv = await memory_store.get_conversation(user_id, bot_id)
+            last_compressed = float(conv.get("last_compressed_at", 0)) if conv else 0
+            model = cfg["model"].get("default_model") or cfg["model"]["name"]
+            summary = await maybe_compress_daily(
+                messages=conversation_ctx.messages,
+                last_compressed_at=last_compressed,
+                gateway=llm_gateway,
+                model_name=model,
+            )
+            if summary:
+                conversation_ctx.replace_with_compressed(summary)
+                cid = f"{user_id}:{bot_id}"
+                await memory_store.apply_compression(cid, conversation_ctx._messages)
+                summary_date = compute_summary_date()
+                await memory_store.save_daily_summary(
+                    cid, summary_date,
+                    f"<summary>\n{summary}\n</summary>",
+                )
+                logger.info("[%s] Compression complete", user_id)
 
             prebuilt_messages = conversation_ctx.messages
 
@@ -1382,22 +1372,26 @@ async def developer_compress_now(request: Request):
     if not user_id:
         raise HTTPException(status_code=400, detail="还没有微信联系人记录")
 
-    bot_id = "default"
-    cid = f"{user_id}:{bot_id}"
+    cid = f"{user_id}:default"
     model = cfg["model"].get("default_model") or cfg["model"]["name"]
 
     logger.info("Manual compression triggered for %s", user_id)
-    ok = await compress_conversation(
-        store=memory_store,
+    summary = await compress_conversation(
+        messages=conversation_ctx.messages,
         gateway=llm_gateway,
-        conversation_id=cid,
         model_name=model,
     )
-    if ok:
-        await conversation_ctx.rebuild(memory_store)
+    if summary:
+        conversation_ctx.replace_with_compressed(summary)
+        await memory_store.apply_compression(cid, conversation_ctx._messages)
+        summary_date = compute_summary_date()
+        await memory_store.save_daily_summary(
+            cid, summary_date,
+            f"<summary>\n{summary}\n</summary>",
+        )
         return {"status": "compressed", "user_id": user_id}
     else:
-        return {"status": "skipped", "reason": "no events or no tool_result found", "user_id": user_id}
+        return {"status": "skipped", "reason": "no summary produced", "user_id": user_id}
 
 
 @app.post("/admin/dev/forget")
@@ -1410,8 +1404,7 @@ async def developer_forget_all(request: Request):
 async def developer_reset_context(request: Request):
     """Developer reset: clear context/test state while keeping WeChat contact state."""
     require_admin(request)
-    counts = await memory_store.clear_all()
-    conversation_ctx._messages = []
+    counts = await conversation_ctx.complete(memory_store)
     return {
         "status": "reset",
         "mode": "context_only_keep_connection",

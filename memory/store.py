@@ -127,6 +127,18 @@ class MemoryStore:
                 tools_json TEXT NOT NULL DEFAULT '[]',
                 created_at REAL NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS daily_summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT NOT NULL,
+                summary_date TEXT NOT NULL,
+                summary_text TEXT NOT NULL,
+                char_count INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_daily_summaries_cid_date
+                ON daily_summaries(conversation_id, summary_date);
             """
         )
 
@@ -237,25 +249,6 @@ class MemoryStore:
         )
         return dict(rows[0]) if rows else None
 
-    async def update_trim_marker(self, user_id: str, bot_id: str, marker: int) -> None:
-        async with self._write_lock:
-            db = await self._get_db()
-            await db.execute(
-                "UPDATE conversations SET trim_marker_turn=? WHERE id=?",
-                (marker, f"{user_id}:{bot_id}"),
-            )
-            await db.commit()
-
-    async def snapshot_changed(self, user_id: str, bot_id: str) -> bool:
-        """Check if current snapshot differs from stored. If yes, clear + return True."""
-        conv = await self.get_conversation(user_id, bot_id)
-        return conv is None or conv["context_snapshot_id"] != (
-            await self._get_db()
-        ).execute_fetchall(
-            "SELECT context_snapshot_id FROM conversations WHERE id=?",
-            (f"{user_id}:{bot_id}",),
-        )
-
     # ── turns ───────────────────────────────────────────────────────
 
     async def begin_turn(
@@ -354,93 +347,23 @@ class MemoryStore:
 
     # ── compress ────────────────────────────────────────────────────
 
-    async def get_all_events_for_compress(
-        self, conversation_id: str
-    ) -> list[dict[str, Any]]:
-        """Read all raw_events for compression — full history, all active states."""
-        db = await self._get_db()
-        rows = await db.execute_fetchall(
-            """SELECT re.id, re.role, re.content_json, re.turn_id, re.seq,
-                      t.turn_number
-               FROM raw_events re
-               JOIN turns t ON re.turn_id = t.id
-               WHERE t.conversation_id = ?
-               ORDER BY t.turn_number, re.seq""",
-            (conversation_id,),
-        )
-        result: list[dict[str, Any]] = []
-        for row in rows:
-            try:
-                content = json.loads(str(row["content_json"]))
-            except (TypeError, json.JSONDecodeError):
-                continue
-            result.append({
-                "id": row["id"],
-                "role": str(row["role"]),
-                "content": content,
-                "turn_id": row["turn_id"],
-                "seq": row["seq"],
-                "turn_number": row["turn_number"],
-            })
-        return result
-
     async def apply_compression(
         self,
         conversation_id: str,
-        summary_text: str,
+        compressed_messages: list[dict[str, Any]],
     ) -> bool:
-        """Soft-delete all events, append summary to last user with tool_result."""
+        """Soft-delete all events, then write the compressed message array.
+
+        *compressed_messages* is the new messages array (from
+        ConversationContext.replace_with_compressed) that replaces all
+        previous history.  Each message is written as a raw_event with
+        active=1 so rebuild restores the correct state after a restart.
+        """
+        import uuid
+
         db = await self._get_db()
         async with self._write_lock:
-            rows = await db.execute_fetchall(
-                """SELECT re.id, re.role, re.content_json, re.turn_id, re.seq,
-                          t.turn_number
-                   FROM raw_events re
-                   JOIN turns t ON re.turn_id = t.id
-                   WHERE t.conversation_id = ?
-                   ORDER BY t.turn_number, re.seq""",
-                (conversation_id,),
-            )
-
-            # Parse all rows
-            events: list[dict[str, Any]] = []
-            for row in rows:
-                try:
-                    content = json.loads(str(row["content_json"]))
-                except (TypeError, json.JSONDecodeError):
-                    continue
-                events.append({
-                    "id": row["id"],
-                    "role": str(row["role"]),
-                    "content": content,
-                })
-
-            # Find last user with tool_result
-            last_user_idx: int | None = None
-            for i, ev in enumerate(events):
-                if ev["role"] == "user" and isinstance(ev["content"], list):
-                    has_tool = any(
-                        isinstance(b, dict) and b.get("type") == "tool_result"
-                        for b in ev["content"]
-                    )
-                    if has_tool:
-                        last_user_idx = i
-
-            if last_user_idx is None:
-                return False  # Nothing to attach summary to
-
-            # Find next assistant after target user
-            next_assistant: dict[str, Any] | None = None
-            for i in range(last_user_idx + 1, len(events)):
-                if events[i]["role"] == "assistant":
-                    next_assistant = events[i]
-                    break
-            if next_assistant is None:
-                return False  # Can't maintain alternation
-
-            target = events[last_user_idx]
-
-            # Soft-delete all events
+            # 1. Soft-delete all existing events
             await db.execute(
                 """UPDATE raw_events SET active = 0
                    WHERE turn_id IN (
@@ -449,21 +372,25 @@ class MemoryStore:
                 (conversation_id,),
             )
 
-            # Append summary to target user's content
-            new_content = list(target["content"]) if isinstance(target["content"], list) else [target["content"]]
-            new_content.append({"type": "text", "text": summary_text})
+            # 2. Create a synthetic turn for the compressed state
+            turn_id = f"compressed_{uuid.uuid4().hex[:12]}"
             await db.execute(
-                "UPDATE raw_events SET content_json = ?, active = 1 WHERE id = ?",
-                (json.dumps(new_content, ensure_ascii=False), target["id"]),
+                """INSERT INTO turns(id, conversation_id, turn_number, status, created_at)
+                   VALUES(?, ?, 0, 'compressed', ?)""",
+                (turn_id, conversation_id, time.time()),
             )
 
-            # Keep next assistant active
-            await db.execute(
-                "UPDATE raw_events SET active = 1 WHERE id = ?",
-                (next_assistant["id"],),
-            )
+            # 3. Write each compressed message as a raw_event (active=1)
+            for seq, msg in enumerate(compressed_messages):
+                await db.execute(
+                    """INSERT INTO raw_events(turn_id, seq, role, content_json, active, created_at)
+                       VALUES(?, ?, ?, ?, 1, ?)""",
+                    (turn_id, seq, msg["role"],
+                     json.dumps(msg["content"], ensure_ascii=False),
+                     time.time()),
+                )
 
-            # Update last_compressed_at
+            # 4. Update last_compressed_at
             await db.execute(
                 "UPDATE conversations SET last_compressed_at = ? WHERE id = ?",
                 (time.time(), conversation_id),
@@ -472,11 +399,46 @@ class MemoryStore:
             await db.commit()
         return True
 
+    # ── daily summaries ────────────────────────────────────────────
+
+    async def save_daily_summary(
+        self,
+        conversation_id: str,
+        summary_date: str,
+        summary_text: str,
+    ) -> None:
+        """Persist a daily summary. Same date overwrites (INSERT OR REPLACE)."""
+        async with self._write_lock:
+            db = await self._get_db()
+            await db.execute(
+                """INSERT OR REPLACE INTO daily_summaries
+                       (conversation_id, summary_date, summary_text, char_count, created_at)
+                       VALUES(?, ?, ?, ?, ?)""",
+                (conversation_id, summary_date, summary_text, len(summary_text), time.time()),
+            )
+            await db.commit()
+
+    async def get_daily_summaries(
+        self,
+        conversation_id: str,
+        limit: int = 30,
+    ) -> list[dict[str, Any]]:
+        """Return daily summaries newest-first."""
+        db = await self._get_db()
+        rows = await db.execute_fetchall(
+            """SELECT * FROM daily_summaries
+               WHERE conversation_id = ?
+               ORDER BY summary_date DESC
+               LIMIT ?""",
+            (conversation_id, limit),
+        )
+        return [dict(r) for r in rows]
+
     # ── clear ───────────────────────────────────────────────────────
 
     async def clear_all(self) -> dict[str, int]:
         """Clear all data except bot_contact_state and runtime_meta."""
-        tables = ("conversations", "turns", "raw_events", "context_snapshots", "tool_versions")
+        tables = ("conversations", "turns", "raw_events", "context_snapshots", "tool_versions", "daily_summaries")
         counts: dict[str, int] = {}
         async with self._write_lock:
             db = await self._get_db()

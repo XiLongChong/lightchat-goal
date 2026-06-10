@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import copy
-import json
 import logging
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from agent.llm_types import LLMRequest
 
@@ -93,103 +93,109 @@ Output the structured summary below. The assistant will ONLY see this block — 
    ...
 </summary>"""
 
+# Compression window: 3:56 AM — 4:25 AM (29 minutes, China time)
+_WINDOW_START_OFFSET = timedelta(minutes=-4)   # 3:56 relative to 4:00
+_WINDOW_END_OFFSET = timedelta(minutes=25)      # 4:25 relative to 4:00
 
-def _build_compress_messages(events: list[dict[str, Any]]) -> str:
-    """Convert raw_events into a text transcript for compression.
+_CST = ZoneInfo("Asia/Shanghai")
 
-    Filters out old summary blocks (text starting with <analysis>) from user
-    messages to prevent error accumulation across daily compressions.
+
+def compute_summary_date() -> str:
+    """Return the date a summary belongs to.
+
+    Before 5:00 AM → previous day (covers the 3:56–4:25 compression window).
+    5:00 AM and after → same day.
     """
-    lines: list[str] = []
-    for ev in events:
-        role = str(ev.get("role", ""))
-        content = ev.get("content")
+    now = datetime.now(_CST)
+    if now.hour < 5:
+        now -= timedelta(days=1)
+    return now.strftime("%Y-%m-%d")
 
+
+def _filter_summary_blocks(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Strip <summary> text blocks from user messages to prevent re-compression."""
+    result: list[dict[str, Any]] = []
+    for msg in messages:
+        content = msg.get("content")
+        role = msg.get("role", "")
         if role == "user" and isinstance(content, list):
-            # Filter out old summary text blocks
-            clean: list[dict[str, Any]] = []
+            filtered: list[dict[str, Any]] = []
             for block in content:
                 if not isinstance(block, dict):
-                    clean.append(block)
+                    filtered.append(block)
                     continue
                 if block.get("type") == "text":
                     text = str(block.get("text", ""))
-                    if text.strip().startswith("<analysis>"):
-                        continue  # Skip old summary
-                clean.append(block)
-            content = clean
-
-        lines.append(f"[{role}] {_content_repr(content)}")
-
-    return "\n".join(lines)
-
-
-def _content_repr(content: Any) -> str:
-    """Lightweight string representation of message content for the compressor."""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for block in content:
-            if not isinstance(block, dict):
-                parts.append(str(block))
+                    if text.strip().startswith("<summary>"):
+                        continue
+                filtered.append(block)
+            if not filtered:
                 continue
-            btype = block.get("type", "")
-            if btype == "text":
-                parts.append(str(block.get("text", "")))
-            elif btype == "thinking":
-                t = str(block.get("thinking", ""))
-                if len(t) > 300:
-                    t = t[:300] + "..."
-                parts.append(f"[thinking: {t}]")
-            elif btype == "tool_use":
-                parts.append(f"[tool_use: {block.get('name', '')}]")
-            elif btype == "tool_result":
-                parts.append(f"[tool_result: {_content_repr(block.get('content', ''))}]")
-            else:
-                parts.append(str(block))
-        return " ".join(parts)
-    return str(content)
+            result.append({"role": role, "content": filtered})
+        else:
+            result.append({"role": role, "content": content})
+    return result
 
 
-def _strip_analysis(summary_text: str) -> str:
-    """Remove <analysis> block, keep only <summary> for injection."""
-    import re
-    m = re.search(r"<summary>(.*?)</summary>", summary_text, re.DOTALL)
+def _build_compression_call(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build the messages array for a compression LLM call.
+
+    1. Filter out old <summary> blocks
+    2. Append a fake user message with the compression prompt
+    """
+    msgs = _filter_summary_blocks(messages)
+    msgs.append({"role": "user", "content": COMPRESSION_PROMPT})
+    return msgs
+
+
+def _extract_summary(text: str) -> str | None:
+    """Extract the <summary> block from the model response."""
+    m = re.search(r"<summary>(.*?)</summary>", text, re.DOTALL)
     if m:
-        return m.group(1).strip()
-    # Fallback: if no tags found, use the whole thing
-    return summary_text.strip()
+        summary = m.group(1).strip()
+        if len(summary) >= 20:
+            return summary
+    return None
+
+
+def _in_compress_window(now: datetime) -> bool:
+    """Check whether *now* falls inside the daily compression window."""
+    today_4am = now.replace(hour=4, minute=0, second=0, microsecond=0)
+    return today_4am + _WINDOW_START_OFFSET <= now < today_4am + _WINDOW_END_OFFSET
 
 
 async def compress_conversation(
-    store: Any,  # MemoryStore (avoid circular import)
+    messages: list[dict[str, Any]],
     gateway: Any,  # LLMGateway
-    conversation_id: str,
     model_name: str,
     timeout_s: int = 120,
-) -> bool:
-    """Read all events, call pro model for summary, apply compression.
+) -> str | None:
+    """Call the pro model to summarise *messages*.  Returns summary text or None.
 
-    Returns True if compression was performed.
+    *messages* should be the current in-memory conversation (conversation_ctx._messages).
     """
-    events = await store.get_all_events_for_compress(conversation_id)
-    if len(events) < 2:
-        logger.info("compress: too few events (%d), skipping", len(events))
-        return False
+    if len(messages) < 4:
+        logger.info("compress: too few messages (%d), skipping", len(messages))
+        return None
 
-    transcript = _build_compress_messages(events)
+    msgs = _build_compression_call(messages)
 
     tz = timezone(timedelta(hours=8))
     now = datetime.now(tz)
-    time_hint = f"Current time: {now:%Y-%m-%d %H:%M:%S} {['周一','周二','周三','周四','周五','周六','周日'][now.weekday()]} (Asia/Shanghai)."
+    time_hint = (
+        f"Current time: {now:%Y-%m-%d %H:%M:%S} "
+        f"{['周一', '周二', '周三', '周四', '周五', '周六', '周日'][now.weekday()]} "
+        f"(Asia/Shanghai)."
+    )
 
     try:
         response = await gateway.complete(LLMRequest(
             purpose="compression",
             model=model_name,
-            messages=[{"role": "user", "content": transcript}],
-            system=[{"type": "text", "text": f"{time_hint}\n\n{COMPRESSION_PROMPT}"}],
+            messages=msgs,
+            system=[{"type": "text", "text": time_hint}],
             temperature=0.3,
             max_tokens=4096,
             timeout_s=timeout_s,
@@ -201,15 +207,37 @@ async def compress_conversation(
         ))
     except Exception:
         logger.exception("compress: LLM call failed")
-        return False
+        return None
 
     content = response.content if hasattr(response, "content") else str(response)
-    summary = _strip_analysis(str(content or "").strip())
-    if not summary or len(summary) < 20:
-        logger.warning("compress: summary too short (%d chars), discarding", len(summary))
-        return False
+    summary = _extract_summary(str(content or "").strip())
+    if not summary:
+        logger.warning("compress: no valid summary in response")
+        return None
 
-    ok = await store.apply_compression(conversation_id, summary)
-    if ok:
-        logger.info("compress: applied summary (%d chars)", len(summary))
-    return ok
+    logger.info("compress: summary extracted (%d chars)", len(summary))
+    return summary
+
+
+async def maybe_compress_daily(
+    messages: list[dict[str, Any]],
+    last_compressed_at: float,
+    gateway: Any,
+    model_name: str,
+) -> str | None:
+    """Daily compression entry point.  Returns summary text or None.
+
+    Guards: time-window check + already-compressed-today check.
+    """
+    tz = timezone(timedelta(hours=8))
+    now = datetime.now(tz)
+
+    if not _in_compress_window(now):
+        return None
+
+    today_4am = now.replace(hour=4, minute=0, second=0, microsecond=0)
+    if last_compressed_at >= today_4am.timestamp():
+        return None
+
+    logger.info("Starting daily compression (last=%s)", last_compressed_at)
+    return await compress_conversation(messages, gateway, model_name)
