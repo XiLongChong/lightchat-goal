@@ -16,7 +16,6 @@ from runtime_contracts import (
     ConversationHistoryMessage,
     DeliveryStatus,
     ProviderMessage,
-    SystemTime,
     TurnType,
 )
 
@@ -31,9 +30,20 @@ class BuiltContextForTurn:
 class ContextBuilder:
     """Single entry point for model input construction."""
 
-    def __init__(self, persona_text: str = "", protocol_dir: str = "prompts") -> None:
+    def __init__(
+        self,
+        persona_text: str = "",
+        protocol_dir: str = "prompts",
+        long_term_memory: Any | None = None,
+        idle_time_reminder_minutes: float = 10,
+    ) -> None:
         del protocol_dir
         self._persona_fallback = persona_text
+        self._long_term_memory = long_term_memory
+        self._idle_time_reminder_seconds = max(
+            float(idle_time_reminder_minutes) * 60,
+            0,
+        )
 
     # ── public API ──────────────────────────────────────────────────
 
@@ -48,7 +58,6 @@ class ContextBuilder:
             request.fixed_output_protocol,
             request.fixed_tool_protocol,
             request.persona or self._persona_fallback,
-            self._time_block(request),
             request.tool_exposure.tool_contract_block if request.tool_exposure else "",
         ):
             if str(text or "").strip():
@@ -101,9 +110,12 @@ class ContextBuilder:
         prebuilt_messages: list[dict[str, Any]] | None = None,
         user_message: str = "",
         bot_id: str = "default",
+        user_id: str = "",
         system_prompt: str = "",
         turn_id: str = "",
         tool_exposure: Any = None,
+        idle_seconds: float | None = None,
+        current_time: datetime | None = None,
     ) -> BuiltContextForTurn:
         """Build complete model input for an ordinary chat turn.
 
@@ -111,7 +123,11 @@ class ContextBuilder:
         history conversion is skipped — the messages are used directly.
         """
         timezone_info = timezone(timedelta(hours=8))
-        now = datetime.now(timezone_info)
+        now = current_time or datetime.now(timezone_info)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone_info)
+        else:
+            now = now.astimezone(timezone_info)
 
         if prebuilt_messages is not None:
             recent_history: list[ConversationHistoryMessage] = []
@@ -159,28 +175,48 @@ class ContextBuilder:
             turn_id=turn_id or f"ctx_{abs(hash(user_message))}",
             call_id=f"ctx_{turn_id or abs(hash(user_message))}",
             turn_type=TurnType.USER_CHAT,
-            user_id="default",
+            user_id=user_id or "default",
             bot_id=bot_id,
             persona=prompt,
             fixed_system_protocol=ORDINARY_CHAT_GLOBAL_PROTOCOL,
-            system_time=SystemTime(
-                dt=now,
-                timezone="Asia/Shanghai",
-                weekday_cn=["周一", "周二", "周三", "周四", "周五", "周六", "周日"][now.weekday()],
-            ),
             recent_history=recent_history,
             tool_exposure=tool_exposure,
         )
 
         built = self.build(request)
+        if self._long_term_memory is not None and user_id:
+            index_text = self._long_term_memory.read_index(user_id).strip()
+            if index_text and index_text != "# 长期记忆索引":
+                built.provider_system.append({"type": "text", "text": (
+                    "<long_term_memory_index>\n"
+                    f"{index_text}\n"
+                    "</long_term_memory_index>\n"
+                    "This index describes fallible past memory. Current explicit "
+                    "user information always has higher priority. Read a linked "
+                    "topic with the memory tool only when relevant."
+                )})
         messages: list[dict[str, Any]] = [
             {"role": item.role, "content": copy.deepcopy(item.content)}
             for item in built.provider_messages
         ]
-        messages.append({
-            "role": "user",
-            "content": self._channel_message(user_message),
-        })
+        current_block = {
+            "type": "text",
+            "text": self._channel_message(user_message),
+        }
+        current_content = [current_block]
+        time_reminder = self._time_reminder_block(now, idle_seconds)
+        if time_reminder:
+            current_content.append({
+                "type": "text",
+                "text": time_reminder,
+            })
+        if messages and self._is_summary_only_user_message(messages[-1]):
+            messages[-1]["content"].extend(current_content)
+        else:
+            messages.append({
+                "role": "user",
+                "content": current_content,
+            })
 
         return BuiltContextForTurn(
             messages=messages,
@@ -189,6 +225,19 @@ class ContextBuilder:
         )
 
     # ── internal helpers ────────────────────────────────────────────
+
+    @staticmethod
+    def _is_summary_only_user_message(msg: dict[str, Any]) -> bool:
+        """True if *msg* is a user message whose sole content is a <summary> block."""
+        if msg.get("role") != "user":
+            return False
+        content = msg.get("content")
+        if not isinstance(content, list) or len(content) != 1:
+            return False
+        block = content[0]
+        if not isinstance(block, dict) or block.get("type") != "text":
+            return False
+        return str(block.get("text", "")).lstrip().startswith("<summary>")
 
     @staticmethod
     def _channel_message(text: str) -> str:
@@ -210,12 +259,33 @@ class ContextBuilder:
                 missing_fields=missing,
             )
 
-    @staticmethod
-    def _time_block(request: BuildContextRequest) -> str:
-        if request.system_time is None:
+    def _time_reminder_block(
+        self,
+        now: datetime,
+        idle_seconds: float | None,
+    ) -> str:
+        if idle_seconds is None or idle_seconds <= self._idle_time_reminder_seconds:
             return ""
-        value = request.system_time
+        elapsed = self._format_elapsed(idle_seconds)
         return (
-            f"Current time: {value.dt:%Y-%m-%d %H:%M:%S} "
-            f"{value.weekday_cn} ({value.timezone})."
+            "<system-reminder>\n"
+            f"Current time: {now:%Y-%m-%d %H:%M:%S} {now:%A}. "
+            f"The previous conversation was {elapsed} ago. "
+            "This is a system reminder. Use this information when relevant; "
+            "otherwise ignore it.\n"
+            "</system-reminder>"
         )
+
+    @staticmethod
+    def _format_elapsed(idle_seconds: float) -> str:
+        total_minutes = max(int(idle_seconds // 60), 1)
+        days, remaining_minutes = divmod(total_minutes, 24 * 60)
+        hours, minutes = divmod(remaining_minutes, 60)
+        parts: list[str] = []
+        if days:
+            parts.append(f"{days} day{'s' if days != 1 else ''}")
+        if hours:
+            parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+        if minutes and not days:
+            parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+        return " ".join(parts)

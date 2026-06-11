@@ -37,6 +37,7 @@ from agent.tools import configure_runtime, configure_tools
 from bridge.wechat_poller import WeChatBridge
 from memory.conversation import ConversationContext
 from memory.store import MemoryStore
+from memory.long_term import LongTermMemoryService
 from runtime.chat_runtime import ChatRuntime, create_chat_runtime
 
 # ================================================================
@@ -225,7 +226,12 @@ temperature = cfg["model"].get("temperature", 0.7)
 memory_store = MemoryStore(
     db_path=cfg.get("storage", {}).get("db_path", "./data/memory.db"),
 )
-configure_runtime(memory_store=memory_store)
+long_term_memory = LongTermMemoryService(
+    cfg.get("storage", {}).get(
+        "long_term_memory_dir", "./data/long_term_memory"
+    )
+)
+configure_runtime(memory_store=memory_store, long_term_memory=long_term_memory)
 
 conversation_ctx = ConversationContext(user_id="", bot_id=BOT_ID)
 
@@ -266,6 +272,10 @@ _tool_exposure_policy = ToolExposurePolicy()
 
 _context_builder = ContextBuilder(
     persona_text=f"{_read_persona()}\n\n{_read_personality()}",
+    long_term_memory=long_term_memory,
+    idle_time_reminder_minutes=float(
+        cfg.get("conversation", {}).get("idle_time_reminder_minutes", 10) or 10
+    ),
 )
 
 chat_agent = ChatAgent(
@@ -291,6 +301,9 @@ chat_agent = ChatAgent(
     max_flash_upgrade_attempts=_max_upgrade,
     tool_exposure_policy=_tool_exposure_policy,
     context_builder=_context_builder,
+    context_window_tokens=int(
+        cfg.get("model", {}).get("context_window_tokens", 1_000_000) or 1_000_000
+    ),
 )
 
 chat_runtime = create_chat_runtime(
@@ -309,12 +322,16 @@ def build_system_prompt_for_turn() -> str:
     persona = _read_persona()
     personality = _read_personality()
     default_city = cfg.get("weather", {}).get("default_city", "")
-    tool_names = ["send_text_message", "get_time", "get_weather"]
+    tool_names = ["send_text_message", "get_time", "get_weather", "memory"]
     return build_chat_system_prompt(
         persona=persona,
         personality=personality,
         tool_names=tool_names,
     )
+
+
+_wechat_send_locks: dict[str, asyncio.Lock] = {}
+_wechat_last_send_at: dict[str, float] = {}
 
 
 async def wechat_sender(user_id: str, context_token: str, messages: list[dict]) -> list[dict]:
@@ -338,32 +355,34 @@ async def wechat_sender(user_id: str, context_token: str, messages: list[dict]) 
     min_gap = float(wechat_cfg.get("message_delay", 0.8) or 0.8)
     max_reply_delay = float(wechat_cfg.get("max_reply_delay", 3.0) or 3.0)
 
-    for i, m in enumerate(messages):
-        text = str(m.get("text", "")).strip()
-        if not text:
-            m["send_status"] = "blocked"
-            m["send_error"] = "empty text"
-            continue
+    lock = _wechat_send_locks.setdefault(user_id, asyncio.Lock())
+    async with lock:
+        for i, m in enumerate(messages):
+            text = str(m.get("text", "")).strip()
+            if not text:
+                m["send_status"] = "blocked"
+                m["send_error"] = "empty text"
+                continue
 
-        delay = max(0.0, float(m.get("delay", 0) or 0))
-        if max_reply_delay:
-            delay = min(delay, max_reply_delay)
+            delay = max(0.0, float(m.get("delay", 0) or 0))
+            if max_reply_delay:
+                delay = min(delay, max_reply_delay)
 
-        try:
-            if i == 0:
-                await asyncio.sleep(max(delay, 0))
-            else:
-                await asyncio.sleep(max(delay, min_gap))
-            await _bridge.send_text(user_id, text, context_token)
-            m["send_status"] = "delivered"
-        except Exception as e:
-            logger.error(f"wechat_sender: failed to send message[{i}]: {e}")
-            err_msg = str(e)[:200]
-            if "请稍后再试" in err_msg or "rate" in err_msg.lower():
-                m["send_status"] = "rate_limited"
-            else:
-                m["send_status"] = "failed"
-            m["send_error"] = err_msg
+            try:
+                elapsed = time.monotonic() - _wechat_last_send_at.get(user_id, 0.0)
+                gap_delay = max(min_gap - elapsed, 0.0)
+                await asyncio.sleep(max(delay, gap_delay))
+                await _bridge.send_text(user_id, text, context_token)
+                _wechat_last_send_at[user_id] = time.monotonic()
+                m["send_status"] = "delivered"
+            except Exception as e:
+                logger.error(f"wechat_sender: failed to send message[{i}]: {e}")
+                err_msg = str(e)[:200]
+                if "请稍后再试" in err_msg or "rate" in err_msg.lower():
+                    m["send_status"] = "rate_limited"
+                else:
+                    m["send_status"] = "failed"
+                m["send_error"] = err_msg
 
     return messages
 
@@ -700,7 +719,7 @@ def apply_runtime_settings(updates: dict):
     save_runtime_settings(runtime_settings)
     _deep_update(cfg, updates)
     configure_tools(cfg)
-    configure_runtime(memory_store=memory_store)
+    configure_runtime(memory_store=memory_store, long_term_memory=long_term_memory)
     chat_agent.defaults = {
         "default_city": cfg.get("weather", {}).get("default_city", "")
     }
@@ -842,6 +861,16 @@ async def lifespan(app: FastAPI):
     del app
     logger.info(f"Starting Goal Chat Agent (model={model_name})")
     _startup_validate()
+    contact = await memory_store.get_contact_state()
+    startup_user_id = str(contact.get("user_id", "") or "").strip()
+    if startup_user_id:
+        diagnostic = long_term_memory.diagnostics(startup_user_id)
+        for warning in diagnostic["warnings"]:
+            logger.warning(
+                "long-term memory diagnostic code=%s message=%s",
+                warning.get("code"),
+                warning.get("message"),
+            )
     if _bridge is not None and _bridge.token:
         await _bridge.start()
     yield
@@ -957,6 +986,38 @@ async def admin_config(request: Request):
     }
 
 
+@app.get("/admin/context-usage")
+async def admin_context_usage(request: Request):
+    require_admin(request)
+    contact = await memory_store.get_contact_state()
+    user_id = str(contact.get("user_id", "") or "").strip()
+    bot_id = str(contact.get("bot_id", "") or BOT_ID).strip() or BOT_ID
+    if not user_id:
+        return {"available": False}
+
+    usage = await memory_store.get_latest_context_usage(user_id, bot_id)
+    if not usage:
+        return {"available": False}
+
+    prompt_tokens_peak = int(usage.get("prompt_tokens_peak", 0) or 0)
+    context_window_tokens = int(usage.get("context_window_tokens", 0) or 0)
+    if prompt_tokens_peak <= 0 or context_window_tokens <= 0:
+        return {"available": False}
+
+    usage_ratio = prompt_tokens_peak / context_window_tokens
+    return {
+        "available": True,
+        "turn_id": str(usage.get("turn_id", "")),
+        "model": str(usage.get("model_name", "")),
+        "prompt_tokens_peak": prompt_tokens_peak,
+        "context_window_tokens": context_window_tokens,
+        "usage_ratio": usage_ratio,
+        "usage_percent": usage_ratio * 100,
+        "estimated": bool(usage.get("usage_estimated", False)),
+        "measured_at": float(usage.get("completed_at", 0) or 0),
+    }
+
+
 @app.post("/admin/persona")
 async def admin_save_persona(request: Request):
     require_admin(request)
@@ -1067,6 +1128,87 @@ def _visible_messages_as_dicts(turn: TurnScratchpad) -> list[dict[str, Any]]:
 # Compression logic lives in agent/compressor.py (maybe_compress_daily, compress_conversation).
 
 
+async def _run_compression(
+    user_id: str,
+    bot_id: str,
+    *,
+    force: bool,
+) -> dict[str, Any]:
+    cid = f"{user_id}:{bot_id}"
+    model = cfg["model"].get("default_model") or cfg["model"]["name"]
+    memory_context = long_term_memory.all_indexed_content(user_id)
+    if force:
+        result = await compress_conversation(
+            messages=conversation_ctx.messages,
+            gateway=llm_gateway,
+            model_name=model,
+            memory_context=memory_context,
+        )
+    else:
+        conv = await memory_store.get_conversation(user_id, bot_id)
+        last_compressed = float(conv.get("last_compressed_at", 0)) if conv else 0
+        result = await maybe_compress_daily(
+            messages=conversation_ctx.messages,
+            last_compressed_at=last_compressed,
+            gateway=llm_gateway,
+            model_name=model,
+            memory_context=memory_context,
+        )
+    if result is None:
+        return {"status": "skipped", "reason": "no valid compression result"}
+
+    receipt = None
+    try:
+        receipt = await long_term_memory.apply_batch(
+            user_id, result.memory_operations
+        )
+        compressed_messages = [{
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": f"<summary>\n{result.summary}\n</summary>",
+            }],
+        }]
+        summary_date = compute_summary_date()
+        summary_text = f"<summary>\n{result.summary}\n</summary>"
+        await memory_store.commit_compression(
+            cid,
+            compressed_messages,
+            summary_date,
+            summary_text,
+        )
+    except Exception:
+        if receipt is not None:
+            await receipt.rollback()
+        logger.exception(
+            "Compression commit failed user=%s memory_operations=%d",
+            long_term_memory.user_key(user_id)[:12],
+            len(result.memory_operations),
+        )
+        raise
+    receipt.finalize()
+    conversation_ctx.replace_with_compressed(result.summary)
+    safe_user = long_term_memory.user_key(user_id)[:12]
+    for operation in result.memory_operations:
+        logger.info(
+            "memory operation source=compact user=%s command=%s path=%s ok=true code=memory_ok",
+            safe_user,
+            operation.command,
+            operation.path,
+        )
+    logger.info(
+        "[%s] Compression complete memory_operations=%d",
+        safe_user,
+        len(result.memory_operations),
+    )
+    return {
+        "status": "compressed",
+        "user_id": user_id,
+        "summary_date": summary_date,
+        "memory_operations": len(result.memory_operations),
+    }
+
+
 def _build_protocol_event_writer(user_id: str, bot_id: str):
     """Persist raw events incrementally and update ConversationContext."""
     async def _writer(
@@ -1108,6 +1250,10 @@ def _build_protocol_event_writer(user_id: str, bot_id: str):
                 status=status,
                 token_count=turn.token_usage.get("total_tokens", 0),
                 elapsed_ms=turn.elapsed_ms,
+                prompt_tokens_peak=turn.token_usage.get("peak_prompt_tokens", 0),
+                context_window_tokens=turn.context_window_tokens,
+                model_name=turn.model_name,
+                usage_estimated=bool(turn.token_usage.get("estimated", False)),
             )
 
     return _writer
@@ -1247,29 +1393,20 @@ async def chat(request: Request):
                 await conversation_ctx.rebuild(memory_store)
 
             # ── daily compression ──────────────────────────────────
-            conv = await memory_store.get_conversation(user_id, bot_id)
-            last_compressed = float(conv.get("last_compressed_at", 0)) if conv else 0
-            model = cfg["model"].get("default_model") or cfg["model"]["name"]
-            summary = await maybe_compress_daily(
-                messages=conversation_ctx.messages,
-                last_compressed_at=last_compressed,
-                gateway=llm_gateway,
-                model_name=model,
-            )
-            if summary:
-                conversation_ctx.replace_with_compressed(summary)
-                cid = f"{user_id}:{bot_id}"
-                await memory_store.apply_compression(cid, conversation_ctx._messages)
-                summary_date = compute_summary_date()
-                await memory_store.save_daily_summary(
-                    cid, summary_date,
-                    f"<summary>\n{summary}\n</summary>",
-                )
-                logger.info("[%s] Compression complete", user_id)
+            await _run_compression(user_id, bot_id, force=False)
 
             prebuilt_messages = conversation_ctx.messages
 
             system_prompt = build_system_prompt_for_turn()
+            previous_user_turn_at = await memory_store.get_latest_user_turn_created_at(
+                user_id,
+                bot_id,
+            )
+            idle_seconds = (
+                max(time.time() - previous_user_turn_at, 0.0)
+                if previous_user_turn_at is not None
+                else None
+            )
 
             async def _bound_sender(messages: list[dict]) -> list[dict]:
                 return await wechat_sender(user_id, context_token, messages)
@@ -1284,6 +1421,8 @@ async def chat(request: Request):
             )
             result: TurnResult = await chat_runtime.handle_chat(
                 user_message=user_message,
+                user_id=user_id,
+                bot_id=bot_id,
                 history=prebuilt_messages,
                 system_prompt=system_prompt,
                 prebuilt_messages=prebuilt_messages,
@@ -1297,6 +1436,7 @@ async def chat(request: Request):
                 interrupt_checker=interrupt_checker,
                 post_turn_hooks=_hook_cbs,
                 protocol_event_writer=_build_protocol_event_writer(user_id, bot_id),
+                idle_seconds=idle_seconds,
             )
 
             turn_id = result.turn_id
@@ -1372,26 +1512,10 @@ async def developer_compress_now(request: Request):
     if not user_id:
         raise HTTPException(status_code=400, detail="还没有微信联系人记录")
 
-    cid = f"{user_id}:default"
-    model = cfg["model"].get("default_model") or cfg["model"]["name"]
-
     logger.info("Manual compression triggered for %s", user_id)
-    summary = await compress_conversation(
-        messages=conversation_ctx.messages,
-        gateway=llm_gateway,
-        model_name=model,
-    )
-    if summary:
-        conversation_ctx.replace_with_compressed(summary)
-        await memory_store.apply_compression(cid, conversation_ctx._messages)
-        summary_date = compute_summary_date()
-        await memory_store.save_daily_summary(
-            cid, summary_date,
-            f"<summary>\n{summary}\n</summary>",
-        )
-        return {"status": "compressed", "user_id": user_id}
-    else:
-        return {"status": "skipped", "reason": "no summary produced", "user_id": user_id}
+    lock = _get_user_lock(user_id)
+    async with lock:
+        return await _run_compression(user_id, "default", force=True)
 
 
 @app.post("/admin/dev/forget")
@@ -1402,15 +1526,110 @@ async def developer_forget_all(request: Request):
 
 @app.post("/admin/dev/reset-context")
 async def developer_reset_context(request: Request):
-    """Developer reset: clear context/test state while keeping WeChat contact state."""
+    """Clear conversation and long-term memory while keeping WeChat contact."""
     require_admin(request)
-    counts = await conversation_ctx.complete(memory_store)
+    contact = await memory_store.get_contact_state()
+    user_id = str(contact.get("user_id", "") or "").strip()
+    if not user_id:
+        counts = await conversation_ctx.complete(memory_store)
+        return {
+            "status": "reset",
+            "mode": "all_memory_keep_connection",
+            "cleared": counts,
+            "long_term_memory": {"files": 0},
+            "kept": ["bot_contact_state"],
+        }
+    lock = _get_user_lock(user_id)
+    async with lock:
+        clear_receipt = await long_term_memory.stage_clear(user_id)
+        try:
+            counts = await conversation_ctx.complete(memory_store)
+        except Exception:
+            await clear_receipt.rollback()
+            raise
+        try:
+            clear_receipt.finalize()
+        except Exception:
+            logger.exception("Failed to finalize long-term memory clear for %s", user_id)
+            raise HTTPException(
+                status_code=500,
+                detail="对话已清除，但长期记忆备份清理失败，请检查日志",
+            )
+        logger.info(
+            "memory clear source=admin user=%s files=%d ok=true",
+            long_term_memory.user_key(user_id)[:12],
+            clear_receipt.removed_files,
+        )
     return {
         "status": "reset",
-        "mode": "context_only_keep_connection",
+        "mode": "all_memory_keep_connection",
         "cleared": counts,
+        "long_term_memory": {"files": clear_receipt.removed_files},
         "kept": ["bot_contact_state"],
     }
+
+
+@app.get("/admin/memories")
+async def admin_list_memories(request: Request):
+    require_admin(request)
+    contact = await memory_store.get_contact_state()
+    user_id = str(contact.get("user_id", "") or "").strip()
+    if not user_id:
+        raise HTTPException(status_code=400, detail="还没有微信联系人记录")
+    lock = _get_user_lock(user_id)
+    async with lock:
+        result = long_term_memory.diagnostics(user_id)
+    return {
+        "user_id": user_id,
+        "entries": result["entries"],
+        "warnings": result["warnings"],
+    }
+
+
+@app.get("/admin/memories/{filename}")
+async def admin_get_memory(filename: str, request: Request):
+    require_admin(request)
+    contact = await memory_store.get_contact_state()
+    user_id = str(contact.get("user_id", "") or "").strip()
+    if not user_id:
+        raise HTTPException(status_code=400, detail="还没有微信联系人记录")
+    lock = _get_user_lock(user_id)
+    async with lock:
+        try:
+            result = long_term_memory.view(user_id, filename)
+        except Exception as exc:
+            from memory.long_term import LongTermMemoryError
+            if isinstance(exc, LongTermMemoryError):
+                raise HTTPException(status_code=404, detail=exc.message) from exc
+            raise
+    return result
+
+
+@app.delete("/admin/memories/{filename}")
+async def admin_delete_memory(filename: str, request: Request):
+    require_admin(request)
+    contact = await memory_store.get_contact_state()
+    user_id = str(contact.get("user_id", "") or "").strip()
+    if not user_id:
+        raise HTTPException(status_code=400, detail="还没有微信联系人记录")
+    lock = _get_user_lock(user_id)
+    async with lock:
+        try:
+            result = await long_term_memory.delete_for_admin(user_id, filename)
+        except Exception as exc:
+            from memory.long_term import LongTermMemoryError
+            if isinstance(exc, LongTermMemoryError):
+                status = 404 if exc.code == "memory_not_found" else 400
+                raise HTTPException(status_code=status, detail=exc.message) from exc
+            raise
+    logger.info(
+        "memory admin delete user=%s path=%s code=%s bytes=%s",
+        long_term_memory.user_key(user_id)[:12],
+        filename,
+        result.get("code"),
+        result.get("bytes", 0),
+    )
+    return result
 
 
 # ================================================================

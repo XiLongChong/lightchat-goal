@@ -88,6 +88,14 @@ def _assistant_parts(response: Any, calls: list[Any]) -> list[dict[str, Any]]:
 def _merge_usage(target: dict[str, int], usage: Any) -> None:
     if not usage:
         return
+    prompt_tokens = getattr(usage, "prompt_tokens", None)
+    if prompt_tokens is None and isinstance(usage, dict):
+        prompt_tokens = usage.get("prompt_tokens")
+    if prompt_tokens is not None:
+        target["peak_prompt_tokens"] = max(
+            int(target.get("peak_prompt_tokens", 0)),
+            int(prompt_tokens),
+        )
     for key in (
         "prompt_tokens",
         "completion_tokens",
@@ -101,6 +109,11 @@ def _merge_usage(target: dict[str, int], usage: Any) -> None:
             value = usage.get(key)
         if value is not None:
             target[key] = int(target.get(key, 0)) + int(value)
+    estimated = getattr(usage, "estimated", None)
+    if estimated is None and isinstance(usage, dict):
+        estimated = usage.get("estimated")
+    if estimated is not None:
+        target["estimated"] = bool(target.get("estimated", False) or estimated)
 
 
 class ChatAgent:
@@ -126,6 +139,7 @@ class ChatAgent:
         post_turn_hooks: list[PostTerminalCallback] | None = None,
         tool_exposure_policy: Any = None,
         context_builder: Any = None,
+        context_window_tokens: int = 1_000_000,
     ) -> None:
         del json_output_enabled, flash_profile, manual_flash_allow_upgrade, max_flash_upgrade_attempts
         self.model = model
@@ -147,6 +161,7 @@ class ChatAgent:
         self._post_turn_hooks = list(post_turn_hooks or [])
         self._tool_exposure_policy = tool_exposure_policy
         self._context_builder = context_builder
+        self._context_window_tokens = max(int(context_window_tokens), 0)
 
     async def chat(
         self,
@@ -157,6 +172,7 @@ class ChatAgent:
         route: str = "",
         context_policy: str = "",
         bot_id: str = "default",
+        user_id: str = "",
         system_prompt: str = "",
         wechat_sender: WeChatSender | None = None,
         source: str = SOURCE_USER_MESSAGE,
@@ -169,6 +185,7 @@ class ChatAgent:
         write_model_history: PostTerminalCallback | None = None,
         post_turn_hooks: list[PostTerminalCallback] | None = None,
         protocol_event_writer: ProtocolEventWriter | None = None,
+        idle_seconds: float | None = None,
         **unused: Any,
     ) -> TurnResult:
         prebuilt_messages = unused.get("prebuilt_messages") if unused else None
@@ -194,12 +211,13 @@ class ChatAgent:
             "user_message": turn.user_message,
             "bot_id": bot_id,
         })
-        self._build_context(turn, history, system_prompt, bot_id,
-                           prebuilt_messages=prebuilt_messages)
+        self._build_context(turn, history, system_prompt, bot_id, user_id,
+                           prebuilt_messages=prebuilt_messages,
+                           idle_seconds=idle_seconds)
 
         allowed = native_allowed_tools_override or self.native_allowed_tools
         allowed = [
-            name for name in ("send_text_message", "get_time", "get_weather")
+            name for name in ("send_text_message", "get_time", "get_weather", "memory")
             if name in allowed
         ]
         tools = TOOL_REGISTRY.get_native_tool_specs(allowed_names=allowed)
@@ -265,7 +283,14 @@ class ChatAgent:
                 elif name == "send_text_message":
                     result = await self._send_text(turn, call, wechat_sender)
                 else:
-                    result = await execute_tool(name, _tool_arguments(call), bot_id=bot_id)
+                    result = await execute_tool(
+                        name,
+                        _tool_arguments(call),
+                        bot_id=bot_id,
+                        user_id=user_id,
+                        turn_id=turn.turn_id,
+                        call_id=call_id,
+                    )
                 record = {
                     "tool_name": name,
                     "tool_call_id": call_id,
@@ -334,8 +359,10 @@ class ChatAgent:
         history: list[dict[str, Any]],
         system_prompt: str,
         bot_id: str,
+        user_id: str,
         *,
         prebuilt_messages: list[dict[str, Any]] | None = None,
+        idle_seconds: float | None = None,
     ) -> None:
         builder = self._context_builder
         if builder is None:
@@ -348,8 +375,10 @@ class ChatAgent:
             prebuilt_messages=prebuilt_messages,
             user_message=turn.user_message,
             bot_id=bot_id,
+            user_id=user_id,
             system_prompt=system_prompt,
             turn_id=turn.turn_id,
+            idle_seconds=idle_seconds,
         )
         turn.messages = built.messages
         turn._provider_system = built.system
@@ -360,6 +389,8 @@ class ChatAgent:
         tools: list[dict[str, Any]],
     ) -> Any | None:
         turn.llm_call_count += 1
+        turn.context_window_tokens = self._context_window_tokens
+        turn.model_name = self._profile.model_name
         started = time.time()
         attempt = ModelAttempt(
             attempt_index=turn.llm_call_count,
@@ -479,4 +510,3 @@ class ChatAgent:
     ) -> None:
         if turn._protocol_event_writer is not None:
             await turn._protocol_event_writer(turn, event_type, payload)
-

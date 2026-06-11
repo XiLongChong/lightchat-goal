@@ -129,6 +129,47 @@ TOOL_REGISTRY.register(ToolDef(
     },
 ))
 
+TOOL_REGISTRY.register(ToolDef(
+    name="memory",
+    description=(
+        "Read and maintain persistent long-term memory files for the current user. "
+        "Use view to inspect MEMORY.md or a relevant topic file. Use create or "
+        "str_replace only when the user explicitly asks you to remember something. "
+        "MEMORY.md is a concise index and must be updated when a topic file is "
+        "created or its summary changes. Topic files must start with a Markdown "
+        "title and include 更新时间：YYYY-MM-DD. Current conversation facts override old "
+        "memory. Deletion is not available."
+    ),
+    args_schema={
+        "properties": {
+            "command": {
+                "type": "string",
+                "enum": ["view", "create", "str_replace"],
+                "description": "Memory file operation.",
+            },
+            "path": {
+                "type": "string",
+                "description": "MEMORY.md or a lowercase kebab-case Markdown filename.",
+            },
+            "file_text": {
+                "type": "string",
+                "description": "Complete initial content. Required for create.",
+            },
+            "old_str": {
+                "type": "string",
+                "description": "Exact unique text to replace. Required for str_replace.",
+            },
+            "new_str": {
+                "type": "string",
+                "description": "Replacement text. Required for str_replace.",
+            },
+        },
+        "required": ["command", "path"],
+    },
+    side_effect_level="high",
+    tool_category="memory_tool",
+))
+
 
 def get_all_tool_names() -> frozenset[str]:
     return TOOL_REGISTRY.names()

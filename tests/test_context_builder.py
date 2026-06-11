@@ -4,11 +4,12 @@ channel wrapping, and edge cases (empty history, missing persona, etc.)."""
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from agent.runtime_context_builder import ContextBuilder
+from memory.long_term import LongTermMemoryService
 from runtime_contracts import (
     BuildContextRequest,
     BuiltContext,
@@ -58,13 +59,13 @@ def _make_history_message(role, content, delivery_status="delivered"):
 # ── System prompt assembly ────────────────────────────────────────────
 
 class TestSystemPromptAssembly:
-    def test_includes_fixed_protocol_persona_and_time(self):
+    def test_includes_fixed_protocol_and_persona_without_time(self):
         built = ContextBuilder().build(_make_request())
 
         texts = [part["text"] for part in built.provider_system]
         assert texts[0] == "test protocol"
         assert texts[1] == "test persona"
-        assert texts[2] == "Current time: 2026-06-09 12:00:00 周二 (UTC)."
+        assert len(texts) == 2
 
     def test_persona_fallback_when_request_persona_empty(self):
         builder = ContextBuilder(persona_text="fallback persona")
@@ -87,13 +88,11 @@ class TestSystemPromptAssembly:
             fixed_system_protocol="",
         ))
 
-        # Only time block should remain (persona empty, protocol empty)
         texts = [part["text"] for part in built.provider_system]
-        assert len(texts) == 1
-        assert "Current time:" in texts[0]
+        assert texts == []
 
-    def test_time_block_absent_when_system_time_none(self):
-        built = ContextBuilder().build(_make_request(system_time=None))
+    def test_time_is_never_added_to_top_level_system(self):
+        built = ContextBuilder().build(_make_request())
 
         texts = [part["text"] for part in built.provider_system]
         assert not any("Current time:" in t for t in texts)
@@ -273,7 +272,6 @@ class TestRegressionAnchors:
         assert system_texts == [
             "PROTOCOL v1",
             "You are helpful.",
-            "Current time: 2026-01-15 08:30:00 周四 (Asia/Shanghai).",
         ]
 
         # Messages (history only, current user message NOT added by builder)
@@ -297,12 +295,105 @@ class TestRegressionAnchors:
         ))
 
         texts = [p["text"] for p in built.provider_system]
-        # Order: protocol → output → tool → persona → time → tool_contract
+        # Order: protocol → output → tool → persona → tool_contract
         assert texts == [
             "test protocol",       # fixed_system_protocol
             "OUTPUT_PROTOCOL",     # fixed_output_protocol
             "TOOL_PROTOCOL",       # fixed_tool_protocol
             "test persona",        # persona
-            "Current time: 2026-06-09 12:00:00 周二 (UTC).",  # time_block
             "TOOL_CONTRACT",       # tool_contract_block
         ]
+
+
+class TestIdleTimeReminder:
+    NOW = datetime(2026, 6, 11, 20, 4, tzinfo=timezone.utc)
+
+    def test_does_not_inject_without_previous_conversation(self):
+        built = ContextBuilder().build_for_chat(
+            user_message="你好",
+            idle_seconds=None,
+            current_time=self.NOW,
+        )
+
+        assert len(built.messages[-1]["content"]) == 1
+        assert built.messages[-1]["content"][0]["text"].startswith("<channel ")
+
+    def test_does_not_inject_at_ten_minute_threshold(self):
+        built = ContextBuilder().build_for_chat(
+            user_message="你好",
+            idle_seconds=600,
+            current_time=self.NOW,
+        )
+
+        assert len(built.messages[-1]["content"]) == 1
+
+    def test_injects_english_reminder_after_channel_when_idle(self):
+        shanghai_now = datetime(
+            2026, 6, 11, 20, 4, tzinfo=timezone(timedelta(hours=8))
+        )
+        built = ContextBuilder().build_for_chat(
+            user_message="你好",
+            idle_seconds=12 * 60,
+            current_time=shanghai_now,
+        )
+
+        content = built.messages[-1]["content"]
+        assert len(content) == 2
+        assert content[0]["text"] == '<channel source="wechat">\n你好\n</channel>'
+        reminder = content[1]["text"]
+        assert reminder.startswith("<system-reminder>\nCurrent time: ")
+        assert "Thursday" in reminder
+        assert "The previous conversation was 12 minutes ago." in reminder
+        assert "Use this information when relevant; otherwise ignore it." in reminder
+        assert "Asia/Shanghai" not in reminder
+        assert "周四" not in reminder
+
+    def test_summary_order_is_summary_channel_then_reminder(self):
+        built = ContextBuilder().build_for_chat(
+            prebuilt_messages=[{
+                "role": "user",
+                "content": [{"type": "text", "text": "<summary>\nold\n</summary>"}],
+            }],
+            user_message="继续",
+            idle_seconds=3600,
+            current_time=self.NOW,
+        )
+
+        content = built.messages[-1]["content"]
+        assert content[0]["text"].startswith("<summary>")
+        assert content[1]["text"].startswith("<channel ")
+        assert content[2]["text"].startswith("<system-reminder>")
+
+
+def test_long_term_memory_index_is_loaded_each_turn(tmp_path):
+    service = LongTermMemoryService(tmp_path)
+    service.ensure_user("user-a").joinpath("MEMORY.md").write_text(
+        "# 长期记忆索引\n\n- [背景](user-background.md) - 用户的稳定背景\n",
+        encoding="utf-8",
+    )
+    builder = ContextBuilder(long_term_memory=service)
+    first = builder.build_for_chat(
+        user_message="你好", user_id="user-a", turn_id="turn-1"
+    )
+    assert any(
+        "<long_term_memory_index>" in block["text"] for block in first.system
+    )
+
+    service.ensure_user("user-a").joinpath("MEMORY.md").write_text(
+        "# 长期记忆索引\n\n- [背景](user-background.md) - 已更新的背景\n",
+        encoding="utf-8",
+    )
+    second = builder.build_for_chat(
+        user_message="继续", user_id="user-a", turn_id="turn-2"
+    )
+    assert any("已更新的背景" in block["text"] for block in second.system)
+
+
+def test_empty_long_term_memory_index_is_not_injected(tmp_path):
+    builder = ContextBuilder(long_term_memory=LongTermMemoryService(tmp_path))
+    built = builder.build_for_chat(
+        user_message="你好", user_id="user-a", turn_id="turn-1"
+    )
+    assert not any(
+        "<long_term_memory_index>" in block["text"] for block in built.system
+    )

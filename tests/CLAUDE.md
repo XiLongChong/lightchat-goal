@@ -24,7 +24,10 @@ test_output_guard.py        — output_guard 消息过滤测试
 test_tools.py               — 工具执行测试（get_time, get_weather）
 test_wechat_bridge.py       — 微信桥接测试
 test_llm_gateway.py         — LLM 网关测试
-test_admin_events.py        — 管理后台事件仪表板测试
+test_context_builder.py     — ContextBuilder 组装与校验测试
+test_compressor.py           — 每日对话压缩测试（31 个）
+test_long_term_memory.py     — 长期记忆文件服务、隔离、回滚与索引诊断
+test_admin_memory.py         — 管理端列表、查看、删除和一键清除长期记忆
 test_current_chat_protocol.py — 当前聊天协议集成测试
 ```
 

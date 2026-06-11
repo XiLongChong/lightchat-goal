@@ -54,6 +54,7 @@ class MemoryStore:
         if current != _SCHEMA_ID:
             await self._reset(db)
         await self._create_tables(db)
+        await self._ensure_turn_metric_columns(db)
         await db.execute(
             "INSERT OR REPLACE INTO runtime_meta(key, value) VALUES('runtime_schema', ?)",
             (_SCHEMA_ID,),
@@ -97,6 +98,10 @@ class MemoryStore:
                 turn_number INTEGER NOT NULL,
                 status TEXT NOT NULL DEFAULT 'running',
                 token_count INTEGER NOT NULL DEFAULT 0,
+                prompt_tokens_peak INTEGER NOT NULL DEFAULT 0,
+                context_window_tokens INTEGER NOT NULL DEFAULT 0,
+                model_name TEXT NOT NULL DEFAULT '',
+                usage_estimated INTEGER NOT NULL DEFAULT 0,
                 elapsed_ms INTEGER NOT NULL DEFAULT 0,
                 created_at REAL NOT NULL,
                 completed_at REAL NOT NULL DEFAULT 0
@@ -141,6 +146,21 @@ class MemoryStore:
                 ON daily_summaries(conversation_id, summary_date);
             """
         )
+
+    async def _ensure_turn_metric_columns(self, db: aiosqlite.Connection) -> None:
+        rows = await db.execute_fetchall("PRAGMA table_info(turns)")
+        existing = {str(row["name"]) for row in rows}
+        additions = {
+            "prompt_tokens_peak": "INTEGER NOT NULL DEFAULT 0",
+            "context_window_tokens": "INTEGER NOT NULL DEFAULT 0",
+            "model_name": "TEXT NOT NULL DEFAULT ''",
+            "usage_estimated": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for name, definition in additions.items():
+            if name not in existing:
+                await db.execute(
+                    f'ALTER TABLE turns ADD COLUMN "{name}" {definition}'
+                )
 
     async def close(self) -> None:
         if self._db is not None:
@@ -304,15 +324,76 @@ class MemoryStore:
         return seq
 
     async def finish_turn(
-        self, turn_id: str, status: str = "completed", token_count: int = 0, elapsed_ms: int = 0
+        self,
+        turn_id: str,
+        status: str = "completed",
+        token_count: int = 0,
+        elapsed_ms: int = 0,
+        *,
+        prompt_tokens_peak: int = 0,
+        context_window_tokens: int = 0,
+        model_name: str = "",
+        usage_estimated: bool = False,
     ) -> None:
         async with self._write_lock:
             db = await self._get_db()
             await db.execute(
-                """UPDATE turns SET status=?, token_count=?, elapsed_ms=?, completed_at=? WHERE id=?""",
-                (status, token_count, elapsed_ms, time.time(), turn_id),
+                """UPDATE turns
+                   SET status=?, token_count=?, elapsed_ms=?,
+                       prompt_tokens_peak=?, context_window_tokens=?,
+                       model_name=?, usage_estimated=?, completed_at=?
+                   WHERE id=?""",
+                (
+                    status,
+                    token_count,
+                    elapsed_ms,
+                    prompt_tokens_peak,
+                    context_window_tokens,
+                    model_name,
+                    int(usage_estimated),
+                    time.time(),
+                    turn_id,
+                ),
             )
             await db.commit()
+
+    async def get_latest_context_usage(
+        self,
+        user_id: str,
+        bot_id: str = "",
+    ) -> dict[str, Any] | None:
+        db = await self._get_db()
+        rows = await db.execute_fetchall(
+            """SELECT id AS turn_id, model_name, prompt_tokens_peak,
+                      context_window_tokens, usage_estimated, completed_at
+               FROM turns
+               WHERE conversation_id = ?
+                 AND completed_at > 0
+                 AND prompt_tokens_peak > 0
+                 AND context_window_tokens > 0
+               ORDER BY completed_at DESC
+               LIMIT 1""",
+            (f"{user_id}:{bot_id}",),
+        )
+        return dict(rows[0]) if rows else None
+
+    async def get_latest_user_turn_created_at(
+        self,
+        user_id: str,
+        bot_id: str = "",
+    ) -> float | None:
+        """Return the previous real user turn timestamp for idle-gap checks."""
+        db = await self._get_db()
+        rows = await db.execute_fetchall(
+            """SELECT created_at
+               FROM turns
+               WHERE conversation_id = ?
+                 AND turn_number > 0
+               ORDER BY turn_number DESC
+               LIMIT 1""",
+            (f"{user_id}:{bot_id}",),
+        )
+        return float(rows[0]["created_at"]) if rows else None
 
     # ── rebuild (restart) ───────────────────────────────────────────
 
@@ -397,6 +478,67 @@ class MemoryStore:
             )
 
             await db.commit()
+        return True
+
+    async def commit_compression(
+        self,
+        conversation_id: str,
+        compressed_messages: list[dict[str, Any]],
+        summary_date: str,
+        summary_text: str,
+    ) -> bool:
+        """Atomically persist compressed history and its dated summary."""
+        import uuid
+
+        db = await self._get_db()
+        async with self._write_lock:
+            await db.execute("BEGIN")
+            try:
+                await db.execute(
+                    """UPDATE raw_events SET active = 0
+                       WHERE turn_id IN (
+                           SELECT id FROM turns WHERE conversation_id = ?
+                       )""",
+                    (conversation_id,),
+                )
+                turn_id = f"compressed_{uuid.uuid4().hex[:12]}"
+                await db.execute(
+                    """INSERT INTO turns(id, conversation_id, turn_number, status, created_at)
+                       VALUES(?, ?, 0, 'compressed', ?)""",
+                    (turn_id, conversation_id, time.time()),
+                )
+                for seq, msg in enumerate(compressed_messages):
+                    await db.execute(
+                        """INSERT INTO raw_events(turn_id, seq, role, content_json, active, created_at)
+                           VALUES(?, ?, ?, ?, 1, ?)""",
+                        (
+                            turn_id,
+                            seq,
+                            msg["role"],
+                            json.dumps(msg["content"], ensure_ascii=False),
+                            time.time(),
+                        ),
+                    )
+                await db.execute(
+                    "UPDATE conversations SET last_compressed_at = ? WHERE id = ?",
+                    (time.time(), conversation_id),
+                )
+                await db.execute(
+                    """INSERT OR REPLACE INTO daily_summaries
+                       (conversation_id, summary_date, summary_text, char_count, created_at)
+                       VALUES(?, ?, ?, ?, ?)""",
+                    (
+                        conversation_id,
+                        summary_date,
+                        summary_text,
+                        len(summary_text),
+                        time.time(),
+                    ),
+                )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
         return True
 
     # ── daily summaries ────────────────────────────────────────────

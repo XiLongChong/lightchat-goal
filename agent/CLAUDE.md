@@ -10,11 +10,11 @@ state_machine.py           — Turn 状态类型：TurnScratchpad, TurnResult, T
 llm_gateway.py             — 供应商无关的 LLM 网关：DeepSeek 适配器 + trace 回调
 llm_types.py               — LLM 请求/响应数据类：LLMRequest, LLMResponse, LLMUsage, LLMError
 providers/base.py          — ProviderAdapter 协议 + ProviderConfig
-providers/deepseek.py      — DeepSeek 适配器（通过 OpenAI SDK 调用 Anthropic 兼容端点）
-compressor.py              — 每日对话压缩：调用 pro 模型生成摘要，注入 raw_events
+providers/deepseek.py      — DeepSeek 适配器（httpx 直接调用 Anthropic 兼容 SSE 端点，OpenAI SDK 仅复用错误类型）
+compressor.py              — 每日对话压缩：伪造 user 消息触发总结，摘要写入 ConversationContext，DB 只存摘要（active=1）
 context_builder.py         — 全局协议文案 + build_chat_system_prompt 工具函数
 runtime_context_builder.py — ContextBuilder：build_for_chat() 统一入口，收拢全部 context 构造逻辑
-tool_registry.py           — ToolDef 注册表 + native tool call spec 生成
+tool_registry.py           — ToolDef 注册表 + native tool call spec 生成（含受限 memory 工具）
 tool_exposure_policy.py    — 每 turn 暴露哪些工具（当前固定 3 个）
 tools.py                   — 工具实现（get_time → wttr.in, get_weather → pytz）
 output_guard.py            — 输出清洗：敏感信息过滤、长度截断、Markdown 去格式化
@@ -43,10 +43,12 @@ output_guard.py            — 输出清洗：敏感信息过滤、长度截断�
 
 ## 工具注册（tool_registry）
 
-三个工具在模块加载时注册：send_text_message（输出）、get_time（信息）、get_weather（信息）。ToolExposurePolicy 为普通聊天暴露全部三个。
+四个工具在模块加载时注册：send_text_message、get_time、get_weather、memory。memory 只允许读取、创建和精确替换当前用户的长期记忆文件，不向模型开放删除。
+
+每日 Compact 不运行工具循环。压缩模型一次返回 `<summary>` 与 `<memory_operations>`，runtime 校验证据和数量后调用长期记忆文件服务执行。
 
 ## 注意事项
 
-- `chat_agent.py` 是脏代码最集中的地方——约 600 行，包含完整的 LLM 对话循环和 fallback 逻辑
+- `chat_agent.py` 是脏代码最集中的地方——约 480 行，包含完整的 LLM 对话循环和 fallback 逻辑
 - LLM 请求使用 `stream=True`，但工具调用的流式处理需要 `response_mode="text"`
 - output_guard 会过滤 API key 泄露、tool_call_id 泄露、Markdown 格式

@@ -32,7 +32,7 @@ class ToolExposurePolicy:
 
     def resolve(self, request: ToolExposureRequest) -> ToolExposure:
         del request
-        names = ["send_text_message", "get_time", "get_weather"]
+        names = ["send_text_message", "get_time", "get_weather", "memory"]
         schemas: list[NativeToolSchema] = []
         for name in names:
             definition = TOOL_REGISTRY.get(name)
@@ -54,12 +54,20 @@ class ToolExposurePolicy:
                 side_effect=(
                     ToolSideEffect.SENDS_MESSAGE
                     if name == "send_text_message"
-                    else ToolSideEffect.READS_EXTERNAL
+                    else (
+                        ToolSideEffect.READS_EXTERNAL
+                        if name in {"get_time", "get_weather"}
+                        else ToolSideEffect.WRITES_STATE
+                    )
                 ),
                 category=(
                     ToolCategory.OUTPUT
                     if name == "send_text_message"
-                    else ToolCategory.INFORMATION
+                    else (
+                        ToolCategory.INFORMATION
+                        if name in {"get_time", "get_weather"}
+                        else ToolCategory.MEMORY
+                    )
                 ),
             ))
         return ToolExposure(
@@ -70,6 +78,10 @@ class ToolExposurePolicy:
             native_tool_schemas=schemas,
             tool_contract_block=(
                 "Use send_text_message for every user-visible reply. "
+                "Use memory create/str_replace only when the user explicitly asks "
+                "you to remember something. Use memory view when the index indicates "
+                "a relevant topic. Never treat old memory as more authoritative than "
+                "the user's current message. "
                 "After each tool result, decide whether another tool call is needed. "
                 "End the turn by returning no tool call."
             ),

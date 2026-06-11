@@ -8,14 +8,6 @@ from types import SimpleNamespace
 from typing import Any
 
 import httpx
-from openai import (
-    APIConnectionError,
-    APIError,
-    APITimeoutError,
-    AuthenticationError,
-    BadRequestError,
-    RateLimitError,
-)
 
 from agent.llm_types import LLMError, LLMRequest, LLMResponse, LLMUsage
 from agent.providers.base import ProviderConfig
@@ -59,8 +51,7 @@ class DeepSeekAdapter:
         request_extra.pop("extra_body", None)
 
         for key, value in request_extra.items():
-            if key != "extra_body":
-                payload[key] = value
+            payload[key] = value
         return payload
 
     async def _raw_chat_completion(self, payload: dict[str, Any], request: LLMRequest) -> Any:
@@ -103,8 +94,6 @@ class DeepSeekAdapter:
         usage = None
         model = None
         response_id = ""
-        block_types: dict[int, str] = {}
-
         async with client.stream("POST", url, headers=headers, json=payload) as resp:
             if resp.status_code >= 400:
                 body = await resp.aread()
@@ -139,7 +128,6 @@ class DeepSeekAdapter:
                     idx = int(event.get("index") or 0)
                     block = event.get("content_block") or {}
                     block_type = str(block.get("type") or "")
-                    block_types[idx] = block_type
                     if block_type == "text" and block.get("text"):
                         content_parts.append(str(block.get("text")))
                     elif block_type == "thinking" and block.get("thinking"):
@@ -289,27 +277,33 @@ class DeepSeekAdapter:
         provider_code = _provider_code(exc)
         message = str(exc)[:500]
 
-        if isinstance(exc, BadRequestError):
-            kind = "provider_bad_request"
-            retryable = False
-        elif isinstance(exc, AuthenticationError):
-            kind = "provider_auth_error"
-            retryable = False
-        elif isinstance(exc, RateLimitError):
-            kind = "rate_limited"
-            retryable = True
-        elif isinstance(exc, APITimeoutError):
+        if isinstance(exc, httpx.TimeoutException):
             kind = "timeout"
             retryable = True
-        elif isinstance(exc, APIConnectionError):
+        elif isinstance(exc, (httpx.ConnectError, httpx.RemoteProtocolError)):
             kind = "network_error"
             retryable = True
-        elif isinstance(exc, APIError) and status_code == 503:
-            kind = "provider_overloaded"
-            retryable = True
-        elif isinstance(exc, APIError) and status_code and status_code >= 500:
-            kind = "provider_server_error"
-            retryable = True
+        elif isinstance(exc, httpx.HTTPStatusError):
+            sc = exc.response.status_code
+            status_code = sc
+            if sc == 429:
+                kind = "rate_limited"
+                retryable = True
+            elif sc == 503:
+                kind = "provider_overloaded"
+                retryable = True
+            elif sc >= 500:
+                kind = "provider_server_error"
+                retryable = True
+            elif sc in (401, 403):
+                kind = "provider_auth_error"
+                retryable = False
+            elif 400 <= sc < 500:
+                kind = "provider_bad_request"
+                retryable = False
+            else:
+                kind = "unknown"
+                retryable = False
         else:
             kind = "unknown"
             retryable = bool(status_code and status_code >= 500)
@@ -325,13 +319,18 @@ class DeepSeekAdapter:
 
 
 def _provider_code(exc: Exception) -> str | None:
-    body = getattr(exc, "body", None)
-    if isinstance(body, dict):
-        error = body.get("error")
-        if isinstance(error, dict) and error.get("code"):
-            return str(error["code"])
-        if body.get("code"):
-            return str(body["code"])
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        try:
+            body = resp.json() if callable(resp.json) else {}
+        except Exception:
+            body = {}
+        if isinstance(body, dict):
+            error = body.get("error")
+            if isinstance(error, dict) and error.get("code"):
+                return str(error["code"])
+            if body.get("code"):
+                return str(body["code"])
     return getattr(exc, "code", None)
 
 

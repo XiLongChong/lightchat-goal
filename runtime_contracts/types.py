@@ -24,12 +24,14 @@ class TurnPhase(StrEnum):
 class ToolCategory(StrEnum):
     OUTPUT = "output"
     INFORMATION = "information"
+    MEMORY = "memory"
 
 
 class ToolSideEffect(StrEnum):
     NONE = "none"
     SENDS_MESSAGE = "sends_message"
     READS_EXTERNAL = "reads_external"
+    WRITES_STATE = "writes_state"
 
 
 class DeliveryStatus(StrEnum):

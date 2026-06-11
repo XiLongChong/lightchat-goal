@@ -21,6 +21,8 @@ class ChatRuntime:
     async def handle_chat(
         self,
         user_message: str,
+        user_id: str = "",
+        bot_id: str = "",
         history: list[dict[str, Any]] | None = None,
         system_prompt: str = "",
         trigger: str = "user",
@@ -35,6 +37,7 @@ class ChatRuntime:
         post_turn_hooks: list | None = None,
         protocol_event_writer: Any = None,
         prebuilt_messages: list[dict[str, Any]] | None = None,
+        idle_seconds: float | None = None,
     ) -> TurnResult:
         if self.chat_agent is None:
             raise RuntimeError("chat_agent not configured")
@@ -42,7 +45,8 @@ class ChatRuntime:
             user_message=user_message,
             history=history or [],
             trigger=trigger,
-            bot_id=self.bot_id,
+            bot_id=bot_id or self.bot_id,
+            user_id=user_id or self.user_id,
             system_prompt=system_prompt,
             wechat_sender=wechat_sender,
             source=source,
@@ -55,11 +59,13 @@ class ChatRuntime:
                 "send_text_message",
                 "get_time",
                 "get_weather",
+                "memory",
             ],
             write_model_history=write_model_history,
             post_turn_hooks=post_turn_hooks,
             protocol_event_writer=protocol_event_writer,
             prebuilt_messages=prebuilt_messages,
+            idle_seconds=idle_seconds,
         )
 
     def build_turn_request(self, user_message: str) -> TurnScratchpad:

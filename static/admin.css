@@ -38,6 +38,8 @@ section {
   border-radius: 8px;
 }
 
+section + section { margin-top: 20px; }
+
 h2 { font-size: 18px; margin-bottom: 18px; }
 h3 { font-size: 15px; margin-bottom: 12px; }
 
@@ -126,6 +128,58 @@ pre {
 }
 
 .error { margin-top: 12px; color: #a63838; font-size: 13px; }
+
+#context-usage-empty {
+  margin-top: 18px;
+  color: #66756d;
+  font-size: 14px;
+}
+
+.context-usage-value {
+  margin-top: 20px;
+  font-size: 20px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.context-usage-track {
+  height: 12px;
+  margin-top: 12px;
+  overflow: hidden;
+  background: #e6ece8;
+  border-radius: 999px;
+}
+
+.context-usage-bar {
+  width: 0;
+  height: 100%;
+  background: #16794a;
+  border-radius: inherit;
+  transition: width .25s ease, background-color .25s ease;
+}
+
+.context-usage-track.warning .context-usage-bar { background: #c17a0b; }
+.context-usage-track.danger .context-usage-bar { background: #a63838; }
+
+.memory-list { margin-top: 20px; }
+.memory-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 0;
+  border-top: 1px solid #e2e7e4;
+}
+.memory-row p { margin-top: 5px; color: #526159; font-size: 13px; }
+.memory-row small { display: block; margin-top: 6px; color: #78867e; }
+.memory-actions { display: flex; gap: 8px; align-items: center; }
+.memory-warnings {
+  margin-top: 16px;
+  padding: 12px;
+  color: #7a4b00;
+  background: #fff4d6;
+  border-radius: 6px;
+  white-space: pre-wrap;
+}
 
 @media (max-width: 560px) {
   header { padding: 0 18px; }

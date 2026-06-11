@@ -7,6 +7,7 @@
   base_url: "${DEEPSEEK_BASE_URL:-https://api.deepseek.com/anthropic}"
   temperature: 0.7
   max_tokens: 4096
+  context_window_tokens: "${MODEL_CONTEXT_WINDOW_TOKENS:-1000000}"
   timeout_s: "${LLM_TIMEOUT_S:-60}"
   max_retries: "${LLM_MAX_RETRIES:-1}"
   thinking:
@@ -17,6 +18,7 @@
       - send_text_message
       - get_time
       - get_weather
+      - memory
   routing_mode: manual_pro
   max_flash_upgrade_attempts: 1
   manual_flash_allow_upgrade: false
@@ -84,11 +86,13 @@ history:
 
 storage:
   db_path: "./data/memory.db"
+  long_term_memory_dir: "./data/long_term_memory"
 
 conversation:
   max_llm_steps: 20
   max_message_chars: 500
   max_total_chars: 2000
+  idle_time_reminder_minutes: 10
 
 weather:
   default_city: "成都"

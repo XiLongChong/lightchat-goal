@@ -21,7 +21,7 @@ ilink_client.py   — 原始 iLink HTTP 调用（QR 码、轮询、发送消息�
 ## wechat_poller 关键行为
 
 - 在 FastAPI lifespan 中作为后台任务启动/停止
-- 消息缓冲：debounce_seconds（默认 5s）内累积消息，buffer_max_wait_seconds（默认 12s）强制刷新
+- 消息缓冲：buffer_debounce_seconds（默认 2s）内累积消息，buffer_max_wait_seconds（默认 8s）强制刷新
 - 发送延迟：通过 send_delay 配置模拟真人打字节奏
 - 单进程设计，不支持多副本（有 TODO 注释说明需要分布式锁）
 

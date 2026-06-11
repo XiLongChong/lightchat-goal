@@ -1,12 +1,13 @@
 # CLAUDE.md
 
-持久化层——纯 SQLite 存储（只写不读，重启时重建）+ 内存常驻消息数组。
+持久化层——SQLite 事件落盘 + ConversationContext 内存常驻消息数组。DB 只做写入和重启重建，日常 /chat 不查 DB。
 
 ## 文件
 
 ```
 store.py         — MemoryStore：纯持久化（事件落盘、DB 迁移、联系人状态）
-conversation.py  — ConversationContext：内存常驻消息数组（追加、裁剪、重建）
+conversation.py  — ConversationContext：内存常驻消息数组（追加、重建、complete 重置）
+long_term.py     — 长期记忆 Markdown 文件服务（隔离、校验、原子批次、诊断、管理端删除）
 ```
 
 ## 数据表
@@ -27,13 +28,17 @@ conversation.py  — ConversationContext：内存常驻消息数组（追加、�
 - **内存常驻**：ConversationContext 持完整 messages 数组，/chat 不查 DB
 - **DB 只做两件事**：事件落盘（每条即写）+ 重启重建（一次 SELECT）
 - **动静分离**：snapshot hash 不含时间块（时间每轮实时注入）
-- **每日压缩**：凌晨 4:00 后首条消息触发。全部 raw_events 软删除（active=0），摘要注入最后一条含 tool_result 的 user 消息，保留紧随的 assistant。`get_recent_events()` 只查 `active=1`。
+- **每日压缩**：3:56-4:25 窗口内触发。从 ConversationContext 内存取消息数组，追加伪造 user 消息调用 LLM 生成摘要。摘要单独写入 raw_events（active=1），旧 event 全部软删除（active=0）。DB 永远只存摘要，不提前混入未完成 turn 的用户消息。下一次 chat 时 ContextBuilder 检测到纯 summary user 消息，自动与当前用户消息合并为一条。
 - **迁移**：schema 版本不匹配时删除除 `bot_contact_state` 和 `runtime_meta` 外的所有表重建
 
 ## 清除
 
-`clear_all()` 删除 conversations/turns/raw_events/context_snapshots/tool_versions，保留 bot_contact_state。管理后台一键清除调用此方法。
+`clear_all()` DELETE FROM conversations/turns/raw_events/context_snapshots/tool_versions，保留 bot_contact_state 和 runtime_meta。ConversationContext.complete() 封装 DB 清除 + 内存重置，管理后台一键清除通过它调用。
 
 ## 压缩
 
-`get_all_events_for_compress()` 读全部 raw_events 用于压缩模型输入。`apply_compression()` 执行软删除 + 摘要注入。压缩来源始终读全部历史，旧摘要通过过滤 `<analysis>` 开头的 text block 排除。详见 `agent/compressor.py`。
+`apply_compression()` 接受压缩后的消息数组（通常是一条 `[user([summary])]`），软删除全部旧 event，写入新消息数组（active=1）。压缩源来自 `ConversationContext._messages`（内存），不从 DB 读。旧摘要通过 `_filter_summary_blocks()` 过滤 `<summary>` 开头的 text block。详见 `agent/compressor.py`。
+
+新流程使用 `commit_compression()` 在一个 SQLite 事务中写压缩事件、`last_compressed_at` 和每日摘要。长期记忆文件批次先执行并保留回滚快照；DB 提交失败时回滚文件，成功后才替换内存。
+
+长期记忆按 user_id 哈希隔离。`MEMORY.md` 是扁平索引，主题正文必须有 Markdown 标题和 `更新时间：YYYY-MM-DD`。模型不能删除；管理端删除会同步移除索引项。

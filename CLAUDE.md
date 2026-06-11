@@ -55,7 +55,7 @@ python scripts/reset_runtime_data.py --confirm  # 确认清除
 
 - **用户交互轮 (turn)**：从用户发送一条消息开始 → 模型完成回复（发送完毕或异常结束）为止。一次用户消息 = 一个 turn。
 - **模型调用 (call/step)**：一次 turn 内可能多次调用 LLM（最大 20 次）。每次收到 `send_text_message` 的 `sent` 结果后，模型判断是否还需要再发一条消息——如需则再调一次 LLM。不能提前预编多条回复。
-- **对话历史加载**：每次 `/chat` 请求从 SQLite 实时加载最近 **20 个已完成 turn** 的 protocol_messages（`conversation.max_history_turns` 控制）。
+- **对话历史加载**：`ConversationContext` 内存常驻完整消息数组，`/chat` 不查 DB。仅在重启 / clear / 压缩变更时从 `raw_events` 重建（只加载 `active=1` 的事件）。
 
 ## LLM 原始事件日志
 
@@ -86,4 +86,14 @@ python scripts/reset_runtime_data.py --confirm  # 确认清除
 - **用户级锁**：每 user_id 一个 asyncio.Lock，同用户串行、跨用户并发
 - **中断检测**：新消息 seq > 当前 turn 的 input_latest_seq 时取消当前 turn
 - **配置**：config.yaml（`${VAR:-default}` 替换）+ .env（密钥）+ data/runtime_settings.json（热加载覆盖）
-- **Schema 迁移**：`runtime_meta` 表存版本号 `chat_only_1`，不匹配时重置非 contact 表
+- **每日压缩**：3:56-4:25 窗口内触发。从内存消息数组追加伪造 user 消息调用 LLM 生成摘要。摘要单独写入 DB（active=1），旧事件软删除（active=0）。ContextBuilder 自动将摘要与下一条用户消息合并。
+- **长期记忆**：`data/long_term_memory/<sha256(user_id)[:32]>/` 下保存 `MEMORY.md` 索引和主题 Markdown。模型工具只允许 view/create/str_replace，删除只通过管理后台。
+- **压缩与记忆事务**：Compact 同时输出 `<summary>` 和 `<memory_operations>`；文件批次与 SQLite 压缩提交均成功后才替换内存。手动和自动压缩共用同一流程。
+- **Schema 迁移**：`runtime_meta` 表存版本号 `v3_daily_compression`，不匹配时删除除 `bot_contact_state` 和 `runtime_meta` 外的所有表重建
+
+## 决策与错误记录
+
+- 对架构、协议和重要实现作出选择时，不只记录最终方案，还要在对应设计文档中集中记录被否决或暂缓的方案及原因。
+- 开发过程中遇到的错误、失败尝试和关键修复原因，应集中记录到对应任务文档或 bug 文档，避免未来重复犯错。
+- 重新讨论已有设计前，先查阅相关文档中的“已否决方案”“已知错误”或同类章节；除非前提已经变化，不重复选择已被否决的路径。
+- 记录必须说明当时的约束和取舍，不能只写“不要这样做”，以便未来判断原结论是否仍然适用。

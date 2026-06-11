@@ -6,6 +6,9 @@ import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pytest
@@ -208,87 +211,222 @@ class TestUsageExtraction:
 # 3. Error mapping
 # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
+# ── httpx error factories (must be defined before parametrize) ─────
+
+def _fake_request():
+    return httpx.Request("POST", "https://api.deepseek.com/anthropic/v1/messages")
+
+
+def _make_http_status(code: int):
+    def _factory():
+        req = _fake_request()
+        resp = httpx.Response(status_code=code, request=req)
+        return httpx.HTTPStatusError(
+            message="test error", request=req, response=resp,
+        )
+    return _factory
+
+
+def _make_timeout():
+    return httpx.ReadTimeout("read timeout", request=_fake_request())
+
+
+def _make_connect_error():
+    return httpx.ConnectError("connection failed", request=_fake_request())
+
+
+def _make_remote_protocol_error():
+    return httpx.RemoteProtocolError("protocol error", request=_fake_request())
+
+
+def _make_unknown():
+    return ValueError("unexpected error type")
+
+
 class TestErrorMapping:
     """Each error type maps to the correct LLMErrorKind and retryable flag."""
 
-    @pytest.mark.parametrize("exc_class_name,status_code,expected_kind,retryable", [
-        ("BadRequestError", 400, "provider_bad_request", False),
-        ("BadRequestError", 422, "provider_bad_request", False),
-        ("AuthenticationError", 401, "provider_auth_error", False),
-        ("AuthenticationError", 403, "provider_auth_error", False),
-        ("RateLimitError", 429, "rate_limited", True),
-        ("APITimeoutError", None, "timeout", True),
-        ("APIConnectionError", None, "network_error", True),
+    @pytest.mark.parametrize("exc_factory,expected_kind,retryable", [
+        # httpx.HTTPStatusError cases
+        (_make_http_status(400), "provider_bad_request", False),
+        (_make_http_status(422), "provider_bad_request", False),
+        (_make_http_status(401), "provider_auth_error", False),
+        (_make_http_status(403), "provider_auth_error", False),
+        (_make_http_status(429), "rate_limited", True),
+        (_make_http_status(500), "provider_server_error", True),
+        (_make_http_status(503), "provider_overloaded", True),
+        # httpx timeout / connection
+        (_make_timeout, "timeout", True),
+        (_make_connect_error, "network_error", True),
+        (_make_remote_protocol_error, "network_error", True),
+        # Unknown
+        (_make_unknown, "unknown", False),
     ])
-    def test_error_mapping(self, exc_class_name, status_code, expected_kind, retryable):
-        from openai import (
-            APIConnectionError,
-            APITimeoutError,
-            AuthenticationError,
-            BadRequestError,
-            RateLimitError,
-        )
-
-        exc_map = {
-            "BadRequestError": BadRequestError,
-            "AuthenticationError": AuthenticationError,
-            "RateLimitError": RateLimitError,
-            "APITimeoutError": APITimeoutError,
-            "APIConnectionError": APIConnectionError,
-        }
-        exc_cls = exc_map[exc_class_name]
-
-        if status_code is not None:
-            # BadRequestError / AuthenticationError / RateLimitError
-            # Construct with (message, *, response, body)
-            fake_resp = MagicMock()
-            fake_resp.status_code = status_code
-            fake_resp.headers = MagicMock()
-            fake_resp.headers.get.return_value = None
-            exc = exc_cls(message="test error", response=fake_resp, body={})
-        else:
-            # APITimeoutError(request) / APIConnectionError(*, message, request)
-            fake_req = MagicMock()
-            if exc_class_name == "APITimeoutError":
-                exc = exc_cls(request=fake_req)
-            else:
-                exc = exc_cls(message="test error", request=fake_req)
-
+    def test_error_mapping(self, exc_factory, expected_kind, retryable):
         adapter = DeepSeekAdapter(_make_config())
-        mapped = adapter._map_error(exc)
-
+        mapped = adapter._map_error(exc_factory())
         assert mapped.kind == expected_kind, f"Expected {expected_kind}, got {mapped.kind}"
         assert mapped.retryable == retryable
 
-    @pytest.mark.parametrize("status_code,expected_kind,retryable", [
-        (500, "provider_server_error", True),
-        (503, "provider_overloaded", True),
-    ])
-    def test_server_error_mapping_via_api_error(self, status_code, expected_kind, retryable):
-        from openai import APIError
 
-        fake_req = MagicMock()
-        exc = APIError(message="server error", request=fake_req, body={})
-        exc.status_code = status_code
+# ── SSE streaming helpers ──────────────────────────────────────────
 
+def _sse_line(event: dict) -> str:
+    return f"data: {json.dumps(event, ensure_ascii=False)}"
+
+
+def _make_sse_response(status_code: int, sse_lines: list[str]):
+    """Build a mock httpx stream response that yields SSE lines."""
+
+    async def _aiter_lines():
+        for line in sse_lines:
+            yield line
+
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.aiter_lines = MagicMock(side_effect=_aiter_lines)
+    resp.aread = AsyncMock(return_value=b"error body")
+
+    class _FakeStream:
+        async def __aenter__(self):
+            return resp
+        async def __aexit__(self, *args):
+            pass
+
+    return _FakeStream()
+
+
+async def _run_sse_stream(adapter, sse_events: list[dict], status_code: int = 200):
+    lines = [_sse_line(ev) for ev in sse_events] + ["data: [DONE]"]
+    fake_stream = _make_sse_response(status_code, lines)
+    client = MagicMock()
+    client.stream.return_value = fake_stream
+    return await adapter._raw_stream_completion(
+        client=client,
+        url="https://api.deepseek.com/anthropic/v1/messages",
+        headers={"x-api-key": "sk-test"},
+        payload={"model": "deepseek-v4-flash", "messages": [], "stream": True},
+    )
+
+
+# ── 3b. SSE streaming parser ───────────────────────────────────────
+
+class TestSSEStreamParser:
+    @pytest.mark.asyncio
+    async def test_simple_text_response(self):
         adapter = DeepSeekAdapter(_make_config())
-        mapped = adapter._map_error(exc)
+        events = [
+            {"type": "message_start", "message": {
+                "id": "msg_1", "model": "deepseek-v4-flash",
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+            }},
+            {"type": "content_block_start", "index": 0,
+             "content_block": {"type": "text", "text": "Hello"}},
+            {"type": "content_block_delta", "index": 0,
+             "delta": {"type": "text_delta", "text": " world"}},
+            {"type": "message_delta",
+             "delta": {"stop_reason": "end_turn"},
+             "usage": {"output_tokens": 5}},
+        ]
+        result = await _run_sse_stream(adapter, events)
+        assert result.choices[0].message.content == "Hello world"
+        assert result.choices[0].finish_reason == "end_turn"
+        assert result.model == "deepseek-v4-flash"
+        assert result.id == "msg_1"
 
-        assert mapped.kind == expected_kind
-        assert mapped.retryable == retryable
-
-    def test_unknown_error(self):
-        from openai import APIError
-
-        fake_req = MagicMock()
-        exc = APIError(message="weird unknown error", request=fake_req, body={})
-        exc.status_code = 418  # I'm a teapot
-
+    @pytest.mark.asyncio
+    async def test_tool_use_response(self):
         adapter = DeepSeekAdapter(_make_config())
-        mapped = adapter._map_error(exc)
+        events = [
+            {"type": "message_start", "message": {"id": "msg_2", "model": "deepseek-v4-flash"}},
+            {"type": "content_block_start", "index": 0,
+             "content_block": {"type": "tool_use", "id": "toolu_1",
+                               "name": "get_weather", "input": {"city": "成都"}}},
+            {"type": "content_block_delta", "index": 0,
+             "delta": {"type": "input_json_delta", "partial_json": ""}},
+            {"type": "message_delta", "delta": {"stop_reason": "tool_use"}},
+        ]
+        result = await _run_sse_stream(adapter, events)
+        assert result.choices[0].message.tool_calls is not None
+        tc = result.choices[0].message.tool_calls[0]
+        assert tc.id == "toolu_1"
+        assert tc.function.name == "get_weather"
+        assert "成都" in tc.function.arguments
+        assert result.choices[0].finish_reason == "tool_use"
 
-        assert mapped.kind == "unknown"
-        assert mapped.retryable is False  # 418 < 500
+    @pytest.mark.asyncio
+    async def test_thinking_block(self):
+        adapter = DeepSeekAdapter(_make_config())
+        events = [
+            {"type": "message_start", "message": {"id": "msg_3", "model": "deepseek-v4-flash"}},
+            {"type": "content_block_start", "index": 0,
+             "content_block": {"type": "thinking", "thinking": "Let me think..."}},
+            {"type": "content_block_delta", "index": 0,
+             "delta": {"type": "thinking_delta", "thinking": " about this."}},
+            {"type": "content_block_start", "index": 1,
+             "content_block": {"type": "text", "text": "OK"}},
+            {"type": "message_delta", "delta": {"stop_reason": "end_turn"}},
+        ]
+        result = await _run_sse_stream(adapter, events)
+        assert "Let me think... about this." in result.choices[0].message.reasoning_content
+        assert result.choices[0].message.content == "OK"
+
+    @pytest.mark.asyncio
+    async def test_error_status_raises_llm_error(self):
+        adapter = DeepSeekAdapter(_make_config())
+        fake_stream = _make_sse_response(400, [])
+        client = MagicMock()
+        client.stream.return_value = fake_stream
+        with pytest.raises(LLMError) as exc_info:
+            await adapter._raw_stream_completion(
+                client=client,
+                url="https://api.deepseek.com/anthropic/v1/messages",
+                headers={"x-api-key": "sk-test"},
+                payload={"model": "deepseek-v4-flash", "messages": [], "stream": True},
+            )
+        assert exc_info.value.kind == "provider_bad_request"
+
+    @pytest.mark.asyncio
+    async def test_json_decode_error_skipped(self):
+        adapter = DeepSeekAdapter(_make_config())
+        events = [
+            {"type": "message_start", "message": {"id": "msg_4", "model": "deepseek-v4-flash"}},
+            {"type": "content_block_start", "index": 0,
+             "content_block": {"type": "text", "text": "good"}},
+            {"type": "message_delta", "delta": {"stop_reason": "end_turn"}},
+        ]
+        lines = ["data: not-json-garbage",
+                 _sse_line(events[0]),
+                 "data: ",
+                 _sse_line(events[1]),
+                 _sse_line(events[2]),
+                 "data: [DONE]"]
+        fake_stream = _make_sse_response(200, lines)
+        client = MagicMock()
+        client.stream.return_value = fake_stream
+        result = await adapter._raw_stream_completion(
+            client=client,
+            url="https://api.deepseek.com/anthropic/v1/messages",
+            headers={"x-api-key": "sk-test"},
+            payload={"model": "deepseek-v4-flash", "messages": [], "stream": True},
+        )
+        assert result.choices[0].message.content == "good"
+
+    @pytest.mark.asyncio
+    async def test_tool_use_input_json_delta_no_start(self):
+        """Delta without preceding content_block_start: parser skips it
+        (no id/name — can't construct a valid tool_call)."""
+        adapter = DeepSeekAdapter(_make_config())
+        events = [
+            {"type": "message_start", "message": {"id": "msg_5", "model": "deepseek-v4-flash"}},
+            {"type": "content_block_delta", "index": 0,
+             "delta": {"type": "input_json_delta", "partial_json": '{"city":"北京"}'}},
+            {"type": "message_delta", "delta": {"stop_reason": "tool_use"}},
+        ]
+        result = await _run_sse_stream(adapter, events)
+        # Orphan delta without content_block_start has no id/name —
+        # parser filters it out.
+        assert result.choices[0].message.tool_calls is None
 
 
 # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€

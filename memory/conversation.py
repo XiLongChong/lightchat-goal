@@ -57,25 +57,23 @@ class ConversationContext:
     def add_event(self, role: str, content: Any) -> None:
         self._messages.append({"role": role, "content": copy.deepcopy(content)})
 
-    async def complete(self, store: MemoryStore) -> None:
-        """Persist full reset: clear DB + rebuild from memory."""
-        await store.clear_all()
-        self._messages = []
+    def replace_with_compressed(self, summary: str) -> None:
+        """Replace the message array with a compressed summary.
 
-    async def reset_for_new_snapshot(self, store: MemoryStore) -> None:
-        """Clear everything because prompt/tools changed incompatibly."""
-        await store.clear_all()
+        Stores a single user message with one text block: <summary>.
+        ContextBuilder.build_for_chat() will merge it with the next
+        incoming user message when building context.
+        """
+        self._messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": f"<summary>\n{summary}\n</summary>"},
+            ]
+        }]
+
+    async def complete(self, store: MemoryStore) -> dict[str, int]:
+        """Clear DB and reset in-memory state. Returns cleared table counts."""
+        counts = await store.clear_all()
         self._messages = []
         self._turn_count = 0
-
-    def maybe_trim(self, store: MemoryStore, estimated_tokens: int, max_budget: int) -> bool:
-        """If over budget, drop the oldest non-critical turns, keeping last 20.
-
-        Returns True if trimming occurred.
-        """
-        if estimated_tokens <= max_budget:
-            return False
-        # Simple strategy: drop from front until under budget or only 20 turns left.
-        # This is synchronous and best-effort — we don't count exact turn boundaries here.
-        # The caller is responsible for exact trimming logic.
-        return True  # Signal that trim is needed (caller handles specifics)
+        return counts
