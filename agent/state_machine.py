@@ -92,6 +92,7 @@ class TurnScratchpad:
     model_attempts: list[ModelAttempt] = field(default_factory=list)
     token_usage: dict[str, int] = field(default_factory=lambda: {
         "prompt_tokens": 0,
+        "peak_prompt_tokens": 0,
         "completion_tokens": 0,
         "total_tokens": 0,
         "cache_hit_tokens": 0,
@@ -99,6 +100,8 @@ class TurnScratchpad:
         "reasoning_tokens": 0,
         "estimated": False,
     })
+    context_window_tokens: int = 0
+    model_name: str = ""
     llm_status: str = "ok"
     llm_call_count: int = 0
     sent_message_count: int = 0
