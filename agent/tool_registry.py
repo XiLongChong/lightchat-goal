@@ -117,15 +117,26 @@ TOOL_REGISTRY.register(ToolDef(
 
 TOOL_REGISTRY.register(ToolDef(
     name="get_weather",
-    description="Get current weather for a city or region.",
+    description=(
+        "Get real-time weather or an official weather forecast for a city. "
+        "Use the requested date exactly and never infer future weather from current conditions."
+    ),
     args_schema={
         "properties": {
             "location": {
                 "type": "string",
-                "description": "City or region name.",
+                "description": "City or region name, such as 成都 or 北京.",
+            },
+            "date": {
+                "type": "string",
+                "description": (
+                    "Optional date: today, tomorrow, 后天, or YYYY-MM-DD. "
+                    "Omit for current real-time weather."
+                ),
             },
         },
         "required": ["location"],
+        "additionalProperties": False,
     },
 ))
 

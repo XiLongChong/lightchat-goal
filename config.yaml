@@ -95,9 +95,13 @@ conversation:
   idle_time_reminder_minutes: 10
 
 weather:
+  enabled: true
+  provider: qweather
   default_city: "成都"
-  timeout_seconds: 4
-  cache_ttl_seconds: 600
+  timeout_seconds: 5
+  observation_cache_ttl_seconds: 600
+  forecast_cache_ttl_seconds: 1800
+  location_cache_ttl_seconds: 86400
 
 logging:
   level: "${LOG_LEVEL:-INFO}"

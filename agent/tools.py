@@ -4,26 +4,65 @@ from __future__ import annotations
 
 import json
 import logging
-import time
+import os
 from datetime import datetime
 from typing import Any
-from urllib.parse import quote
 
-import httpx
 import pytz
 
 from agent.tool_registry import is_external_tool
+from agent.weather_provider import (
+    QWeatherProvider,
+    WeatherError,
+    format_weather_error,
+    format_weather_result,
+    normalize_date,
+)
 from memory.long_term import LongTermMemoryError, LongTermMemoryService, MemoryOperation
 
 TOOL_RUNTIME_CONFIG: dict[str, Any] = {}
 LONG_TERM_MEMORY: LongTermMemoryService | None = None
-_WEATHER_CACHE: dict[str, tuple[float, str]] = {}
+_weather_provider: QWeatherProvider | None = None
 logger = logging.getLogger(__name__)
 
 
 def configure_tools(config: dict[str, Any]) -> None:
-    global TOOL_RUNTIME_CONFIG
+    global TOOL_RUNTIME_CONFIG, _weather_provider
     TOOL_RUNTIME_CONFIG = config or {}
+    _init_weather_provider()
+
+
+def _init_weather_provider() -> None:
+    global _weather_provider
+    weather_cfg = TOOL_RUNTIME_CONFIG.get("weather", {})
+    provider_name = str(weather_cfg.get("provider", "qweather")).strip()
+    if provider_name != "qweather":
+        logger.warning("Unknown weather provider: %s", provider_name)
+        _weather_provider = None
+        return
+
+    api_key = os.getenv("QWEATHER_API_KEY", "")
+    if not api_key:
+        logger.warning("QWEATHER_API_KEY not set; weather tool will fail on use")
+        _weather_provider = None
+        return
+
+    api_host = os.getenv("QWEATHER_API_HOST", "")
+    # Backward-compatible: old cache_ttl_seconds → observation_cache_ttl_seconds
+    obs_ttl = float(
+        weather_cfg.get("observation_cache_ttl_seconds")
+        or weather_cfg.get("cache_ttl_seconds", 600)
+    )
+
+    _weather_provider = QWeatherProvider(
+        api_key=api_key,
+        api_host=api_host,
+        timeout_seconds=float(weather_cfg.get("timeout_seconds", 5)),
+        observation_cache_ttl=obs_ttl,
+        forecast_cache_ttl=float(weather_cfg.get("forecast_cache_ttl_seconds", 1800)),
+        location_cache_ttl=float(weather_cfg.get("location_cache_ttl_seconds", 86400)),
+    )
+    logger.info("QWeather provider initialized (host=%s)", api_host or "api.qweather.com")
 
 
 def configure_runtime(
@@ -46,30 +85,28 @@ async def _get_time(timezone_name: str = "Asia/Shanghai") -> str:
     return f"{now:%Y-%m-%d %H:%M:%S} ({timezone_name})"
 
 
-async def _get_weather(location: str = "") -> str:
-    location = str(location or "").strip()[:80] or _default_weather_city()
+async def _execute_get_weather(args: dict[str, Any]) -> str:
+    location = str(args.get("location") or "").strip()[:80]
+    if not location:
+        location = _default_weather_city()
     if not location:
         return "A location is required."
+    if _weather_provider is None:
+        return "Weather service is not configured. Set QWEATHER_API_KEY environment variable."
 
-    weather_config = TOOL_RUNTIME_CONFIG.get("weather", {})
-    ttl = float(weather_config.get("cache_ttl_seconds", 600))
-    timeout = float(weather_config.get("timeout_seconds", 4))
-    cache_key = location.casefold()
-    now = time.time()
-    cached = _WEATHER_CACHE.get(cache_key)
-    if cached and now - cached[0] < ttl:
-        return cached[1]
-
-    url = f"https://wttr.in/{quote(location)}?format=%C+%t+%h+%w&lang=zh"
+    raw_date = str(args.get("date") or "").strip()
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.get(url)
-        if response.status_code != 200:
-            return f"Weather lookup failed for {location}."
-        result = f"{location}: {response.text.strip()}"
-        _WEATHER_CACHE[cache_key] = (now, result)
-        return result
+        date = normalize_date(raw_date) if raw_date else None
+    except WeatherError as exc:
+        return format_weather_error(exc)
+
+    try:
+        result = await _weather_provider.get_weather(location, date)
+        return format_weather_result(result)
+    except WeatherError as exc:
+        return format_weather_error(exc)
     except Exception as exc:
+        logger.exception("weather tool failed for location=%s date=%s", location, raw_date)
         return f"Weather lookup failed: {exc}"
 
 
@@ -97,7 +134,9 @@ async def execute_tool(
         return f"Tool is unavailable: {name}"
     if name == "get_time":
         return await _get_time(str(args.get("timezone") or "Asia/Shanghai"))
-    return await _get_weather(str(args.get("location") or args.get("city") or ""))
+    if name == "get_weather":
+        return await _execute_get_weather(args)
+    return f"Tool is unavailable: {name}"
 
 
 async def _memory_tool(

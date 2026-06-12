@@ -16,7 +16,8 @@ context_builder.py         — 全局协议文案 + build_chat_system_prompt 工
 runtime_context_builder.py — ContextBuilder：build_for_chat() 统一入口，收拢全部 context 构造逻辑
 tool_registry.py           — ToolDef 注册表 + native tool call spec 生成（含受限 memory 工具）
 tool_exposure_policy.py    — 每 turn 暴露哪些工具（当前固定 3 个）
-tools.py                   — 工具实现（get_time → wttr.in, get_weather → pytz）
+tools.py                   — 工具实现（get_time, get_weather, memory 分发）
+weather_provider.py        — 天气 Provider 协议 + QWeather 实现（GeoAPI + 实时 + 预报 + 缓存）
 output_guard.py            — 输出清洗：敏感信息过滤、长度截断、Markdown 去格式化
 ```
 

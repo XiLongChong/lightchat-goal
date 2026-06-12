@@ -536,6 +536,18 @@ def _startup_validate() -> None:
     else:
         logger.info("Startup validation: all checks passed")
 
+    # 6. Weather provider credentials
+    weather_provider = str(cfg.get("weather", {}).get("provider", "")).strip()
+    if weather_provider == "qweather":
+        qw_key = os.getenv("QWEATHER_API_KEY", "")
+        if not qw_key:
+            logger.warning(
+                "weather.provider=qweather but QWEATHER_API_KEY is not set; "
+                "weather tool will not work"
+            )
+        else:
+            logger.info("QWeather API key: configured")
+
 
 def _require_chat_auth(request: Request, api_cfg: dict[str, Any]) -> None:
     if not api_cfg["chat_auth_enabled"]:
@@ -644,9 +656,13 @@ def public_settings() -> dict:
             ),
         },
         "weather": {
+            "enabled": _as_bool(cfg.get("weather", {}).get("enabled", True)),
+            "provider": cfg.get("weather", {}).get("provider", "qweather"),
             "default_city": cfg.get("weather", {}).get("default_city", ""),
-            "timeout_seconds": cfg.get("weather", {}).get("timeout_seconds", 4),
-            "cache_ttl_seconds": cfg.get("weather", {}).get("cache_ttl_seconds", 600),
+            "timeout_seconds": cfg.get("weather", {}).get("timeout_seconds", 5),
+            "observation_cache_ttl_seconds": cfg.get("weather", {}).get("observation_cache_ttl_seconds", 600),
+            "forecast_cache_ttl_seconds": cfg.get("weather", {}).get("forecast_cache_ttl_seconds", 1800),
+            "location_cache_ttl_seconds": cfg.get("weather", {}).get("location_cache_ttl_seconds", 86400),
         },
         "email": {
             "enabled": email_cfg.get("enabled", False),
