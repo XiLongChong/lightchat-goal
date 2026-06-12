@@ -39,7 +39,7 @@ output_guard.py            — 输出清洗：敏感信息过滤、长度截断�
 ## 关键常量
 
 - `MAX_LLM_STEPS_PER_TURN = 20` — 单 turn 最多 LLM 调用轮次
-- `MAX_REPLY_MESSAGES_PER_TURN = 8` — 单 turn 最多回复条数
+- `MAX_REPLY_MESSAGES_PER_TURN = 10` — 单 turn 最多回复条数（对齐 iLink 回复窗口上限）
 - `MAX_MESSAGE_LEN = 500` (output_guard) — 单条消息最大字符数
 
 ## 工具注册（tool_registry）

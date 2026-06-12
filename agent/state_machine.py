@@ -157,6 +157,6 @@ class TurnResult:
 InterruptChecker = Callable[[str], bool]
 PostTerminalCallback = Callable[[TurnScratchpad, TurnState], Awaitable[None]]
 
-MAX_REPLY_MESSAGES_PER_TURN = 15
+MAX_REPLY_MESSAGES_PER_TURN = 10
 MAX_LLM_STEPS_PER_TURN = 20
 MAX_PROTOCOL_RETRIES_PER_TURN = 2

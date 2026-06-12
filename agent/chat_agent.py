@@ -303,17 +303,20 @@ class ChatAgent:
                     "content": result,
                 })
                 if turn.sent_message_count >= MAX_REPLY_MESSAGES_PER_TURN:
+                    for part in result_parts:
+                        if part.get("content") == "sent":
+                            part["content"] = "limit_reached: maximum 10 messages per turn reached"
                     terminal = TurnState.END_MAX_LIMIT
                     break
+            if result_parts:
+                tool_result_message = {"role": "user", "content": result_parts}
+                turn.messages.append(tool_result_message)
+                await self._write_event(turn, "message", {
+                    "message": copy.deepcopy(tool_result_message),
+                    "message_kind": "tool_result",
+                })
             if terminal == TurnState.END_MAX_LIMIT:
                 break
-
-            tool_result_message = {"role": "user", "content": result_parts}
-            turn.messages.append(tool_result_message)
-            await self._write_event(turn, "message", {
-                "message": copy.deepcopy(tool_result_message),
-                "message_kind": "tool_result",
-            })
         else:
             terminal = TurnState.END_MAX_LIMIT
 
