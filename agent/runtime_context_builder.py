@@ -270,9 +270,8 @@ class ContextBuilder:
         return (
             "<system-reminder>\n"
             f"Current time: {now:%Y-%m-%d %H:%M:%S} {now:%A}. "
-            f"The previous conversation was {elapsed} ago. "
-            "This is a system reminder. Use this information when relevant; "
-            "otherwise ignore it.\n"
+            f"The latest message was received just now, after {elapsed} of inactivity since the previous user message. "
+            "Use this idle gap only as conversational context when relevant; otherwise ignore it.\n"
             "</system-reminder>"
         )
 

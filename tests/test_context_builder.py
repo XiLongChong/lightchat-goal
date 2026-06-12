@@ -343,8 +343,8 @@ class TestIdleTimeReminder:
         reminder = content[1]["text"]
         assert reminder.startswith("<system-reminder>\nCurrent time: ")
         assert "Thursday" in reminder
-        assert "The previous conversation was 12 minutes ago." in reminder
-        assert "Use this information when relevant; otherwise ignore it." in reminder
+        assert "The latest message was received just now, after 12 minutes of inactivity since the previous user message." in reminder
+        assert "Use this idle gap only as conversational context when relevant; otherwise ignore it." in reminder
         assert "Asia/Shanghai" not in reminder
         assert "周四" not in reminder
 
@@ -363,6 +363,29 @@ class TestIdleTimeReminder:
         assert content[0]["text"].startswith("<summary>")
         assert content[1]["text"].startswith("<channel ")
         assert content[2]["text"].startswith("<system-reminder>")
+
+    def test_reminder_explicitly_states_just_now(self):
+        """时间提醒必须明确标记当前消息是刚收到的。"""
+        built = ContextBuilder().build_for_chat(
+            user_message="嗯 还早",
+            idle_seconds=22 * 60,
+            current_time=datetime(2026, 6, 11, 21, 0, 45, tzinfo=timezone(timedelta(hours=8))),
+        )
+        reminder = built.messages[-1]["content"][1]["text"]
+        assert "received just now" in reminder
+        assert "of inactivity since the previous user message" in reminder
+        assert " ago" not in reminder
+
+    def test_reminder_does_not_contain_location(self):
+        """提醒不应包含地点。"""
+        built = ContextBuilder().build_for_chat(
+            user_message="hi",
+            idle_seconds=15 * 60,
+            current_time=datetime(2026, 6, 11, 20, 0, tzinfo=timezone(timedelta(hours=8))),
+        )
+        reminder = built.messages[-1]["content"][1]["text"]
+        assert "Asia/Shanghai" not in reminder
+        assert "Beijing" not in reminder
 
 
 def test_long_term_memory_index_is_loaded_each_turn(tmp_path):
