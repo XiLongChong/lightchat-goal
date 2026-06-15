@@ -24,6 +24,7 @@ TOOL_RUNTIME_CONFIG: dict[str, Any] = {}
 LONG_TERM_MEMORY: LongTermMemoryService | None = None
 _weather_provider: QWeatherProvider | None = None
 _todo_provider: Any = None  # MSTodoProvider, lazy init
+_reminder_store: Any = None  # ReminderStore, set by configure_runtime
 logger = logging.getLogger(__name__)
 
 
@@ -288,14 +289,124 @@ async def _execute_web_search(args: dict[str, Any]) -> str:
     )
 
 
+# ── Reminder tools ──────────────────────────────────────
+
+async def _execute_create_reminder(args: dict[str, Any]) -> str:
+    """创建定时提醒。"""
+    from datetime import datetime, timedelta, timezone
+
+    global _reminder_store
+    if _reminder_store is None:
+        return "❌ 提醒服务未初始化。"
+
+    trigger_at = str(args.get("trigger_at", "")).strip()
+    reminder_note = str(args.get("reminder_note", "")).strip()
+    delivery_text = str(args.get("delivery_text", "")).strip()
+
+    if not trigger_at or not reminder_note or not delivery_text:
+        return "❌ 缺少必要参数：trigger_at, reminder_note, delivery_text。"
+
+    # 校验 ISO 8601 格式
+    try:
+        # 尝试解析 ISO 8601
+        dt = datetime.fromisoformat(trigger_at)
+    except ValueError:
+        return "❌ trigger_at 格式无效，需要 ISO 8601 格式（如 2026-06-16T14:40:00+08:00）。"
+
+    # 校验未来时间
+    tz = dt.tzinfo or timezone(timedelta(hours=8))
+    now = datetime.now(tz)
+    min_advance = timedelta(seconds=10)
+    if dt <= now + min_advance:
+        return "❌ 提醒时间必须在至少 10 秒之后。"
+
+    # 校验最大提前量
+    max_advance = timedelta(days=90)
+    if dt > now + max_advance:
+        return "❌ 提醒时间不能超过 90 天。"
+
+    # 校验 delivery_text 长度
+    if len(delivery_text) > 500:
+        return f"❌ delivery_text 不能超过 500 字符（当前 {len(delivery_text)}）。"
+
+    try:
+        result = await _reminder_store.create(
+            user_id="default",
+            message=delivery_text,
+            remind_at=trigger_at,
+        )
+    except Exception as e:
+        return f"❌ 创建提醒失败：{e}"
+
+    return (
+        f"✅ 提醒已创建！\n"
+        f"ID: `{result['id']}`\n"
+        f"时间: {trigger_at}\n"
+        f"内容: {delivery_text}"
+    )
+
+
+async def _execute_list_reminders(args: dict[str, Any]) -> str:
+    """列出提醒。"""
+    del args
+    global _reminder_store
+    if _reminder_store is None:
+        return "❌ 提醒服务未初始化。"
+
+    try:
+        reminders = await _reminder_store.list_by_user("default", status="pending")
+    except Exception as e:
+        return f"❌ 获取提醒列表失败：{e}"
+
+    if not reminders:
+        return "📋 暂无待处理的提醒。"
+
+    lines = [f"📋 待处理提醒（共 {len(reminders)} 个）：", ""]
+    for i, r in enumerate(reminders, 1):
+        lines.append(f"{i}. ID: `{r['id']}`")
+        lines.append(f"   时间: {r['remind_at']}")
+        lines.append(f"   内容: {r['message']}")
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
+async def _execute_cancel_reminder(args: dict[str, Any]) -> str:
+    """取消提醒。"""
+    global _reminder_store
+    if _reminder_store is None:
+        return "❌ 提醒服务未初始化。"
+
+    task_id = str(args.get("task_id", "")).strip()
+    if not task_id:
+        return "❌ 需要提供 task_id。"
+
+    try:
+        ok = await _reminder_store.cancel(task_id, "default")
+    except Exception as e:
+        return f"❌ 取消提醒失败：{e}"
+
+    if ok:
+        return f"✅ 提醒 `{task_id}` 已取消。"
+    return f"🔍 未找到待处理的提醒 `{task_id}`。"
+
+
 def configure_runtime(
     memory_store: Any = None,
     long_term_memory: LongTermMemoryService | None = None,
 ) -> None:
-    global LONG_TERM_MEMORY
+    global LONG_TERM_MEMORY, _reminder_store
     del memory_store
     if long_term_memory is not None:
         LONG_TERM_MEMORY = long_term_memory
+
+    # 初始化 ReminderStore
+    if _reminder_store is None:
+        from memory.reminder_store import ReminderStore
+        from runtime.config import get_config
+        cfg = get_config()
+        db_path = cfg.get("storage", {}).get("db_path", "./data/memory.db")
+        _reminder_store = ReminderStore(db_path)
 
 
 async def _get_time(timezone_name: str = "Asia/Shanghai") -> str:
@@ -369,6 +480,12 @@ async def execute_tool(
         return await _execute_todo_create_task(args)
     if name == "todo_complete_task":
         return await _execute_todo_complete_task(args)
+    if name == "create_reminder":
+        return await _execute_create_reminder(args)
+    if name == "list_reminders":
+        return await _execute_list_reminders(args)
+    if name == "cancel_reminder":
+        return await _execute_cancel_reminder(args)
     return f"Tool is unavailable: {name}"
 
 

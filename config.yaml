@@ -119,6 +119,13 @@ tavily:
   include_domains: []
   exclude_domains: []
 
+# ── 定时提醒 ──
+reminders:
+  enabled: true
+  max_advance_days: 90
+  min_advance_seconds: 10
+  max_delivery_text_chars: 500
+
 # ── 主动消息推送 ──
 proactive:
   enabled: true
