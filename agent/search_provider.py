@@ -12,10 +12,9 @@ logger = logging.getLogger(__name__)
 
 
 def _get_tavily_config() -> dict[str, Any]:
-    """获取 Tavily 配置。延迟导入避免循环依赖。"""
-    from runtime.config import get_config
-
-    cfg = get_config()
+    """获取 Tavily 配置。"""
+    import main
+    cfg = getattr(main, "cfg", {})
     return cfg.get("tavily", {})
 
 

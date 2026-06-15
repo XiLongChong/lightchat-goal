@@ -29,9 +29,8 @@ class TodoError(Exception):
 
 
 def _get_config() -> dict[str, Any]:
-    from runtime.config import get_config
-
-    return get_config().get("microsoft_todo", {})
+    import main
+    return getattr(main, "cfg", {}).get("microsoft_todo", {})
 
 
 def _build_token_cache() -> Any | None:

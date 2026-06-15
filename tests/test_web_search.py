@@ -112,7 +112,6 @@ class TestWebSearch:
             result = web_search("test")
 
         assert "..." in result
-        # Content should be truncated
         displayed = long_content[:300] + "..."
         assert displayed in result
 

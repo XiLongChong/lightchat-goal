@@ -31,8 +31,8 @@ class ProactiveService:
 
     @property
     def config(self) -> dict:
-        from runtime.config import get_config
-        return get_config().get("proactive", {})
+        import main
+        return getattr(main, "cfg", {}).get("proactive", {})
 
     @property
     def enabled(self) -> bool:

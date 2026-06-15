@@ -403,9 +403,7 @@ def configure_runtime(
     # 初始化 ReminderStore
     if _reminder_store is None:
         from memory.reminder_store import ReminderStore
-        from runtime.config import get_config
-        cfg = get_config()
-        db_path = cfg.get("storage", {}).get("db_path", "./data/memory.db")
+        db_path = str(TOOL_RUNTIME_CONFIG.get("storage", {}).get("db_path", "./data/memory.db"))
         _reminder_store = ReminderStore(db_path)
 
 

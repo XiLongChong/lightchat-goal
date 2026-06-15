@@ -187,6 +187,14 @@ def test_tool_definitions_are_complete():
         "get_time",
         "get_weather",
         "memory",
+        "web_search",
+        "todo_list_lists",
+        "todo_list_tasks",
+        "todo_create_task",
+        "todo_complete_task",
+        "create_reminder",
+        "list_reminders",
+        "cancel_reminder",
     }
     for definition in TOOL_REGISTRY.iter_defs():
         assert definition.description
