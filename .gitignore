@@ -15,6 +15,11 @@ docs/doing/
 # Local dev tools
 run_with_tap.bat
 .traces/
+.tmp/
+
+# Open-source PR / audit artifacts
+scripts/finalize_orphaned_tap_sessions.py
+security_best_practices_report.md
 
 # Editor / OS
 .DS_Store
