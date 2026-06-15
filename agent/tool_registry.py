@@ -209,6 +209,113 @@ TOOL_REGISTRY.register(ToolDef(
     },
 ))
 
+TOOL_REGISTRY.register(ToolDef(
+    name="todo_list_lists",
+    description="Get all Microsoft To Do task lists for the connected account.",
+    args_schema={
+        "properties": {},
+        "required": [],
+        "additionalProperties": False,
+    },
+    tool_category="fact_tool",
+))
+
+TOOL_REGISTRY.register(ToolDef(
+    name="todo_list_tasks",
+    description=(
+        "Get tasks from a Microsoft To Do list. Returns incomplete tasks "
+        "by default. Use include_completed=true to also see completed ones."
+    ),
+    args_schema={
+        "properties": {
+            "list_name": {
+                "type": "string",
+                "description": "Filter by list name. If omitted, uses default list.",
+            },
+            "include_completed": {
+                "type": "boolean",
+                "description": "Include completed tasks (default false).",
+            },
+            "max_results": {
+                "type": "integer",
+                "description": "Maximum tasks to return (default 20, max 50).",
+            },
+        },
+        "required": [],
+        "additionalProperties": False,
+    },
+    tool_category="fact_tool",
+))
+
+TOOL_REGISTRY.register(ToolDef(
+    name="todo_create_task",
+    description=(
+        "Create a new task in Microsoft To Do. Only call when the user "
+        "explicitly asks to create a task. Do not create tasks proactively."
+    ),
+    args_schema={
+        "properties": {
+            "title": {
+                "type": "string",
+                "description": "Task title (max 255 chars).",
+            },
+            "list_name": {
+                "type": "string",
+                "description": "Target list name. If omitted, uses default list.",
+            },
+            "due_date": {
+                "type": "string",
+                "description": "Due date in YYYY-MM-DD format.",
+            },
+            "reminder_date": {
+                "type": "string",
+                "description": "Reminder datetime in YYYY-MM-DD HH:MM format.",
+            },
+            "note": {
+                "type": "string",
+                "description": "Additional notes (max 1000 chars).",
+            },
+            "importance": {
+                "type": "string",
+                "description": "low | normal | high (default normal).",
+            },
+        },
+        "required": ["title"],
+        "additionalProperties": False,
+    },
+    side_effect_level="high",
+    tool_category="action_tool",
+))
+
+TOOL_REGISTRY.register(ToolDef(
+    name="todo_complete_task",
+    description=(
+        "Mark a task as completed. Prefer task_id when it was returned by a "
+        "previous candidate list. Without task_id, this only works when there "
+        "is exactly one exact title match."
+    ),
+    args_schema={
+        "properties": {
+            "task_title": {
+                "type": "string",
+                "description": "Exact task title to complete.",
+            },
+            "task_id": {
+                "type": "string",
+                "description": "Exact Graph task ID from a prior list result.",
+            },
+            "list_name": {
+                "type": "string",
+                "description": "List to search in. If omitted, uses default list.",
+            },
+        },
+        "required": [],
+        "additionalProperties": False,
+    },
+    side_effect_level="high",
+    tool_category="action_tool",
+))
+
 
 def get_all_tool_names() -> frozenset[str]:
     return TOOL_REGISTRY.names()
@@ -219,4 +326,4 @@ def is_action(name: str) -> bool:
 
 
 def is_external_tool(name: str) -> bool:
-    return name in {"get_time", "get_weather", "web_search"}
+    return name in {"get_time", "get_weather", "web_search", "todo_list_lists", "todo_list_tasks", "todo_create_task", "todo_complete_task"}

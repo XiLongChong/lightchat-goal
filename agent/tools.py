@@ -23,6 +23,7 @@ from memory.long_term import LongTermMemoryError, LongTermMemoryService, MemoryO
 TOOL_RUNTIME_CONFIG: dict[str, Any] = {}
 LONG_TERM_MEMORY: LongTermMemoryService | None = None
 _weather_provider: QWeatherProvider | None = None
+_todo_provider: Any = None  # MSTodoProvider, lazy init
 logger = logging.getLogger(__name__)
 
 
@@ -63,6 +64,200 @@ def _init_weather_provider() -> None:
         location_cache_ttl=float(weather_cfg.get("location_cache_ttl_seconds", 86400)),
     )
     logger.info("QWeather provider initialized (host=%s)", api_host or "api.qweather.com")
+
+
+def _get_todo_provider():
+    """延迟初始化 MSTodoProvider。"""
+    global _todo_provider
+    if _todo_provider is None:
+        from agent.todo_provider import MSTodoProvider
+        _todo_provider = MSTodoProvider()
+    return _todo_provider
+
+
+def _format_todo_result(result: dict) -> str:
+    """将 MSTodoProvider 返回的 dict 格式化为给模型的字符串。"""
+    if "error" in result:
+        code = result.get("error", "unknown")
+        msg = result.get("message", "")
+        if code == "not_connected":
+            return f"❌ Microsoft To Do 未连接。{msg}"
+        if code == "not_found":
+            return f"🔍 未找到：{msg}"
+        if code == "ambiguous":
+            candidates = result.get("candidates", [])
+            lines = [f"⚠️ 找到 {len(candidates)} 个同名任务，请指定 task_id：", ""]
+            for c in candidates:
+                lines.append(f"  - task_id: `{c['task_id']}` — {c.get('title', '')}")
+                if c.get("due"):
+                    lines.append(f"    截止: {c['due']}")
+            return "\n".join(lines)
+        if code == "rate_limited":
+            return f"⏳ {msg}"
+        return f"❌ {msg or code}"
+
+    if result.get("completed"):
+        if result.get("already_completed"):
+            return f"✅「{result.get('title', '')}」已经是完成状态。"
+        return f"✅ 已完成：{result.get('title', '')}"
+
+    # list results
+    if "value" in result:
+        items = result["value"]
+        if not items:
+            return "📋 暂无内容。"
+        lines = [f"📋 共 {len(items)} 项：", ""]
+        for i, item in enumerate(items, 1):
+            name = item.get("displayName") or item.get("title", "未命名")
+            item_id = item.get("id", "")
+            wl = item.get("wellknownListName", "")
+            status = item.get("status", "")
+            tag = " 📌" if wl == "defaultList" else ""
+            status_icon = {"completed": "✅", "inProgress": "🔄"}.get(status, "⬜")
+            lines.append(f"{i}. {status_icon} {name}{tag}")
+            if item_id:
+                lines.append(f"   ID: `{item_id}`")
+            due = item.get("dueDateTime", {})
+            if due.get("dateTime"):
+                lines.append(f"   📅 {due['dateTime']}")
+        return "\n".join(lines)
+
+    if result.get("title") and result.get("id"):
+        return f"✅ 已创建：{result['title']} (ID: `{result['id']}`)"
+
+    return json.dumps(result, ensure_ascii=False, default=str)
+
+
+async def _execute_todo_list_lists(args: dict[str, Any]) -> str:
+    del args
+    provider = _get_todo_provider()
+    if not provider.configured:
+        return "❌ Microsoft To Do 未配置（缺少 MS_TODO_CLIENT_ID）。"
+
+    token = await provider.acquire_token()
+    if token is None:
+        return provider.initiate_device_flow()
+
+    try:
+        lists = await provider.get_lists()
+    except Exception as e:
+        return f"❌ 获取列表失败：{e}"
+
+    return _format_todo_result({"value": lists})
+
+
+async def _execute_todo_list_tasks(args: dict[str, Any]) -> str:
+    provider = _get_todo_provider()
+    if not provider.configured:
+        return "❌ Microsoft To Do 未配置。"
+
+    token = await provider.acquire_token()
+    if token is None:
+        return provider.initiate_device_flow()
+
+    try:
+        default_list = await provider.get_default_list()
+        list_id = default_list["id"]
+    except Exception:
+        return "❌ 找不到默认任务列表。"
+
+    list_name = str(args.get("list_name", "")).strip()
+    if list_name:
+        matches = await provider.find_list_by_name(list_name)
+        if not matches:
+            return f"🔍 未找到名为「{list_name}」的列表。"
+        list_id = matches[0]["id"]
+
+    include_completed = bool(args.get("include_completed", False))
+    max_results = int(args.get("max_results", 20))
+
+    try:
+        tasks = await provider.get_tasks(list_id, max_results=max_results, include_completed=include_completed)
+    except Exception as e:
+        return f"❌ 获取任务失败：{e}"
+
+    return _format_todo_result({"value": tasks})
+
+
+async def _execute_todo_create_task(args: dict[str, Any]) -> str:
+    title = str(args.get("title", "")).strip()
+    if not title:
+        return "❌ 任务标题不能为空。"
+
+    provider = _get_todo_provider()
+    if not provider.configured:
+        return "❌ Microsoft To Do 未配置。"
+
+    token = await provider.acquire_token()
+    if token is None:
+        return provider.initiate_device_flow()
+
+    try:
+        default_list = await provider.get_default_list()
+        list_id = default_list["id"]
+    except Exception:
+        return "❌ 找不到默认任务列表。"
+
+    list_name = str(args.get("list_name", "")).strip()
+    if list_name:
+        matches = await provider.find_list_by_name(list_name)
+        if not matches:
+            return f"🔍 未找到名为「{list_name}」的列表。"
+        list_id = matches[0]["id"]
+
+    try:
+        result = await provider.create_task(
+            list_id=list_id,
+            title=title,
+            due_date=args.get("due_date"),
+            reminder_date=args.get("reminder_date"),
+            note=args.get("note"),
+            importance=str(args.get("importance", "normal")),
+        )
+    except Exception as e:
+        return f"❌ 创建任务失败：{e}"
+
+    return _format_todo_result(result)
+
+
+async def _execute_todo_complete_task(args: dict[str, Any]) -> str:
+    provider = _get_todo_provider()
+    if not provider.configured:
+        return "❌ Microsoft To Do 未配置。"
+
+    token = await provider.acquire_token()
+    if token is None:
+        return provider.initiate_device_flow()
+
+    try:
+        default_list = await provider.get_default_list()
+        list_id = default_list["id"]
+    except Exception:
+        return "❌ 找不到默认任务列表。"
+
+    list_name = str(args.get("list_name", "")).strip()
+    if list_name:
+        matches = await provider.find_list_by_name(list_name)
+        if not matches:
+            return f"🔍 未找到名为「{list_name}」的列表。"
+        list_id = matches[0]["id"]
+
+    task_id = str(args.get("task_id", "")).strip() or None
+    task_title = str(args.get("task_title", "")).strip() or None
+
+    if not task_id and not task_title:
+        return "❌ 需要提供 task_id 或 task_title。"
+
+    try:
+        result = await provider.complete_task(
+            list_id=list_id,
+            task_id=task_id,
+            task_title=task_title,
+        )
+    except Exception as e:
+        return f"❌ 完成任务失败：{e}"
+
+    return _format_todo_result(result)
 
 
 async def _execute_web_search(args: dict[str, Any]) -> str:
@@ -166,6 +361,14 @@ async def execute_tool(
         return await _execute_get_weather(args)
     if name == "web_search":
         return await _execute_web_search(args)
+    if name == "todo_list_lists":
+        return await _execute_todo_list_lists(args)
+    if name == "todo_list_tasks":
+        return await _execute_todo_list_tasks(args)
+    if name == "todo_create_task":
+        return await _execute_todo_create_task(args)
+    if name == "todo_complete_task":
+        return await _execute_todo_complete_task(args)
     return f"Tool is unavailable: {name}"
 
 
