@@ -103,6 +103,14 @@ weather:
   forecast_cache_ttl_seconds: 1800
   location_cache_ttl_seconds: 86400
 
+# ── Microsoft To Do (Microsoft Graph API) ──
+microsoft_todo:
+  enabled: false
+  client_id: "${MS_TODO_CLIENT_ID:-}"
+  tenant_id: "${MS_TODO_TENANT:-common}"
+  token_cache_path: "data/ms_todo_cache.bin"
+  timeout_seconds: 15
+
 # ── 联网搜索 (Tavily) ──
 tavily:
   api_key: "${TAVILY_API_KEY:-}"
