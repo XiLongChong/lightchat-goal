@@ -3,15 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import os
-import tempfile
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 
 class TestReminderStore:
-    """测试 ReminderStore CRUD（使用 :memory: 避免 Windows 文件锁问题）。"""
-
     def make_store(self):
         from memory.reminder_store import ReminderStore
         return ReminderStore(":memory:")
@@ -68,8 +64,6 @@ class TestReminderStore:
 
 
 class TestReminderTools:
-    """测试提醒工具执行器（都是 async）。"""
-
     def test_create_no_store(self):
         from agent.tools import _execute_create_reminder
         with patch("agent.tools._reminder_store", None):
@@ -103,10 +97,24 @@ class TestReminderTools:
         }))
         assert "格式无效" in result
 
-    def test_create_too_long(self):
+    def test_create_too_far(self):
+        """超过 90 天的提醒被拒绝。"""
         from agent.tools import _execute_create_reminder
         result = asyncio.run(_execute_create_reminder({
-            "trigger_at": "2026-12-31T00:00:00+08:00",
+            "trigger_at": "2026-09-30T00:00:00+08:00",
+            "reminder_note": "test",
+            "delivery_text": "x" * 600,
+        }))
+        assert "不能超过 90 天" in result
+
+    def test_create_too_long(self):
+        """delivery_text 超过 500 字符被拒绝（时间在范围内但文本过长）。"""
+        from agent.tools import _execute_create_reminder
+        # Use a date just barely within 90 days
+        tz = timezone(timedelta(hours=8))
+        future = (datetime.now(tz) + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+        result = asyncio.run(_execute_create_reminder({
+            "trigger_at": future,
             "reminder_note": "test",
             "delivery_text": "x" * 600,
         }))

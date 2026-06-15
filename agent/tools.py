@@ -261,7 +261,7 @@ async def _execute_todo_complete_task(args: dict[str, Any]) -> str:
     return _format_todo_result(result)
 
 
-async def _execute_web_search(args: dict[str, Any]) -> str:
+def _execute_web_search(args: dict[str, Any]) -> str:
     """Execute web_search tool."""
     from agent.search_provider import web_search
 
@@ -280,7 +280,7 @@ async def _execute_web_search(args: dict[str, Any]) -> str:
     include_domains = args.get("include_domains")
     exclude_domains = args.get("exclude_domains")
 
-    return await web_search(
+    return web_search(
         query=query,
         max_results=max_results,
         include_answer=include_answer,

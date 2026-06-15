@@ -23,7 +23,24 @@ class ReminderStore:
     def _get_conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
+        # For :memory: databases, ensure table exists on every connection
+        if self.db_path == ":memory:":
+            self._ensure_table_on(conn)
         return conn
+
+    def _ensure_table_on(self, conn: sqlite3.Connection) -> None:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS reminders (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                message TEXT NOT NULL,
+                remind_at TEXT NOT NULL,
+                timezone TEXT NOT NULL DEFAULT 'Asia/Shanghai',
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                sent_at TEXT
+            )
+        """)
 
     def _ensure_table(self):
         with self._get_conn() as conn:

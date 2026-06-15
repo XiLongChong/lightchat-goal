@@ -1,8 +1,4 @@
-"""测试 web_search 工具。
-
-web_search 是同步函数（通过 _get_client 延迟加载 TavilyClient），
-工具执行器 _execute_web_search 也是同步的。
-"""
+"""测试 web_search 工具（同步函数）。"""
 
 from __future__ import annotations
 
@@ -10,8 +6,6 @@ from unittest.mock import MagicMock, patch
 
 
 class TestWebSearch:
-    """测试 web_search 工具。"""
-
     def test_no_api_key(self):
         from agent.search_provider import web_search
         with patch("agent.search_provider._get_tavily_config", return_value={"api_key": ""}):
@@ -22,8 +16,7 @@ class TestWebSearch:
         from agent.search_provider import web_search
         mock = MagicMock()
         mock.search.return_value = {
-            "answer": "答案",
-            "results": [{"title": "T", "url": "https://a.com", "content": "C"}],
+            "answer": "答案", "results": [{"title": "T", "url": "https://a.com", "content": "C"}],
         }
         with (
             patch("agent.search_provider._get_tavily_config", return_value={"api_key": "k", "max_results": 5, "include_answer": True}),

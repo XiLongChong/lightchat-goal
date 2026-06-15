@@ -29,7 +29,7 @@ def _get_client():
     return TavilyClient(api_key=api_key)
 
 
-async def web_search(
+def web_search(
     query: str,
     max_results: int | None = None,
     include_answer: bool | None = None,

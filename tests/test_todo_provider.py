@@ -1,7 +1,4 @@
-"""测试 Microsoft To Do Provider 和工具执行器。
-
-todo 工具执行器是 async 函数，测试需用 asyncio.run() 调用。
-"""
+"""测试 Microsoft To Do Provider 和工具执行器。"""
 
 from __future__ import annotations
 
@@ -10,8 +7,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 
 class TestTodoProvider:
-    """测试 MSTodoProvider 核心方法。"""
-
     def test_not_configured(self):
         from agent.todo_provider import MSTodoProvider
         with patch("agent.todo_provider._get_config", return_value={"client_id": ""}):
@@ -34,12 +29,10 @@ class TestTodoProvider:
         from agent.todo_provider import MSTodoProvider
         p = MSTodoProvider()
         p._current_token = "t"
-        p._request = AsyncMock(return_value={
-            "value": [
-                {"displayName": "Custom", "id": "l1", "wellknownListName": ""},
-                {"displayName": "Tasks", "id": "l2", "wellknownListName": "defaultList"},
-            ]
-        })
+        p._request = AsyncMock(return_value={"value": [
+            {"displayName": "Custom", "id": "l1", "wellknownListName": ""},
+            {"displayName": "Tasks", "id": "l2", "wellknownListName": "defaultList"},
+        ]})
         r = asyncio.run(p.get_default_list())
         assert r["id"] == "l2"
 
@@ -60,8 +53,7 @@ class TestTodoProvider:
         p = MSTodoProvider()
         p._current_token = "t"
         p._request = AsyncMock(return_value={"value": [
-            {"displayName": "Shopping", "id": "l1"},
-            {"displayName": "Work", "id": "l2"},
+            {"displayName": "Shopping", "id": "l1"}, {"displayName": "Work", "id": "l2"},
         ]})
         r = asyncio.run(p.find_list_by_name("shop"))
         assert len(r) == 1
@@ -121,8 +113,6 @@ class TestTodoProvider:
 
 
 class TestTodoToolExecutors:
-    """测试 todo 工具执行器（都是 async）。"""
-
     def test_list_lists_not_configured(self):
         from agent.tools import _execute_todo_list_lists
         with patch("agent.tools._get_todo_provider") as mock_p:
