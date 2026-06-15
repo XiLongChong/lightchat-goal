@@ -65,6 +65,34 @@ def _init_weather_provider() -> None:
     logger.info("QWeather provider initialized (host=%s)", api_host or "api.qweather.com")
 
 
+async def _execute_web_search(args: dict[str, Any]) -> str:
+    """Execute web_search tool."""
+    from agent.search_provider import web_search
+
+    query = str(args.get("query", "")).strip()
+    if not query:
+        return "❌ 搜索查询不能为空。"
+
+    max_results = args.get("max_results")
+    if max_results is not None:
+        max_results = int(max_results)
+
+    include_answer = args.get("include_answer")
+    if include_answer is not None:
+        include_answer = bool(include_answer)
+
+    include_domains = args.get("include_domains")
+    exclude_domains = args.get("exclude_domains")
+
+    return await web_search(
+        query=query,
+        max_results=max_results,
+        include_answer=include_answer,
+        include_domains=include_domains,
+        exclude_domains=exclude_domains,
+    )
+
+
 def configure_runtime(
     memory_store: Any = None,
     long_term_memory: LongTermMemoryService | None = None,
@@ -136,6 +164,8 @@ async def execute_tool(
         return await _get_time(str(args.get("timezone") or "Asia/Shanghai"))
     if name == "get_weather":
         return await _execute_get_weather(args)
+    if name == "web_search":
+        return await _execute_web_search(args)
     return f"Tool is unavailable: {name}"
 
 
