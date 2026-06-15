@@ -190,8 +190,9 @@ class ChatAgent:
     ) -> TurnResult:
         prebuilt_messages = unused.get("prebuilt_messages") if unused else None
         del context_policy, unused
-        if source != SOURCE_USER_MESSAGE:
-            raise ValueError("only ordinary user-message turns are supported")
+        is_proactive = source == "proactive"
+        if source != SOURCE_USER_MESSAGE and not is_proactive:
+            raise ValueError("only ordinary user-message and proactive turns are supported")
         if user_message is None or not str(user_message).strip():
             raise ValueError("user_message is required")
 

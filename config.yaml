@@ -119,6 +119,14 @@ tavily:
   include_domains: []
   exclude_domains: []
 
+# ── 主动消息推送 ──
+proactive:
+  enabled: true
+  interval_minutes: 30
+  time_window_start: 8
+  time_window_end: 22
+  cooldown_minutes: 5
+
 logging:
   level: "${LOG_LEVEL:-INFO}"
   file: "./data/agent.log"

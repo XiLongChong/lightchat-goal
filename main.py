@@ -39,6 +39,7 @@ from memory.conversation import ConversationContext
 from memory.store import MemoryStore
 from memory.long_term import LongTermMemoryService
 from runtime.chat_runtime import ChatRuntime, create_chat_runtime
+from runtime.proactive_service import ProactiveService
 
 # ================================================================
 # Config loading
@@ -889,8 +890,19 @@ async def lifespan(app: FastAPI):
             )
     if _bridge is not None and _bridge.token:
         await _bridge.start()
+
+    # 启动主动消息推送服务
+    proactive_svc = ProactiveService(
+        user_id=startup_user_id,
+        settings=runtime_settings,
+        store=memory_store,
+    )
+    await proactive_svc.start()
+
     yield
+
     logger.info("Shutting down...")
+    await proactive_svc.stop()
     if _bridge is not None:
         await _bridge.stop()
     await memory_store.close()
@@ -1372,6 +1384,7 @@ async def chat(request: Request):
     user_id = _validate_chat_user_id(str(body.get("user_id", "default")), api_cfg)
     context_token = str(body.get("context_token", ""))
     inbound_trigger = str(body.get("trigger") or "user")
+    inbound_source = str(body.get("source", "user_message"))
     input_message_ids = body.get("input_message_ids")
     if not isinstance(input_message_ids, list):
         input_message_ids = []
@@ -1442,8 +1455,8 @@ async def chat(request: Request):
                 history=prebuilt_messages,
                 system_prompt=system_prompt,
                 prebuilt_messages=prebuilt_messages,
-                trigger="user",
-                source="user_message",
+                trigger="user" if inbound_source == "user_message" else "proactive",
+                source=inbound_source,
                 wechat_sender=_bound_sender,
                 input_message_ids=input_message_ids,
                 input_first_seq=input_first_seq,
