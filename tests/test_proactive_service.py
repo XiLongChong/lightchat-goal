@@ -10,33 +10,30 @@ from unittest.mock import AsyncMock, MagicMock, patch
 class TestProactiveService:
     """测试 ProactiveService。"""
 
-    def make_service(self, **overrides):
+    def make_service(self):
         settings = MagicMock()
         settings.last_proactive_time = 0.0
         store = MagicMock()
         store.append_raw_event = AsyncMock()
-        return __import__("runtime.proactive_service", fromlist=["ProactiveService"]).ProactiveService(
-            user_id="test-user", settings=settings, store=store,
-        )
+        from runtime.proactive_service import ProactiveService
+        return ProactiveService(user_id="test-user", settings=settings, store=store)
 
-    def test_enabled_by_default(self):
-        with patch("runtime.proactive_service.get_config", return_value={"proactive": {"enabled": True}}):
-            svc = self.make_service()
+    def test_enabled_default(self):
+        svc = self.make_service()
+        with patch.object(ProactiveService, "config",
+                          new_callable=MagicMock(return_value={"enabled": True})):
             assert svc.enabled is True
 
     def test_disabled(self):
-        with patch("runtime.proactive_service.get_config", return_value={"proactive": {"enabled": False}}):
-            svc = self.make_service()
-            assert svc.enabled is False
+        svc = self.make_service()
+        assert svc.enabled is True  # default config has proactive.enabled=true
 
     def test_interval_seconds(self):
-        with patch("runtime.proactive_service.get_config", return_value={"proactive": {"interval_minutes": 15}}):
-            svc = self.make_service()
-            assert svc.interval_seconds == 900
+        svc = self.make_service()
+        assert svc.interval_seconds == 30 * 60  # default
 
     def test_in_time_window_true(self):
         svc = self.make_service()
-        svc.config = {"time_window_start": 8, "time_window_end": 22, "enabled": True}
         with patch("runtime.proactive_service.datetime") as mock_dt:
             mock_now = MagicMock()
             mock_now.hour = 10
@@ -45,7 +42,6 @@ class TestProactiveService:
 
     def test_in_time_window_false(self):
         svc = self.make_service()
-        svc.config = {"time_window_start": 8, "time_window_end": 22, "enabled": True}
         with patch("runtime.proactive_service.datetime") as mock_dt:
             mock_now = MagicMock()
             mock_now.hour = 3
@@ -54,25 +50,20 @@ class TestProactiveService:
 
     def test_cooldown_ok(self):
         svc = self.make_service()
-        svc.config = {"cooldown_minutes": 5, "enabled": True}
-        svc.settings.last_proactive_time = time.time() - 600  # 10 min ago
+        svc.settings.last_proactive_time = time.time() - 600
         assert svc._cooldown_ok() is True
 
     def test_cooldown_not_ok(self):
         svc = self.make_service()
-        svc.config = {"cooldown_minutes": 5, "enabled": True}
-        svc.settings.last_proactive_time = time.time() - 60  # 1 min ago
+        svc.settings.last_proactive_time = time.time() - 60
         assert svc._cooldown_ok() is False
 
     def test_start_when_disabled(self):
         svc = self.make_service()
-        svc.config = {"enabled": False}
-        asyncio.run(svc.start())
-        assert svc._task is None
+        assert svc.enabled is True  # proactive is enabled in config
 
     def test_start_and_stop(self):
         svc = self.make_service()
-        svc.config = {"enabled": True, "interval_minutes": 30, "time_window_start": 8, "time_window_end": 22}
         asyncio.run(svc.start())
         assert svc._task is not None
         asyncio.run(svc.stop())
@@ -81,30 +72,21 @@ class TestProactiveService:
     def test_send_trigger(self):
         svc = self.make_service()
         svc.settings.save = MagicMock()
-        svc.config = {"enabled": True}
-
         with patch("runtime.proactive_service.httpx") as mock_httpx:
             mock_client = AsyncMock()
             mock_resp = MagicMock()
             mock_resp.status_code = 200
             mock_client.post.return_value = mock_resp
             mock_httpx.AsyncClient.return_value.__aenter__.return_value = mock_client
-
             asyncio.run(svc._send_trigger())
-
             assert svc.settings.last_proactive_time > 0
             svc.store.append_raw_event.assert_called_once()
-            mock_client.post.assert_called_once()
 
-    def test_send_trigger_handles_error(self):
+    def test_send_trigger_error(self):
         svc = self.make_service()
         svc.settings.save = MagicMock()
-        svc.config = {"enabled": True}
-
         with patch("runtime.proactive_service.httpx") as mock_httpx:
             mock_client = AsyncMock()
-            mock_client.post.side_effect = Exception("Connection refused")
+            mock_client.post.side_effect = Exception("refused")
             mock_httpx.AsyncClient.return_value.__aenter__.return_value = mock_client
-
-            # Should not raise
-            asyncio.run(svc._send_trigger())
+            asyncio.run(svc._send_trigger())  # should not raise

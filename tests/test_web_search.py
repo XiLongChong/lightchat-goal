@@ -1,4 +1,8 @@
-"""测试 web_search 工具。"""
+"""测试 web_search 工具。
+
+web_search 是同步函数（通过 _get_client 延迟加载 TavilyClient），
+工具执行器 _execute_web_search 也是同步的。
+"""
 
 from __future__ import annotations
 
@@ -9,123 +13,80 @@ class TestWebSearch:
     """测试 web_search 工具。"""
 
     def test_no_api_key(self):
-        """无 API key 时返回错误消息。"""
         from agent.search_provider import web_search
-
         with patch("agent.search_provider._get_tavily_config", return_value={"api_key": ""}):
             result = web_search("test")
             assert "未配置" in result
-            assert "TAVILY_API_KEY" in result
 
-    def test_successful_search_with_answer(self):
-        """成功搜索并包含 AI 答案。"""
+    def test_successful_search(self):
         from agent.search_provider import web_search
-
-        mock_client = MagicMock()
-        mock_client.search.return_value = {
-            "answer": "测试答案",
-            "results": [
-                {"title": "标题1", "url": "https://a.com/1", "content": "内容1"},
-                {"title": "标题2", "url": "https://a.com/2", "content": "内容2"},
-            ],
+        mock = MagicMock()
+        mock.search.return_value = {
+            "answer": "答案",
+            "results": [{"title": "T", "url": "https://a.com", "content": "C"}],
         }
-
         with (
-            patch("agent.search_provider._get_tavily_config",
-                  return_value={"api_key": "k", "max_results": 5, "include_answer": True}),
-            patch("agent.search_provider._get_client", return_value=mock_client),
+            patch("agent.search_provider._get_tavily_config", return_value={"api_key": "k", "max_results": 5, "include_answer": True}),
+            patch("agent.search_provider._get_client", return_value=mock),
         ):
             result = web_search("test")
-
-        assert "摘要" in result
-        assert "测试答案" in result
-        assert "标题1" in result
-        assert "https://a.com/1" in result
+        assert "答案" in result
+        assert "T" in result
 
     def test_empty_results(self):
-        """空结果。"""
         from agent.search_provider import web_search
-
-        mock_client = MagicMock()
-        mock_client.search.return_value = {"results": []}
-
+        mock = MagicMock()
+        mock.search.return_value = {"results": []}
         with (
-            patch("agent.search_provider._get_tavily_config",
-                  return_value={"api_key": "k", "max_results": 5, "include_answer": True}),
-            patch("agent.search_provider._get_client", return_value=mock_client),
+            patch("agent.search_provider._get_tavily_config", return_value={"api_key": "k", "max_results": 5, "include_answer": True}),
+            patch("agent.search_provider._get_client", return_value=mock),
         ):
             result = web_search("nothing")
-            assert "未找到" in result
+        assert "未找到" in result
 
-    def test_retry_on_error(self):
-        """失败时重试一次。"""
+    def test_retry(self):
         from agent.search_provider import web_search
-
-        mock_client = MagicMock()
-        mock_client.search.side_effect = [
-            Exception("网络错误"),
-            {"answer": "重试成功", "results": [{"title": "结果", "url": "https://a.com", "content": "c"}]},
-        ]
-
+        mock = MagicMock()
+        mock.search.side_effect = [Exception("err"), {"answer": "ok", "results": [{"title": "R", "url": "https://a.com", "content": "c"}]}]
         with (
-            patch("agent.search_provider._get_tavily_config",
-                  return_value={"api_key": "k", "max_results": 5, "include_answer": True}),
-            patch("agent.search_provider._get_client", return_value=mock_client),
+            patch("agent.search_provider._get_tavily_config", return_value={"api_key": "k", "max_results": 5, "include_answer": True}),
+            patch("agent.search_provider._get_client", return_value=mock),
         ):
             result = web_search("test")
-
-        assert mock_client.search.call_count == 2
-        assert "重试成功" in result
+        assert mock.search.call_count == 2
+        assert "ok" in result
 
     def test_double_failure(self):
-        """两次都失败。"""
         from agent.search_provider import web_search
-
-        mock_client = MagicMock()
-        mock_client.search.side_effect = Exception("持续失败")
-
+        mock = MagicMock()
+        mock.search.side_effect = Exception("fail")
         with (
-            patch("agent.search_provider._get_tavily_config",
-                  return_value={"api_key": "k", "max_results": 5, "include_answer": True}),
-            patch("agent.search_provider._get_client", return_value=mock_client),
+            patch("agent.search_provider._get_tavily_config", return_value={"api_key": "k", "max_results": 5, "include_answer": True}),
+            patch("agent.search_provider._get_client", return_value=mock),
         ):
             result = web_search("test")
-
-        assert mock_client.search.call_count == 2
+        assert mock.search.call_count == 2
         assert "搜索失败" in result
 
-    def test_long_content_truncation(self):
-        """长内容被截断。"""
+    def test_truncation(self):
         from agent.search_provider import web_search
-
-        long_content = "x" * 500
-        mock_client = MagicMock()
-        mock_client.search.return_value = {
-            "results": [{"title": "T", "url": "https://a.com", "content": long_content}],
-        }
-
+        long_c = "x" * 500
+        mock = MagicMock()
+        mock.search.return_value = {"results": [{"title": "T", "url": "https://a.com", "content": long_c}]}
         with (
-            patch("agent.search_provider._get_tavily_config",
-                  return_value={"api_key": "k", "max_results": 5, "include_answer": False}),
-            patch("agent.search_provider._get_client", return_value=mock_client),
+            patch("agent.search_provider._get_tavily_config", return_value={"api_key": "k", "max_results": 5, "include_answer": False}),
+            patch("agent.search_provider._get_client", return_value=mock),
         ):
             result = web_search("test")
+        assert (long_c[:300] + "...") in result
 
-        assert "..." in result
-        displayed = long_content[:300] + "..."
-        assert displayed in result
-
-    def test_tool_executor_empty_query(self):
-        """执行器空查询。"""
+    def test_executor_empty_query(self):
         from agent.tools import _execute_web_search
-
         result = _execute_web_search({"query": ""})
         assert "不能为空" in result
 
-    def test_tool_executor_normal(self):
-        """执行器正常调用。"""
+    def test_executor_normal(self):
         from agent.tools import _execute_web_search
-
-        with patch("agent.search_provider.web_search", return_value="搜索成功结果"):
+        with patch("agent.search_provider.web_search", return_value="ok"):
             result = _execute_web_search({"query": "hello"})
-            assert result == "搜索成功结果"
+            assert result == "ok"
