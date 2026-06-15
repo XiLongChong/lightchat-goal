@@ -103,6 +103,14 @@ weather:
   forecast_cache_ttl_seconds: 1800
   location_cache_ttl_seconds: 86400
 
+# ── 联网搜索 (Tavily) ──
+tavily:
+  api_key: "${TAVILY_API_KEY:-}"
+  max_results: 5
+  include_answer: true
+  include_domains: []
+  exclude_domains: []
+
 logging:
   level: "${LOG_LEVEL:-INFO}"
   file: "./data/agent.log"
