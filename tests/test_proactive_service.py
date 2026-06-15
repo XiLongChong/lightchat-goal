@@ -78,8 +78,7 @@ class TestProactiveService:
     def test_send_trigger(self):
         svc = self.make_service()
         svc.settings.save = MagicMock()
-        # Mock the internal httpx import via patching the method's internals
-        with patch("runtime.proactive_service.httpx.AsyncClient") as mock_ac:
+        with patch("httpx.AsyncClient") as mock_ac:
             mock_client = AsyncMock()
             mock_resp = MagicMock()
             mock_resp.status_code = 200
@@ -92,7 +91,7 @@ class TestProactiveService:
     def test_send_trigger_error(self):
         svc = self.make_service()
         svc.settings.save = MagicMock()
-        with patch("runtime.proactive_service.httpx.AsyncClient") as mock_ac:
+        with patch("httpx.AsyncClient") as mock_ac:
             mock_client = AsyncMock()
             mock_client.post.side_effect = Exception("refused")
             mock_ac.return_value.__aenter__.return_value = mock_client

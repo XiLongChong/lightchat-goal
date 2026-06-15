@@ -127,8 +127,14 @@ class TestTodoToolExecutors:
 
     def test_complete_task_no_args(self):
         from agent.tools import _execute_todo_complete_task
-        result = asyncio.run(_execute_todo_complete_task({}))
-        assert "需要提供" in result
+        # _execute_todo_complete_task first checks provider.configured,
+        # so we need to mock that to reach the "need args" check
+        with patch("agent.tools._get_todo_provider") as mock_p:
+            mock_p.return_value.configured = True
+            mock_p.return_value.acquire_token = AsyncMock(return_value="token")
+            mock_p.return_value.get_default_list = AsyncMock(return_value={"id": "l1"})
+            result = asyncio.run(_execute_todo_complete_task({}))
+            assert "需要提供" in result
 
     def test_format_ambiguous(self):
         from agent.tools import _format_todo_result

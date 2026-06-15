@@ -136,12 +136,12 @@ class TestReminderTools:
         mock_store = MagicMock()
         mock_store.create = AsyncMock(return_value={
             "id": "abc123", "message": "test msg",
-            "remind_at": "2026-12-31T00:00:00+08:00",
+            "remind_at": "2026-07-01T00:00:00+08:00",
             "status": "pending", "created_at": "2026-01-01",
         })
         with patch("agent.tools._reminder_store", mock_store):
             result = asyncio.run(_execute_create_reminder({
-                "trigger_at": "2026-12-31T00:00:00+08:00",
+                "trigger_at": "2026-07-01T00:00:00+08:00",
                 "reminder_note": "test",
                 "delivery_text": "test msg",
             }))
