@@ -188,6 +188,27 @@ class MemoryStore:
                 updated_at REAL NOT NULL,
                 PRIMARY KEY(user_id, date)
             );
+
+            CREATE TABLE IF NOT EXISTS app_messages (
+                id TEXT PRIMARY KEY,
+                client_message_id TEXT,
+                role TEXT NOT NULL CHECK(role IN ('user', 'agent', 'system')),
+                content TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                source_turn_id TEXT NOT NULL DEFAULT '',
+                source_tool_call_id TEXT NOT NULL DEFAULT '',
+                sequence INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_app_messages_client_msg_id
+                ON app_messages(client_message_id)
+                WHERE client_message_id IS NOT NULL;
+
+            CREATE INDEX IF NOT EXISTS idx_app_messages_created_at
+                ON app_messages(created_at);
+
+            CREATE INDEX IF NOT EXISTS idx_app_messages_source_turn_id
+                ON app_messages(source_turn_id);
             """
         )
 
@@ -936,11 +957,110 @@ class MemoryStore:
         )
         return [dict(r) for r in rows]
 
+    # ── app_messages ──────────────────────────────────────────────────
+
+    async def insert_app_message(
+        self,
+        *,
+        remote_id: str,
+        client_message_id: str | None,
+        role: str,
+        content: str,
+        source_turn_id: str = "",
+        source_tool_call_id: str = "",
+        sequence: int = 0,
+    ) -> None:
+        """Insert a single app message (user or agent reply)."""
+        now = time.time()
+        async with self._write_lock:
+            db = await self._get_db()
+            await db.execute(
+                """INSERT INTO app_messages(
+                       id, client_message_id, role, content, created_at,
+                       source_turn_id, source_tool_call_id, sequence
+                   )
+                   VALUES(?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    remote_id,
+                    client_message_id,
+                    role,
+                    content,
+                    now,
+                    source_turn_id,
+                    source_tool_call_id,
+                    sequence,
+                ),
+            )
+            await db.commit()
+
+    async def find_app_message_by_client_message_id(
+        self, client_message_id: str,
+    ) -> dict[str, Any] | None:
+        """Look up an app message by its client-generated idempotency key."""
+        db = await self._get_db()
+        rows = await db.execute_fetchall(
+            "SELECT * FROM app_messages WHERE client_message_id = ?",
+            (client_message_id,),
+        )
+        return dict(rows[0]) if rows else None
+
+    async def find_app_agent_replies_by_turn_id(
+        self, source_turn_id: str,
+    ) -> list[dict[str, Any]]:
+        """Return agent replies for a given turn, ordered by sequence."""
+        db = await self._get_db()
+        rows = await db.execute_fetchall(
+            """SELECT * FROM app_messages
+               WHERE source_turn_id = ? AND role = 'agent'
+               ORDER BY sequence ASC""",
+            (source_turn_id,),
+        )
+        return [dict(row) for row in rows]
+
+    async def get_app_messages_after_cursor(
+        self,
+        cursor: str | None = None,
+        limit: int = 50,
+    ) -> tuple[list[dict[str, Any]], str | None, bool]:
+        """Return app messages ordered by created_at ASC, id ASC.
+
+        cursor  – the id of the last-seen message (exclusive), or None for
+                  the first page.
+        limit   – maximum messages to return (1-200, clamped).
+        Returns (messages, next_cursor, has_more).
+        """
+        limit = max(1, min(int(limit), 200))
+        db = await self._get_db()
+
+        if cursor is None:
+            rows = await db.execute_fetchall(
+                """SELECT * FROM app_messages
+                   ORDER BY created_at ASC, id ASC
+                   LIMIT ?""",
+                (limit + 1,),
+            )
+        else:
+            rows = await db.execute_fetchall(
+                """SELECT * FROM app_messages
+                   WHERE id > ?
+                   ORDER BY created_at ASC, id ASC
+                   LIMIT ?""",
+                (cursor, limit + 1,),
+            )
+
+        has_more = len(rows) > limit
+        if has_more:
+            rows = rows[:limit]
+
+        messages = [dict(row) for row in rows]
+        next_cursor = messages[-1]["id"] if messages else cursor
+        return messages, next_cursor, has_more
+
     # ── clear ───────────────────────────────────────────────────────
 
     async def clear_all(self) -> dict[str, int]:
         """Clear all data except bot_contact_state and runtime_meta."""
-        tables = ("conversations", "turns", "raw_events", "context_snapshots", "tool_versions", "daily_summaries", "scheduled_tasks")
+        tables = ("conversations", "turns", "raw_events", "context_snapshots", "tool_versions", "daily_summaries", "scheduled_tasks", "app_messages")
         counts: dict[str, int] = {}
         async with self._write_lock:
             db = await self._get_db()

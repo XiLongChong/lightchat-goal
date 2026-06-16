@@ -11,7 +11,7 @@ import re
 import sys
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, time as datetime_time
+from datetime import datetime, time as datetime_time, timezone
 from typing import Any
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -1630,6 +1630,226 @@ async def chat(request: Request):
             "route": "error",
             "error": "internal_error",
         }
+
+
+# ================================================================
+# App adapter endpoints (AsPocket Android client)
+# ================================================================
+
+_APP_USER_ID = os.getenv("APP_USER_ID", "app:user")
+_APP_AGENT_TIMEOUT_S = 55.0
+
+
+@app.get("/api/profile")
+async def api_profile(request: Request):
+    """Validate auth and return agent name — same auth as /chat."""
+    api_cfg = _api_config()
+    _require_chat_auth(request, api_cfg)
+    return {
+        "agentName": cfg.get("agent", {}).get("name", "bot"),
+        "connectedAt": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+@app.post("/api/messages")
+async def api_send_message(request: Request):
+    """Accept one user message, call Agent, return all delivered replies.
+
+    Idempotent by clientMessageId.  Only send_text_message tool calls
+    become visible bubbles — assistant final text, thinking, tool_result,
+    and non-send tools are ignored.  Server-side timeout: 55 s.
+    """
+    api_cfg = _api_config()
+    _require_chat_auth(request, api_cfg)
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="JSON body must be an object")
+
+    client_message_id = str(body.get("clientMessageId", "")).strip()
+    content = str(body.get("content", "")).strip()
+    if not client_message_id:
+        raise HTTPException(status_code=400, detail="clientMessageId is required")
+    if not content:
+        raise HTTPException(status_code=400, detail="content is required")
+
+    # ── idempotency ──────────────────────────────────────────────
+    existing_user = await memory_store.find_app_message_by_client_message_id(
+        client_message_id,
+    )
+    if existing_user is not None:
+        if str(existing_user.get("content", "")) != content:
+            raise HTTPException(
+                status_code=409,
+                detail="clientMessageId already used with different content",
+            )
+        # Return the existing result
+        source_turn_id = str(existing_user.get("source_turn_id", ""))
+        agent_replies = await memory_store.find_app_agent_replies_by_turn_id(
+            source_turn_id,
+        )
+        return {
+            "userMessage": {
+                "remoteId": existing_user["id"],
+                "clientMessageId": client_message_id,
+                "status": "sent",
+                "createdAt": _iso_from_ts(existing_user.get("created_at", 0)),
+            },
+            "agentReplies": [
+                {
+                    "remoteId": r["id"],
+                    "content": r["content"],
+                    "createdAt": _iso_from_ts(r.get("created_at", 0)),
+                    "sourceToolCallId": r.get("source_tool_call_id") or None,
+                }
+                for r in agent_replies
+            ],
+        }
+
+    # ── persist user message ─────────────────────────────────────
+    turn_id = f"app_turn_{uuid.uuid4().hex[:12]}"
+    user_remote_id = f"app_rm_user_{uuid.uuid4().hex[:12]}"
+    now_ts = time.time()
+
+    await memory_store.insert_app_message(
+        remote_id=user_remote_id,
+        client_message_id=client_message_id,
+        role="user",
+        content=content,
+        source_turn_id=turn_id,
+        sequence=0,
+    )
+
+    # ── collector sender (replaces wechat_sender) ─────────────────
+    collected_texts: list[str] = []
+
+    async def _app_collector(messages: list[dict]) -> list[dict]:
+        for m in messages:
+            text = str(m.get("text", "")).strip()
+            if text:
+                collected_texts.append(text)
+            m["send_status"] = "delivered"
+        return messages
+
+    # ── call Agent with 55 s timeout ──────────────────────────────
+    try:
+        result: TurnResult = await asyncio.wait_for(
+            chat_runtime.handle_chat(
+                user_message=content,
+                user_id=_APP_USER_ID,
+                bot_id=BOT_ID,
+                history=[],
+                system_prompt=build_system_prompt_for_turn(),
+                trigger="user",
+                source="user_message",
+                wechat_sender=_app_collector,
+                prebuilt_messages=[],
+                post_turn_hooks=[],
+                protocol_event_writer=None,
+            ),
+            timeout=_APP_AGENT_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "[app] Agent turn timed out after %.1fs clientMessageId=%s",
+            _APP_AGENT_TIMEOUT_S, client_message_id,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=json.dumps({
+                "error": {
+                    "code": "agent_timeout",
+                    "message": "Agent 响应超时，请稍后重试",
+                },
+            }),
+        )
+
+    # ── extract delivered replies ─────────────────────────────────
+    # Only SENT_CONFIRMED / delivered send_text_message outputs become
+    # agentReplies.  Assistant final text, thinking, tool_result, and
+    # non-send tools are ignored.
+    agent_replies: list[dict[str, Any]] = []
+    seq = 1
+    for vm in result.visible_messages:
+        is_delivered = (
+            vm.get("delivery_status") == DeliveryStatus.SENT_CONFIRMED
+            or vm.get("send_status") == "delivered"
+        )
+        if is_delivered:
+            reply_id = f"app_rm_agent_{uuid.uuid4().hex[:12]}"
+            reply_text = str(vm.get("text", ""))
+            agent_replies.append({
+                "remoteId": reply_id,
+                "content": reply_text,
+                "createdAt": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            })
+            await memory_store.insert_app_message(
+                remote_id=reply_id,
+                client_message_id=None,
+                role="agent",
+                content=reply_text,
+                source_turn_id=turn_id,
+                sequence=seq,
+            )
+            seq += 1
+
+    logger.info(
+        "[app] turn=%s user_remote=%s agent_replies=%d elapsed_ms=%d",
+        turn_id, user_remote_id, len(agent_replies), result.elapsed_ms,
+    )
+
+    return {
+        "userMessage": {
+            "remoteId": user_remote_id,
+            "clientMessageId": client_message_id,
+            "status": "sent",
+            "createdAt": _iso_from_ts(now_ts),
+        },
+        "agentReplies": agent_replies,
+    }
+
+
+@app.get("/api/messages")
+async def api_get_messages(
+    request: Request,
+    cursor: str | None = None,
+    limit: int = 50,
+):
+    """Return app_messages ordered by created_at.  Paginated by id cursor."""
+    api_cfg = _api_config()
+    _require_chat_auth(request, api_cfg)
+
+    messages, next_cursor, has_more = (
+        await memory_store.get_app_messages_after_cursor(
+            cursor=cursor,
+            limit=limit,
+        )
+    )
+    return {
+        "messages": [
+            {
+                "remoteId": m["id"],
+                "clientMessageId": m.get("client_message_id") or None,
+                "role": m["role"],
+                "content": m["content"],
+                "createdAt": _iso_from_ts(m.get("created_at", 0)),
+            }
+            for m in messages
+        ],
+        "nextCursor": next_cursor,
+        "hasMore": has_more,
+    }
+
+
+def _iso_from_ts(ts: float) -> str:
+    """Convert a Unix timestamp (seconds) to ISO 8601 UTC string."""
+    try:
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    except (OSError, ValueError, OverflowError):
+        return datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 @app.post("/admin/dev/compress")
