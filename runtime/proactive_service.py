@@ -1,38 +1,47 @@
-"""主动消息推送服务。
-
-后台定时检查是否应该触发模型主动联系用户。
-"""
+"""Timed proactive check-in service."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from datetime import datetime
+from typing import Any
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger("runtime")
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+TriggerCallback = Callable[[str, int], Awaitable[None]]
 
 
 class ProactiveService:
-    """主动消息推送后台服务。
+    """Periodically asks the runtime to run a proactive check-in.
 
-    定时检查时间窗口和冷却时间，满足条件时通过内部 HTTP 触发 /chat。
+    This service intentionally does not post a fake user request to /chat. The
+    caller provides an in-process callback that owns the background turn.
     """
 
-    def __init__(self, user_id: str, settings: Any, store: Any):
+    def __init__(
+        self,
+        user_id: str,
+        settings: Any,
+        store: Any,
+        trigger_callback: TriggerCallback | None = None,
+    ) -> None:
         self.user_id = user_id
         self.settings = settings
         self.store = store
+        self.trigger_callback = trigger_callback
         self._task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
 
     @property
-    def config(self) -> dict:
-        import main
-        return getattr(main, "cfg", {}).get("proactive", {})
+    def config(self) -> dict[str, Any]:
+        from agent.tools import TOOL_RUNTIME_CONFIG
+
+        return TOOL_RUNTIME_CONFIG.get("proactive", {})
 
     @property
     def enabled(self) -> bool:
@@ -43,80 +52,63 @@ class ProactiveService:
         return int(self.config.get("interval_minutes", 30)) * 60
 
     def _in_time_window(self) -> bool:
-        """检查当前时间是否在允许推送的窗口内。"""
         now = datetime.now(SHANGHAI)
         start = int(self.config.get("time_window_start", 8))
         end = int(self.config.get("time_window_end", 22))
         return start <= now.hour < end
 
     def _cooldown_ok(self) -> bool:
-        """检查距上次推送是否已过冷却时间。"""
         cooldown = int(self.config.get("cooldown_minutes", 5)) * 60
-        last = getattr(self.settings, "last_proactive_time", 0.0)
+        last = float(getattr(self.settings, "last_proactive_time", 0.0) or 0.0)
         return (time.time() - last) >= cooldown
 
-    async def start(self):
-        """启动后台任务。"""
+    async def start(self) -> None:
         if not self.enabled:
-            logger.info("ProactiveService: 主动推送已禁用")
+            logger.info("ProactiveService disabled")
             return
-
+        if self._task is not None:
+            return
         self._stop_event.clear()
         self._task = asyncio.create_task(self._run_loop())
-        logger.info(
-            f"ProactiveService: 已启动 (interval={self.interval_seconds}s, "
-            f"window={self.config.get('time_window_start', 8)}:00-{self.config.get('time_window_end', 22)}:00)"
-        )
+        logger.info("ProactiveService started interval=%ss", self.interval_seconds)
 
-    async def stop(self):
-        """停止后台任务。"""
-        if self._task:
-            self._stop_event.set()
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-            self._task = None
-            logger.info("ProactiveService: 已停止")
+    async def stop(self) -> None:
+        if self._task is None:
+            return
+        self._stop_event.set()
+        self._task.cancel()
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            pass
+        self._task = None
+        logger.info("ProactiveService stopped")
 
-    async def _run_loop(self):
-        """后台循环。"""
+    async def _run_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=self.interval_seconds)
                 break
             except asyncio.TimeoutError:
                 pass
+            if not self._stop_event.is_set():
+                await self._check_and_trigger()
 
-            if self._stop_event.is_set():
-                break
-
-            await self._check_and_trigger()
-
-    async def _check_and_trigger(self):
-        """检查条件并触发主动消息。"""
+    async def _check_and_trigger(self) -> None:
         if not self._in_time_window():
-            logger.debug("ProactiveService: 不在时间窗口内")
+            logger.debug("ProactiveService outside time window")
             return
-
         if not self._cooldown_ok():
-            logger.debug("ProactiveService: 冷却中")
+            logger.debug("ProactiveService in cooldown")
             return
-
         await self._send_trigger()
 
-    async def _send_trigger(self):
-        """发送主动触发到 /chat 端点。"""
-        import uuid
-
+    async def _send_trigger(self) -> None:
         self.settings.last_proactive_time = time.time()
         if hasattr(self.settings, "save"):
             self.settings.save()
 
         trigger_seq = int(time.time() * 1000)
-
-        # 记录触发事件
         await self.store.append_raw_event(
             user_id=self.user_id,
             seq=trigger_seq,
@@ -126,23 +118,7 @@ class ProactiveService:
             content="__proactive_trigger__",
         )
 
-        logger.info(f"ProactiveService: 已触发主动检查 (seq={trigger_seq})")
-
-        try:
-            import httpx
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(
-                    "http://127.0.0.1:8000/chat",
-                    json={
-                        "user_id": self.user_id,
-                        "message": "__proactive_trigger__",
-                        "source": "proactive",
-                        "seq": trigger_seq,
-                    },
-                )
-                if resp.status_code == 200:
-                    logger.info("ProactiveService: /chat 响应成功")
-                else:
-                    logger.warning(f"ProactiveService: /chat 返回 {resp.status_code}")
-        except Exception as e:
-            logger.warning(f"ProactiveService: /chat 请求失败: {e}")
+        if self.trigger_callback is None:
+            logger.warning("ProactiveService has no trigger callback configured")
+            return
+        await self.trigger_callback(self.user_id, trigger_seq)

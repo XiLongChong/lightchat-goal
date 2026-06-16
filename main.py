@@ -33,13 +33,14 @@ from agent.output_guard import guard_messages, guard_single_message
 from agent.runtime_context_builder import ContextBuilder
 from agent.state_machine import ModelProfile, TurnResult, TurnScratchpad, TurnState, DeliveryStatus
 from agent.tool_exposure_policy import ToolExposurePolicy
+from agent.tool_registry import TOOL_REGISTRY
 from agent.tools import configure_runtime, configure_tools
 from bridge.wechat_poller import WeChatBridge
 from memory.conversation import ConversationContext
 from memory.store import MemoryStore
 from memory.long_term import LongTermMemoryService
 from runtime.chat_runtime import ChatRuntime, create_chat_runtime
-from runtime.proactive_service import ProactiveService
+from runtime.task_scheduler import TaskScheduler
 
 # ================================================================
 # Config loading
@@ -75,9 +76,7 @@ if _native_override in ("true", "1", "yes", "on"):
     _ntc["chat_agent"] = True
     if not _ntc.get("allowed_tools"):
         _ntc["allowed_tools"] = [
-            "send_text_message",
-            "get_weather",
-            "get_time",
+            definition.name for definition in TOOL_REGISTRY.iter_defs()
         ]
 
 # Development-only LLM tap/proxy override. This lets local tools such as
@@ -322,8 +321,7 @@ def build_system_prompt_for_turn() -> str:
     """Build minimal system prompt for a chat turn."""
     persona = _read_persona()
     personality = _read_personality()
-    default_city = cfg.get("weather", {}).get("default_city", "")
-    tool_names = ["send_text_message", "get_time", "get_weather", "memory"]
+    tool_names = [definition.name for definition in TOOL_REGISTRY.iter_defs()]
     return build_chat_system_prompt(
         persona=persona,
         personality=personality,
@@ -405,6 +403,15 @@ if cfg.get("wechat", {}).get("enabled"):
         buffer_max_wait_seconds=wcfg.get("buffer_max_wait_seconds", 12.0),
         chat_request_timeout_seconds=wcfg.get("chat_request_timeout_seconds", 200.0),
     )
+
+task_scheduler = TaskScheduler(
+    memory_store=memory_store,
+    send_text=wechat_sender,
+    bot_id=BOT_ID,
+    max_attempts=int(cfg.get("reminders", {}).get("max_retry_attempts", 3) or 3),
+    proactive_config_getter=lambda: cfg.get("proactive", {}),
+)
+configure_runtime(task_scheduler=task_scheduler)
 
 # ================================================================
 # TODO: single-process only; multi-process / multi-replica needs a distributed lock
@@ -890,19 +897,12 @@ async def lifespan(app: FastAPI):
             )
     if _bridge is not None and _bridge.token:
         await _bridge.start()
-
-    # 启动主动消息推送服务
-    proactive_svc = ProactiveService(
-        user_id=startup_user_id,
-        settings=runtime_settings,
-        store=memory_store,
-    )
-    await proactive_svc.start()
+    await task_scheduler.start()
 
     yield
 
     logger.info("Shutting down...")
-    await proactive_svc.stop()
+    await task_scheduler.stop()
     if _bridge is not None:
         await _bridge.stop()
     await memory_store.close()
@@ -1140,6 +1140,75 @@ _IS_DELIVERED = {"delivered", "sent_confirmed"}
 # ================================================================
 # ================================================================
 
+async def _handle_proactive_trigger(
+    user_id: str,
+    trigger_seq: int,
+    task_id: str | None = None,
+    task_generation: int | None = None,
+) -> TurnResult | None:
+    """Run a proactive check-in without posting a fake user request to /chat."""
+    if not user_id:
+        return None
+    contact = await memory_store.get_contact_state()
+    context_token = str(contact.get("context_token", "") or "")
+    if not context_token or str(contact.get("user_id", "")) != user_id:
+        logger.warning("proactive trigger skipped: no current contact for user=%s", user_id)
+        return None
+
+    lock = _get_user_lock(user_id)
+    async with lock:
+        if conversation_ctx.user_id != user_id:
+            conversation_ctx.user_id = user_id
+            conversation_ctx.bot_id = BOT_ID
+            await memory_store.ensure_conversation(user_id, BOT_ID)
+            await conversation_ctx.rebuild(memory_store)
+
+        async def _bound_sender(messages: list[dict]) -> list[dict]:
+            return await wechat_sender(user_id, context_token, messages)
+
+        system_reminder = (
+            "<system-reminder>\n"
+            "This is a proactive check-in. The user has been inactive. "
+            "You must send one natural message now to reconnect. After sending, "
+            "use schedule_next_proactive to suggest your next check-in.\n"
+            "</system-reminder>"
+        )
+        result = await chat_runtime.handle_chat(
+            user_message=system_reminder,
+            user_id=user_id,
+            bot_id=BOT_ID,
+            history=conversation_ctx.messages,
+            system_prompt=build_system_prompt_for_turn(),
+            prebuilt_messages=conversation_ctx.messages,
+            trigger="proactive_speak",
+            source="proactive_speak",
+            wechat_sender=_bound_sender,
+            input_latest_seq=trigger_seq,
+            protocol_event_writer=_build_protocol_event_writer(user_id, BOT_ID),
+            post_turn_hooks=_build_chatagent_post_turn_hooks(
+                user_id=user_id,
+                bot_id=BOT_ID,
+                route="proactive",
+                context_policy="short_term_history",
+                raw_messages=[system_reminder],
+                memory_store=memory_store,
+                proactive_task_id=task_id,
+                proactive_task_generation=task_generation,
+            ),
+        )
+        logger.info(
+            "proactive trigger completed user=%s turn=%s delivered=%d terminal=%s",
+            user_id,
+            result.turn_id,
+            result.delivered_count,
+            result.terminal_state,
+        )
+        return result
+
+
+task_scheduler.set_proactive_callback(_handle_proactive_trigger)
+
+
 def _visible_messages_as_dicts(turn: TurnScratchpad) -> list[dict[str, Any]]:
     """Convert VisibleMessage list to backward-compat dict list."""
     return [
@@ -1251,6 +1320,8 @@ def _build_protocol_event_writer(user_id: str, bot_id: str):
                 turn_id=turn.turn_id,
                 conversation_id=cid,
                 user_message=None if user_message is None else str(user_message),
+                source=turn.source,
+                turn_type=turn.source if turn.source != "user_message" else "user_chat",
             )
             if user_message:
                 conversation_ctx.add_event("user", str(user_message))
@@ -1294,6 +1365,8 @@ def _build_chatagent_post_turn_hooks(
     context_policy: str,
     raw_messages: list[str],
     memory_store: Any,
+    proactive_task_id: str | None = None,
+    proactive_task_generation: int | None = None,
 ) -> list:
     """Return a list of PostTerminalCallback hooks for ChatAgent.
 
@@ -1334,9 +1407,36 @@ def _build_chatagent_post_turn_hooks(
                 attempt.upgraded_from,
             )
 
+    async def _hook_proactive_schedule(turn: TurnScratchpad, terminal_state: TurnState) -> None:
+        delivered = sum(
+            1 for item in turn.visible_messages
+            if str(item.delivery_status) in _IS_DELIVERED
+        )
+        if terminal_state != TurnState.END_REPLIED or delivered <= 0:
+            return
+
+        if route == "ordinary_chat":
+            await task_scheduler.cancel_user_proactive_tasks(
+                user_id,
+                reason="user_message_arrived",
+            )
+            await task_scheduler.schedule_initial_proactive(user_id)
+            return
+
+        if route == "proactive":
+            result = await task_scheduler.complete_proactive_turn(
+                turn=turn,
+                user_id=user_id,
+                bot_id=bot_id,
+                current_task_id=proactive_task_id,
+                current_generation=proactive_task_generation,
+            )
+            logger.info("proactive schedule commit user=%s result=%s", user_id, result)
+
     return [
         _hook_dev_logs,
         _hook_model_attempt_log,
+        _hook_proactive_schedule,
     ]
 
 

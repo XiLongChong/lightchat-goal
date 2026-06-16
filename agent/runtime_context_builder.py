@@ -244,6 +244,8 @@ class ContextBuilder:
         content = str(text or "").strip()
         if content.startswith("<channel "):
             return content
+        if content.startswith("<system-reminder>"):
+            return content
         return f'<channel source="wechat">\n{content}\n</channel>'
 
     @staticmethod

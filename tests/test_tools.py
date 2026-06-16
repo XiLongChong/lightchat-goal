@@ -188,6 +188,7 @@ def test_tool_definitions_are_complete():
         "get_weather",
         "memory",
         "web_search",
+        "web_fetch",
         "todo_list_lists",
         "todo_list_tasks",
         "todo_create_task",
@@ -195,6 +196,7 @@ def test_tool_definitions_are_complete():
         "create_reminder",
         "list_reminders",
         "cancel_reminder",
+        "schedule_next_proactive",
     }
     for definition in TOOL_REGISTRY.iter_defs():
         assert definition.description

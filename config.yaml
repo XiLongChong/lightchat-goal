@@ -19,6 +19,16 @@
       - get_time
       - get_weather
       - memory
+      - web_search
+      - web_fetch
+      - todo_list_lists
+      - todo_list_tasks
+      - todo_create_task
+      - todo_complete_task
+      - create_reminder
+      - list_reminders
+      - cancel_reminder
+      - schedule_next_proactive
   routing_mode: manual_pro
   max_flash_upgrade_attempts: 1
   manual_flash_allow_upgrade: false
@@ -114,10 +124,14 @@ microsoft_todo:
 # ── 联网搜索 (Tavily) ──
 tavily:
   api_key: "${TAVILY_API_KEY:-}"
+  timeout_seconds: 10
   max_results: 5
   include_answer: true
   include_domains: []
   exclude_domains: []
+  cache_ttl_seconds: 300
+  cache_max_entries: 200
+  max_extract_chars: 12000
 
 # ── 定时提醒 ──
 reminders:
@@ -133,6 +147,21 @@ proactive:
   time_window_start: 8
   time_window_end: 22
   cooldown_minutes: 5
+  default_frequency: "moderate"
+  quiet_hours_start: 23
+  quiet_hours_end: 8
+  quiet_hours_timezone: "Asia/Shanghai"
+  first_check_delay_seconds: 120
+  frequencies:
+    minimal:
+      daily_limit: 5
+      interval_range_seconds: [3600, 10800]
+    moderate:
+      daily_limit: 10
+      interval_range_seconds: [1800, 7200]
+    enthusiastic:
+      daily_limit: 20
+      interval_range_seconds: [900, 3600]
 
 logging:
   level: "${LOG_LEVEL:-INFO}"

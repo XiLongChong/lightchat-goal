@@ -106,6 +106,7 @@ class TurnScratchpad:
     llm_call_count: int = 0
     sent_message_count: int = 0
     reply_sequence_status: str = "in_progress"
+    proactive_interval_candidate: int | None = None
     terminal_state: TurnState | None = None
     _protocol_event_writer: Any = field(default=None, repr=False)
 

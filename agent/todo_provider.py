@@ -1,6 +1,11 @@
 """Microsoft To Do Provider — 通过 Microsoft Graph API 管理任务。
 
 使用 MSAL Device Code Flow + PersistedTokenCache 进行认证。
+
+认证状态机：
+  1. 无 token、无 pending flow → 发起 device flow，返回设备码
+  2. 无 token、有 pending flow → 单次轮询；若仍 pending，复用同一 flow（不生成新码）
+  3. 有 token → 直接调用 API
 """
 
 from __future__ import annotations
@@ -29,8 +34,9 @@ class TodoError(Exception):
 
 
 def _get_config() -> dict[str, Any]:
-    import main
-    return getattr(main, "cfg", {}).get("microsoft_todo", {})
+    from agent.tools import TOOL_RUNTIME_CONFIG
+
+    return TOOL_RUNTIME_CONFIG.get("microsoft_todo", {})
 
 
 def _build_token_cache() -> Any | None:
@@ -59,12 +65,25 @@ class MSTodoProvider:
         self._app: Any = None
         self._account: dict | None = None
         self._current_token: str | None = None
+        # 存储 MSAL initiate_device_flow 返回的完整 flow dict
+        # （含 device_code / user_code / verification_uri / interval 等）
         self._device_flow_data: dict | None = None
+        self._flow_expires_at: float = 0
+        # 序列化认证操作，防止并发生成多个 device flow
+        self._lock = asyncio.Lock()
 
     @property
     def configured(self) -> bool:
         config = _get_config()
         return bool(config.get("client_id", ""))
+
+    @property
+    def auth_pending(self) -> bool:
+        """是否有待完成的设备码流程。"""
+        return (
+            self._device_flow_data is not None
+            and time.time() < self._flow_expires_at
+        )
 
     def _get_msal_app(self) -> Any:
         if self._app is not None:
@@ -93,43 +112,54 @@ class MSTodoProvider:
 
     # ── 认证 ──────────────────────────────────────────
 
+    def _format_device_flow_message(self) -> str:
+        """格式化设备码提示消息（复用已有 flow 的 user_code）。"""
+        if not self._device_flow_data:
+            return "❌ No pending device flow."
+        flow = self._device_flow_data
+        remaining = max(0, self._flow_expires_at - time.time())
+        return (
+            f"🔑 Microsoft To Do 登录\n\n"
+            f"请打开 {flow.get('verification_uri', 'https://microsoft.com/devicelogin')} "
+            f"并输入以下代码：\n\n"
+            f"{flow.get('user_code', 'N/A')}\n\n"
+            f"此代码在 {int(remaining) // 60} 分钟内有效。"
+        )
+
     def initiate_device_flow(self) -> str:
-        """启动设备码登录流程，返回给用户显示的指引消息。"""
+        """启动设备码登录流程。如果已有未过期的 pending flow，返回同一消息而不覆盖。"""
         if not self.configured:
             return "❌ Microsoft To Do 未配置（缺少 MS_TODO_CLIENT_ID）。"
+
+        # 已有未过期 pending flow → 复用，不生成新码
+        if self._device_flow_data and time.time() < self._flow_expires_at:
+            return self._format_device_flow_message()
 
         import msal
 
         app = self._get_msal_app()
-        config = _get_config()
         scopes = ["Tasks.ReadWrite"]
 
         flow = app.initiate_device_flow(scopes=scopes)
         if "error" in flow:
             return f"❌ 设备码登录启动失败：{flow.get('error_description', flow['error'])}"
 
-        self._device_flow_data = {
-            "device_code": flow["device_code"],
-            "interval": flow.get("interval", 5),
-            "expires_at": int(time.time()) + flow.get("expires_in", 900),
-        }
+        # 存储完整 flow dict（含 user_code 等字段）以便复用消息
+        self._device_flow_data = flow
+        self._flow_expires_at = time.time() + flow.get("expires_in", 900)
 
-        return (
-            f"🔑 Microsoft To Do 登录\n\n"
-            f"请打开 {flow['verification_uri']} 并输入以下代码：\n\n"
-            f"{flow['user_code']}\n\n"
-            f"此代码在 {flow.get('expires_in', 900) // 60} 分钟内有效。"
-        )
+        return self._format_device_flow_message()
 
     async def acquire_token(self) -> str | None:
-        """获取有效的 access token。返回 None 表示需要启动设备码流程。"""
+        """仅尝试静默获取 access token（从缓存/刷新），不触发 device flow。
+        返回 None 表示无可用 token，需调用 ensure_auth()。
+        """
         if not self.configured:
             return None
 
         app = self._get_msal_app()
         scopes = ["Tasks.ReadWrite"]
 
-        # 1. 尝试静默获取
         accounts = app.get_accounts()
         if accounts:
             self._account = accounts[0]
@@ -140,38 +170,80 @@ class MSTodoProvider:
                 self._current_token = result["access_token"]
                 return self._current_token
 
-        # 2. 尝试完成设备码流程
-        if self._device_flow_data:
-            device_code = self._device_flow_data["device_code"]
-            expires_at = self._device_flow_data.get("expires_at", 0)
-
-            if time.time() >= expires_at:
-                self._device_flow_data = None
-                return None
-
-            try:
-                result = await asyncio.to_thread(
-                    app.acquire_token_by_device_flow,
-                    {"device_code": device_code, "interval": self._device_flow_data.get("interval", 5)},
-                )
-            except Exception:
-                return None
-
-            if "access_token" in result:
-                self._device_flow_data = None
-                self._current_token = result["access_token"]
-                if app.get_accounts():
-                    self._account = app.get_accounts()[0]
-                return self._current_token
-
-            if result.get("error") == "authorization_pending":
-                return None  # 用户还没完成登录
-
-            # 其他错误，清除设备码数据
-            self._device_flow_data = None
-            return None
-
         return None
+
+    async def ensure_auth(self) -> tuple[str | None, str | None]:
+        """确保认证完成（线程安全）。返回 (token, auth_message)。
+
+        - token 非 None：认证成功，可直接调用 API
+        - auth_message 非 None：应返回给用户（设备码或错误消息）
+        - 两者都 None：未配置
+        """
+        if not self.configured:
+            return None, None
+
+        async with self._lock:
+            # 1. 尝试静默获取
+            app = self._get_msal_app()
+            scopes = ["Tasks.ReadWrite"]
+
+            accounts = app.get_accounts()
+            if accounts:
+                self._account = accounts[0]
+                result = await asyncio.to_thread(
+                    app.acquire_token_silent, scopes, account=accounts[0]
+                )
+                if result and "access_token" in result:
+                    self._current_token = result["access_token"]
+                    return self._current_token, None
+
+            # 2. 尝试完成已有 device flow（单次轮询，不阻塞）
+            if self._device_flow_data:
+                if time.time() >= self._flow_expires_at:
+                    self._device_flow_data = None
+                    self._flow_expires_at = 0
+                else:
+                    try:
+                        # 传 flow 副本并设 expires_at=0 → MSAL 退出条件立即满足
+                        # 效果：单次 HTTP 请求，不进入 MSAL 内部轮询循环
+                        flow_copy = dict(self._device_flow_data)
+                        flow_copy["expires_at"] = 0
+                        result = await asyncio.to_thread(
+                            app.acquire_token_by_device_flow,
+                            flow_copy,
+                        )
+                    except Exception as e:
+                        logger.warning(f"Device flow poll error: {e}")
+                    else:
+                        if "access_token" in result:
+                            self._device_flow_data = None
+                            self._flow_expires_at = 0
+                            self._current_token = result["access_token"]
+                            if app.get_accounts():
+                                self._account = app.get_accounts()[0]
+                            return self._current_token, None
+
+                        if result.get("error") != "authorization_pending":
+                            # 非等待中的错误（如 expired、denied），清除 flow
+                            logger.warning(
+                                f"Device flow error: {result.get('error')}: "
+                                f"{result.get('error_description', '')}"
+                            )
+                            self._device_flow_data = None
+                            self._flow_expires_at = 0
+                        # authorization_pending → 保留 flow，复用消息
+
+            # 3. 需要设备码 — 复用已有 pending flow 或创建新的
+            if self._device_flow_data and time.time() < self._flow_expires_at:
+                return None, self._format_device_flow_message()
+
+            flow = app.initiate_device_flow(scopes=scopes)
+            if "error" in flow:
+                return None, f"❌ 设备码登录启动失败：{flow.get('error_description', flow['error'])}"
+
+            self._device_flow_data = flow
+            self._flow_expires_at = time.time() + flow.get("expires_in", 900)
+            return None, self._format_device_flow_message()
 
     # ── API 请求 ──────────────────────────────────────
 

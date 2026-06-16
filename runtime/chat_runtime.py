@@ -55,12 +55,6 @@ class ChatRuntime:
             input_latest_seq=input_latest_seq,
             input_cutoff_time=input_cutoff_time,
             interrupt_checker=interrupt_checker,
-            native_allowed_tools_override=[
-                "send_text_message",
-                "get_time",
-                "get_weather",
-                "memory",
-            ],
             write_model_history=write_model_history,
             post_turn_hooks=post_turn_hooks,
             protocol_event_writer=protocol_event_writer,

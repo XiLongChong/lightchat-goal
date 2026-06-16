@@ -150,9 +150,7 @@ class ChatAgent:
         self.llm_gateway = llm_gateway
         self.native_tool_calls = native_tool_calls
         self.native_allowed_tools = native_allowed_tools or [
-            "send_text_message",
-            "get_time",
-            "get_weather",
+            definition.name for definition in TOOL_REGISTRY.iter_defs()
         ]
         self.test_mode = test_mode
         self._profile = pro_profile or ModelProfile(model_name=model)
@@ -190,7 +188,7 @@ class ChatAgent:
     ) -> TurnResult:
         prebuilt_messages = unused.get("prebuilt_messages") if unused else None
         del context_policy, unused
-        is_proactive = source == "proactive"
+        is_proactive = source in {"proactive", "proactive_speak"}
         if source != SOURCE_USER_MESSAGE and not is_proactive:
             raise ValueError("only ordinary user-message and proactive turns are supported")
         if user_message is None or not str(user_message).strip():
@@ -216,10 +214,11 @@ class ChatAgent:
                            prebuilt_messages=prebuilt_messages,
                            idle_seconds=idle_seconds)
 
-        allowed = native_allowed_tools_override or self.native_allowed_tools
+        allowed_filter = set(native_allowed_tools_override or self.native_allowed_tools)
         allowed = [
-            name for name in ("send_text_message", "get_time", "get_weather", "memory")
-            if name in allowed
+            definition.name
+            for definition in TOOL_REGISTRY.iter_defs()
+            if definition.name in allowed_filter
         ]
         tools = TOOL_REGISTRY.get_native_tool_specs(allowed_names=allowed)
         protocol_retries = 0
@@ -291,6 +290,8 @@ class ChatAgent:
                         user_id=user_id,
                         turn_id=turn.turn_id,
                         call_id=call_id,
+                        source=source,
+                        turn=turn,
                     )
                 record = {
                     "tool_name": name,

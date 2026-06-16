@@ -10,12 +10,17 @@ from runtime.proactive_service import ProactiveService
 
 
 class TestProactiveService:
-    def make_service(self):
+    def make_service(self, trigger_callback=None):
         settings = MagicMock()
         settings.last_proactive_time = 0.0
         store = MagicMock()
         store.append_raw_event = AsyncMock()
-        return ProactiveService(user_id="test-user", settings=settings, store=store)
+        return ProactiveService(
+            user_id="test-user",
+            settings=settings,
+            store=store,
+            trigger_callback=trigger_callback,
+        )
 
     def test_enabled_default(self):
         svc = self.make_service()
@@ -76,23 +81,16 @@ class TestProactiveService:
             assert svc._task is None
 
     def test_send_trigger(self):
-        svc = self.make_service()
+        callback = AsyncMock()
+        svc = self.make_service(trigger_callback=callback)
         svc.settings.save = MagicMock()
-        with patch("httpx.AsyncClient") as mock_ac:
-            mock_client = AsyncMock()
-            mock_resp = MagicMock()
-            mock_resp.status_code = 200
-            mock_client.post.return_value = mock_resp
-            mock_ac.return_value.__aenter__.return_value = mock_client
-            asyncio.run(svc._send_trigger())
-            assert svc.settings.last_proactive_time > 0
-            svc.store.append_raw_event.assert_called_once()
+        asyncio.run(svc._send_trigger())
+        assert svc.settings.last_proactive_time > 0
+        svc.store.append_raw_event.assert_called_once()
+        callback.assert_awaited_once()
 
     def test_send_trigger_error(self):
         svc = self.make_service()
         svc.settings.save = MagicMock()
-        with patch("httpx.AsyncClient") as mock_ac:
-            mock_client = AsyncMock()
-            mock_client.post.side_effect = Exception("refused")
-            mock_ac.return_value.__aenter__.return_value = mock_client
-            asyncio.run(svc._send_trigger())  # should not raise
+        asyncio.run(svc._send_trigger())  # should not raise without a callback
+        svc.store.append_raw_event.assert_called_once()

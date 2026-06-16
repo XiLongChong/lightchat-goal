@@ -7,11 +7,16 @@ import hashlib
 import json
 import time
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import Any
 
 import aiosqlite
 
 _SCHEMA_ID = "v3_daily_compression"
+
+
+def datetime_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 class MemoryStore:
@@ -144,6 +149,45 @@ class MemoryStore:
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_daily_summaries_cid_date
                 ON daily_summaries(conversation_id, summary_date);
+
+            CREATE TABLE IF NOT EXISTS scheduled_tasks (
+                task_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                bot_id TEXT NOT NULL DEFAULT 'default',
+                task_type TEXT NOT NULL CHECK(task_type IN ('user_reminder', 'proactive_speak')),
+                trigger_at_utc TEXT NOT NULL,
+                timezone TEXT NOT NULL DEFAULT 'Asia/Shanghai',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'scheduled'
+                    CHECK(status IN (
+                        'scheduled','firing','sending','fired','cancelled','failed',
+                        'unknown_after_attempt'
+                    )),
+                generation INTEGER NOT NULL DEFAULT 1,
+                delivery_key TEXT NOT NULL UNIQUE,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL DEFAULT 3,
+                last_error TEXT,
+                delivery_started_at TEXT,
+                last_attempt_at TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                fired_at REAL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_status_trigger
+                ON scheduled_tasks(status, trigger_at_utc);
+            CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_user
+                ON scheduled_tasks(user_id, status);
+
+            CREATE TABLE IF NOT EXISTS proactive_quota (
+                user_id TEXT NOT NULL,
+                date TEXT NOT NULL,
+                used_count INTEGER NOT NULL DEFAULT 0,
+                frequency_tier TEXT NOT NULL DEFAULT 'moderate',
+                updated_at REAL NOT NULL,
+                PRIMARY KEY(user_id, date)
+            );
             """
         )
 
@@ -155,6 +199,8 @@ class MemoryStore:
             "context_window_tokens": "INTEGER NOT NULL DEFAULT 0",
             "model_name": "TEXT NOT NULL DEFAULT ''",
             "usage_estimated": "INTEGER NOT NULL DEFAULT 0",
+            "source": "TEXT NOT NULL DEFAULT 'user_message'",
+            "turn_type": "TEXT NOT NULL DEFAULT 'user_chat'",
         }
         for name, definition in additions.items():
             if name not in existing:
@@ -276,6 +322,9 @@ class MemoryStore:
         turn_id: str,
         conversation_id: str,
         user_message: str,
+        *,
+        source: str = "user_message",
+        turn_type: str = "user_chat",
     ) -> int:
         """Start a turn, write user_input as raw_event seq=0. Returns turn_number."""
         now = time.time()
@@ -287,9 +336,9 @@ class MemoryStore:
             )
             number = int(rows[0]["value"])
             await db.execute(
-                """INSERT INTO turns(id, conversation_id, turn_number, status, created_at)
-                   VALUES(?, ?, ?, 'running', ?)""",
-                (turn_id, conversation_id, number, now),
+                """INSERT INTO turns(id, conversation_id, turn_number, status, created_at, source, turn_type)
+                   VALUES(?, ?, ?, 'running', ?, ?, ?)""",
+                (turn_id, conversation_id, number, now, source, turn_type),
             )
             await db.execute(
                 """INSERT INTO raw_events(turn_id, seq, role, content_json, created_at)
@@ -394,6 +443,317 @@ class MemoryStore:
             (f"{user_id}:{bot_id}",),
         )
         return float(rows[0]["created_at"]) if rows else None
+
+    # ── scheduled tasks ─────────────────────────────────────────────
+
+    async def create_scheduled_task(
+        self,
+        *,
+        task_id: str,
+        user_id: str,
+        bot_id: str,
+        task_type: str,
+        trigger_at_utc: str,
+        timezone_name: str,
+        payload: dict[str, Any],
+        delivery_key: str,
+        max_attempts: int = 3,
+    ) -> dict[str, Any]:
+        now = time.time()
+        async with self._write_lock:
+            db = await self._get_db()
+            await db.execute(
+                """INSERT INTO scheduled_tasks(
+                       task_id, user_id, bot_id, task_type, trigger_at_utc, timezone,
+                       payload_json, status, generation, delivery_key, max_attempts,
+                       created_at, updated_at
+                   )
+                   VALUES(?, ?, ?, ?, ?, ?, ?, 'scheduled', 1, ?, ?, ?, ?)""",
+                (
+                    task_id,
+                    user_id,
+                    bot_id,
+                    task_type,
+                    trigger_at_utc,
+                    timezone_name,
+                    json.dumps(payload, ensure_ascii=False),
+                    delivery_key,
+                    max_attempts,
+                    now,
+                    now,
+                ),
+            )
+            await db.commit()
+        task = await self.get_scheduled_task(task_id)
+        if task is None:
+            raise RuntimeError("scheduled task was not created")
+        return task
+
+    async def get_scheduled_task(self, task_id: str) -> dict[str, Any] | None:
+        db = await self._get_db()
+        rows = await db.execute_fetchall(
+            "SELECT * FROM scheduled_tasks WHERE task_id=?",
+            (task_id,),
+        )
+        return dict(rows[0]) if rows else None
+
+    async def list_scheduled_tasks(
+        self,
+        *,
+        user_id: str | None = None,
+        task_type: str | None = None,
+        statuses: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        db = await self._get_db()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if user_id is not None:
+            clauses.append("user_id=?")
+            params.append(user_id)
+        if task_type is not None:
+            clauses.append("task_type=?")
+            params.append(task_type)
+        if statuses:
+            clauses.append("status IN (%s)" % ",".join("?" for _ in statuses))
+            params.extend(statuses)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = await db.execute_fetchall(
+            "SELECT * FROM scheduled_tasks" + where + " ORDER BY trigger_at_utc ASC",
+            tuple(params),
+        )
+        return [dict(row) for row in rows]
+
+    async def cancel_scheduled_task(self, task_id: str, user_id: str) -> bool:
+        async with self._write_lock:
+            db = await self._get_db()
+            cursor = await db.execute(
+                """UPDATE scheduled_tasks
+                   SET status='cancelled', generation=generation+1, updated_at=?
+                   WHERE task_id=? AND user_id=? AND status='scheduled'""",
+                (time.time(), task_id, user_id),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def cancel_scheduled_tasks(
+        self,
+        *,
+        user_id: str,
+        task_type: str,
+        reason: str = "",
+    ) -> int:
+        async with self._write_lock:
+            db = await self._get_db()
+            now = time.time()
+            cursor = await db.execute(
+                """UPDATE scheduled_tasks
+                   SET status='cancelled',
+                       generation=generation+1,
+                       last_error=?,
+                       updated_at=?
+                   WHERE user_id=?
+                     AND task_type=?
+                     AND status IN ('scheduled','firing')""",
+                (reason[:500], now, user_id, task_type),
+            )
+            await db.commit()
+            return cursor.rowcount
+
+    async def claim_scheduled_task(self, task_id: str, expected_generation: int) -> dict[str, Any] | None:
+        async with self._write_lock:
+            db = await self._get_db()
+            now = time.time()
+            cursor = await db.execute(
+                """UPDATE scheduled_tasks
+                   SET status='firing', last_attempt_at=?, updated_at=?
+                   WHERE task_id=? AND generation=? AND status='scheduled'""",
+                (now, now, task_id, expected_generation),
+            )
+            await db.commit()
+            if cursor.rowcount <= 0:
+                return None
+        return await self.get_scheduled_task(task_id)
+
+    async def mark_task_sending(self, task_id: str, generation: int) -> bool:
+        async with self._write_lock:
+            db = await self._get_db()
+            now_iso = datetime_utc_iso()
+            cursor = await db.execute(
+                """UPDATE scheduled_tasks
+                   SET status='sending', delivery_started_at=?, updated_at=?
+                   WHERE task_id=? AND generation=? AND status='firing'""",
+                (now_iso, time.time(), task_id, generation),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def mark_task_unknown(self, task_id: str, generation: int, reason: str) -> None:
+        async with self._write_lock:
+            db = await self._get_db()
+            await db.execute(
+                """UPDATE scheduled_tasks
+                   SET status='unknown_after_attempt', last_error=?, updated_at=?
+                   WHERE task_id=? AND generation=?""",
+                (reason[:500], time.time(), task_id, generation),
+            )
+            await db.commit()
+
+    async def mark_task_failed_or_retry(self, task_id: str, generation: int, reason: str) -> None:
+        async with self._write_lock:
+            db = await self._get_db()
+            rows = await db.execute_fetchall(
+                "SELECT attempt_count, max_attempts FROM scheduled_tasks WHERE task_id=?",
+                (task_id,),
+            )
+            if not rows:
+                return
+            attempts = int(rows[0]["attempt_count"]) + 1
+            max_attempts = int(rows[0]["max_attempts"])
+            status = "failed" if attempts >= max_attempts else "scheduled"
+            await db.execute(
+                """UPDATE scheduled_tasks
+                   SET status=?, attempt_count=?, last_error=?, updated_at=?
+                   WHERE task_id=? AND generation=?""",
+                (status, attempts, reason[:500], time.time(), task_id, generation),
+            )
+            await db.commit()
+
+    async def commit_delivered_reminder(
+        self,
+        *,
+        task: dict[str, Any],
+        anchor: str,
+        delivered_text: str,
+    ) -> str:
+        conversation_id = f"{task['user_id']}:{task.get('bot_id') or 'default'}"
+        turn_id = f"reminder_{task['task_id']}"
+        now = time.time()
+        db = await self._get_db()
+        async with self._write_lock:
+            await db.execute("BEGIN")
+            try:
+                rows = await db.execute_fetchall(
+                    "SELECT COALESCE(MAX(turn_number), 0) + 1 AS value FROM turns WHERE conversation_id=?",
+                    (conversation_id,),
+                )
+                number = int(rows[0]["value"])
+                await db.execute(
+                    """INSERT INTO turns(id, conversation_id, turn_number, status, created_at,
+                                         completed_at, source, turn_type)
+                       VALUES(?, ?, ?, 'completed', ?, ?, 'reminder_due', 'reminder_due')""",
+                    (turn_id, conversation_id, number, now, now),
+                )
+                await db.execute(
+                    """INSERT INTO raw_events(turn_id, seq, role, content_json, active, created_at)
+                       VALUES(?, 0, 'user', ?, 1, ?)""",
+                    (
+                        turn_id,
+                        json.dumps([{"type": "text", "text": anchor}], ensure_ascii=False),
+                        now,
+                    ),
+                )
+                await db.execute(
+                    """INSERT INTO raw_events(turn_id, seq, role, content_json, active, created_at)
+                       VALUES(?, 1, 'assistant', ?, 1, ?)""",
+                    (
+                        turn_id,
+                        json.dumps([{"type": "text", "text": delivered_text}], ensure_ascii=False),
+                        now,
+                    ),
+                )
+                await db.execute(
+                    """UPDATE scheduled_tasks
+                       SET status='fired', fired_at=?, updated_at=?
+                       WHERE task_id=? AND generation=? AND status='sending'""",
+                    (now, now, task["task_id"], task["generation"]),
+                )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+        return turn_id
+
+    async def get_proactive_quota_used(
+        self,
+        *,
+        user_id: str,
+        date: str,
+    ) -> int:
+        db = await self._get_db()
+        rows = await db.execute_fetchall(
+            "SELECT used_count FROM proactive_quota WHERE user_id=? AND date=?",
+            (user_id, date),
+        )
+        return int(rows[0]["used_count"]) if rows else 0
+
+    async def commit_proactive_success(
+        self,
+        *,
+        user_id: str,
+        bot_id: str,
+        date: str,
+        frequency_tier: str,
+        current_task_id: str | None,
+        current_generation: int | None,
+        next_task: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        now = time.time()
+        db = await self._get_db()
+        async with self._write_lock:
+            await db.execute("BEGIN")
+            try:
+                if current_task_id:
+                    cursor = await db.execute(
+                        """UPDATE scheduled_tasks
+                           SET status='fired', fired_at=?, updated_at=?
+                           WHERE task_id=?
+                             AND generation=?
+                             AND task_type='proactive_speak'
+                             AND status='firing'""",
+                        (now, now, current_task_id, current_generation),
+                    )
+                    if cursor.rowcount <= 0:
+                        raise RuntimeError("proactive task generation mismatch")
+
+                await db.execute(
+                    """INSERT INTO proactive_quota(user_id, date, used_count, frequency_tier, updated_at)
+                       VALUES(?, ?, 1, ?, ?)
+                       ON CONFLICT(user_id, date) DO UPDATE SET
+                         used_count=used_count+1,
+                         frequency_tier=excluded.frequency_tier,
+                         updated_at=excluded.updated_at""",
+                    (user_id, date, frequency_tier, now),
+                )
+
+                created_next = False
+                if next_task is not None:
+                    await db.execute(
+                        """INSERT INTO scheduled_tasks(
+                               task_id, user_id, bot_id, task_type, trigger_at_utc, timezone,
+                               payload_json, status, generation, delivery_key, max_attempts,
+                               created_at, updated_at
+                           )
+                           VALUES(?, ?, ?, 'proactive_speak', ?, ?, ?, 'scheduled', 1, ?, ?, ?, ?)""",
+                        (
+                            next_task["task_id"],
+                            user_id,
+                            bot_id,
+                            next_task["trigger_at_utc"],
+                            next_task.get("timezone", "Asia/Shanghai"),
+                            json.dumps(next_task.get("payload", {}), ensure_ascii=False),
+                            next_task["delivery_key"],
+                            int(next_task.get("max_attempts", 1)),
+                            now,
+                            now,
+                        ),
+                    )
+                    created_next = True
+
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+        return {"status": "committed", "next_task_created": created_next}
 
     # ── rebuild (restart) ───────────────────────────────────────────
 
@@ -580,7 +940,7 @@ class MemoryStore:
 
     async def clear_all(self) -> dict[str, int]:
         """Clear all data except bot_contact_state and runtime_meta."""
-        tables = ("conversations", "turns", "raw_events", "context_snapshots", "tool_versions", "daily_summaries")
+        tables = ("conversations", "turns", "raw_events", "context_snapshots", "tool_versions", "daily_summaries", "scheduled_tasks")
         counts: dict[str, int] = {}
         async with self._write_lock:
             db = await self._get_db()
