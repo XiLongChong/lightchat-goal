@@ -53,6 +53,12 @@ python scripts/reset_runtime_data.py --confirm  # 确认清除
 
 ## 关键概念
 
+- **Android App 适配器端点**：`main.py` 中 `/api/profile`、`POST /api/messages`、`GET /api/messages`
+  是为 AsPocket Android 客户端新增的 REST 适配器端点（与 `/chat` 的 iLink/微信桥接逻辑解耦）。
+  认证同 `/chat`（Bearer / `x-api-key`）；`POST /api/messages` 按 `clientMessageId` 幂等，仅
+  `send_text_message` 的已投递输出成为 `agentReplies[]`；Agent 超时 55s。2026-06-17 已与 App 侧
+  `docs/api-contract.md` 逐字段核对一致（详见 App 仓库 `docs/demo/2026-06-16-integration-check.md`）。
+
 - **用户交互轮 (turn)**：从用户发送一条消息开始 → 模型完成回复（发送完毕或异常结束）为止。一次用户消息 = 一个 turn。
 - **模型调用 (call/step)**：一次 turn 内可能多次调用 LLM（最大 20 次）。每次收到 `send_text_message` 的 `sent` 结果后，模型判断是否还需要再发一条消息——如需则再调一次 LLM。不能提前预编多条回复。
 - **对话历史加载**：`ConversationContext` 内存常驻完整消息数组，`/chat` 不查 DB。仅在重启 / clear / 压缩变更时从 `raw_events` 重建（只加载 `active=1` 的事件）。
