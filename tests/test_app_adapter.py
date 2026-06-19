@@ -1309,3 +1309,818 @@ async def test_get_messages_coder_succeeds_when_configured(monkeypatch):
     result = await api_get_messages(FakeRequest(), remoteAgentId="coder")
     assert "messages" in result
     assert isinstance(result["messages"], list)
+
+
+# ================================================================
+# AppAgentSessionRegistry tests
+# ================================================================
+
+
+@pytest.mark.asyncio
+async def test_session_registry_register_creates_online_session():
+    from runtime.app_agent_session_registry import AppAgentSessionRegistry
+
+    reg = AppAgentSessionRegistry()
+    sess = await reg.register(
+        session_id="s1",
+        remote_agent_id="s1",
+        display_name="Test Session",
+        description="A test session",
+        callback_url="http://127.0.0.1:9010",
+    )
+    assert sess["sessionId"] == "s1"
+    assert sess["remoteAgentId"] == "s1"
+    assert sess["displayName"] == "Test Session"
+    assert sess["status"] == "online"
+    assert sess["callbackUrl"] == "http://127.0.0.1:9010"
+    assert sess["createdAt"].endswith("Z")
+    assert sess["lastSeenAt"].endswith("Z")
+    assert sess["expiresAt"] is None
+
+
+@pytest.mark.asyncio
+async def test_session_registry_repeat_register_updates_metadata():
+    from runtime.app_agent_session_registry import AppAgentSessionRegistry
+
+    reg = AppAgentSessionRegistry()
+    await reg.register(
+        session_id="s1",
+        remote_agent_id="s1",
+        display_name="Old Name",
+    )
+    sess2 = await reg.register(
+        session_id="s1",
+        remote_agent_id="s1",
+        display_name="New Name",
+        description="Updated",
+    )
+    assert sess2["displayName"] == "New Name"
+    assert sess2["description"] == "Updated"
+    assert sess2["status"] == "online"
+
+
+@pytest.mark.asyncio
+async def test_session_registry_same_remote_agent_id_conflict():
+    from runtime.app_agent_session_registry import AppAgentSessionRegistry
+
+    reg = AppAgentSessionRegistry()
+    await reg.register(
+        session_id="s1",
+        remote_agent_id="same-rid",
+        display_name="S1",
+    )
+    with pytest.raises(ValueError) as exc:
+        await reg.register(
+            session_id="s2",
+            remote_agent_id="same-rid",
+            display_name="S2",
+        )
+    assert "same-rid" in str(exc.value)
+    assert "s1" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_session_registry_heartbeat_updates_last_seen():
+    from runtime.app_agent_session_registry import AppAgentSessionRegistry
+
+    reg = AppAgentSessionRegistry()
+    await reg.register(
+        session_id="s1",
+        remote_agent_id="s1",
+        display_name="S1",
+    )
+    sess = await reg.heartbeat("s1")
+    assert sess["status"] == "online"
+    assert sess["lastSeenAt"].endswith("Z")
+
+
+@pytest.mark.asyncio
+async def test_session_registry_heartbeat_missing_returns_none():
+    from runtime.app_agent_session_registry import AppAgentSessionRegistry
+
+    reg = AppAgentSessionRegistry()
+    result = await reg.heartbeat("nonexistent")
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_session_registry_offline_marks_offline():
+    from runtime.app_agent_session_registry import AppAgentSessionRegistry
+
+    reg = AppAgentSessionRegistry()
+    await reg.register(
+        session_id="s1",
+        remote_agent_id="s1",
+        display_name="S1",
+    )
+    sess = await reg.offline("s1")
+    assert sess["status"] == "offline"
+
+
+@pytest.mark.asyncio
+async def test_session_registry_offline_missing_returns_none():
+    from runtime.app_agent_session_registry import AppAgentSessionRegistry
+
+    reg = AppAgentSessionRegistry()
+    result = await reg.offline("nonexistent")
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_session_registry_list_returns_sessions():
+    from runtime.app_agent_session_registry import AppAgentSessionRegistry
+
+    reg = AppAgentSessionRegistry()
+    await reg.register(
+        session_id="s1",
+        remote_agent_id="s1",
+        display_name="S1",
+    )
+    await reg.register(
+        session_id="s2",
+        remote_agent_id="s2",
+        display_name="S2",
+    )
+    all_sessions = await reg.list_all()
+    assert len(all_sessions) == 2
+
+
+@pytest.mark.asyncio
+async def test_session_registry_list_online_excludes_offline():
+    from runtime.app_agent_session_registry import AppAgentSessionRegistry
+
+    reg = AppAgentSessionRegistry()
+    await reg.register(
+        session_id="s1",
+        remote_agent_id="s1",
+        display_name="S1",
+    )
+    await reg.register(
+        session_id="s2",
+        remote_agent_id="s2",
+        display_name="S2",
+    )
+    await reg.offline("s2")
+    online = await reg.list_online()
+    assert len(online) == 1
+    assert online[0]["sessionId"] == "s1"
+
+
+def test_session_registry_known_remote_agent_ids():
+    """known_remote_agent_ids is sync and includes registered sessions."""
+    from runtime.app_agent_session_registry import AppAgentSessionRegistry
+
+    reg = AppAgentSessionRegistry()
+    reg._sessions["s1"] = {
+        "sessionId": "s1",
+        "remoteAgentId": "cc-1",
+        "displayName": "CC1",
+        "description": "desc",
+        "status": "online",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "expiresAt": None,
+        "callbackUrl": None,
+        "sourceLabel": None,
+    }
+    ids = reg.known_remote_agent_ids()
+    assert "cc-1" in ids
+
+
+# ================================================================
+# Invitations + session registry integration tests
+# ================================================================
+
+
+@pytest.mark.asyncio
+async def test_invitations_includes_online_session(monkeypatch):
+    """Online session appears in /api/contact-invitations."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+    monkeypatch.setenv("COMPUTERNAME", "MY-PC")
+
+    from main import cfg, app_agent_session_registry, api_contact_invitations
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    sid = f"cc-{_uuid.uuid4().hex[:8]}"
+    await app_agent_session_registry.register(
+        session_id=sid,
+        remote_agent_id=sid,
+        display_name="My Claude Code",
+        description="Working on goal",
+        callback_url="http://127.0.0.1:9010",
+    )
+
+    result = await api_contact_invitations(
+        _FakeAppRequest(
+            headers={"authorization": "Bearer secret"},
+            base_url="http://10.0.2.2:8000/",
+        )
+    )
+
+    invitations = result["invitations"]
+    session_invs = [i for i in invitations if i["agentType"] == "attached-session"]
+    assert len(session_invs) == 1
+    sinv = session_invs[0]
+    assert sinv["id"] == f"session-{sid}"
+    assert sinv["remoteAgentId"] == sid
+    assert sinv["displayName"] == "My Claude Code"
+    assert sinv["description"] == "Working on goal"
+    assert sinv["endpoint"] == "http://10.0.2.2:8000"
+    assert sinv["avatarUri"] is None
+
+    # Default still present
+    pc_invs = [i for i in invitations if i["agentType"] == "pc-agent"]
+    assert len(pc_invs) >= 1
+
+
+@pytest.mark.asyncio
+async def test_invitations_excludes_offline_session(monkeypatch):
+    """Offline session does NOT appear in invitations."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import cfg, app_agent_session_registry, api_contact_invitations
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    sid = f"cc-{_uuid.uuid4().hex[:8]}"
+    await app_agent_session_registry.register(
+        session_id=sid,
+        remote_agent_id=sid,
+        display_name="Offline CC",
+    )
+    await app_agent_session_registry.offline(sid)
+
+    result = await api_contact_invitations(
+        _FakeAppRequest(
+            headers={"authorization": "Bearer secret"},
+            base_url="http://testserver/",
+        )
+    )
+
+    invitations = result["invitations"]
+    session_invs = [i for i in invitations if i["agentType"] == "attached-session"]
+    assert len(session_invs) == 0
+
+
+@pytest.mark.asyncio
+async def test_invitations_session_remote_agent_id_conflict_uses_session(monkeypatch):
+    """When config and session share remoteAgentId, session wins."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import cfg, app_agent_session_registry, api_contact_invitations
+
+    app_agent_session_registry._sessions.clear()
+
+    rid = f"shared-{_uuid.uuid4().hex[:8]}"
+    sid = f"cc-{_uuid.uuid4().hex[:8]}"
+
+    await app_agent_session_registry.register(
+        session_id=sid,
+        remote_agent_id=rid,
+        display_name="Session Version",
+        description="From session",
+    )
+
+    cfg["app"] = {
+        "contact_invitations": [
+            {"id": "config-entry", "remoteAgentId": rid, "displayName": "Config Version"},
+        ]
+    }
+
+    result = await api_contact_invitations(
+        _FakeAppRequest(
+            headers={"authorization": "Bearer secret"},
+            base_url="http://testserver/",
+        )
+    )
+
+    invitations = result["invitations"]
+    session_invs = [i for i in invitations if i["agentType"] == "attached-session"]
+    assert len(session_invs) == 1
+    assert session_invs[0]["displayName"] == "Session Version"
+    config_matches = [i for i in invitations if i["remoteAgentId"] == rid and i["agentType"] == "pc-agent"]
+    assert len(config_matches) == 0
+
+
+# ================================================================
+# Resolver + session registry integration tests
+# ================================================================
+
+
+def test_resolver_known_includes_session_remote_agent_id():
+    from main import get_known_app_remote_agent_ids, cfg, app_agent_session_registry
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    app_agent_session_registry._sessions["s1"] = {
+        "sessionId": "s1",
+        "remoteAgentId": "cc-test",
+        "displayName": "CC",
+        "description": "desc",
+        "status": "online",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "expiresAt": None,
+        "callbackUrl": None,
+        "sourceLabel": None,
+    }
+
+    ids = get_known_app_remote_agent_ids()
+    assert "cc-test" in ids
+    assert "default" in ids
+
+
+def test_resolve_session_online_returns_attached_session():
+    from main import resolve_app_remote_agent, app_agent_session_registry
+
+    app_agent_session_registry._sessions.clear()
+    app_agent_session_registry._sessions["s1"] = {
+        "sessionId": "s1",
+        "remoteAgentId": "cc-online",
+        "displayName": "CC",
+        "description": "desc",
+        "status": "online",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "expiresAt": None,
+        "callbackUrl": "http://127.0.0.1:9010",
+        "sourceLabel": None,
+    }
+
+    resolved = resolve_app_remote_agent("cc-online")
+    assert resolved["target"] == "attached_session"
+    assert resolved["sessionId"] == "s1"
+    assert resolved["status"] == "online"
+    assert resolved["callbackUrl"] == "http://127.0.0.1:9010"
+
+
+def test_resolve_session_offline_still_succeeds():
+    from main import resolve_app_remote_agent, app_agent_session_registry
+
+    app_agent_session_registry._sessions.clear()
+    app_agent_session_registry._sessions["s1"] = {
+        "sessionId": "s1",
+        "remoteAgentId": "cc-offline",
+        "displayName": "CC",
+        "description": "desc",
+        "status": "offline",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "expiresAt": None,
+        "callbackUrl": "http://127.0.0.1:9010",
+        "sourceLabel": None,
+    }
+
+    resolved = resolve_app_remote_agent("cc-offline")
+    assert resolved["target"] == "attached_session"
+    assert resolved["status"] == "offline"
+
+
+def test_resolve_unknown_still_400():
+    from main import resolve_app_remote_agent, app_agent_session_registry
+
+    app_agent_session_registry._sessions.clear()
+
+    with pytest.raises(HTTPException) as exc:
+        resolve_app_remote_agent("unknown-xyz")
+    assert exc.value.status_code == 400
+
+
+# ================================================================
+# Endpoint tests: session registry API
+# ================================================================
+
+
+@pytest.mark.asyncio
+async def test_register_session_endpoint_creates_session(monkeypatch):
+    """POST /api/app-agent-sessions/register creates an online session."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    sid = f"cc-{_uuid.uuid4().hex[:8]}"
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {
+                "sessionId": sid,
+                "displayName": "Test CC",
+                "description": "Testing",
+                "callbackUrl": "http://127.0.0.1:9010",
+            }
+
+    from main import api_register_app_agent_session
+
+    result = await api_register_app_agent_session(FakeRequest())
+    assert "session" in result
+    s = result["session"]
+    assert s["sessionId"] == sid
+    assert s["remoteAgentId"] == sid
+    assert s["status"] == "online"
+    assert s["displayName"] == "Test CC"
+
+
+@pytest.mark.asyncio
+async def test_register_session_endpoint_409_conflict(monkeypatch):
+    """Same remoteAgentId different sessionId returns 409."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    app_agent_session_registry._sessions["s1"] = {
+        "sessionId": "s1",
+        "remoteAgentId": "rid-dup",
+        "displayName": "S1",
+        "description": "desc",
+        "status": "online",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "expiresAt": None,
+        "callbackUrl": None,
+        "sourceLabel": None,
+    }
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {
+                "sessionId": "s2",
+                "remoteAgentId": "rid-dup",
+                "displayName": "S2",
+            }
+
+    from main import api_register_app_agent_session
+
+    with pytest.raises(HTTPException) as exc:
+        await api_register_app_agent_session(FakeRequest())
+    assert exc.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_register_session_endpoint_requires_auth(monkeypatch):
+    """Unauthenticated register returns 401 before body validation."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    class FakeRequest:
+        headers = {}
+        base_url = "http://testserver/"
+
+    from main import _require_chat_auth, _api_config
+
+    api_cfg = _api_config()
+    with pytest.raises(HTTPException) as exc:
+        _require_chat_auth(FakeRequest(), api_cfg)
+    assert exc.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_endpoint_updates_session(monkeypatch):
+    """POST /api/app-agent-sessions/{id}/heartbeat updates lastSeenAt."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    app_agent_session_registry._sessions["s1"] = {
+        "sessionId": "s1",
+        "remoteAgentId": "s1",
+        "displayName": "S1",
+        "description": "desc",
+        "status": "offline",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "expiresAt": None,
+        "callbackUrl": None,
+        "sourceLabel": None,
+    }
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+    from main import api_app_agent_session_heartbeat
+
+    result = await api_app_agent_session_heartbeat("s1", FakeRequest())
+    assert result["session"]["status"] == "online"
+    assert result["session"]["lastSeenAt"] > "2026-01-01"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_endpoint_missing_returns_404(monkeypatch):
+    """Heartbeat for unknown session returns 404."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+    from main import api_app_agent_session_heartbeat
+
+    with pytest.raises(HTTPException) as exc:
+        await api_app_agent_session_heartbeat("nonexistent", FakeRequest())
+    assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_offline_endpoint_marks_offline(monkeypatch):
+    """POST /api/app-agent-sessions/{id}/offline marks offline."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    app_agent_session_registry._sessions["s1"] = {
+        "sessionId": "s1",
+        "remoteAgentId": "s1",
+        "displayName": "S1",
+        "description": "desc",
+        "status": "online",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "expiresAt": None,
+        "callbackUrl": None,
+        "sourceLabel": None,
+    }
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+    from main import api_app_agent_session_offline
+
+    result = await api_app_agent_session_offline("s1", FakeRequest())
+    assert result["session"]["status"] == "offline"
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_endpoint(monkeypatch):
+    """GET /api/app-agent-sessions returns list."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    app_agent_session_registry._sessions["s1"] = {
+        "sessionId": "s1",
+        "remoteAgentId": "s1",
+        "displayName": "S1",
+        "description": "desc",
+        "status": "online",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "expiresAt": None,
+        "callbackUrl": None,
+        "sourceLabel": None,
+    }
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+    from main import api_list_app_agent_sessions
+
+    result = await api_list_app_agent_sessions(FakeRequest())
+    assert len(result["sessions"]) == 1
+
+
+# ================================================================
+# POST /api/messages — attached session routing guards
+# ================================================================
+
+
+@pytest.mark.asyncio
+async def test_post_messages_attached_session_no_callback_returns_501(monkeypatch):
+    """POST with attached session without callbackUrl returns 501, no insert."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"cc-nocb-{_uuid.uuid4().hex[:8]}"
+    app_agent_session_registry._sessions["s1"] = {
+        "sessionId": "s1",
+        "remoteAgentId": rid,
+        "displayName": "No CB",
+        "description": "desc",
+        "status": "online",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "expiresAt": None,
+        "callbackUrl": None,
+        "sourceLabel": None,
+    }
+
+    cid = f"cm-nocb-{_uuid.uuid4().hex[:8]}"
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {
+                "clientMessageId": cid,
+                "content": "hello",
+                "remoteAgentId": rid,
+            }
+
+    from main import api_send_message
+
+    with pytest.raises(HTTPException) as exc:
+        await api_send_message(FakeRequest())
+    assert exc.value.status_code == 501
+
+    from main import memory_store
+    found = await memory_store.find_app_message_by_client_message_id(
+        cid, remote_agent_id=rid,
+    )
+    assert found is None
+
+
+@pytest.mark.asyncio
+async def test_post_messages_attached_session_offline_returns_503(monkeypatch):
+    """POST with offline attached session returns 503, no insert."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"cc-off-{_uuid.uuid4().hex[:8]}"
+    app_agent_session_registry._sessions["s1"] = {
+        "sessionId": "s1",
+        "remoteAgentId": rid,
+        "displayName": "Offline CC",
+        "description": "desc",
+        "status": "offline",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "expiresAt": None,
+        "callbackUrl": "http://127.0.0.1:9010",
+        "sourceLabel": None,
+    }
+
+    cid = f"cm-off-{_uuid.uuid4().hex[:8]}"
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {
+                "clientMessageId": cid,
+                "content": "hello",
+                "remoteAgentId": rid,
+            }
+
+    from main import api_send_message
+
+    with pytest.raises(HTTPException) as exc:
+        await api_send_message(FakeRequest())
+    assert exc.value.status_code == 503
+
+    from main import memory_store
+    found = await memory_store.find_app_message_by_client_message_id(
+        cid, remote_agent_id=rid,
+    )
+    assert found is None
+
+
+@pytest.mark.asyncio
+async def test_post_messages_default_still_works(monkeypatch):
+    """POST /api/messages with default remoteAgentId still works."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {
+                "clientMessageId": "cm-default-ok",
+                "content": "hello default",
+            }
+
+    from main import api_send_message
+
+    result = await api_send_message(FakeRequest())
+    assert "userMessage" in result
+
+
+# ================================================================
+# GET /api/messages — attached session history
+# ================================================================
+
+
+@pytest.mark.asyncio
+async def test_get_messages_attached_session_offline_still_reads_history(monkeypatch):
+    """GET /api/messages works for offline attached session (reads history)."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"cc-hist-{_uuid.uuid4().hex[:8]}"
+    app_agent_session_registry._sessions["s1"] = {
+        "sessionId": "s1",
+        "remoteAgentId": rid,
+        "displayName": "History CC",
+        "description": "desc",
+        "status": "offline",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "expiresAt": None,
+        "callbackUrl": "http://127.0.0.1:9010",
+        "sourceLabel": None,
+    }
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+    from main import api_get_messages
+
+    result = await api_get_messages(FakeRequest(), remoteAgentId=rid)
+    assert "messages" in result
+    assert isinstance(result["messages"], list)
+
+
+@pytest.mark.asyncio
+async def test_get_messages_unknown_still_400(monkeypatch):
+    """GET /api/messages with unknown remoteAgentId still returns 400."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+    from main import api_get_messages
+
+    with pytest.raises(HTTPException) as exc:
+        await api_get_messages(FakeRequest(), remoteAgentId="unknown-xyz")
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_auth_before_session_validation(monkeypatch):
+    """401 returned before session/remoteAgentId validation — no info leak."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    class FakeRequest:
+        headers = {}
+
+    from main import _require_chat_auth, _api_config
+
+    api_cfg = _api_config()
+    with pytest.raises(HTTPException) as exc:
+        _require_chat_auth(FakeRequest(), api_cfg)
+    assert exc.value.status_code == 401

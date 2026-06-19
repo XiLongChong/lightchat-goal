@@ -54,6 +54,7 @@ from runtime.turn_hooks import build_observability_hooks
 from runtime.user_turns import UserTurnRegistry
 from runtime.log_reader import read_recent_log_lines
 from runtime.task_scheduler import TaskScheduler
+from runtime.app_agent_session_registry import AppAgentSessionRegistry
 
 # ================================================================
 # Config loading
@@ -1312,6 +1313,10 @@ async def chat(request: Request):
 _APP_USER_ID = os.getenv("APP_USER_ID", "app:user")
 _APP_AGENT_TIMEOUT_S = 55.0
 
+# In-memory registry for attached agent sessions (Claude Code etc.).
+# Sessions are lost on restart — acceptable for this prototype stage.
+app_agent_session_registry = AppAgentSessionRegistry()
+
 
 # ── app contact-invitation / remote-agent helpers ──────────────────
 
@@ -1331,8 +1336,8 @@ def normalize_remote_agent_id(value: str | None) -> str:
 def get_known_app_remote_agent_ids() -> set[str]:
     """Return the set of remoteAgentId values the server recognises.
 
-    Derived from ``app.contact_invitations`` config.  Always includes
-    ``"default"`` so that the single-agent fallback is never rejected.
+    Derived from ``app.contact_invitations`` config and the in-memory
+    :class:`AppAgentSessionRegistry`.  Always includes ``"default"``.
     """
     ids: set[str] = {"default"}
     configured = cfg.get("app", {}).get("contact_invitations")
@@ -1341,18 +1346,23 @@ def get_known_app_remote_agent_ids() -> set[str]:
             rid = str(entry.get("remoteAgentId", "default")).strip()
             if rid:
                 ids.add(rid)
+    ids |= app_agent_session_registry.known_remote_agent_ids()
     return ids
 
 
 def resolve_app_remote_agent(remote_agent_id: str) -> dict:
     """Validate *remote_agent_id* and return routing metadata.
 
-    Returns a dict with keys ``remoteAgentId`` (str) and ``target`` (str,
-    always ``"default"`` for now).  Raises ``HTTPException(400)`` for
-    unknown ids.
+    Returns a dict with keys:
 
-    This is a routing *placeholder* — every known id currently maps to the
-    single-agent runtime.  Multi-agent dispatch will be wired here later.
+    * ``remoteAgentId`` — the canonical id (str)
+    * ``target`` — ``"default"`` for internal, ``"attached_session"`` for
+      registered sessions
+    * ``sessionId`` — session id or None
+    * ``status`` — ``"online"`` / ``"offline"`` or None
+    * ``callbackUrl`` — callback URL or None
+
+    Raises ``HTTPException(400)`` for unknown ids.
     """
     known = get_known_app_remote_agent_ids()
     if remote_agent_id not in known:
@@ -1360,7 +1370,26 @@ def resolve_app_remote_agent(remote_agent_id: str) -> dict:
             status_code=400,
             detail=f"unknown remoteAgentId: {remote_agent_id}",
         )
-    return {"remoteAgentId": remote_agent_id, "target": "default"}
+
+    # Check registry for an attached session with this remoteAgentId
+    session = app_agent_session_registry.find_by_remote_agent_id(remote_agent_id)
+    if session is not None:
+        return {
+            "remoteAgentId": remote_agent_id,
+            "target": "attached_session",
+            "sessionId": session["sessionId"],
+            "status": session["status"],
+            "callbackUrl": session.get("callbackUrl"),
+        }
+
+    # Config / default
+    return {
+        "remoteAgentId": remote_agent_id,
+        "target": "default",
+        "sessionId": None,
+        "status": None,
+        "callbackUrl": None,
+    }
 
 
 @app.get("/api/profile")
@@ -1411,6 +1440,29 @@ async def api_send_message(request: Request):
         "[app] POST /api/messages remoteAgentId=%s resolved_target=%s",
         remote_agent_id, resolved["target"],
     )
+
+    # ── attached-session routing guards ─────────────────────────────
+    if resolved["target"] == "attached_session":
+        if resolved.get("status") != "online":
+            raise HTTPException(
+                status_code=503,
+                detail=json.dumps({
+                    "error": {
+                        "code": "agent_session_offline",
+                        "message": "Agent session is offline",
+                    },
+                }),
+            )
+        if not resolved.get("callbackUrl"):
+            raise HTTPException(
+                status_code=501,
+                detail=json.dumps({
+                    "error": {
+                        "code": "agent_session_callback_not_configured",
+                        "message": "Agent session has no callback URL configured",
+                    },
+                }),
+            )
 
     # ── idempotency ──────────────────────────────────────────────
     existing_user = await memory_store.find_app_message_by_client_message_id(
@@ -1639,38 +1691,72 @@ def build_app_contact_invitation(request: Request) -> dict:
 def build_app_contact_invitations(request: Request) -> list[dict]:
     """Build the list of contact invitation dicts.
 
-    When ``app.contact_invitations`` is configured in the config tree each
-    entry produces one invitation; otherwise a single default invitation is
-    returned via :func:`build_app_contact_invitation`.
+    Merges three sources:
 
-    Config-driven fields (per entry): ``id``, ``remoteAgentId``,
-    ``displayName``, ``description``.  Runtime-driven fields (never from
-    config): ``endpoint`` (from *request.base_url*), ``sourceLabel`` (from
-    ``COMPUTERNAME`` env), ``createdAt`` (current UTC).
+    1. Config-driven invitations from ``app.contact_invitations``.
+    2. Online attached sessions from :class:`AppAgentSessionRegistry`.
+    3. Default fallback (pc-agent-default) when neither source exists.
+
+    When a config invitation's ``remoteAgentId`` collides with a session,
+    the session takes precedence and the config entry is dropped.
     """
-    configured = cfg.get("app", {}).get("contact_invitations")
-    if not configured:
-        return [build_app_contact_invitation(request)]
-
     endpoint = str(request.base_url).rstrip("/")
     source_label = os.getenv("COMPUTERNAME", "PC Agent")
     created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     default_display_name = cfg.get("agent", {}).get("name", "PC Agent")
 
     invitations: list[dict] = []
-    for entry in configured:
+    session_ids = app_agent_session_registry.known_remote_agent_ids()
+
+    # 1. Config-driven invitations
+    configured = cfg.get("app", {}).get("contact_invitations")
+    if configured:
+        for entry in configured:
+            rid = str(entry.get("remoteAgentId", "default")).strip() or "default"
+            if rid in session_ids:
+                # Session takes precedence — skip config entry
+                continue
+            invitations.append({
+                "id": str(entry.get("id", "pc-agent-default")),
+                "remoteAgentId": rid,
+                "displayName": str(entry.get("displayName") or default_display_name),
+                "avatarUri": None,
+                "description": str(entry.get("description") or "Personal assistant on this PC"),
+                "agentType": "pc-agent",
+                "sourceLabel": source_label,
+                "endpoint": endpoint,
+                "createdAt": created_at,
+                "expiresAt": None,
+            })
+
+    # 2. Online attached sessions
+    # list_online() is async — but this function is sync.  We access the
+    # internal _sessions dict directly, which is safe for a read-only
+    # snapshot in the synchronous context.
+    online_sessions = [
+        s for s in app_agent_session_registry._sessions.values()
+        if s["status"] == "online"
+    ]
+    for sess in online_sessions:
         invitations.append({
-            "id": str(entry.get("id", "pc-agent-default")),
-            "remoteAgentId": str(entry.get("remoteAgentId", "default")),
-            "displayName": str(entry.get("displayName") or default_display_name),
+            "id": f"session-{sess['sessionId']}",
+            "remoteAgentId": sess["remoteAgentId"],
+            "displayName": sess["displayName"],
             "avatarUri": None,
-            "description": str(entry.get("description") or "Personal assistant on this PC"),
-            "agentType": "pc-agent",
-            "sourceLabel": source_label,
+            "description": sess["description"],
+            "agentType": "attached-session",
+            "sourceLabel": sess.get("sourceLabel") or source_label,
             "endpoint": endpoint,
-            "createdAt": created_at,
-            "expiresAt": None,
+            "createdAt": sess["createdAt"],
+            "expiresAt": sess.get("expiresAt"),
         })
+
+    # 3. Default fallback — always include unless its remoteAgentId
+    #    ("default") is already covered by a session or config entry.
+    existing_rids = {inv["remoteAgentId"] for inv in invitations}
+    if "default" not in session_ids and "default" not in existing_rids:
+        invitations.append(build_app_contact_invitation(request))
+
     return invitations
 
 
@@ -1680,6 +1766,96 @@ def _iso_from_ts(ts: float) -> str:
         return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat().replace("+00:00", "Z")
     except (OSError, ValueError, OverflowError):
         return datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ================================================================
+# App agent session registry endpoints
+# ================================================================
+
+
+@app.post("/api/app-agent-sessions/register")
+async def api_register_app_agent_session(request: Request):
+    """Register or update an attached agent session.
+
+    Same auth as the other /api/* endpoints.  Body: ``sessionId``
+    (required), ``remoteAgentId`` (defaults to sessionId),
+    ``displayName`` (defaults to sessionId), ``description``,
+    ``callbackUrl``, ``sourceLabel``.
+
+    409 if *remoteAgentId* is already claimed by a different session.
+    """
+    api_cfg = _api_config()
+    _require_chat_auth(request, api_cfg)
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="JSON body must be an object")
+
+    session_id = str(body.get("sessionId", "")).strip()
+    if not session_id:
+        raise HTTPException(status_code=400, detail="sessionId is required")
+
+    remote_agent_id = str(body.get("remoteAgentId") or session_id).strip() or session_id
+    display_name = str(body.get("displayName") or session_id).strip() or session_id
+    description = str(body.get("description") or "Attached agent session").strip() or "Attached agent session"
+    callback_url = str(body.get("callbackUrl", "")).strip() or None
+    source_label = str(body.get("sourceLabel", "")).strip() or None
+
+    try:
+        session = await app_agent_session_registry.register(
+            session_id=session_id,
+            remote_agent_id=remote_agent_id,
+            display_name=display_name,
+            description=description,
+            callback_url=callback_url,
+            source_label=source_label,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    logger.info(
+        "[app] session registered sessionId=%s remoteAgentId=%s",
+        session_id, remote_agent_id,
+    )
+    return {"session": session}
+
+
+@app.post("/api/app-agent-sessions/{session_id}/heartbeat")
+async def api_app_agent_session_heartbeat(session_id: str, request: Request):
+    """Update lastSeenAt and set status to online."""
+    api_cfg = _api_config()
+    _require_chat_auth(request, api_cfg)
+
+    session = await app_agent_session_registry.heartbeat(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    return {"session": session}
+
+
+@app.post("/api/app-agent-sessions/{session_id}/offline")
+async def api_app_agent_session_offline(session_id: str, request: Request):
+    """Mark a session offline."""
+    api_cfg = _api_config()
+    _require_chat_auth(request, api_cfg)
+
+    session = await app_agent_session_registry.offline(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    logger.info("[app] session offline sessionId=%s", session_id)
+    return {"session": session}
+
+
+@app.get("/api/app-agent-sessions")
+async def api_list_app_agent_sessions(request: Request):
+    """Return all registered sessions (debug / inspection)."""
+    api_cfg = _api_config()
+    _require_chat_auth(request, api_cfg)
+
+    sessions = await app_agent_session_registry.list_all()
+    return {"sessions": sessions}
 
 
 @app.post("/admin/dev/compress")
