@@ -284,10 +284,11 @@ async def test_contact_invitations_has_required_fields(monkeypatch):
     inv = result["invitations"][0]
 
     required_fields = {
-        "id", "displayName", "avatarUri", "description",
+        "id", "remoteAgentId", "displayName", "avatarUri", "description",
         "agentType", "sourceLabel", "endpoint", "createdAt", "expiresAt",
     }
     assert required_fields.issubset(inv.keys())
+    assert inv["remoteAgentId"] == "default"
     assert inv["avatarUri"] is None
     assert inv["expiresAt"] is None
     assert inv["description"] == "Personal assistant on this PC"
@@ -342,6 +343,7 @@ def test_build_contact_invitation_stable_id():
         _FakeAppRequest(base_url="http://10.0.2.2:8000/"),
     )
     assert inv["id"] == "pc-agent-default"
+    assert inv["remoteAgentId"] == "default"
 
 
 def test_build_contact_invitation_uses_request_base_url():
@@ -435,3 +437,203 @@ def test_build_contact_invitation_fixed_fields():
     assert inv["expiresAt"] is None
     assert inv["description"] == "Personal assistant on this PC"
     assert inv["agentType"] == "pc-agent"
+    assert inv["remoteAgentId"] == "default"
+
+
+# ──────────────────────────────────────────────────────────────────
+# build_app_contact_invitations (config-driven multi-invitation) tests
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_build_invitations_no_config_returns_default():
+    """Without app.contact_invitations config, returns single default."""
+    from main import build_app_contact_invitations, cfg
+
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    invs = build_app_contact_invitations(
+        _FakeAppRequest(base_url="http://10.0.2.2:8000/"),
+    )
+    assert len(invs) == 1
+    assert invs[0]["id"] == "pc-agent-default"
+    assert invs[0]["remoteAgentId"] == "default"
+
+
+def test_build_invitations_with_config_returns_multiple(monkeypatch):
+    """With app.contact_invitations config, returns one per entry."""
+    from main import build_app_contact_invitations, cfg
+
+    cfg["app"] = {
+        "contact_invitations": [
+            {
+                "id": "pc-agent-default",
+                "remoteAgentId": "default",
+                "displayName": "Yu",
+                "description": "Connected PC agent",
+            },
+            {
+                "id": "pc-agent-coder",
+                "remoteAgentId": "coder",
+                "displayName": "Coder",
+                "description": "Coding assistant on this PC",
+            },
+        ]
+    }
+
+    invs = build_app_contact_invitations(
+        _FakeAppRequest(base_url="http://10.0.2.2:8000/"),
+    )
+    assert len(invs) == 2
+
+    assert invs[0]["id"] == "pc-agent-default"
+    assert invs[0]["remoteAgentId"] == "default"
+    assert invs[0]["displayName"] == "Yu"
+    assert invs[0]["description"] == "Connected PC agent"
+
+    assert invs[1]["id"] == "pc-agent-coder"
+    assert invs[1]["remoteAgentId"] == "coder"
+    assert invs[1]["displayName"] == "Coder"
+    assert invs[1]["description"] == "Coding assistant on this PC"
+
+
+def test_build_invitations_endpoint_always_from_request(monkeypatch):
+    """endpoint is always from request.base_url, never from config."""
+    from main import build_app_contact_invitations, cfg
+
+    cfg["app"] = {
+        "contact_invitations": [
+            {
+                "id": "pc-agent-default",
+                "displayName": "Test",
+            },
+        ]
+    }
+
+    invs = build_app_contact_invitations(
+        _FakeAppRequest(base_url="http://192.168.1.100:8899/"),
+    )
+    assert invs[0]["endpoint"] == "http://192.168.1.100:8899"
+
+
+def test_build_invitations_source_label_from_env(monkeypatch):
+    """sourceLabel from COMPUTERNAME env, shared across all invitations."""
+    monkeypatch.setenv("COMPUTERNAME", "DESKTOP-XYZ")
+
+    from main import build_app_contact_invitations, cfg
+
+    cfg["app"] = {
+        "contact_invitations": [
+            {"id": "a", "displayName": "A"},
+            {"id": "b", "displayName": "B"},
+        ]
+    }
+
+    invs = build_app_contact_invitations(
+        _FakeAppRequest(base_url="http://testserver/"),
+    )
+    assert invs[0]["sourceLabel"] == "DESKTOP-XYZ"
+    assert invs[1]["sourceLabel"] == "DESKTOP-XYZ"
+
+
+def test_build_invitations_created_at_ends_with_z(monkeypatch):
+    """createdAt is ISO 8601 UTC Z for every invitation."""
+    from main import build_app_contact_invitations, cfg
+
+    cfg["app"] = {
+        "contact_invitations": [
+            {"id": "a", "displayName": "A"},
+            {"id": "b", "displayName": "B"},
+        ]
+    }
+
+    invs = build_app_contact_invitations(
+        _FakeAppRequest(base_url="http://testserver/"),
+    )
+    for inv in invs:
+        assert inv["createdAt"].endswith("Z")
+        assert "T" in inv["createdAt"]
+
+
+def test_build_invitations_fallback_display_name(monkeypatch):
+    """displayName falls back to cfg agent.name when entry has no displayName."""
+    from main import build_app_contact_invitations, cfg
+
+    cfg["agent"] = {"name": "Fallback Agent"}
+    cfg["app"] = {
+        "contact_invitations": [
+            {"id": "pc-agent-default"},
+        ]
+    }
+
+    invs = build_app_contact_invitations(
+        _FakeAppRequest(base_url="http://testserver/"),
+    )
+    assert invs[0]["displayName"] == "Fallback Agent"
+
+
+def test_build_invitations_fallback_description(monkeypatch):
+    """description falls back to default when entry has no description."""
+    from main import build_app_contact_invitations, cfg
+
+    cfg["app"] = {
+        "contact_invitations": [
+            {"id": "pc-agent-default"},
+        ]
+    }
+
+    invs = build_app_contact_invitations(
+        _FakeAppRequest(base_url="http://testserver/"),
+    )
+    assert invs[0]["description"] == "Personal assistant on this PC"
+
+
+def test_build_invitations_fallback_remote_agent_id(monkeypatch):
+    """remoteAgentId falls back to 'default' when entry has no remoteAgentId."""
+    from main import build_app_contact_invitations, cfg
+
+    cfg["app"] = {
+        "contact_invitations": [
+            {"id": "pc-agent-custom"},
+        ]
+    }
+
+    invs = build_app_contact_invitations(
+        _FakeAppRequest(base_url="http://testserver/"),
+    )
+    assert invs[0]["remoteAgentId"] == "default"
+
+
+def test_build_invitations_fallback_id(monkeypatch):
+    """id falls back to 'pc-agent-default' when entry has no id."""
+    from main import build_app_contact_invitations, cfg
+
+    cfg["app"] = {
+        "contact_invitations": [
+            {"displayName": "NoId"},
+        ]
+    }
+
+    invs = build_app_contact_invitations(
+        _FakeAppRequest(base_url="http://testserver/"),
+    )
+    assert invs[0]["id"] == "pc-agent-default"
+
+
+def test_build_invitations_fixed_fields_per_entry(monkeypatch):
+    """avatarUri, expiresAt, agentType are fixed for every invitation."""
+    from main import build_app_contact_invitations, cfg
+
+    cfg["app"] = {
+        "contact_invitations": [
+            {"id": "a", "displayName": "A"},
+            {"id": "b", "displayName": "B"},
+        ]
+    }
+
+    invs = build_app_contact_invitations(
+        _FakeAppRequest(base_url="http://testserver/"),
+    )
+    for inv in invs:
+        assert inv["avatarUri"] is None
+        assert inv["expiresAt"] is None
+        assert inv["agentType"] == "pc-agent"

@@ -1521,21 +1521,20 @@ async def api_get_messages(
 async def api_contact_invitations(request: Request):
     """Return contact invitations for the AsPocket app.
 
-    Single PC agent invitation with a stable id so the app can dedupe.
-    Same auth as /api/profile and /api/messages.  No relay, no multi-agent.
+    Driven by ``app.contact_invitations`` config when present; otherwise
+    falls back to the single pc-agent-default.  Same auth as /api/profile
+    and /api/messages.  No relay, no multi-agent runtime.
     """
     api_cfg = _api_config()
     _require_chat_auth(request, api_cfg)
 
     return {
-        "invitations": [
-            build_app_contact_invitation(request),
-        ]
+        "invitations": build_app_contact_invitations(request),
     }
 
 
 def build_app_contact_invitation(request: Request) -> dict:
-    """Build a single PC agent contact invitation dict.
+    """Build the default single PC agent contact invitation dict.
 
     Helper so the invitation shape can be reused or tested independently
     without invoking the full endpoint.  Returns one invitation dict (not
@@ -1543,6 +1542,7 @@ def build_app_contact_invitation(request: Request) -> dict:
     """
     return {
         "id": "pc-agent-default",
+        "remoteAgentId": "default",
         "displayName": cfg.get("agent", {}).get("name", "PC Agent"),
         "avatarUri": None,
         "description": "Personal assistant on this PC",
@@ -1552,6 +1552,44 @@ def build_app_contact_invitation(request: Request) -> dict:
         "createdAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "expiresAt": None,
     }
+
+
+def build_app_contact_invitations(request: Request) -> list[dict]:
+    """Build the list of contact invitation dicts.
+
+    When ``app.contact_invitations`` is configured in the config tree each
+    entry produces one invitation; otherwise a single default invitation is
+    returned via :func:`build_app_contact_invitation`.
+
+    Config-driven fields (per entry): ``id``, ``remoteAgentId``,
+    ``displayName``, ``description``.  Runtime-driven fields (never from
+    config): ``endpoint`` (from *request.base_url*), ``sourceLabel`` (from
+    ``COMPUTERNAME`` env), ``createdAt`` (current UTC).
+    """
+    configured = cfg.get("app", {}).get("contact_invitations")
+    if not configured:
+        return [build_app_contact_invitation(request)]
+
+    endpoint = str(request.base_url).rstrip("/")
+    source_label = os.getenv("COMPUTERNAME", "PC Agent")
+    created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    default_display_name = cfg.get("agent", {}).get("name", "PC Agent")
+
+    invitations: list[dict] = []
+    for entry in configured:
+        invitations.append({
+            "id": str(entry.get("id", "pc-agent-default")),
+            "remoteAgentId": str(entry.get("remoteAgentId", "default")),
+            "displayName": str(entry.get("displayName") or default_display_name),
+            "avatarUri": None,
+            "description": str(entry.get("description") or "Personal assistant on this PC"),
+            "agentType": "pc-agent",
+            "sourceLabel": source_label,
+            "endpoint": endpoint,
+            "createdAt": created_at,
+            "expiresAt": None,
+        })
+    return invitations
 
 
 def _iso_from_ts(ts: float) -> str:
