@@ -1313,6 +1313,56 @@ _APP_USER_ID = os.getenv("APP_USER_ID", "app:user")
 _APP_AGENT_TIMEOUT_S = 55.0
 
 
+# ── app contact-invitation / remote-agent helpers ──────────────────
+
+
+def normalize_remote_agent_id(value: str | None) -> str:
+    """Normalize an incoming remoteAgentId to a non-empty string.
+
+    ``None``, empty string, and whitespace-only all map to ``"default"``
+    so that old App clients that don't send the field continue to work.
+    """
+    if not value:
+        return "default"
+    stripped = str(value).strip()
+    return stripped if stripped else "default"
+
+
+def get_known_app_remote_agent_ids() -> set[str]:
+    """Return the set of remoteAgentId values the server recognises.
+
+    Derived from ``app.contact_invitations`` config.  Always includes
+    ``"default"`` so that the single-agent fallback is never rejected.
+    """
+    ids: set[str] = {"default"}
+    configured = cfg.get("app", {}).get("contact_invitations")
+    if configured:
+        for entry in configured:
+            rid = str(entry.get("remoteAgentId", "default")).strip()
+            if rid:
+                ids.add(rid)
+    return ids
+
+
+def resolve_app_remote_agent(remote_agent_id: str) -> dict:
+    """Validate *remote_agent_id* and return routing metadata.
+
+    Returns a dict with keys ``remoteAgentId`` (str) and ``target`` (str,
+    always ``"default"`` for now).  Raises ``HTTPException(400)`` for
+    unknown ids.
+
+    This is a routing *placeholder* — every known id currently maps to the
+    single-agent runtime.  Multi-agent dispatch will be wired here later.
+    """
+    known = get_known_app_remote_agent_ids()
+    if remote_agent_id not in known:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown remoteAgentId: {remote_agent_id}",
+        )
+    return {"remoteAgentId": remote_agent_id, "target": "default"}
+
+
 @app.get("/api/profile")
 async def api_profile(request: Request):
     """Validate auth and return agent name — same auth as /chat."""
@@ -1331,6 +1381,10 @@ async def api_send_message(request: Request):
     Idempotent by clientMessageId.  Only send_text_message tool calls
     become visible bubbles — assistant final text, thinking, tool_result,
     and non-send tools are ignored.  Server-side timeout: 55 s.
+
+    Optional *remoteAgentId* selects the target agent (defaults to
+    ``"default"``).  Routing is a placeholder — every known id currently
+    resolves to the single-agent runtime.
     """
     api_cfg = _api_config()
     _require_chat_auth(request, api_cfg)
@@ -1348,6 +1402,15 @@ async def api_send_message(request: Request):
         raise HTTPException(status_code=400, detail="clientMessageId is required")
     if not content:
         raise HTTPException(status_code=400, detail="content is required")
+
+    # ── resolve remote agent id ────────────────────────────────────
+    raw_remote = body.get("remoteAgentId")
+    remote_agent_id = normalize_remote_agent_id(raw_remote)
+    resolved = resolve_app_remote_agent(remote_agent_id)
+    logger.info(
+        "[app] POST /api/messages remoteAgentId=%s resolved_target=%s",
+        remote_agent_id, resolved["target"],
+    )
 
     # ── idempotency ──────────────────────────────────────────────
     existing_user = await memory_store.find_app_message_by_client_message_id(
@@ -1490,10 +1553,24 @@ async def api_get_messages(
     request: Request,
     cursor: str | None = None,
     limit: int = 50,
+    remoteAgentId: str | None = None,
 ):
-    """Return app_messages ordered by created_at.  Paginated by id cursor."""
+    """Return app_messages ordered by created_at.  Paginated by id cursor.
+
+    Optional *remoteAgentId* selects the target agent (defaults to
+    ``"default"``).  Routing is a placeholder — every known id currently
+    returns the same message history.
+    """
     api_cfg = _api_config()
     _require_chat_auth(request, api_cfg)
+
+    # ── resolve remote agent id ────────────────────────────────────
+    resolved_id = normalize_remote_agent_id(remoteAgentId)
+    resolved = resolve_app_remote_agent(resolved_id)
+    logger.info(
+        "[app] GET /api/messages remoteAgentId=%s resolved_target=%s",
+        resolved_id, resolved["target"],
+    )
 
     messages, next_cursor, has_more = (
         await memory_store.get_app_messages_after_cursor(

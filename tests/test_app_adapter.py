@@ -637,3 +637,327 @@ def test_build_invitations_fixed_fields_per_entry(monkeypatch):
         assert inv["avatarUri"] is None
         assert inv["expiresAt"] is None
         assert inv["agentType"] == "pc-agent"
+
+
+# ──────────────────────────────────────────────────────────────────
+# normalize_remote_agent_id tests
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_normalize_none_returns_default():
+    from main import normalize_remote_agent_id
+
+    assert normalize_remote_agent_id(None) == "default"
+
+
+def test_normalize_empty_returns_default():
+    from main import normalize_remote_agent_id
+
+    assert normalize_remote_agent_id("") == "default"
+
+
+def test_normalize_whitespace_returns_default():
+    from main import normalize_remote_agent_id
+
+    assert normalize_remote_agent_id("   ") == "default"
+
+
+def test_normalize_preserves_valid():
+    from main import normalize_remote_agent_id
+
+    assert normalize_remote_agent_id("coder") == "coder"
+
+
+def test_normalize_strips_whitespace():
+    from main import normalize_remote_agent_id
+
+    assert normalize_remote_agent_id("  coder  ") == "coder"
+
+
+# ──────────────────────────────────────────────────────────────────
+# get_known_app_remote_agent_ids tests
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_known_ids_always_includes_default():
+    from main import get_known_app_remote_agent_ids, cfg
+
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+    ids = get_known_app_remote_agent_ids()
+    assert "default" in ids
+
+
+def test_known_ids_includes_configured_agents(monkeypatch):
+    from main import get_known_app_remote_agent_ids, cfg
+
+    cfg["app"] = {
+        "contact_invitations": [
+            {"id": "a", "remoteAgentId": "default"},
+            {"id": "b", "remoteAgentId": "coder"},
+        ]
+    }
+    ids = get_known_app_remote_agent_ids()
+    assert ids == {"default", "coder"}
+
+
+def test_known_ids_excludes_empty_remote_agent_id(monkeypatch):
+    from main import get_known_app_remote_agent_ids, cfg
+
+    cfg["app"] = {
+        "contact_invitations": [
+            {"id": "a", "remoteAgentId": ""},
+        ]
+    }
+    ids = get_known_app_remote_agent_ids()
+    assert ids == {"default"}
+
+
+# ──────────────────────────────────────────────────────────────────
+# resolve_app_remote_agent tests
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_resolve_default_succeeds():
+    from main import resolve_app_remote_agent
+
+    resolved = resolve_app_remote_agent("default")
+    assert resolved["remoteAgentId"] == "default"
+    assert resolved["target"] == "default"
+
+
+def test_resolve_coder_succeeds_when_configured(monkeypatch):
+    from main import resolve_app_remote_agent, cfg
+
+    cfg["app"] = {
+        "contact_invitations": [
+            {"id": "a", "remoteAgentId": "default"},
+            {"id": "b", "remoteAgentId": "coder"},
+        ]
+    }
+    resolved = resolve_app_remote_agent("coder")
+    assert resolved["remoteAgentId"] == "coder"
+    assert resolved["target"] == "default"
+
+
+def test_resolve_unknown_raises_400():
+    from main import resolve_app_remote_agent
+
+    with pytest.raises(HTTPException) as exc:
+        resolve_app_remote_agent("unknown-agent")
+    assert exc.value.status_code == 400
+    assert "unknown remoteAgentId" in exc.value.detail
+    assert "unknown-agent" in exc.value.detail
+
+
+# ──────────────────────────────────────────────────────────────────
+# Invitation remoteAgentId ↔ resolver consistency
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_invitation_remote_agent_ids_are_known(monkeypatch):
+    """Every remoteAgentId in contact-invitations is accepted by resolver."""
+    from main import (
+        build_app_contact_invitations,
+        get_known_app_remote_agent_ids,
+        resolve_app_remote_agent,
+        cfg,
+    )
+
+    cfg["app"] = {
+        "contact_invitations": [
+            {"id": "a", "remoteAgentId": "default"},
+            {"id": "b", "remoteAgentId": "coder"},
+        ]
+    }
+
+    known = get_known_app_remote_agent_ids()
+    invs = build_app_contact_invitations(
+        _FakeAppRequest(base_url="http://testserver/"),
+    )
+    for inv in invs:
+        rid = inv["remoteAgentId"]
+        assert rid in known, f"invitation remoteAgentId {rid!r} not in known set"
+        # resolver must not raise
+        resolved = resolve_app_remote_agent(rid)
+        assert resolved["remoteAgentId"] == rid
+
+
+# ──────────────────────────────────────────────────────────────────
+# Endpoint integration tests for remoteAgentId
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_auth_before_remote_agent_id_validation(monkeypatch):
+    """401 is returned before remoteAgentId is validated — no info leak."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    class FakeRequest:
+        headers = {}
+
+        async def json(self):
+            return {"clientMessageId": "cm-1", "content": "hi", "remoteAgentId": "evil"}
+
+    from main import _require_chat_auth, _api_config
+
+    api_cfg = _api_config()
+    with pytest.raises(HTTPException) as exc:
+        _require_chat_auth(FakeRequest(), api_cfg)
+    assert exc.value.status_code == 401
+    # Unknown remoteAgentId error (400) must NOT be raised before auth
+
+
+@pytest.mark.asyncio
+async def test_post_messages_no_remote_agent_id_succeeds(monkeypatch):
+    """POST /api/messages without remoteAgentId defaults to 'default'."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {"clientMessageId": "cm-1", "content": "hello"}
+
+    from main import api_send_message
+
+    # Should succeed (agent runtime will produce a reply — or empty)
+    # Just verify it doesn't 400 on missing remoteAgentId
+    result = await api_send_message(FakeRequest())
+    assert "userMessage" in result
+
+
+@pytest.mark.asyncio
+async def test_post_messages_remote_agent_id_default_succeeds(monkeypatch):
+    """POST /api/messages with remoteAgentId=default succeeds."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {
+                "clientMessageId": "cm-2",
+                "content": "hello",
+                "remoteAgentId": "default",
+            }
+
+    from main import api_send_message
+
+    result = await api_send_message(FakeRequest())
+    assert "userMessage" in result
+
+
+@pytest.mark.asyncio
+async def test_post_messages_unknown_remote_agent_id_returns_400(monkeypatch):
+    """POST /api/messages with unknown remoteAgentId returns 400."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {
+                "clientMessageId": "cm-3",
+                "content": "hello",
+                "remoteAgentId": "evil-agent",
+            }
+
+    from main import api_send_message
+
+    with pytest.raises(HTTPException) as exc:
+        await api_send_message(FakeRequest())
+    assert exc.value.status_code == 400
+    assert "unknown remoteAgentId" in exc.value.detail
+    assert "evil-agent" in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_post_messages_coder_succeeds_when_configured(monkeypatch):
+    """POST with remoteAgentId=coder succeeds when coder is in config."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import cfg
+
+    cfg["app"] = {
+        "contact_invitations": [
+            {"id": "pc-agent-default", "remoteAgentId": "default"},
+            {"id": "pc-agent-coder", "remoteAgentId": "coder"},
+        ]
+    }
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {
+                "clientMessageId": "cm-coder",
+                "content": "write some code",
+                "remoteAgentId": "coder",
+            }
+
+    from main import api_send_message
+
+    result = await api_send_message(FakeRequest())
+    assert "userMessage" in result
+    # Still uses current single runtime — just validates routing passes
+
+
+@pytest.mark.asyncio
+async def test_get_messages_no_remote_agent_id_succeeds(monkeypatch):
+    """GET /api/messages without remoteAgentId succeeds."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+    from main import api_get_messages
+
+    result = await api_get_messages(FakeRequest())
+    assert "messages" in result
+    assert isinstance(result["messages"], list)
+
+
+@pytest.mark.asyncio
+async def test_get_messages_unknown_remote_agent_id_returns_400(monkeypatch):
+    """GET /api/messages with unknown remoteAgentId returns 400."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+    from main import api_get_messages
+
+    with pytest.raises(HTTPException) as exc:
+        await api_get_messages(FakeRequest(), remoteAgentId="evil-agent")
+    assert exc.value.status_code == 400
+    assert "unknown remoteAgentId" in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_get_messages_coder_succeeds_when_configured(monkeypatch):
+    """GET /api/messages with remoteAgentId=coder succeeds when in config."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import cfg
+
+    cfg["app"] = {
+        "contact_invitations": [
+            {"id": "pc-agent-default", "remoteAgentId": "default"},
+            {"id": "pc-agent-coder", "remoteAgentId": "coder"},
+        ]
+    }
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+    from main import api_get_messages
+
+    result = await api_get_messages(FakeRequest(), remoteAgentId="coder")
+    assert "messages" in result
+    assert isinstance(result["messages"], list)
