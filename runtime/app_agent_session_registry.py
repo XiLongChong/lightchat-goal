@@ -38,13 +38,25 @@ class AppAgentSessionRegistry:
         description: str = "Attached agent session",
         callback_url: str | None = None,
         source_label: str | None = None,
+        kind: str = "attached_session",
     ) -> dict:
         """Register or update an attached agent session.
 
         Returns the session dict.  Raises ``ValueError`` with code
         ``"remote_agent_id_conflict"`` when *remote_agent_id* is already
         claimed by a different *session_id*.
+
+        *kind* selects the session target type:
+
+        * ``"attached_session"`` (default) — Router forwards messages to
+          ``callbackUrl`` via HTTP POST.
+        * ``"claude_channel"`` — Router stores messages in an in-memory
+          pending inbox; a channel server polls them.  ``callbackUrl``
+          is ignored.
         """
+        # Normalise kind: unknown values fall back to "attached_session".
+        if kind != "claude_channel":
+            kind = "attached_session"
         now = _utc_now_z()
         async with self._lock:
             existing = self._sessions.get(session_id)
@@ -63,6 +75,7 @@ class AppAgentSessionRegistry:
                 existing["description"] = description
                 existing["callbackUrl"] = callback_url
                 existing["sourceLabel"] = source_label
+                existing["kind"] = kind
                 existing["status"] = "online"
                 existing["lastSeenAt"] = now
             else:
@@ -73,6 +86,7 @@ class AppAgentSessionRegistry:
                     "description": description,
                     "sourceLabel": source_label,
                     "callbackUrl": callback_url,
+                    "kind": kind,
                     "status": "online",
                     "createdAt": now,
                     "lastSeenAt": now,

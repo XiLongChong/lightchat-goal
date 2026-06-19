@@ -56,6 +56,7 @@ from runtime.user_turns import UserTurnRegistry
 from runtime.log_reader import read_recent_log_lines
 from runtime.task_scheduler import TaskScheduler
 from runtime.app_agent_session_registry import AppAgentSessionRegistry
+from runtime.channel_pending_inbox import ChannelPendingInbox
 
 # ================================================================
 # Config loading
@@ -1318,6 +1319,11 @@ _APP_AGENT_TIMEOUT_S = 55.0
 # Sessions are lost on restart — acceptable for this prototype stage.
 app_agent_session_registry = AppAgentSessionRegistry()
 
+# In-memory pending inbox for claude_channel sessions.  A channel server
+# polls this to pull user messages and pushes them to Claude Code via
+# ``notifications/claude/channel``.  Lost on restart — acceptable.
+channel_pending_inbox = ChannelPendingInbox()
+
 
 # ── app contact-invitation / remote-agent helpers ──────────────────
 
@@ -1406,10 +1412,12 @@ def resolve_app_remote_agent(remote_agent_id: str) -> dict:
 
     * ``remoteAgentId`` — the canonical id (str)
     * ``target`` — ``"default"`` for internal, ``"attached_session"`` for
-      registered sessions
+      registered callback sessions, ``"claude_channel"`` for channel
+      sessions polled by an MCP channel server
     * ``sessionId`` — session id or None
     * ``status`` — ``"online"`` / ``"offline"`` or None
     * ``callbackUrl`` — callback URL or None
+    * ``kind`` — session kind (``"attached_session"`` / ``"claude_channel"``) or None
 
     Raises ``HTTPException(400)`` for unknown ids.
     """
@@ -1420,12 +1428,15 @@ def resolve_app_remote_agent(remote_agent_id: str) -> dict:
             detail=f"unknown remoteAgentId: {remote_agent_id}",
         )
 
-    # Check registry for an attached session with this remoteAgentId
+    # Check registry for a registered session with this remoteAgentId
     session = app_agent_session_registry.find_by_remote_agent_id(remote_agent_id)
     if session is not None:
+        kind = session.get("kind") or "attached_session"
+        target = "claude_channel" if kind == "claude_channel" else "attached_session"
         return {
             "remoteAgentId": remote_agent_id,
-            "target": "attached_session",
+            "target": target,
+            "kind": kind,
             "sessionId": session["sessionId"],
             "status": session["status"],
             "callbackUrl": session.get("callbackUrl"),
@@ -1435,6 +1446,7 @@ def resolve_app_remote_agent(remote_agent_id: str) -> dict:
     return {
         "remoteAgentId": remote_agent_id,
         "target": "default",
+        "kind": None,
         "sessionId": None,
         "status": None,
         "callbackUrl": None,
@@ -1513,6 +1525,10 @@ async def api_send_message(request: Request):
                 }),
             )
 
+    # Note: claude_channel sessions accept user messages regardless of
+    # online/offline status — the pending inbox decouples App delivery
+    # from channel polling.  No routing guard needed here.
+
     # ── idempotency ──────────────────────────────────────────────
     existing_user = await memory_store.find_app_message_by_client_message_id(
         client_message_id,
@@ -1546,6 +1562,54 @@ async def api_send_message(request: Request):
                 }
                 for r in agent_replies
             ],
+        }
+
+    # ── claude_channel inbox path ───────────────────────────────────
+    # Channel sessions don't call a callback or the internal agent.
+    # The user message is persisted to app_messages and enqueued in the
+    # in-memory pending inbox.  A channel server polls the inbox and
+    # pushes messages to Claude Code via ``notifications/claude/channel``.
+    # Replies come back via ``POST /api/app-agent-sessions/{id}/replies``.
+    if resolved["target"] == "claude_channel":
+        turn_id = f"app_turn_{uuid.uuid4().hex[:12]}"
+        user_remote_id = f"app_rm_user_{uuid.uuid4().hex[:12]}"
+        now_ts = time.time()
+
+        await memory_store.insert_app_message(
+            remote_id=user_remote_id,
+            client_message_id=client_message_id,
+            role="user",
+            content=content,
+            source_turn_id=turn_id,
+            sequence=0,
+            remote_agent_id=remote_agent_id,
+            created_at=now_ts,
+        )
+
+        # Enqueue in the pending inbox for channel polling.  The inbox
+        # is idempotent by (sessionId, clientMessageId) so a retry after
+        # a transient failure would not create a duplicate delivery.
+        await channel_pending_inbox.add(
+            remote_agent_id=remote_agent_id,
+            session_id=resolved["sessionId"],
+            client_message_id=client_message_id,
+            content=content,
+            created_at=_iso_from_ts(now_ts),
+        )
+
+        logger.info(
+            "[app] claude_channel turn=%s user_remote=%s session=%s queued",
+            turn_id, user_remote_id, resolved["sessionId"],
+        )
+
+        return {
+            "userMessage": {
+                "remoteId": user_remote_id,
+                "clientMessageId": client_message_id,
+                "status": "sent",
+                "createdAt": _iso_from_ts(now_ts),
+            },
+            "agentReplies": [],
         }
 
     # ── attached-session callback path ───────────────────────────────
@@ -1863,13 +1927,15 @@ def build_app_contact_invitations(request: Request) -> list[dict]:
         if s["status"] == "online"
     ]
     for sess in online_sessions:
+        kind = sess.get("kind") or "attached_session"
+        agent_type = "claude-code-channel" if kind == "claude_channel" else "attached-session"
         invitations.append({
             "id": f"session-{sess['sessionId']}",
             "remoteAgentId": sess["remoteAgentId"],
             "displayName": sess["displayName"],
             "avatarUri": None,
             "description": sess["description"],
-            "agentType": "attached-session",
+            "agentType": agent_type,
             "sourceLabel": sess.get("sourceLabel") or source_label,
             "endpoint": endpoint,
             "createdAt": sess["createdAt"],
@@ -2076,7 +2142,15 @@ async def api_register_app_agent_session(request: Request):
     Same auth as the other /api/* endpoints.  Body: ``sessionId``
     (required), ``remoteAgentId`` (defaults to sessionId),
     ``displayName`` (defaults to sessionId), ``description``,
-    ``callbackUrl``, ``sourceLabel``.
+    ``callbackUrl``, ``sourceLabel``, ``kind``.
+
+    ``kind`` selects the session target type:
+
+    * ``"attached_session"`` (default) — Router forwards messages to
+      ``callbackUrl`` via HTTP POST.
+    * ``"claude_channel"`` — Router stores messages in an in-memory
+      pending inbox polled by a channel server.  ``callbackUrl`` is
+      not required and ignored.
 
     409 if *remoteAgentId* is already claimed by a different session.
     """
@@ -2097,6 +2171,8 @@ async def api_register_app_agent_session(request: Request):
     remote_agent_id = str(body.get("remoteAgentId") or session_id).strip() or session_id
     display_name = str(body.get("displayName") or session_id).strip() or session_id
     description = str(body.get("description") or "Attached agent session").strip() or "Attached agent session"
+    raw_kind = str(body.get("kind", "")).strip()
+    kind = raw_kind if raw_kind in ("attached_session", "claude_channel") else "attached_session"
     raw_callback_url = str(body.get("callbackUrl", "")).strip()
     try:
         callback_url = validate_attached_session_callback_url(raw_callback_url) or None
@@ -2115,13 +2191,14 @@ async def api_register_app_agent_session(request: Request):
             description=description,
             callback_url=callback_url,
             source_label=source_label,
+            kind=kind,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
     logger.info(
-        "[app] session registered sessionId=%s remoteAgentId=%s",
-        session_id, remote_agent_id,
+        "[app] session registered sessionId=%s remoteAgentId=%s kind=%s",
+        session_id, remote_agent_id, kind,
     )
     return {"session": session}
 
@@ -2159,6 +2236,179 @@ async def api_list_app_agent_sessions(request: Request):
 
     sessions = await app_agent_session_registry.list_all()
     return {"sessions": sessions}
+
+
+# ================================================================
+# Claude channel inbox / outbox endpoints
+# ================================================================
+#
+# These endpoints serve MCP ``claude/channel`` servers (e.g. an
+# AsPocket channel server that bridges App messages to Claude Code).
+# A channel server polls pending user messages, pushes them to Claude
+# Code via ``notifications/claude/channel``, acks delivery, and posts
+# Claude Code's replies back so the App can fetch them via
+# ``GET /api/messages``.
+
+
+@app.get("/api/app-agent-sessions/{session_id}/pending-messages")
+async def api_channel_poll_pending(
+    session_id: str, request: Request, limit: int = 10,
+):
+    """Poll undelivered user messages for a claude_channel session.
+
+    Returns up to *limit* pending messages (default 10).  Each message
+    stays in the inbox until ``ack`` is called — at-least-once delivery.
+    """
+    api_cfg = _api_config()
+    _require_chat_auth(request, api_cfg)
+
+    session = await app_agent_session_registry.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    if (session.get("kind") or "attached_session") != "claude_channel":
+        raise HTTPException(
+            status_code=400,
+            detail="session is not a claude_channel session",
+        )
+
+    messages = await channel_pending_inbox.list_pending(session_id, limit=limit)
+    return {
+        "messages": [
+            {
+                "deliveryId": m["deliveryId"],
+                "remoteAgentId": m["remoteAgentId"],
+                "sessionId": m["sessionId"],
+                "clientMessageId": m["clientMessageId"],
+                "content": m["content"],
+                "createdAt": m["createdAt"],
+            }
+            for m in messages
+        ],
+    }
+
+
+@app.post("/api/app-agent-sessions/{session_id}/pending-messages/{delivery_id}/ack")
+async def api_channel_ack_pending(
+    session_id: str, delivery_id: str, request: Request,
+):
+    """Acknowledge that a pending message was delivered to the channel.
+
+    Ack is not a reply; it only suppresses the message from later polls
+    so the channel doesn't re-deliver it to Claude Code.
+    """
+    api_cfg = _api_config()
+    _require_chat_auth(request, api_cfg)
+
+    session = await app_agent_session_registry.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    if (session.get("kind") or "attached_session") != "claude_channel":
+        raise HTTPException(
+            status_code=400,
+            detail="session is not a claude_channel session",
+        )
+
+    msg = await channel_pending_inbox.get(delivery_id)
+    if msg is None or msg["sessionId"] != session_id:
+        raise HTTPException(status_code=404, detail="delivery not found")
+
+    acked = await channel_pending_inbox.ack(delivery_id)
+    return {"acked": acked}
+
+
+@app.post("/api/app-agent-sessions/{session_id}/replies")
+async def api_channel_post_reply(session_id: str, request: Request):
+    """Post a Claude Code reply back to the App's message history.
+
+    The reply is persisted as an agent ``app_message`` under the same
+    ``remoteAgentId`` and ``source_turn_id`` as the original user
+    message, so ``GET /api/messages`` returns it as a normal reply.
+
+    Body: ``clientMessageId`` (the original App message id),
+    ``content`` (non-empty), ``sourceToolCallId`` (optional).
+    """
+    api_cfg = _api_config()
+    _require_chat_auth(request, api_cfg)
+
+    session = await app_agent_session_registry.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    if (session.get("kind") or "attached_session") != "claude_channel":
+        raise HTTPException(
+            status_code=400,
+            detail="session is not a claude_channel session",
+        )
+    if session.get("status") != "online":
+        raise HTTPException(
+            status_code=503,
+            detail=json.dumps({
+                "error": {
+                    "code": "agent_session_offline",
+                    "message": "Agent session is offline",
+                },
+            }),
+        )
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="JSON body must be an object")
+
+    client_message_id = str(body.get("clientMessageId", "")).strip()
+    if not client_message_id:
+        raise HTTPException(status_code=400, detail="clientMessageId is required")
+    content = str(body.get("content", "")).strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="content is required")
+    source_tool_call_id = str(body.get("sourceToolCallId", "")).strip() or ""
+
+    remote_agent_id = session["remoteAgentId"]
+    user_msg = await memory_store.find_app_message_by_client_message_id(
+        client_message_id, remote_agent_id=remote_agent_id,
+    )
+    if user_msg is None:
+        raise HTTPException(
+            status_code=404,
+            detail="unknown clientMessageId for this session",
+        )
+
+    turn_id = str(user_msg.get("source_turn_id", ""))
+    # Sequence = max existing agent sequence + 1 for this turn
+    existing_replies = await memory_store.find_app_agent_replies_by_turn_id(
+        turn_id, remote_agent_id=remote_agent_id,
+    )
+    next_seq = max((r.get("sequence", 0) for r in existing_replies), default=0) + 1
+    reply_remote_id = f"app_rm_agent_{uuid.uuid4().hex[:12]}"
+    now_ts = time.time()
+
+    await memory_store.insert_app_message(
+        remote_id=reply_remote_id,
+        client_message_id=None,
+        role="agent",
+        content=content,
+        source_turn_id=turn_id,
+        source_tool_call_id=source_tool_call_id,
+        sequence=next_seq,
+        remote_agent_id=remote_agent_id,
+        created_at=now_ts,
+    )
+
+    logger.info(
+        "[app] claude_channel reply session=%s turn=%s reply_remote=%s",
+        session_id, turn_id, reply_remote_id,
+    )
+
+    return {
+        "reply": {
+            "remoteId": reply_remote_id,
+            "clientMessageId": client_message_id,
+            "content": content,
+            "createdAt": _iso_from_ts(now_ts),
+            "sourceToolCallId": source_tool_call_id or None,
+        },
+    }
 
 
 @app.post("/admin/dev/compress")

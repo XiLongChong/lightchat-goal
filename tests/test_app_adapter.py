@@ -4133,3 +4133,1004 @@ async def test_register_with_no_callback_url_succeeds(monkeypatch):
 
     result = await api_register_app_agent_session(FakeRequest())
     assert result["session"]["callbackUrl"] is None
+
+
+# ================================================================
+# Claude channel — register kind=claude_channel
+# ================================================================
+
+
+@pytest.mark.asyncio
+async def test_register_kind_claude_channel_succeeds_without_callback(monkeypatch):
+    """register with kind=claude_channel succeeds without callbackUrl."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    sid = f"chan-{_uuid.uuid4().hex[:8]}"
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {
+                "sessionId": sid,
+                "remoteAgentId": sid,
+                "displayName": "Claude Channel",
+                "kind": "claude_channel",
+            }
+
+    from main import api_register_app_agent_session
+
+    result = await api_register_app_agent_session(FakeRequest())
+    s = result["session"]
+    assert s["kind"] == "claude_channel"
+    assert s["callbackUrl"] is None
+    assert s["status"] == "online"
+
+
+@pytest.mark.asyncio
+async def test_register_default_kind_is_attached_session(monkeypatch):
+    """register without kind defaults to attached_session."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    sid = f"att-{_uuid.uuid4().hex[:8]}"
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {"sessionId": sid, "remoteAgentId": sid}
+
+    from main import api_register_app_agent_session
+
+    result = await api_register_app_agent_session(FakeRequest())
+    assert result["session"]["kind"] == "attached_session"
+
+
+@pytest.mark.asyncio
+async def test_register_unknown_kind_falls_back_to_attached_session(monkeypatch):
+    """register with unknown kind falls back to attached_session."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    sid = f"unk-{_uuid.uuid4().hex[:8]}"
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {"sessionId": sid, "remoteAgentId": sid, "kind": "unknown_kind"}
+
+    from main import api_register_app_agent_session
+
+    result = await api_register_app_agent_session(FakeRequest())
+    assert result["session"]["kind"] == "attached_session"
+
+
+# ================================================================
+# Claude channel — contact-invitations agentType
+# ================================================================
+
+
+@pytest.mark.asyncio
+async def test_contact_invitations_claude_channel_shows_correct_agent_type(monkeypatch):
+    """Online claude_channel session shows agentType=claude-code-channel."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import cfg, app_agent_session_registry, api_contact_invitations
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    sid = f"chan-{_uuid.uuid4().hex[:8]}"
+    await app_agent_session_registry.register(
+        session_id=sid,
+        remote_agent_id=sid,
+        display_name="Claude Channel",
+        description="Channel session",
+        kind="claude_channel",
+    )
+
+    result = await api_contact_invitations(
+        _FakeAppRequest(
+            headers={"authorization": "Bearer secret"},
+            base_url="http://testserver/",
+        )
+    )
+
+    chan_invs = [i for i in result["invitations"] if i["agentType"] == "claude-code-channel"]
+    assert len(chan_invs) == 1
+    assert chan_invs[0]["remoteAgentId"] == sid
+    assert chan_invs[0]["displayName"] == "Claude Channel"
+
+
+@pytest.mark.asyncio
+async def test_contact_invitations_attached_session_still_shows_attached_session(monkeypatch):
+    """attached_session kind still shows agentType=attached-session."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import cfg, app_agent_session_registry, api_contact_invitations
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    sid = f"att-{_uuid.uuid4().hex[:8]}"
+    await app_agent_session_registry.register(
+        session_id=sid,
+        remote_agent_id=sid,
+        display_name="Attached",
+        callback_url="http://127.0.0.1:9010",
+    )
+
+    result = await api_contact_invitations(
+        _FakeAppRequest(
+            headers={"authorization": "Bearer secret"},
+            base_url="http://testserver/",
+        )
+    )
+
+    att_invs = [i for i in result["invitations"] if i["agentType"] == "attached-session"]
+    assert len(att_invs) == 1
+    assert att_invs[0]["remoteAgentId"] == sid
+
+
+# ================================================================
+# Claude channel — resolve_app_remote_agent
+# ================================================================
+
+
+def test_resolve_claude_channel_returns_correct_target():
+    """resolve_app_remote_agent returns target=claude_channel for channel sessions."""
+    from main import resolve_app_remote_agent, app_agent_session_registry
+
+    app_agent_session_registry._sessions.clear()
+    app_agent_session_registry._sessions["s1"] = {
+        "sessionId": "s1",
+        "remoteAgentId": "chan-resolve",
+        "displayName": "Chan",
+        "description": "desc",
+        "kind": "claude_channel",
+        "status": "online",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "expiresAt": None,
+        "callbackUrl": None,
+        "sourceLabel": None,
+    }
+
+    resolved = resolve_app_remote_agent("chan-resolve")
+    assert resolved["target"] == "claude_channel"
+    assert resolved["kind"] == "claude_channel"
+    assert resolved["sessionId"] == "s1"
+
+
+# ================================================================
+# Claude channel — POST /api/messages inbox path
+# ================================================================
+
+
+def _make_claude_channel_session(rid, sid=None, status="online"):
+    """Helper: build a claude_channel session dict for the registry."""
+    return {
+        "sessionId": sid or f"s-{rid}",
+        "remoteAgentId": rid,
+        "displayName": rid,
+        "description": "claude channel",
+        "kind": "claude_channel",
+        "status": status,
+        "createdAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "expiresAt": None,
+        "callbackUrl": None,
+        "sourceLabel": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_post_messages_claude_channel_returns_sent_and_empty_replies(monkeypatch):
+    """POST to claude_channel returns userMessage.status=sent, agentReplies=[]."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg, channel_pending_inbox
+
+    app_agent_session_registry._sessions.clear()
+    channel_pending_inbox._messages.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"chan-{_uuid.uuid4().hex[:8]}"
+    app_agent_session_registry._sessions[f"s-{rid}"] = _make_claude_channel_session(rid)
+
+    cid = f"cm-chan-{_uuid.uuid4().hex[:8]}"
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {"clientMessageId": cid, "content": "hi", "remoteAgentId": rid}
+
+    from main import api_send_message
+
+    result = await api_send_message(FakeRequest())
+    assert result["userMessage"]["status"] == "sent"
+    assert result["userMessage"]["clientMessageId"] == cid
+    assert result["agentReplies"] == []
+
+
+@pytest.mark.asyncio
+async def test_post_messages_claude_channel_writes_user_app_message(monkeypatch):
+    """POST to claude_channel persists the user app_message."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg, memory_store, channel_pending_inbox
+
+    app_agent_session_registry._sessions.clear()
+    channel_pending_inbox._messages.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"chan-wm-{_uuid.uuid4().hex[:8]}"
+    app_agent_session_registry._sessions[f"s-{rid}"] = _make_claude_channel_session(rid)
+
+    cid = f"cm-chan-wm-{_uuid.uuid4().hex[:8]}"
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {"clientMessageId": cid, "content": "hello chan", "remoteAgentId": rid}
+
+    from main import api_send_message
+
+    await api_send_message(FakeRequest())
+
+    found = await memory_store.find_app_message_by_client_message_id(cid, remote_agent_id=rid)
+    assert found is not None
+    assert found["role"] == "user"
+    assert found["content"] == "hello chan"
+    assert found["remote_agent_id"] == rid
+
+
+@pytest.mark.asyncio
+async def test_post_messages_claude_channel_creates_pending_delivery(monkeypatch):
+    """POST to claude_channel creates one pending delivery in the inbox."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg, channel_pending_inbox
+
+    app_agent_session_registry._sessions.clear()
+    channel_pending_inbox._messages.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"chan-pd-{_uuid.uuid4().hex[:8]}"
+    sid = f"s-{rid}"
+    app_agent_session_registry._sessions[sid] = _make_claude_channel_session(rid, sid)
+
+    cid = f"cm-pd-{_uuid.uuid4().hex[:8]}"
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {"clientMessageId": cid, "content": "queue me", "remoteAgentId": rid}
+
+    from main import api_send_message
+
+    await api_send_message(FakeRequest())
+
+    pending = await channel_pending_inbox.list_pending(sid)
+    assert len(pending) == 1
+    assert pending[0]["clientMessageId"] == cid
+    assert pending[0]["content"] == "queue me"
+    assert pending[0]["remoteAgentId"] == rid
+    assert pending[0]["sessionId"] == sid
+    assert pending[0]["deliveryId"]
+
+
+@pytest.mark.asyncio
+async def test_post_messages_claude_channel_duplicate_does_not_create_duplicate_pending(monkeypatch):
+    """Duplicate POST with same remoteAgentId + clientMessageId doesn't duplicate pending."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg, channel_pending_inbox
+
+    app_agent_session_registry._sessions.clear()
+    channel_pending_inbox._messages.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"chan-dup-{_uuid.uuid4().hex[:8]}"
+    sid = f"s-{rid}"
+    app_agent_session_registry._sessions[sid] = _make_claude_channel_session(rid, sid)
+
+    cid = f"cm-dup-{_uuid.uuid4().hex[:8]}"
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {"clientMessageId": cid, "content": "once", "remoteAgentId": rid}
+
+    from main import api_send_message
+
+    result1 = await api_send_message(FakeRequest())
+    result2 = await api_send_message(FakeRequest())
+
+    # Both return the same userMessage
+    assert result1["userMessage"]["remoteId"] == result2["userMessage"]["remoteId"]
+    assert result2["agentReplies"] == []
+
+    pending = await channel_pending_inbox.list_pending(sid)
+    assert len(pending) == 1
+
+
+# ================================================================
+# Claude channel — poll pending messages
+# ================================================================
+
+
+@pytest.mark.asyncio
+async def test_poll_pending_returns_message_for_correct_session(monkeypatch):
+    """poll returns pending messages only for the requested session."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg, channel_pending_inbox
+
+    app_agent_session_registry._sessions.clear()
+    channel_pending_inbox._messages.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid1 = f"chan-poll1-{_uuid.uuid4().hex[:8]}"
+    rid2 = f"chan-poll2-{_uuid.uuid4().hex[:8]}"
+    sid1 = f"s-{rid1}"
+    sid2 = f"s-{rid2}"
+    app_agent_session_registry._sessions[sid1] = _make_claude_channel_session(rid1, sid1)
+    app_agent_session_registry._sessions[sid2] = _make_claude_channel_session(rid2, sid2)
+
+    await channel_pending_inbox.add(
+        remote_agent_id=rid1, session_id=sid1,
+        client_message_id="cm-1", content="msg1", created_at="2026-06-20T00:00:00Z",
+    )
+    await channel_pending_inbox.add(
+        remote_agent_id=rid2, session_id=sid2,
+        client_message_id="cm-2", content="msg2", created_at="2026-06-20T00:00:00Z",
+    )
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+    from main import api_channel_poll_pending
+
+    result1 = await api_channel_poll_pending(sid1, FakeRequest())
+    assert len(result1["messages"]) == 1
+    assert result1["messages"][0]["clientMessageId"] == "cm-1"
+    assert result1["messages"][0]["content"] == "msg1"
+    assert result1["messages"][0]["sessionId"] == sid1
+    assert result1["messages"][0]["deliveryId"]
+
+    result2 = await api_channel_poll_pending(sid2, FakeRequest())
+    assert len(result2["messages"]) == 1
+    assert result2["messages"][0]["clientMessageId"] == "cm-2"
+
+
+@pytest.mark.asyncio
+async def test_poll_pending_unknown_session_returns_404(monkeypatch):
+    """poll on unknown session returns 404."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+    from main import api_channel_poll_pending
+
+    with pytest.raises(HTTPException) as exc:
+        await api_channel_poll_pending("nonexistent", FakeRequest())
+    assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_poll_pending_non_channel_session_returns_400(monkeypatch):
+    """poll on attached_session returns 400."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    sid = f"att-{_uuid.uuid4().hex[:8]}"
+    app_agent_session_registry._sessions[sid] = {
+        "sessionId": sid,
+        "remoteAgentId": sid,
+        "displayName": "Attached",
+        "description": "desc",
+        "kind": "attached_session",
+        "status": "online",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "expiresAt": None,
+        "callbackUrl": "http://127.0.0.1:9010",
+        "sourceLabel": None,
+    }
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+    from main import api_channel_poll_pending
+
+    with pytest.raises(HTTPException) as exc:
+        await api_channel_poll_pending(sid, FakeRequest())
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_poll_pending_requires_auth(monkeypatch):
+    """poll requires auth before session validation."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    class FakeRequest:
+        headers = {}
+        base_url = "http://testserver/"
+
+    from main import _require_chat_auth, _api_config
+
+    api_cfg = _api_config()
+    with pytest.raises(HTTPException) as exc:
+        _require_chat_auth(FakeRequest(), api_cfg)
+    assert exc.value.status_code == 401
+
+
+# ================================================================
+# Claude channel — ack pending messages
+# ================================================================
+
+
+@pytest.mark.asyncio
+async def test_ack_suppresses_pending_from_later_polls(monkeypatch):
+    """ack removes the message from later polls."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg, channel_pending_inbox
+
+    app_agent_session_registry._sessions.clear()
+    channel_pending_inbox._messages.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"chan-ack-{_uuid.uuid4().hex[:8]}"
+    sid = f"s-{rid}"
+    app_agent_session_registry._sessions[sid] = _make_claude_channel_session(rid, sid)
+
+    msg = await channel_pending_inbox.add(
+        remote_agent_id=rid, session_id=sid,
+        client_message_id="cm-ack", content="ack me", created_at="2026-06-20T00:00:00Z",
+    )
+    delivery_id = msg["deliveryId"]
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+    from main import api_channel_ack_pending, api_channel_poll_pending
+
+    # Before ack: poll returns the message
+    before = await api_channel_poll_pending(sid, FakeRequest())
+    assert len(before["messages"]) == 1
+
+    # Ack
+    ack_result = await api_channel_ack_pending(sid, delivery_id, FakeRequest())
+    assert ack_result["acked"]["deliveryId"] == delivery_id
+    assert ack_result["acked"]["status"] == "acked"
+
+    # After ack: poll returns empty
+    after = await api_channel_poll_pending(sid, FakeRequest())
+    assert len(after["messages"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_ack_unknown_delivery_returns_404(monkeypatch):
+    """ack on unknown deliveryId returns 404."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"chan-ack404-{_uuid.uuid4().hex[:8]}"
+    sid = f"s-{rid}"
+    app_agent_session_registry._sessions[sid] = _make_claude_channel_session(rid, sid)
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+    from main import api_channel_ack_pending
+
+    with pytest.raises(HTTPException) as exc:
+        await api_channel_ack_pending(sid, "unknown-delivery", FakeRequest())
+    assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_ack_requires_auth(monkeypatch):
+    """ack requires auth before validation."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    class FakeRequest:
+        headers = {}
+        base_url = "http://testserver/"
+
+    from main import _require_chat_auth, _api_config
+
+    api_cfg = _api_config()
+    with pytest.raises(HTTPException) as exc:
+        _require_chat_auth(FakeRequest(), api_cfg)
+    assert exc.value.status_code == 401
+
+
+# ================================================================
+# Claude channel — post replies
+# ================================================================
+
+
+@pytest.mark.asyncio
+async def test_reply_writes_agent_message_under_same_turn(monkeypatch):
+    """reply writes agent message under same remoteAgentId/source_turn_id."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg, memory_store, channel_pending_inbox
+
+    app_agent_session_registry._sessions.clear()
+    channel_pending_inbox._messages.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"chan-rep-{_uuid.uuid4().hex[:8]}"
+    sid = f"s-{rid}"
+    app_agent_session_registry._sessions[sid] = _make_claude_channel_session(rid, sid)
+
+    cid = f"cm-rep-{_uuid.uuid4().hex[:8]}"
+
+    # First: POST a user message to create the turn
+    class PostRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {"clientMessageId": cid, "content": "hello", "remoteAgentId": rid}
+
+    from main import api_send_message
+
+    post_result = await api_send_message(PostRequest())
+    user_turn_id = None
+    found = await memory_store.find_app_message_by_client_message_id(cid, remote_agent_id=rid)
+    assert found is not None
+    user_turn_id = found["source_turn_id"]
+
+    # Then: post a reply
+    class ReplyRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {
+                "clientMessageId": cid,
+                "content": "Claude Code reply",
+                "sourceToolCallId": "aspocket_reply_1",
+            }
+
+    from main import api_channel_post_reply
+
+    reply_result = await api_channel_post_reply(sid, ReplyRequest())
+    assert reply_result["reply"]["content"] == "Claude Code reply"
+    assert reply_result["reply"]["remoteId"].startswith("app_rm_agent_")
+    assert reply_result["reply"]["sourceToolCallId"] == "aspocket_reply_1"
+
+    # Verify DB: agent reply under same turn_id + remote_agent_id
+    replies = await memory_store.find_app_agent_replies_by_turn_id(
+        user_turn_id, remote_agent_id=rid,
+    )
+    assert len(replies) == 1
+    assert replies[0]["content"] == "Claude Code reply"
+    assert replies[0]["source_tool_call_id"] == "aspocket_reply_1"
+    assert replies[0]["remote_agent_id"] == rid
+
+
+@pytest.mark.asyncio
+async def test_reply_unknown_client_message_id_returns_404(monkeypatch):
+    """reply with unknown clientMessageId returns 404."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg, channel_pending_inbox
+
+    app_agent_session_registry._sessions.clear()
+    channel_pending_inbox._messages.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"chan-rep404-{_uuid.uuid4().hex[:8]}"
+    sid = f"s-{rid}"
+    app_agent_session_registry._sessions[sid] = _make_claude_channel_session(rid, sid)
+
+    class ReplyRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {"clientMessageId": "never-existed", "content": "reply"}
+
+    from main import api_channel_post_reply
+
+    with pytest.raises(HTTPException) as exc:
+        await api_channel_post_reply(sid, ReplyRequest())
+    assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_reply_empty_content_returns_400(monkeypatch):
+    """reply with empty content returns 400."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg, channel_pending_inbox
+
+    app_agent_session_registry._sessions.clear()
+    channel_pending_inbox._messages.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"chan-rep400-{_uuid.uuid4().hex[:8]}"
+    sid = f"s-{rid}"
+    app_agent_session_registry._sessions[sid] = _make_claude_channel_session(rid, sid)
+
+    class ReplyRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {"clientMessageId": "cm-x", "content": "   "}
+
+    from main import api_channel_post_reply
+
+    with pytest.raises(HTTPException) as exc:
+        await api_channel_post_reply(sid, ReplyRequest())
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_reply_offline_session_returns_503(monkeypatch):
+    """reply on offline claude_channel session returns 503."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg, channel_pending_inbox
+
+    app_agent_session_registry._sessions.clear()
+    channel_pending_inbox._messages.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"chan-rep503-{_uuid.uuid4().hex[:8]}"
+    sid = f"s-{rid}"
+    app_agent_session_registry._sessions[sid] = _make_claude_channel_session(rid, sid, status="offline")
+
+    class ReplyRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {"clientMessageId": "cm-x", "content": "reply"}
+
+    from main import api_channel_post_reply
+
+    with pytest.raises(HTTPException) as exc:
+        await api_channel_post_reply(sid, ReplyRequest())
+    assert exc.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_reply_requires_auth(monkeypatch):
+    """reply requires auth before validation."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    class FakeRequest:
+        headers = {}
+        base_url = "http://testserver/"
+
+    from main import _require_chat_auth, _api_config
+
+    api_cfg = _api_config()
+    with pytest.raises(HTTPException) as exc:
+        _require_chat_auth(FakeRequest(), api_cfg)
+    assert exc.value.status_code == 401
+
+
+# ================================================================
+# Claude channel — GET /api/messages history includes replies
+# ================================================================
+
+
+@pytest.mark.asyncio
+async def test_get_history_returns_user_and_reply(monkeypatch):
+    """GET /api/messages returns user message + channel reply."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg, channel_pending_inbox
+
+    app_agent_session_registry._sessions.clear()
+    channel_pending_inbox._messages.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"chan-hist-{_uuid.uuid4().hex[:8]}"
+    sid = f"s-{rid}"
+    app_agent_session_registry._sessions[sid] = _make_claude_channel_session(rid, sid)
+
+    cid = f"cm-hist-{_uuid.uuid4().hex[:8]}"
+
+    class PostRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {"clientMessageId": cid, "content": "hi hist", "remoteAgentId": rid}
+
+    from main import api_send_message, api_channel_post_reply, api_get_messages
+
+    await api_send_message(PostRequest())
+
+    class ReplyRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {"clientMessageId": cid, "content": "reply hist"}
+
+    await api_channel_post_reply(sid, ReplyRequest())
+
+    class GetRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+    result = await api_get_messages(GetRequest(), remoteAgentId=rid)
+    msgs = result["messages"]
+    assert len(msgs) == 2
+    roles = [m["role"] for m in msgs]
+    assert roles == ["user", "agent"]
+    assert msgs[0]["content"] == "hi hist"
+    assert msgs[1]["content"] == "reply hist"
+
+
+# ================================================================
+# Claude channel — ChannelPendingInbox unit tests
+# ================================================================
+
+
+@pytest.mark.asyncio
+async def test_inbox_add_is_idempotent_by_session_and_client_message_id():
+    from runtime.channel_pending_inbox import ChannelPendingInbox
+
+    inbox = ChannelPendingInbox()
+    msg1 = await inbox.add(
+        remote_agent_id="rid", session_id="s1",
+        client_message_id="cm-1", content="hello", created_at="2026-06-20T00:00:00Z",
+    )
+    msg2 = await inbox.add(
+        remote_agent_id="rid", session_id="s1",
+        client_message_id="cm-1", content="hello", created_at="2026-06-20T00:00:00Z",
+    )
+    assert msg1["deliveryId"] == msg2["deliveryId"]
+    pending = await inbox.list_pending("s1")
+    assert len(pending) == 1
+
+
+@pytest.mark.asyncio
+async def test_inbox_list_pending_filters_by_session():
+    from runtime.channel_pending_inbox import ChannelPendingInbox
+
+    inbox = ChannelPendingInbox()
+    await inbox.add(
+        remote_agent_id="r1", session_id="s1",
+        client_message_id="cm-1", content="m1", created_at="t",
+    )
+    await inbox.add(
+        remote_agent_id="r2", session_id="s2",
+        client_message_id="cm-2", content="m2", created_at="t",
+    )
+    s1_pending = await inbox.list_pending("s1")
+    s2_pending = await inbox.list_pending("s2")
+    assert len(s1_pending) == 1
+    assert s1_pending[0]["content"] == "m1"
+    assert len(s2_pending) == 1
+    assert s2_pending[0]["content"] == "m2"
+
+
+@pytest.mark.asyncio
+async def test_inbox_ack_marks_status_acked():
+    from runtime.channel_pending_inbox import ChannelPendingInbox
+
+    inbox = ChannelPendingInbox()
+    msg = await inbox.add(
+        remote_agent_id="r", session_id="s",
+        client_message_id="cm", content="x", created_at="t",
+    )
+    acked = await inbox.ack(msg["deliveryId"])
+    assert acked["status"] == "acked"
+    pending = await inbox.list_pending("s")
+    assert len(pending) == 0  # acked messages are suppressed
+
+
+@pytest.mark.asyncio
+async def test_inbox_ack_unknown_returns_none():
+    from runtime.channel_pending_inbox import ChannelPendingInbox
+
+    inbox = ChannelPendingInbox()
+    result = await inbox.ack("nonexistent")
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_inbox_ack_is_idempotent():
+    from runtime.channel_pending_inbox import ChannelPendingInbox
+
+    inbox = ChannelPendingInbox()
+    msg = await inbox.add(
+        remote_agent_id="r", session_id="s",
+        client_message_id="cm", content="x", created_at="t",
+    )
+    first = await inbox.ack(msg["deliveryId"])
+    second = await inbox.ack(msg["deliveryId"])
+    assert first is not None
+    assert second is not None
+    assert first["deliveryId"] == second["deliveryId"]
+
+
+@pytest.mark.asyncio
+async def test_inbox_list_pending_respects_limit():
+    from runtime.channel_pending_inbox import ChannelPendingInbox
+
+    inbox = ChannelPendingInbox()
+    for i in range(5):
+        await inbox.add(
+            remote_agent_id="r", session_id="s",
+            client_message_id=f"cm-{i}", content=f"m{i}", created_at="t",
+        )
+    pending = await inbox.list_pending("s", limit=3)
+    assert len(pending) == 3
+
+
+# ================================================================
+# Claude channel — regression: default and attached_session unchanged
+# ================================================================
+
+
+@pytest.mark.asyncio
+async def test_default_internal_path_still_works_with_channel_code_present(monkeypatch):
+    """POST /api/messages with default remoteAgentId still works (internal agent)."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg, channel_pending_inbox
+
+    app_agent_session_registry._sessions.clear()
+    channel_pending_inbox._messages.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {
+                "clientMessageId": "cm-regress-default-chan",
+                "content": "hello default",
+            }
+
+    from main import api_send_message
+
+    result = await api_send_message(FakeRequest())
+    assert "userMessage" in result
+
+
+@pytest.mark.asyncio
+async def test_attached_session_callback_still_works_with_channel_code_present(monkeypatch):
+    """Attached-session callback path still works (claude_channel code doesn't interfere)."""
+    import uuid as _uuid
+    import httpx
+    from unittest.mock import AsyncMock, MagicMock
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg, channel_pending_inbox
+
+    app_agent_session_registry._sessions.clear()
+    channel_pending_inbox._messages.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"att-cb-{_uuid.uuid4().hex[:8]}"
+    app_agent_session_registry._sessions[f"s-{rid}"] = _make_attached_session(rid)
+
+    fake_resp = MagicMock()
+    fake_resp.status_code = 200
+    fake_resp.json.return_value = {"agentReplies": [{"content": "cb reply"}]}
+
+    class _FakeClientCtx:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            client = MagicMock()
+            client.post = AsyncMock(return_value=fake_resp)
+            return client
+
+        async def __aexit__(self, *args):
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClientCtx)
+
+    cid = f"cm-att-{_uuid.uuid4().hex[:8]}"
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {"clientMessageId": cid, "content": "hi", "remoteAgentId": rid}
+
+    from main import api_send_message
+
+    result = await api_send_message(FakeRequest())
+    assert len(result["agentReplies"]) == 1
+    assert result["agentReplies"][0]["content"] == "cb reply"
+
+    # Channel inbox should be empty (message went through callback path)
+    pending = await channel_pending_inbox.list_pending(f"s-{rid}")
+    assert len(pending) == 0
