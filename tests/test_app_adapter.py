@@ -327,3 +327,111 @@ async def test_contact_invitations_id_is_stable(monkeypatch):
         )
     )
     assert result["invitations"][0]["id"] == "pc-agent-default"
+
+
+# ──────────────────────────────────────────────────────────────────
+# build_app_contact_invitation helper tests
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_build_contact_invitation_stable_id():
+    """Helper always returns pc-agent-default id for app dedupe."""
+    from main import build_app_contact_invitation
+
+    inv = build_app_contact_invitation(
+        _FakeAppRequest(base_url="http://10.0.2.2:8000/"),
+    )
+    assert inv["id"] == "pc-agent-default"
+
+
+def test_build_contact_invitation_uses_request_base_url():
+    """endpoint equals request base_url with trailing slash stripped."""
+    from main import build_app_contact_invitation
+
+    inv = build_app_contact_invitation(
+        _FakeAppRequest(base_url="http://10.0.2.2:8000/"),
+    )
+    assert inv["endpoint"] == "http://10.0.2.2:8000"
+
+
+def test_build_contact_invitation_uses_request_base_url_no_trailing_slash():
+    """endpoint matches base_url when no trailing slash to strip."""
+    from main import build_app_contact_invitation
+
+    inv = build_app_contact_invitation(
+        _FakeAppRequest(base_url="http://192.168.1.100:8899"),
+    )
+    assert inv["endpoint"] == "http://192.168.1.100:8899"
+
+
+def test_build_contact_invitation_uses_cfg_agent_name(monkeypatch):
+    """displayName comes from config agent.name when set."""
+    from main import build_app_contact_invitation, cfg
+
+    monkeypatch.setitem(cfg.setdefault("agent", {}), "name", "My Test Agent")
+
+    inv = build_app_contact_invitation(
+        _FakeAppRequest(base_url="http://testserver/"),
+    )
+    assert inv["displayName"] == "My Test Agent"
+
+
+def test_build_contact_invitation_fallback_display_name(monkeypatch):
+    """displayName falls back to 'PC Agent' when cfg agent.name is missing."""
+    from main import build_app_contact_invitation, cfg
+
+    cfg.setdefault("agent", {}).pop("name", None)
+
+    inv = build_app_contact_invitation(
+        _FakeAppRequest(base_url="http://testserver/"),
+    )
+    assert inv["displayName"] == "PC Agent"
+
+
+def test_build_contact_invitation_fallback_source_label(monkeypatch):
+    """sourceLabel falls back to 'PC Agent' when COMPUTERNAME env is unset."""
+    monkeypatch.delenv("COMPUTERNAME", raising=False)
+
+    from main import build_app_contact_invitation
+
+    inv = build_app_contact_invitation(
+        _FakeAppRequest(base_url="http://testserver/"),
+    )
+    assert inv["sourceLabel"] == "PC Agent"
+
+
+def test_build_contact_invitation_uses_computername_env(monkeypatch):
+    """sourceLabel uses COMPUTERNAME env var when set."""
+    monkeypatch.setenv("COMPUTERNAME", "DESKTOP-XYZ")
+
+    from main import build_app_contact_invitation
+
+    inv = build_app_contact_invitation(
+        _FakeAppRequest(base_url="http://testserver/"),
+    )
+    assert inv["sourceLabel"] == "DESKTOP-XYZ"
+
+
+def test_build_contact_invitation_created_at_ends_with_z():
+    """createdAt is ISO 8601 UTC with Z suffix."""
+    from main import build_app_contact_invitation
+
+    inv = build_app_contact_invitation(
+        _FakeAppRequest(base_url="http://testserver/"),
+    )
+    assert inv["createdAt"].endswith("Z")
+    # Basic ISO format check: "2026-06-19T..."
+    assert "T" in inv["createdAt"]
+
+
+def test_build_contact_invitation_fixed_fields():
+    """avatarUri, expiresAt, description, agentType are fixed."""
+    from main import build_app_contact_invitation
+
+    inv = build_app_contact_invitation(
+        _FakeAppRequest(base_url="http://testserver/"),
+    )
+    assert inv["avatarUri"] is None
+    assert inv["expiresAt"] is None
+    assert inv["description"] == "Personal assistant on this PC"
+    assert inv["agentType"] == "pc-agent"

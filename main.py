@@ -1320,7 +1320,7 @@ async def api_profile(request: Request):
     _require_chat_auth(request, api_cfg)
     return {
         "agentName": cfg.get("agent", {}).get("name", "bot"),
-        "connectedAt": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "connectedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 
 
@@ -1457,7 +1457,7 @@ async def api_send_message(request: Request):
             agent_replies.append({
                 "remoteId": reply_id,
                 "content": reply_text,
-                "createdAt": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "createdAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             })
             await memory_store.insert_app_message(
                 remote_id=reply_id,
@@ -1527,25 +1527,30 @@ async def api_contact_invitations(request: Request):
     api_cfg = _api_config()
     _require_chat_auth(request, api_cfg)
 
-    agent_name = cfg.get("agent", {}).get("name", "PC Agent")
-    source_label = os.getenv("COMPUTERNAME", "PC Agent")
-    endpoint = str(request.base_url).rstrip("/")
-    created_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-
     return {
         "invitations": [
-            {
-                "id": "pc-agent-default",
-                "displayName": agent_name,
-                "avatarUri": None,
-                "description": "Personal assistant on this PC",
-                "agentType": "pc-agent",
-                "sourceLabel": source_label,
-                "endpoint": endpoint,
-                "createdAt": created_at,
-                "expiresAt": None,
-            }
+            build_app_contact_invitation(request),
         ]
+    }
+
+
+def build_app_contact_invitation(request: Request) -> dict:
+    """Build a single PC agent contact invitation dict.
+
+    Helper so the invitation shape can be reused or tested independently
+    without invoking the full endpoint.  Returns one invitation dict (not
+    wrapped in the ``invitations`` envelope).
+    """
+    return {
+        "id": "pc-agent-default",
+        "displayName": cfg.get("agent", {}).get("name", "PC Agent"),
+        "avatarUri": None,
+        "description": "Personal assistant on this PC",
+        "agentType": "pc-agent",
+        "sourceLabel": os.getenv("COMPUTERNAME", "PC Agent"),
+        "endpoint": str(request.base_url).rstrip("/"),
+        "createdAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "expiresAt": None,
     }
 
 
