@@ -1,0 +1,20 @@
+{
+  "name": "aspocket-channel",
+  "version": "0.1.0",
+  "description": "Dev-only AsPocket Claude Code channel server",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "aspocket-channel": "./channel.js"
+  },
+  "scripts": {
+    "start": "node channel.js",
+    "test": "node --test test/helpers.test.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
