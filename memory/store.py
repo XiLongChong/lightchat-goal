@@ -1016,9 +1016,15 @@ class MemoryStore:
         source_tool_call_id: str = "",
         sequence: int = 0,
         remote_agent_id: str = "default",
+        created_at: float | None = None,
     ) -> None:
-        """Insert a single app message (user or agent reply)."""
-        now = time.time()
+        """Insert a single app message (user or agent reply).
+
+        *created_at* may be supplied to persist a caller-provided timestamp
+        (e.g. an attached-session callback reply ``createdAt``); otherwise
+        the current time is used.
+        """
+        now = created_at if created_at is not None else time.time()
         async with self._write_lock:
             db = await self._get_db()
             await db.execute(
@@ -1040,6 +1046,78 @@ class MemoryStore:
                 ),
             )
             await db.commit()
+
+    async def insert_app_turn_messages(
+        self,
+        *,
+        user_message: dict[str, Any],
+        agent_replies: list[dict[str, Any]],
+    ) -> None:
+        """Atomically insert a user message and its agent replies.
+
+        All rows share the same ``source_turn_id`` and are written in a
+        single ``write_lock`` + transaction.  If any insert fails the
+        entire transaction is rolled back, so no half-success history is
+        left behind.
+
+        *user_message* keys: ``remote_id``, ``client_message_id``,
+        ``content``, ``source_turn_id``, ``remote_agent_id``,
+        ``created_at`` (optional).
+
+        Each *agent_replies* entry keys: ``remote_id``, ``content``,
+        ``source_turn_id``, ``sequence``, ``remote_agent_id``,
+        ``source_tool_call_id`` (optional), ``created_at`` (optional).
+        """
+        async with self._write_lock:
+            db = await self._get_db()
+            try:
+                user_ts = user_message.get("created_at")
+                if user_ts is None:
+                    user_ts = time.time()
+                await db.execute(
+                    """INSERT INTO app_messages(
+                           id, client_message_id, remote_agent_id, role, content,
+                           created_at, source_turn_id, source_tool_call_id, sequence
+                       )
+                       VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        user_message["remote_id"],
+                        user_message.get("client_message_id"),
+                        user_message.get("remote_agent_id", "default"),
+                        "user",
+                        user_message["content"],
+                        user_ts,
+                        user_message.get("source_turn_id", ""),
+                        "",
+                        0,
+                    ),
+                )
+                for reply in agent_replies:
+                    reply_ts = reply.get("created_at")
+                    if reply_ts is None:
+                        reply_ts = time.time()
+                    await db.execute(
+                        """INSERT INTO app_messages(
+                               id, client_message_id, remote_agent_id, role, content,
+                               created_at, source_turn_id, source_tool_call_id, sequence
+                           )
+                           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            reply["remote_id"],
+                            None,
+                            reply.get("remote_agent_id", "default"),
+                            "agent",
+                            reply["content"],
+                            reply_ts,
+                            reply.get("source_turn_id", ""),
+                            reply.get("source_tool_call_id", ""),
+                            reply.get("sequence", 0),
+                        ),
+                    )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
 
     async def find_app_message_by_client_message_id(
         self, client_message_id: str,

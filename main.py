@@ -1,4 +1,4 @@
-﻿"""Goal text-chat agent and WeChat bridge entry point."""
+"""Goal text-chat agent and WeChat bridge entry point."""
 
 import asyncio
 import secrets
@@ -1505,39 +1505,60 @@ async def api_send_message(request: Request):
             resolved, client_message_id, content,
         )
 
-        # Persist user message + replies after successful callback
+        # Persist user message + replies after successful callback.
+        #
+        # Router generates its own local app_messages.id for every agent
+        # reply (``app_rm_agent_<uuid>``); the session callback's
+        # ``remoteId`` is preserved in ``source_tool_call_id`` for
+        # debugging/tracing.  This avoids cross-session id collisions:
+        # different sessions may return the same ``remoteId`` (e.g.
+        # "msg-1") without conflicting on the Router's global primary key.
+        #
+        # All rows (user + replies) are written in a single transaction
+        # via ``insert_app_turn_messages`` so that a failure in any reply
+        # insert rolls back the user message too — no half-success state.
         turn_id = f"app_turn_{uuid.uuid4().hex[:12]}"
         user_remote_id = f"app_rm_user_{uuid.uuid4().hex[:12]}"
         now_ts = time.time()
-        await memory_store.insert_app_message(
-            remote_id=user_remote_id,
-            client_message_id=client_message_id,
-            role="user",
-            content=content,
-            source_turn_id=turn_id,
-            sequence=0,
-            remote_agent_id=remote_agent_id,
-        )
 
         agent_replies: list[dict[str, Any]] = []
+        reply_rows: list[dict[str, Any]] = []
         for seq, reply in enumerate(callback_replies, start=1):
-            reply_id = reply.get("remoteId") or f"app_rm_agent_{uuid.uuid4().hex[:12]}"
+            router_reply_id = f"app_rm_agent_{uuid.uuid4().hex[:12]}"
             reply_text = reply["content"]
-            reply_created_at = reply.get("createdAt") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            session_remote_id = reply.get("remoteId") or ""
+            cb_created_at = reply.get("createdAt")
+            reply_ts = _parse_iso_to_ts(cb_created_at)
+            if reply_ts is None:
+                reply_ts = now_ts
+                cb_created_at = _iso_from_ts(now_ts)
             agent_replies.append({
-                "remoteId": reply_id,
+                "remoteId": router_reply_id,
                 "content": reply_text,
-                "createdAt": reply_created_at,
+                "createdAt": cb_created_at,
+                "sourceToolCallId": session_remote_id or None,
             })
-            await memory_store.insert_app_message(
-                remote_id=reply_id,
-                client_message_id=None,
-                role="agent",
-                content=reply_text,
-                source_turn_id=turn_id,
-                sequence=seq,
-                remote_agent_id=remote_agent_id,
-            )
+            reply_rows.append({
+                "remote_id": router_reply_id,
+                "content": reply_text,
+                "source_turn_id": turn_id,
+                "sequence": seq,
+                "source_tool_call_id": session_remote_id,
+                "created_at": reply_ts,
+                "remote_agent_id": remote_agent_id,
+            })
+
+        await memory_store.insert_app_turn_messages(
+            user_message={
+                "remote_id": user_remote_id,
+                "client_message_id": client_message_id,
+                "content": content,
+                "source_turn_id": turn_id,
+                "remote_agent_id": remote_agent_id,
+                "created_at": now_ts,
+            },
+            agent_replies=reply_rows,
+        )
 
         logger.info(
             "[app] callback turn=%s user_remote=%s agent_replies=%d",
@@ -1821,6 +1842,20 @@ def _iso_from_ts(ts: float) -> str:
         return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat().replace("+00:00", "Z")
     except (OSError, ValueError, OverflowError):
         return datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_iso_to_ts(iso_str: str | None) -> float | None:
+    """Parse an ISO 8601 UTC string (e.g. ``2026-06-19T12:00:02Z``) to a Unix timestamp.
+
+    Returns ``None`` when *iso_str* is missing or cannot be parsed.
+    Used to persist attached-session callback reply ``createdAt`` values.
+    """
+    if not iso_str or not isinstance(iso_str, str):
+        return None
+    try:
+        return datetime.fromisoformat(iso_str.replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        return None
 
 
 # ── attached session callback forwarding (v1) ──────────────────────

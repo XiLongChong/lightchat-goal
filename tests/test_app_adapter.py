@@ -3454,3 +3454,462 @@ async def test_auth_before_remote_agent_id_validation_still_holds(monkeypatch):
     with pytest.raises(HTTPException) as exc:
         _require_chat_auth(FakeRequest(), api_cfg)
     assert exc.value.status_code == 401
+
+
+# ================================================================
+# Attached-session reply id isolation & atomic persistence
+# ================================================================
+
+
+def _make_attached_session(rid, callback_url="http://127.0.0.1:19010"):
+    """Helper: build a session dict for app_agent_session_registry."""
+    return {
+        "sessionId": f"s-{rid}",
+        "remoteAgentId": rid,
+        "displayName": rid,
+        "description": "desc",
+        "status": "online",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "expiresAt": None,
+        "callbackUrl": callback_url,
+        "sourceLabel": None,
+    }
+
+
+def _patch_httpx_callback(monkeypatch, json_return_value):
+    """Patch httpx.AsyncClient to return *json_return_value* with status 200."""
+    import httpx
+    from unittest.mock import AsyncMock, MagicMock
+
+    fake_resp = MagicMock()
+    fake_resp.status_code = 200
+    fake_resp.json.return_value = json_return_value
+
+    class _FakeClientCtx:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            client = MagicMock()
+            client.post = AsyncMock(return_value=fake_resp)
+            return client
+
+        async def __aexit__(self, *args):
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClientCtx)
+
+
+@pytest.mark.asyncio
+async def test_callback_two_sessions_same_session_remote_id_both_succeed(monkeypatch):
+    """Two different remoteAgentId callbacks both returning remoteId='msg-1' both succeed.
+
+    The Router generates its own app_messages.id for each reply, so the
+    same session-side remoteId from different sessions must not collide.
+    """
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid1 = f"cc-a-{_uuid.uuid4().hex[:8]}"
+    rid2 = f"cc-b-{_uuid.uuid4().hex[:8]}"
+    app_agent_session_registry._sessions[f"s-{rid1}"] = _make_attached_session(rid1)
+    app_agent_session_registry._sessions[f"s-{rid2}"] = _make_attached_session(rid2, "http://127.0.0.1:19011")
+
+    _patch_httpx_callback(monkeypatch, {
+        "agentReplies": [{"content": "reply", "remoteId": "msg-1"}],
+    })
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        def __init__(self, cid, rid):
+            self._cid = cid
+            self._rid = rid
+
+        async def json(self):
+            return {"clientMessageId": self._cid, "content": "hi", "remoteAgentId": self._rid}
+
+    from main import api_send_message
+
+    result1 = await api_send_message(FakeRequest(f"cm-a-{_uuid.uuid4().hex[:8]}", rid1))
+    result2 = await api_send_message(FakeRequest(f"cm-b-{_uuid.uuid4().hex[:8]}", rid2))
+
+    assert "userMessage" in result1
+    assert "userMessage" in result2
+    # Both replies have Router-generated ids (not "msg-1")
+    assert result1["agentReplies"][0]["remoteId"].startswith("app_rm_agent_")
+    assert result2["agentReplies"][0]["remoteId"].startswith("app_rm_agent_")
+    assert result1["agentReplies"][0]["remoteId"] != result2["agentReplies"][0]["remoteId"]
+    # session remoteId preserved in sourceToolCallId
+    assert result1["agentReplies"][0]["sourceToolCallId"] == "msg-1"
+    assert result2["agentReplies"][0]["sourceToolCallId"] == "msg-1"
+
+
+@pytest.mark.asyncio
+async def test_callback_stored_ids_are_router_generated_and_distinct(monkeypatch):
+    """Stored app_messages ids are Router-generated and distinct across replies."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg, memory_store
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"cc-dist-{_uuid.uuid4().hex[:8]}"
+    app_agent_session_registry._sessions[f"s-{rid}"] = _make_attached_session(rid)
+
+    _patch_httpx_callback(monkeypatch, {
+        "agentReplies": [
+            {"content": "reply 1", "remoteId": "session-rm-1"},
+            {"content": "reply 2", "remoteId": "session-rm-2"},
+            {"content": "reply 3"},
+        ],
+    })
+
+    cid = f"cm-dist-{_uuid.uuid4().hex[:8]}"
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {"clientMessageId": cid, "content": "hi", "remoteAgentId": rid}
+
+    from main import api_send_message
+
+    result = await api_send_message(FakeRequest())
+    assert len(result["agentReplies"]) == 3
+
+    # All returned remoteIds are Router-generated
+    for r in result["agentReplies"]:
+        assert r["remoteId"].startswith("app_rm_agent_")
+    # Distinct
+    ids = [r["remoteId"] for r in result["agentReplies"]]
+    assert len(set(ids)) == 3
+
+    # Verify storage: user message + 3 agent replies, all with Router ids
+    msgs, _, _ = await memory_store.get_app_messages_after_cursor(remote_agent_id=rid)
+    assert len(msgs) == 4  # 1 user + 3 agent
+    agent_rows = [m for m in msgs if m["role"] == "agent"]
+    assert len(agent_rows) == 3
+    for m in agent_rows:
+        assert m["id"].startswith("app_rm_agent_")
+    stored_ids = [m["id"] for m in agent_rows]
+    assert len(set(stored_ids)) == 3
+    # None of the stored ids equal the session remoteIds
+    assert "session-rm-1" not in stored_ids
+    assert "session-rm-2" not in stored_ids
+
+
+@pytest.mark.asyncio
+async def test_callback_source_tool_call_id_stores_session_remote_id(monkeypatch):
+    """source_tool_call_id stores the session callback remoteId for tracing."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg, memory_store
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"cc-stc-{_uuid.uuid4().hex[:8]}"
+    app_agent_session_registry._sessions[f"s-{rid}"] = _make_attached_session(rid)
+
+    _patch_httpx_callback(monkeypatch, {
+        "agentReplies": [
+            {"content": "with id", "remoteId": "session-xyz"},
+            {"content": "without id"},
+        ],
+    })
+
+    cid = f"cm-stc-{_uuid.uuid4().hex[:8]}"
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {"clientMessageId": cid, "content": "hi", "remoteAgentId": rid}
+
+    from main import api_send_message
+
+    result = await api_send_message(FakeRequest())
+    assert result["agentReplies"][0]["sourceToolCallId"] == "session-xyz"
+    assert result["agentReplies"][1]["sourceToolCallId"] is None
+
+    # Verify DB persistence
+    found = await memory_store.find_app_message_by_client_message_id(cid, remote_agent_id=rid)
+    assert found is not None
+    turn_id = found["source_turn_id"]
+    replies = await memory_store.find_app_agent_replies_by_turn_id(turn_id, remote_agent_id=rid)
+    assert len(replies) == 2
+    assert replies[0]["source_tool_call_id"] == "session-xyz"
+    assert replies[1]["source_tool_call_id"] == ""
+
+
+@pytest.mark.asyncio
+async def test_callback_idempotent_second_post_returns_router_remote_id(monkeypatch):
+    """Idempotent second POST returns stored Router remoteId, not session remoteId.
+
+    The callback is NOT called a second time.  The returned remoteId is
+    the Router-generated id from the first call; sourceToolCallId still
+    carries the session remoteId.
+    """
+    import uuid as _uuid
+    import httpx
+    from unittest.mock import AsyncMock, MagicMock
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"cc-idem2-{_uuid.uuid4().hex[:8]}"
+    app_agent_session_registry._sessions[f"s-{rid}"] = _make_attached_session(rid)
+
+    cid = f"cm-idem2-{_uuid.uuid4().hex[:8]}"
+    call_count = 0
+
+    fake_resp = MagicMock()
+    fake_resp.status_code = 200
+    fake_resp.json.return_value = {
+        "agentReplies": [{"content": "first reply", "remoteId": "session-abc"}],
+    }
+
+    class _FakeClientCtx:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            client = MagicMock()
+
+            async def _counted_post(*args, **kwargs):
+                nonlocal call_count
+                call_count += 1
+                return fake_resp
+
+            client.post = _counted_post
+            return client
+
+        async def __aexit__(self, *args):
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClientCtx)
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        def __init__(self, cid, content, rid):
+            self._cid = cid
+            self._content = content
+            self._rid = rid
+
+        async def json(self):
+            return {
+                "clientMessageId": self._cid,
+                "content": self._content,
+                "remoteAgentId": self._rid,
+            }
+
+    from main import api_send_message
+
+    # First call
+    result1 = await api_send_message(FakeRequest(cid, "hello", rid))
+    assert call_count == 1
+    first_remote_id = result1["agentReplies"][0]["remoteId"]
+    assert first_remote_id.startswith("app_rm_agent_")
+    assert first_remote_id != "session-abc"
+    assert result1["agentReplies"][0]["sourceToolCallId"] == "session-abc"
+
+    # Second call — same cid + rid → idempotent, no callback
+    result2 = await api_send_message(FakeRequest(cid, "hello", rid))
+    assert call_count == 1  # callback NOT called again
+    second_remote_id = result2["agentReplies"][0]["remoteId"]
+    assert second_remote_id == first_remote_id  # stored Router remoteId
+    assert second_remote_id != "session-abc"
+    assert result2["agentReplies"][0]["sourceToolCallId"] == "session-abc"
+    assert result2["agentReplies"][0]["content"] == "first reply"
+
+
+@pytest.mark.asyncio
+async def test_insert_app_turn_messages_rolls_back_on_reply_failure():
+    """If any reply insert fails, user message is also rolled back."""
+    from memory.store import MemoryStore
+
+    store = MemoryStore(db_path=":memory:")
+    try:
+        # Two replies share the same id → second insert raises
+        # PRIMARY KEY conflict; the entire transaction must roll back.
+        with pytest.raises(Exception):
+            await store.insert_app_turn_messages(
+                user_message={
+                    "remote_id": "app_rm_user_rollback",
+                    "client_message_id": "cm-rollback",
+                    "content": "hello",
+                    "source_turn_id": "turn-rollback",
+                    "remote_agent_id": "default",
+                },
+                agent_replies=[
+                    {
+                        "remote_id": "app_rm_agent_dup",
+                        "content": "reply 1",
+                        "source_turn_id": "turn-rollback",
+                        "sequence": 1,
+                        "remote_agent_id": "default",
+                    },
+                    {
+                        "remote_id": "app_rm_agent_dup",  # duplicate → conflict
+                        "content": "reply 2",
+                        "source_turn_id": "turn-rollback",
+                        "sequence": 2,
+                        "remote_agent_id": "default",
+                    },
+                ],
+            )
+        # User message must NOT be persisted
+        found = await store.find_app_message_by_client_message_id("cm-rollback")
+        assert found is None
+        # No replies for this turn
+        replies = await store.find_app_agent_replies_by_turn_id("turn-rollback")
+        assert replies == []
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_insert_app_turn_messages_persists_user_and_replies_atomically():
+    """Successful insert_app_turn_messages writes user + replies together."""
+    from memory.store import MemoryStore
+
+    store = MemoryStore(db_path=":memory:")
+    try:
+        await store.insert_app_turn_messages(
+            user_message={
+                "remote_id": "app_rm_user_ok",
+                "client_message_id": "cm-ok",
+                "content": "hello",
+                "source_turn_id": "turn-ok",
+                "remote_agent_id": "default",
+                "created_at": 1718539200.0,
+            },
+            agent_replies=[
+                {
+                    "remote_id": "app_rm_agent_1",
+                    "content": "reply 1",
+                    "source_turn_id": "turn-ok",
+                    "sequence": 1,
+                    "remote_agent_id": "default",
+                    "source_tool_call_id": "session-rm-1",
+                    "created_at": 1718539202.0,
+                },
+                {
+                    "remote_id": "app_rm_agent_2",
+                    "content": "reply 2",
+                    "source_turn_id": "turn-ok",
+                    "sequence": 2,
+                    "remote_agent_id": "default",
+                },
+            ],
+        )
+        found = await store.find_app_message_by_client_message_id("cm-ok")
+        assert found is not None
+        assert found["content"] == "hello"
+        assert found["created_at"] == 1718539200.0
+
+        replies = await store.find_app_agent_replies_by_turn_id("turn-ok")
+        assert len(replies) == 2
+        assert replies[0]["source_tool_call_id"] == "session-rm-1"
+        assert replies[0]["created_at"] == 1718539202.0
+        assert replies[1]["source_tool_call_id"] == ""
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_callback_persists_callback_created_at(monkeypatch):
+    """Callback reply createdAt is persisted (not dropped)."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg, memory_store
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"cc-cts-{_uuid.uuid4().hex[:8]}"
+    app_agent_session_registry._sessions[f"s-{rid}"] = _make_attached_session(rid)
+
+    _patch_httpx_callback(monkeypatch, {
+        "agentReplies": [
+            {"content": "timed", "createdAt": "2026-06-19T12:00:02Z"},
+        ],
+    })
+
+    cid = f"cm-cts-{_uuid.uuid4().hex[:8]}"
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {"clientMessageId": cid, "content": "hi", "remoteAgentId": rid}
+
+    from main import api_send_message
+
+    result = await api_send_message(FakeRequest())
+    assert result["agentReplies"][0]["createdAt"] == "2026-06-19T12:00:02Z"
+
+    # Verify DB has the parsed timestamp
+    found = await memory_store.find_app_message_by_client_message_id(cid, remote_agent_id=rid)
+    assert found is not None
+    replies = await memory_store.find_app_agent_replies_by_turn_id(
+        found["source_turn_id"], remote_agent_id=rid,
+    )
+    assert len(replies) == 1
+    # 2026-06-19T12:00:02Z parsed as Unix timestamp
+    from datetime import datetime as _dt, timezone as _tz
+    expected_ts = _dt.fromisoformat("2026-06-19T12:00:02+00:00").timestamp()
+    assert replies[0]["created_at"] == expected_ts
+
+
+@pytest.mark.asyncio
+async def test_default_internal_path_unaffected_by_callback_changes(monkeypatch):
+    """Default internal agent path still works and uses insert_app_message."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {
+                "clientMessageId": "cm-default-unaffected",
+                "content": "hello default",
+            }
+
+    from main import api_send_message
+
+    result = await api_send_message(FakeRequest())
+    assert "userMessage" in result
+    assert result["userMessage"]["remoteId"].startswith("app_rm_user_")
+    assert result["userMessage"]["status"] == "sent"
