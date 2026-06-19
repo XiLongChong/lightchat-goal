@@ -2124,3 +2124,174 @@ async def test_auth_before_session_validation(monkeypatch):
     with pytest.raises(HTTPException) as exc:
         _require_chat_auth(FakeRequest(), api_cfg)
     assert exc.value.status_code == 401
+
+
+# ================================================================
+# validate_callback_response tests (v1 contract)
+# ================================================================
+
+
+def test_validate_callback_valid_simple_text():
+    from main import validate_callback_response
+
+    result = validate_callback_response({
+        "agentReplies": [{"content": "你好，我在。"}],
+    })
+    assert result["ok"] is True
+    assert len(result["replies"]) == 1
+    assert result["replies"][0]["content"] == "你好，我在。"
+
+
+def test_validate_callback_missing_agent_replies():
+    from main import validate_callback_response
+
+    result = validate_callback_response({})
+    assert result["ok"] is False
+    assert "missing agentReplies" in result["error"]
+
+
+def test_validate_callback_top_level_array_rejected():
+    from main import validate_callback_response
+
+    result = validate_callback_response([{"content": "hi"}])
+    assert result["ok"] is False
+    assert "JSON object" in result["error"]
+
+
+def test_validate_callback_agent_replies_not_list():
+    from main import validate_callback_response
+
+    result = validate_callback_response({"agentReplies": "not-a-list"})
+    assert result["ok"] is False
+    assert "must be an array" in result["error"]
+
+
+def test_validate_callback_reply_content_not_string_skipped():
+    from main import validate_callback_response
+
+    result = validate_callback_response({
+        "agentReplies": [
+            {"content": "valid"},
+            {"content": 123},
+        ],
+    })
+    assert result["ok"] is True
+    assert len(result["replies"]) == 1
+    assert result["replies"][0]["content"] == "valid"
+
+
+def test_validate_callback_empty_content_skipped():
+    from main import validate_callback_response
+
+    result = validate_callback_response({
+        "agentReplies": [
+            {"content": ""},
+            {"content": "  "},
+            {"content": "valid"},
+        ],
+    })
+    assert result["ok"] is True
+    assert len(result["replies"]) == 1
+    assert result["replies"][0]["content"] == "valid"
+
+
+def test_validate_callback_mixed_valid_and_invalid():
+    from main import validate_callback_response
+
+    result = validate_callback_response({
+        "agentReplies": [
+            "not-a-dict",
+            {"content": "first"},
+            {"no_content": "missing"},
+            {"content": "second"},
+            {"content": 456},
+            {"content": ""},
+        ],
+    })
+    assert result["ok"] is True
+    assert len(result["replies"]) == 2
+    contents = {r["content"] for r in result["replies"]}
+    assert contents == {"first", "second"}
+
+
+def test_validate_callback_empty_replies_ok():
+    from main import validate_callback_response
+
+    result = validate_callback_response({"agentReplies": []})
+    assert result["ok"] is True
+    assert result["replies"] == []
+
+
+def test_validate_callback_unknown_fields_ignored():
+    from main import validate_callback_response
+
+    result = validate_callback_response({
+        "agentReplies": [{"content": "hi", "unknownField": "ignored"}],
+        "extraTop": 123,
+    })
+    assert result["ok"] is True
+    assert len(result["replies"]) == 1
+    assert result["replies"][0]["content"] == "hi"
+
+
+def test_validate_callback_optional_fields_preserved():
+    from main import validate_callback_response
+
+    result = validate_callback_response({
+        "agentReplies": [
+            {
+                "content": "hi",
+                "remoteId": "rm-1",
+                "createdAt": "2026-06-19T12:00:02Z",
+            },
+        ],
+    })
+    assert result["ok"] is True
+    assert result["replies"][0]["remoteId"] == "rm-1"
+    assert result["replies"][0]["createdAt"] == "2026-06-19T12:00:02Z"
+
+
+def test_validate_callback_content_strips_whitespace():
+    from main import validate_callback_response
+
+    result = validate_callback_response({
+        "agentReplies": [{"content": "  hello world  "}],
+    })
+    assert result["ok"] is True
+    assert result["replies"][0]["content"] == "hello world"
+
+
+def test_validate_callback_anthropic_content_block_rejected_as_content():
+    """Anthropic content blocks {type,text} are NOT valid content — adapter must convert."""
+    from main import validate_callback_response
+
+    result = validate_callback_response({
+        "agentReplies": [
+            {"content": {"type": "text", "text": "hello"}},
+        ],
+    })
+    assert result["ok"] is True
+    # content is a dict, not a string → skipped
+    assert result["replies"] == []
+
+
+def test_validate_callback_string_not_object_rejected():
+    from main import validate_callback_response
+
+    result = validate_callback_response("just a string")
+    assert result["ok"] is False
+    assert "JSON object" in result["error"]
+
+
+def test_validate_callback_multiple_replies():
+    from main import validate_callback_response
+
+    result = validate_callback_response({
+        "agentReplies": [
+            {"content": "第一条"},
+            {"content": "第二条"},
+            {"content": "第三条"},
+        ],
+    })
+    assert result["ok"] is True
+    assert len(result["replies"]) == 3

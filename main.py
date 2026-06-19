@@ -1768,6 +1768,46 @@ def _iso_from_ts(ts: float) -> str:
         return datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# ── attached session callback validation (v1 spec, not wired yet) ───
+
+
+def validate_callback_response(body: Any) -> dict[str, Any]:
+    """Validate an attached-session callback response against the v1 contract.
+
+    Returns ``{"ok": True, "replies": [...]}`` when valid, or
+    ``{"ok": False, "error": str}`` when the envelope is malformed.
+
+    Individual reply entries with missing / non-string / empty content are
+    silently skipped (not treated as an error).
+
+    This is a pure validator — it does NOT insert messages or modify state.
+    It is not yet wired into any production code path.
+    """
+    if not isinstance(body, dict):
+        return {"ok": False, "error": "callback response must be a JSON object"}
+    if "agentReplies" not in body:
+        return {"ok": False, "error": "callback response missing agentReplies field"}
+    raw = body["agentReplies"]
+    if not isinstance(raw, list):
+        return {"ok": False, "error": "agentReplies must be an array"}
+
+    replies: list[dict[str, Any]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        content = entry.get("content")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        reply: dict[str, Any] = {"content": content.strip()}
+        if isinstance(entry.get("remoteId"), str):
+            reply["remoteId"] = entry["remoteId"]
+        if isinstance(entry.get("createdAt"), str):
+            reply["createdAt"] = entry["createdAt"]
+        replies.append(reply)
+
+    return {"ok": True, "replies": replies}
+
+
 # ================================================================
 # App agent session registry endpoints
 # ================================================================
