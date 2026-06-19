@@ -39,6 +39,29 @@ def _utc_iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _int_config(config: dict[str, Any], key: str, default: int) -> int:
+    """Read an int config value, explicitly preserving 0.
+
+    Unlike ``int(config.get(key, default) or default)``, this never treats
+    a legitimate ``0`` as falsy:
+
+    - key missing from *config* -> *default*
+    - value is None -> *default*
+    - value == 0 -> 0
+    - value can be int-parsed -> int(value)
+    - otherwise (non-numeric) -> *default*
+    """
+    if key not in config:
+        return default
+    value = config[key]
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 class TaskScheduler:
     """Run persisted scheduled_tasks records through APScheduler."""
 
@@ -204,7 +227,7 @@ class TaskScheduler:
         selected = frequencies.get(tier)
         if not isinstance(selected, dict):
             selected = {}
-        daily_limit = int(selected.get("daily_limit", config.get("daily_limit", 10)) or 10)
+        daily_limit = _int_config(selected, "daily_limit", _int_config(config, "daily_limit", 10))
         interval_range = selected.get("interval_range_seconds", [1800, 7200])
         if (
             not isinstance(interval_range, list)
@@ -225,8 +248,8 @@ class TaskScheduler:
         config = self._proactive_config()
         timezone_name = str(config.get("quiet_hours_timezone") or "Asia/Shanghai")
         zone = ZoneInfo(timezone_name)
-        quiet_start = int(config.get("quiet_hours_start", config.get("time_window_end", 23)) or 23)
-        quiet_end = int(config.get("quiet_hours_end", config.get("time_window_start", 8)) or 8)
+        quiet_start = _int_config(config, "quiet_hours_start", _int_config(config, "time_window_end", 23))
+        quiet_end = _int_config(config, "quiet_hours_end", _int_config(config, "time_window_start", 8))
         target = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
         local = target.astimezone(zone)
 
@@ -248,7 +271,7 @@ class TaskScheduler:
         if not bool(config.get("enabled", True)):
             await self.cancel_user_proactive_tasks(user_id, reason="proactive_disabled")
             return None
-        delay = int(config.get("first_check_delay_seconds", 120) or 120)
+        delay = _int_config(config, "first_check_delay_seconds", 120)
         return await self.schedule_proactive(
             user_id=user_id,
             delay_seconds=delay,

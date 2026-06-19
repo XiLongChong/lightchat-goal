@@ -374,3 +374,86 @@ class TestTaskScheduler:
         job_ids = asyncio.run(run())
         assert "daily_compression_0356" in job_ids
         assert "daily_compression_0401_0421" in job_ids
+
+    def test_int_config_preserves_zero(self):
+        """_int_config returns 0 when the value is 0, not the default."""
+        from runtime.task_scheduler import _int_config
+
+        assert _int_config({"k": 0}, "k", 8) == 0
+        assert _int_config({"k": "0"}, "k", 8) == 0
+
+    def test_int_config_uses_default_when_missing(self):
+        """Missing key returns the default."""
+        from runtime.task_scheduler import _int_config
+
+        assert _int_config({}, "k", 8) == 8
+        assert _int_config({"other": 1}, "k", 23) == 23
+
+    def test_int_config_uses_default_when_none(self):
+        """None value returns the default."""
+        from runtime.task_scheduler import _int_config
+
+        assert _int_config({"k": None}, "k", 8) == 8
+
+    def test_int_config_uses_default_when_unparseable(self):
+        """Non-numeric value returns the default."""
+        from runtime.task_scheduler import _int_config
+
+        assert _int_config({"k": "abc"}, "k", 8) == 8
+        assert _int_config({"k": [1, 2]}, "k", 8) == 8
+
+    def test_int_config_parses_numeric_string(self):
+        """Numeric strings are parsed to int."""
+        from runtime.task_scheduler import _int_config
+
+        assert _int_config({"k": "5"}, "k", 8) == 5
+        assert _int_config({"k": 12}, "k", 8) == 12
+
+    def test_quiet_hours_end_zero_does_not_fall_back_to_default(self):
+        """quiet_hours_end=0 is preserved, not replaced by default 8.
+
+        With quiet_hours_start=99 (never quiet on the start side) and
+        quiet_hours_end=0 (no hour is < 0), the trigger should not be
+        pushed into the quiet window.  This is the regression that caused
+        test_initial_proactive_delay_is_not_clamped_to_frequency_minimum
+        to fail near midnight Beijing time.
+        """
+        from runtime.task_scheduler import TaskScheduler
+
+        scheduler = TaskScheduler.__new__(TaskScheduler)
+        scheduler._proactive_config_getter = lambda: {
+            "quiet_hours_start": 99,
+            "quiet_hours_end": 0,
+            "quiet_hours_timezone": "Asia/Shanghai",
+        }
+        # With quiet_end=0 preserved, no hour is < 0, so in_quiet is
+        # always False and the trigger equals now + delay.
+        trigger = scheduler._resolve_proactive_trigger_at(60)
+        now = datetime.now(timezone.utc)
+        # Trigger should be within a few seconds of now+60, not pushed
+        # to 08:00 Shanghai (which would be ~hours away).
+        assert abs((trigger - now).total_seconds() - 60) < 10
+
+    def test_quiet_hours_end_missing_uses_default(self):
+        """When quiet_hours_end is absent, the default (8) is used."""
+        from runtime.task_scheduler import TaskScheduler
+
+        scheduler = TaskScheduler.__new__(TaskScheduler)
+        scheduler._proactive_config_getter = lambda: {
+            "quiet_hours_start": 23,
+            # quiet_hours_end intentionally omitted
+            "quiet_hours_timezone": "Asia/Shanghai",
+        }
+        # Manually verify the resolved values via the same logic the
+        # method uses.  We can't easily assert the exact trigger time
+        # without knowing the current hour, but we can verify that the
+        # config resolution preserves the default by checking the
+        # helper directly on the same config dict.
+        from runtime.task_scheduler import _int_config
+
+        config = scheduler._proactive_config()
+        quiet_end = _int_config(
+            config, "quiet_hours_end",
+            _int_config(config, "time_window_start", 8),
+        )
+        assert quiet_end == 8
