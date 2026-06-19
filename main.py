@@ -1517,6 +1517,38 @@ async def api_get_messages(
     }
 
 
+@app.get("/api/contact-invitations")
+async def api_contact_invitations(request: Request):
+    """Return contact invitations for the AsPocket app.
+
+    Single PC agent invitation with a stable id so the app can dedupe.
+    Same auth as /api/profile and /api/messages.  No relay, no multi-agent.
+    """
+    api_cfg = _api_config()
+    _require_chat_auth(request, api_cfg)
+
+    agent_name = cfg.get("agent", {}).get("name", "PC Agent")
+    source_label = os.getenv("COMPUTERNAME", "PC Agent")
+    endpoint = str(request.base_url).rstrip("/")
+    created_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    return {
+        "invitations": [
+            {
+                "id": "pc-agent-default",
+                "displayName": agent_name,
+                "avatarUri": None,
+                "description": "Personal assistant on this PC",
+                "agentType": "pc-agent",
+                "sourceLabel": source_label,
+                "endpoint": endpoint,
+                "createdAt": created_at,
+                "expiresAt": None,
+            }
+        ]
+    }
+
+
 def _iso_from_ts(ts: float) -> str:
     """Convert a Unix timestamp (seconds) to ISO 8601 UTC string."""
     try:

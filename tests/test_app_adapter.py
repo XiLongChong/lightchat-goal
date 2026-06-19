@@ -216,3 +216,114 @@ async def test_app_message_idempotency_conflict():
             )
     finally:
         await store.close()
+
+
+# ──────────────────────────────────────────────────────────────────
+# /api/contact-invitations tests
+# ──────────────────────────────────────────────────────────────────
+
+
+class _FakeAppRequest:
+    """Minimal stand-in for fastapi.Request used by app adapter endpoints.
+
+    Only the attributes the endpoints touch are implemented: ``headers``
+    (dict-like, supports ``.get``) and ``base_url`` (passed through ``str()``).
+    """
+
+    def __init__(self, headers=None, base_url="http://testserver/"):
+        self.headers = headers if headers is not None else {}
+        self.base_url = base_url
+
+
+def test_contact_invitations_requires_auth(monkeypatch):
+    """GET /api/contact-invitations returns 401 without valid token."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    with pytest.raises(HTTPException) as exc:
+        from main import _api_config, _require_chat_auth
+
+        api_cfg = _api_config()
+        _require_chat_auth(_FakeAppRequest(headers={}), api_cfg)
+    assert exc.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_contact_invitations_returns_envelope(monkeypatch):
+    """Authenticated GET /api/contact-invitations returns invitations envelope."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+    monkeypatch.setenv("COMPUTERNAME", "MY-PC")
+
+    from main import api_contact_invitations
+
+    result = await api_contact_invitations(
+        _FakeAppRequest(
+            headers={"authorization": "Bearer secret"},
+            base_url="http://10.0.2.2:8000/",
+        )
+    )
+
+    assert "invitations" in result
+    assert isinstance(result["invitations"], list)
+    assert len(result["invitations"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_contact_invitations_has_required_fields(monkeypatch):
+    """Invitation envelope contains all required fields with correct values."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+    monkeypatch.setenv("COMPUTERNAME", "MY-PC")
+
+    from main import api_contact_invitations
+
+    result = await api_contact_invitations(
+        _FakeAppRequest(
+            headers={"authorization": "Bearer secret"},
+            base_url="http://10.0.2.2:8000/",
+        )
+    )
+    inv = result["invitations"][0]
+
+    required_fields = {
+        "id", "displayName", "avatarUri", "description",
+        "agentType", "sourceLabel", "endpoint", "createdAt", "expiresAt",
+    }
+    assert required_fields.issubset(inv.keys())
+    assert inv["avatarUri"] is None
+    assert inv["expiresAt"] is None
+    assert inv["description"] == "Personal assistant on this PC"
+    assert inv["agentType"] == "pc-agent"
+    assert inv["sourceLabel"] == "MY-PC"
+    assert isinstance(inv["displayName"], str) and inv["displayName"]
+    assert inv["createdAt"].endswith("Z")
+
+
+@pytest.mark.asyncio
+async def test_contact_invitations_endpoint_strips_trailing_slash(monkeypatch):
+    """endpoint equals request base url without trailing slash."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import api_contact_invitations
+
+    result = await api_contact_invitations(
+        _FakeAppRequest(
+            headers={"authorization": "Bearer secret"},
+            base_url="http://10.0.2.2:8000/",
+        )
+    )
+    assert result["invitations"][0]["endpoint"] == "http://10.0.2.2:8000"
+
+
+@pytest.mark.asyncio
+async def test_contact_invitations_id_is_stable(monkeypatch):
+    """Invitation id is the stable pc-agent-default for app dedupe."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import api_contact_invitations
+
+    result = await api_contact_invitations(
+        _FakeAppRequest(
+            headers={"authorization": "Bearer secret"},
+            base_url="http://testserver/",
+        )
+    )
+    assert result["invitations"][0]["id"] == "pc-agent-default"
