@@ -3913,3 +3913,223 @@ async def test_default_internal_path_unaffected_by_callback_changes(monkeypatch)
     assert "userMessage" in result
     assert result["userMessage"]["remoteId"].startswith("app_rm_user_")
     assert result["userMessage"]["status"] == "sent"
+
+
+# ================================================================
+# attached session callbackUrl localhost validation (SSRF)
+# ================================================================
+
+
+def test_validate_callback_url_accepts_127_ipv4():
+    from main import validate_attached_session_callback_url
+
+    assert validate_attached_session_callback_url("http://127.0.0.1:9010") == "http://127.0.0.1:9010"
+
+
+def test_validate_callback_url_accepts_localhost():
+    from main import validate_attached_session_callback_url
+
+    assert validate_attached_session_callback_url("http://localhost:9010") == "http://localhost:9010"
+
+
+def test_validate_callback_url_strips_trailing_slash():
+    from main import validate_attached_session_callback_url
+
+    assert validate_attached_session_callback_url("http://localhost:9010/") == "http://localhost:9010"
+    assert validate_attached_session_callback_url("http://127.0.0.1:9010/path") == "http://127.0.0.1:9010"
+
+
+def test_validate_callback_url_accepts_ipv6_loopback():
+    from main import validate_attached_session_callback_url
+
+    # Bracketed IPv6 loopback
+    assert validate_attached_session_callback_url("http://[::1]:9010") == "http://[::1]:9010"
+    # Without port
+    assert validate_attached_session_callback_url("http://[::1]") == "http://[::1]"
+
+
+def test_validate_callback_url_empty_returns_empty():
+    from main import validate_attached_session_callback_url
+
+    assert validate_attached_session_callback_url("") == ""
+    assert validate_attached_session_callback_url("   ") == ""
+    assert validate_attached_session_callback_url(None) == ""
+
+
+def test_validate_callback_url_rejects_0000():
+    from main import validate_attached_session_callback_url
+
+    with pytest.raises(ValueError):
+        validate_attached_session_callback_url("http://0.0.0.0:9010")
+
+
+def test_validate_callback_url_rejects_private_lan_192():
+    from main import validate_attached_session_callback_url
+
+    with pytest.raises(ValueError):
+        validate_attached_session_callback_url("http://192.168.1.10:9010")
+
+
+def test_validate_callback_url_rejects_private_10():
+    from main import validate_attached_session_callback_url
+
+    with pytest.raises(ValueError):
+        validate_attached_session_callback_url("http://10.0.0.1:9010")
+
+
+def test_validate_callback_url_rejects_private_172():
+    from main import validate_attached_session_callback_url
+
+    with pytest.raises(ValueError):
+        validate_attached_session_callback_url("http://172.16.0.1:9010")
+
+
+def test_validate_callback_url_rejects_public_hostname():
+    from main import validate_attached_session_callback_url
+
+    with pytest.raises(ValueError):
+        validate_attached_session_callback_url("http://example.com")
+
+
+def test_validate_callback_url_rejects_file_scheme():
+    from main import validate_attached_session_callback_url
+
+    with pytest.raises(ValueError):
+        validate_attached_session_callback_url("file:///etc/passwd")
+
+
+def test_validate_callback_url_rejects_javascript_scheme():
+    from main import validate_attached_session_callback_url
+
+    with pytest.raises(ValueError):
+        validate_attached_session_callback_url("javascript:alert(1)")
+
+
+def test_validate_callback_url_rejects_https():
+    """https is intentionally not allowed for local dev callbacks."""
+    from main import validate_attached_session_callback_url
+
+    with pytest.raises(ValueError):
+        validate_attached_session_callback_url("https://127.0.0.1:9010")
+
+
+def test_validate_callback_url_rejects_credentials():
+    from main import validate_attached_session_callback_url
+
+    with pytest.raises(ValueError):
+        validate_attached_session_callback_url("http://user:pass@127.0.0.1:9010")
+
+
+def test_validate_callback_url_rejects_no_hostname():
+    from main import validate_attached_session_callback_url
+
+    with pytest.raises(ValueError):
+        validate_attached_session_callback_url("http:///path")
+
+
+@pytest.mark.asyncio
+async def test_register_unauthorized_returns_401_before_callback_validation(monkeypatch):
+    """401 returned before callbackUrl validation — no info leak."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    class FakeRequest:
+        headers = {}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            # Even with an obviously invalid callbackUrl, auth runs first.
+            return {
+                "sessionId": "s1",
+                "callbackUrl": "http://evil.example.com",
+            }
+
+    from main import api_register_app_agent_session
+
+    with pytest.raises(HTTPException) as exc:
+        await api_register_app_agent_session(FakeRequest())
+    assert exc.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_register_with_invalid_callback_url_returns_400_when_authorized(monkeypatch):
+    """Authorized register with invalid callbackUrl → 400."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {
+                "sessionId": "s-bad-cb",
+                "remoteAgentId": "s-bad-cb",
+                "callbackUrl": "http://192.168.1.10:9010",
+            }
+
+    from main import api_register_app_agent_session
+
+    with pytest.raises(HTTPException) as exc:
+        await api_register_app_agent_session(FakeRequest())
+    assert exc.value.status_code == 400
+    assert "callbackUrl" in exc.value.detail
+    # Session must not be registered
+    assert await app_agent_session_registry.list_all() == []
+
+
+@pytest.mark.asyncio
+async def test_register_with_valid_localhost_callback_url_succeeds(monkeypatch):
+    """Authorized register with valid localhost callbackUrl succeeds."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {
+                "sessionId": "s-good-cb",
+                "remoteAgentId": "s-good-cb",
+                "callbackUrl": "http://127.0.0.1:9010/",
+            }
+
+    from main import api_register_app_agent_session
+
+    result = await api_register_app_agent_session(FakeRequest())
+    # Normalised: trailing slash stripped
+    assert result["session"]["callbackUrl"] == "http://127.0.0.1:9010"
+
+
+@pytest.mark.asyncio
+async def test_register_with_no_callback_url_succeeds(monkeypatch):
+    """Authorized register with empty callbackUrl succeeds (501 on send)."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {
+                "sessionId": "s-no-cb",
+                "remoteAgentId": "s-no-cb",
+            }
+
+    from main import api_register_app_agent_session
+
+    result = await api_register_app_agent_session(FakeRequest())
+    assert result["session"]["callbackUrl"] is None

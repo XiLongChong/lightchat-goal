@@ -324,11 +324,16 @@ POST /api/app-agent-replies
 
 ## 8. 安全边界
 
-### 8.1 callbackUrl localhost 校验
+### 8.1 callbackUrl localhost 校验（已实现，必须保持）
 
 - `callbackUrl` 只允许 `localhost` / `127.0.0.1` / `::1`
 - 避免 SSRF（Server-Side Request Forgery）
-- 未来实现时必须校验
+- **已实现**：`validate_attached_session_callback_url` 在 `POST /api/app-agent-sessions/register` 阶段校验，失败返回 400
+- 只允许 `http` scheme（本地 dev callback 不需要 https）
+- 拒绝 `0.0.0.0`、`192.168.*`、`10.*`、`172.16-31.*`、公网 hostname、`file:` / `javascript:`、带 credentials 的 URL、无 hostname 的 URL
+- 校验在鉴权之后执行：未授权请求返回 401，不暴露 callbackUrl 校验结果
+- **callback server 可以 listen `127.0.0.1`**：Router 和 adapter 在同一台 PC 上通信，callbackUrl 是 Router → adapter 方向，必须是 localhost
+- **注意 Android emulator**：emulator 访问 Router 用 `10.0.2.2`（emulator 中 `10.0.2.2` 指向宿主机），但 callbackUrl 仍是 Router 访问 adapter，所以必须是 localhost
 
 ### 8.2 注册鉴权
 
@@ -437,11 +442,12 @@ POST /api/app-agent-sessions/{sessionId}/offline
 
 ## 11. 下一步实现建议
 
-### 11.1 callbackUrl localhost 校验
+### 11.1 callbackUrl localhost 校验（已完成）
 
-- 在 `POST /api/app-agent-sessions/register` 中校验 `callbackUrl`
-- 只允许 `localhost` / `127.0.0.1` / `::1` / `http://127.0.0.1:*`
-- 拒绝外部 URL，防止 SSRF
+- ✅ 已在 `POST /api/app-agent-sessions/register` 中校验 `callbackUrl`
+- ✅ 只允许 `localhost` / `127.0.0.1` / `::1`（http scheme）
+- ✅ 拒绝外部 URL、`0.0.0.0`、私有网段、非 http scheme、credentials，防止 SSRF
+- ✅ 鉴权先于校验，未授权返回 401
 
 ### 11.2 Claude Code mock adapter
 

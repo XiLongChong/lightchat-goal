@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, time as datetime_time, timezone
 from typing import Any
 from pathlib import Path
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -1333,6 +1334,54 @@ def normalize_remote_agent_id(value: str | None) -> str:
     return stripped if stripped else "default"
 
 
+def validate_attached_session_callback_url(callback_url: str) -> str:
+    """Validate and normalise an attached-session ``callbackUrl``.
+
+    Returns the normalised URL (trailing slash stripped) on success.
+
+    An empty/whitespace-only input is allowed and returns ``""`` — a
+    session without a callback simply returns 501 when messaged.
+
+    Only ``http://`` URLs pointing at ``localhost``, ``127.0.0.1``, or
+    ``::1`` (IPv6 loopback) are accepted.  This closes the SSRF surface
+    on the callback forwarding path: the Router only ever calls back to
+    the same machine it runs on.
+
+    Rejected: non-http schemes, ``0.0.0.0``, private/LAN ranges
+    (``192.168.*``, ``10.*``, ``172.16-31.*``), public hostnames,
+    ``file:`` / ``javascript:``, URLs with credentials, and URLs with
+    no hostname.
+    """
+    text = str(callback_url or "").strip()
+    if not text:
+        return ""
+
+    parsed = urlparse(text)
+    if parsed.scheme != "http":
+        raise ValueError("callbackUrl must be an http URL")
+    if parsed.username or parsed.password:
+        raise ValueError("callbackUrl must not contain credentials")
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError("callbackUrl must have a hostname")
+
+    # Normalise hostname: lowercase, strip IPv6 brackets already removed
+    # by urlparse.hostname.
+    host = hostname.lower()
+    if host not in ("localhost", "127.0.0.1", "::1"):
+        raise ValueError("callbackUrl must point at localhost / 127.0.0.1 / ::1")
+
+    # Rebuild a clean URL without trailing slash / path / query / fragment.
+    # We keep scheme + host (+ port).  IPv6 ::1 is written back in bracket
+    # form for HTTP semantics.
+    port = parsed.port
+    if host == "::1":
+        netloc = f"[::1]:{port}" if port is not None else "[::1]"
+    else:
+        netloc = host if port is None else f"{host}:{port}"
+    return f"http://{netloc}"
+
+
 def get_known_app_remote_agent_ids() -> set[str]:
     """Return the set of remoteAgentId values the server recognises.
 
@@ -2048,7 +2097,14 @@ async def api_register_app_agent_session(request: Request):
     remote_agent_id = str(body.get("remoteAgentId") or session_id).strip() or session_id
     display_name = str(body.get("displayName") or session_id).strip() or session_id
     description = str(body.get("description") or "Attached agent session").strip() or "Attached agent session"
-    callback_url = str(body.get("callbackUrl", "")).strip() or None
+    raw_callback_url = str(body.get("callbackUrl", "")).strip()
+    try:
+        callback_url = validate_attached_session_callback_url(raw_callback_url) or None
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"callbackUrl must be a localhost http URL ({exc})",
+        )
     source_label = str(body.get("sourceLabel", "")).strip() or None
 
     try:
