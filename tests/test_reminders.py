@@ -346,3 +346,31 @@ class TestTaskScheduler:
         before, after, trigger_at = asyncio.run(run())
         assert before + timedelta(seconds=90) <= trigger_at
         assert trigger_at <= after + timedelta(seconds=180)
+
+    def test_daily_compression_jobs_are_registered_on_start(self):
+        from memory.store import MemoryStore
+        from runtime.task_scheduler import TaskScheduler
+
+        async def run():
+            store = MemoryStore(":memory:")
+
+            async def sender(user_id, context_token, messages):
+                return [{"send_status": "delivered"}]
+
+            async def compression_callback():
+                return {"status": "skipped"}
+
+            scheduler = TaskScheduler(
+                memory_store=store,
+                send_text=sender,
+                daily_compression_callback=compression_callback,
+            )
+            await scheduler.start()
+            job_ids = {job.id for job in scheduler._scheduler.get_jobs()}
+            await scheduler.stop()
+            await store.close()
+            return job_ids
+
+        job_ids = asyncio.run(run())
+        assert "daily_compression_0356" in job_ids
+        assert "daily_compression_0401_0421" in job_ids

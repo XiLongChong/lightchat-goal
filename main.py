@@ -1,7 +1,6 @@
 ﻿"""Goal text-chat agent and WeChat bridge entry point."""
 
 import asyncio
-import io
 import secrets
 import uuid
 import json
@@ -16,7 +15,6 @@ from typing import Any
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import yaml
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -36,10 +34,25 @@ from agent.tool_exposure_policy import ToolExposurePolicy
 from agent.tool_registry import TOOL_REGISTRY
 from agent.tools import configure_runtime, configure_tools
 from bridge.wechat_poller import WeChatBridge
+from bridge.qr_utils import normalize_qr_payload, make_qr_svg, make_qr_png
+from bridge.sender import WeChatSender
 from memory.conversation import ConversationContext
 from memory.store import MemoryStore
 from memory.long_term import LongTermMemoryService
+from runtime.admin_labels import (
+    route_label,
+    policy_label,
+    send_status_label,
+    source_label,
+)
 from runtime.chat_runtime import ChatRuntime, create_chat_runtime
+from runtime.config import RuntimeConfig, load_config
+from runtime.contact import contact_send_block_reason, contact_can_send_for_bot
+from runtime.daily_compression import DailyCompressionRunner
+from runtime.protocol_writer import ProtocolEventWriter
+from runtime.turn_hooks import build_observability_hooks
+from runtime.user_turns import UserTurnRegistry
+from runtime.log_reader import read_recent_log_lines
 from runtime.task_scheduler import TaskScheduler
 
 # ================================================================
@@ -48,26 +61,18 @@ from runtime.task_scheduler import TaskScheduler
 
 load_dotenv()
 
-def _env_replace(value: str) -> str:
-    """Replace ${VAR:-default} patterns with env values."""
-    import re
-    def replacer(match):
-        var_expr = match.group(1)
-        if ":-" in var_expr:
-            var, default = var_expr.split(":-", 1)
-            return os.getenv(var.strip(), default.strip())
-        return os.getenv(var_expr.strip(), "")
-    return re.sub(r"\$\{([^}]+)\}", replacer, value)
+RUNTIME_SETTINGS_PATH = Path("./data/runtime_settings.json")
 
-
-def load_config(path: str = "config.yaml") -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        raw = f.read()
-    raw = _env_replace(raw)
-    return yaml.safe_load(raw)
-
-
-cfg = load_config()
+# RuntimeConfig loads config.yaml (with ${VAR:-default} env substitution) and
+# data/runtime_settings.json, then deep-merges runtime settings into cfg —
+# matching the original load sequence.  Env-only dev overrides
+# (GOAL_NATIVE_TOOL_CALLS, GOAL_LLM_BASE_URL) are applied below.
+runtime_config = RuntimeConfig(
+    config_path="config.yaml",
+    runtime_settings_path=RUNTIME_SETTINGS_PATH,
+)
+cfg = runtime_config.cfg
+runtime_settings = runtime_config.runtime_settings
 
 # GOAL_NATIVE_TOOL_CALLS=true overrides config.yaml without editing the file.
 _native_override = os.getenv("GOAL_NATIVE_TOOL_CALLS", "").strip().lower()
@@ -87,40 +92,12 @@ _llm_tap_base_url = (
 )
 if _llm_tap_base_url:
     cfg.setdefault("model", {})["base_url"] = _llm_tap_base_url
-RUNTIME_SETTINGS_PATH = Path("./data/runtime_settings.json")
+
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
 ADMIN_SESSIONS: set[str] = set()
 ADMIN_COOKIE = "goal_admin_session"
 PROCESS_STARTED_AT = time.time()
 BOT_ID = "default"
-
-
-def _deep_update(base: dict, updates: dict) -> dict:
-    for key, value in updates.items():
-        if isinstance(value, dict) and isinstance(base.get(key), dict):
-            _deep_update(base[key], value)
-        else:
-            base[key] = value
-    return base
-
-
-def load_runtime_settings() -> dict:
-    if not RUNTIME_SETTINGS_PATH.exists():
-        return {}
-    try:
-        with open(RUNTIME_SETTINGS_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        logging.getLogger("goal").warning(
-            "Failed to load runtime settings", exc_info=True
-        )
-        return {}
-
-
-def save_runtime_settings(settings: dict):
-    RUNTIME_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(RUNTIME_SETTINGS_PATH, "w", encoding="utf-8") as f:
-        json.dump(settings, f, ensure_ascii=False, indent=2)
 
 
 def read_persona_file() -> str:
@@ -134,10 +111,6 @@ def require_admin(request: Request):
     token = request.cookies.get(ADMIN_COOKIE, "")
     if not token or token not in ADMIN_SESSIONS:
         raise HTTPException(status_code=401, detail="请先登录")
-
-
-runtime_settings = load_runtime_settings()
-_deep_update(cfg, runtime_settings)
 
 # ================================================================
 # Logging
@@ -160,59 +133,6 @@ logging.basicConfig(
 logger = logging.getLogger("goal")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 configure_tools(cfg)
-
-
-def _read_recent_log_lines(
-    log_path: str | Path,
-    limit: int = 200,
-    level: str = "",
-    contains: str = "",
-) -> dict[str, Any]:
-    """Return recent log lines without loading a large log file into memory."""
-    path = Path(log_path)
-    if not path.is_absolute():
-        path = (Path.cwd() / path).resolve()
-    limit = max(1, min(int(limit or 200), 1000))
-    level_filter = str(level or "").strip().upper()
-    contains_filter = str(contains or "").strip().lower()
-
-    if not path.exists():
-        return {"path": str(path), "lines": [], "truncated": False, "exists": False}
-
-    chunk_size = 8192
-    max_bytes = 512 * 1024
-    file_size = path.stat().st_size
-    data = b""
-    with path.open("rb") as f:
-        pos = file_size
-        while pos > 0 and len(data) < max_bytes:
-            read_size = min(chunk_size, pos)
-            pos -= read_size
-            f.seek(pos)
-            data = f.read(read_size) + data
-            if data.count(b"\n") > limit * 3:
-                break
-
-    text = data.decode("utf-8", errors="replace")
-    raw_lines = [line.rstrip("\r") for line in text.splitlines() if line.strip()]
-    if file_size > len(data) and raw_lines:
-        raw_lines = raw_lines[1:]
-
-    filtered = []
-    for line in raw_lines:
-        line_lower = line.lower()
-        if level_filter and f"[{level_filter}]" not in line.upper():
-            continue
-        if contains_filter and contains_filter not in line_lower:
-            continue
-        filtered.append(line)
-
-    return {
-        "path": str(path),
-        "lines": filtered[-limit:],
-        "truncated": file_size > len(data),
-        "exists": True,
-    }
 
 # ================================================================
 # Clients and services
@@ -329,12 +249,11 @@ def build_system_prompt_for_turn() -> str:
     )
 
 
-_wechat_send_locks: dict[str, asyncio.Lock] = {}
-_wechat_last_send_at: dict[str, float] = {}
-
-
 async def wechat_sender(user_id: str, context_token: str, messages: list[dict]) -> list[dict]:
     """Send messages through the WeChat bridge with delivery tracking.
+
+    Thin wrapper around ``wechat_sender_service.send_batch`` — the actual
+    sending logic lives in :class:`bridge.sender.WeChatSender`.
 
     Args:
         user_id: WeChat user to send to
@@ -344,46 +263,7 @@ async def wechat_sender(user_id: str, context_token: str, messages: list[dict]) 
     Returns:
         Same messages with send_status added ("delivered" | "failed")
     """
-    if _bridge is None or not _bridge.token or not context_token:
-        for m in messages:
-            m["send_status"] = "failed"
-            m["send_error"] = "no_bridge"
-        return messages
-
-    wechat_cfg = cfg.get("wechat", {})
-    min_gap = float(wechat_cfg.get("message_delay", 0.8) or 0.8)
-    max_reply_delay = float(wechat_cfg.get("max_reply_delay", 3.0) or 3.0)
-
-    lock = _wechat_send_locks.setdefault(user_id, asyncio.Lock())
-    async with lock:
-        for i, m in enumerate(messages):
-            text = str(m.get("text", "")).strip()
-            if not text:
-                m["send_status"] = "blocked"
-                m["send_error"] = "empty text"
-                continue
-
-            delay = max(0.0, float(m.get("delay", 0) or 0))
-            if max_reply_delay:
-                delay = min(delay, max_reply_delay)
-
-            try:
-                elapsed = time.monotonic() - _wechat_last_send_at.get(user_id, 0.0)
-                gap_delay = max(min_gap - elapsed, 0.0)
-                await asyncio.sleep(max(delay, gap_delay))
-                await _bridge.send_text(user_id, text, context_token)
-                _wechat_last_send_at[user_id] = time.monotonic()
-                m["send_status"] = "delivered"
-            except Exception as e:
-                logger.error(f"wechat_sender: failed to send message[{i}]: {e}")
-                err_msg = str(e)[:200]
-                if "请稍后再试" in err_msg or "rate" in err_msg.lower():
-                    m["send_status"] = "rate_limited"
-                else:
-                    m["send_status"] = "failed"
-                m["send_error"] = err_msg
-
-    return messages
+    return await wechat_sender_service.send_batch(user_id, context_token, messages)
 
 # WeChat iLink bridge (lazy start if config.enabled)
 _bridge: WeChatBridge | None = None
@@ -404,6 +284,15 @@ if cfg.get("wechat", {}).get("enabled"):
         chat_request_timeout_seconds=wcfg.get("chat_request_timeout_seconds", 200.0),
     )
 
+# WeChat sender service — encapsulates batch sending logic (batch E).
+# bridge_getter returns the current _bridge so start/stop/redeploy cycles
+# are reflected without re-injection; config_getter returns the live
+# wechat config so runtime_settings updates take effect immediately.
+wechat_sender_service = WeChatSender(
+    bridge_getter=lambda: _bridge,
+    config_getter=lambda: cfg.get("wechat", {}),
+)
+
 task_scheduler = TaskScheduler(
     memory_store=memory_store,
     send_text=wechat_sender,
@@ -417,36 +306,9 @@ configure_runtime(task_scheduler=task_scheduler)
 # TODO: single-process only; multi-process / multi-replica needs a distributed lock
 # ================================================================
 
-_user_turn_locks: dict[str, asyncio.Lock] = {}
-_user_turn_lock_access: dict[str, float] = {}
-_MAX_USER_TURN_LOCKS = 512
+user_turns = UserTurnRegistry(max_locks=512)
+
 _USER_ID_RE = re.compile(r"^[A-Za-z0-9_.:@-]+$")
-
-# Maps user_id → latest inbound seq seen globally.
-_user_latest_inbound_seq: dict[str, int] = {}
-
-
-def _record_user_message_arrival(user_id: str, seq: int = 0) -> None:
-    """Record the latest inbound sequence for a user."""
-    if seq > 0:
-        current = _user_latest_inbound_seq.get(user_id, 0)
-        if seq > current:
-            _user_latest_inbound_seq[user_id] = seq
-
-
-def _make_interrupt_checker(user_id: str, input_latest_seq: int):
-    """Return a checker that detects a newer inbound message."""
-    def _check(_interrupt_token: str) -> bool:
-        latest_seq = _user_latest_inbound_seq.get(user_id, 0)
-        interrupted = latest_seq > input_latest_seq
-        if interrupted:
-            logging.getLogger("goal").info(
-                "interrupt_check: latest_seq=%d > input_latest_seq=%d -> interrupted=True",
-                latest_seq, input_latest_seq,
-            )
-        return interrupted
-
-    return _check
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -544,7 +406,24 @@ def _startup_validate() -> None:
     else:
         logger.info("Startup validation: all checks passed")
 
-    # 6. Weather provider credentials
+    # 6. Proactive runtime override visibility
+    config_proactive = load_config().get("proactive", {})
+    effective_proactive = cfg.get("proactive", {})
+    effective_enabled = bool(effective_proactive.get("enabled", True))
+    default_enabled = bool(config_proactive.get("enabled", True))
+    logger.info(
+        "proactive config: enabled=%s default_enabled=%s runtime_override_present=%s",
+        effective_enabled,
+        default_enabled,
+        "enabled" in (runtime_settings.get("proactive") or {}),
+    )
+    if default_enabled and not effective_enabled:
+        logger.warning(
+            "proactive.enabled is disabled by runtime settings; no proactive_speak "
+            "tasks will be scheduled"
+        )
+
+    # 7. Weather provider credentials
     weather_provider = str(cfg.get("weather", {}).get("provider", "")).strip()
     if weather_provider == "qweather":
         qw_key = os.getenv("QWEATHER_API_KEY", "")
@@ -618,35 +497,6 @@ def _normalize_chat_messages(body: dict[str, Any], api_cfg: dict[str, Any]) -> l
     return messages
 
 
-def _cleanup_user_locks(now: float | None = None) -> None:
-    if len(_user_turn_locks) <= _MAX_USER_TURN_LOCKS:
-        return
-    now = now or time.time()
-    stale_ids = sorted(
-        _user_turn_lock_access,
-        key=lambda uid: _user_turn_lock_access.get(uid, 0),
-    )
-    target = _MAX_USER_TURN_LOCKS // 2
-    for uid in stale_ids:
-        lock = _user_turn_locks.get(uid)
-        if lock is not None and lock.locked():
-            continue
-        _user_turn_locks.pop(uid, None)
-        _user_turn_lock_access.pop(uid, None)
-        if len(_user_turn_locks) <= target:
-            break
-
-
-def _get_user_lock(user_id: str) -> asyncio.Lock:
-    """Get or create a per-user async lock for turn ordering."""
-    now = time.time()
-    _cleanup_user_locks(now)
-    if user_id not in _user_turn_locks:
-        _user_turn_locks[user_id] = asyncio.Lock()
-    _user_turn_lock_access[user_id] = now
-    return _user_turn_locks[user_id]
-
-
 MAX_HISTORY_TURNS = cfg["conversation"].get("max_history_turns", 20)
 
 
@@ -707,41 +557,9 @@ def _admin_time(ts: Any) -> str:
     return time.strftime("%H:%M", time.localtime(value))
 
 
-def _route_label(route: str) -> str:
-    return {
-        "ordinary_chat": "普通聊天",
-    }.get(route or "", route or "未知")
-
-
-def _policy_label(policy: str) -> str:
-    return {
-        "short_term_history": "短期对话历史",
-    }.get(policy or "", policy or "无")
-
-
-def _send_status_label(status: str) -> str:
-    return {
-        "created": "已生成",
-        "generated": "已生成",
-        "sending": "发送中",
-        "delivered": "已送达",
-        "failed": "发送失败",
-    }.get(status or "", status or "未知")
-
-
-def _source_label(source: str) -> str:
-    return {
-        "wechat": "微信",
-        "user_reply": "用户回复",
-        "admin": "后台手动",
-    }.get(source or "", source or "未知")
-
-
 def apply_runtime_settings(updates: dict):
     """Persist and apply runtime-editable settings."""
-    _deep_update(runtime_settings, updates)
-    save_runtime_settings(runtime_settings)
-    _deep_update(cfg, updates)
+    runtime_config.apply_updates(updates)
     configure_tools(cfg)
     configure_runtime(memory_store=memory_store, long_term_memory=long_term_memory)
     chat_agent.defaults = {
@@ -797,82 +615,6 @@ def persist_wechat_deployment(token: str, base_url: str = ""):
         }
     }
     apply_runtime_settings(updates)
-
-
-def normalize_qr_payload(raw: dict) -> dict:
-    """Normalize the iLink QR response for the admin frontend."""
-    qrcode = (
-        raw.get("qrcode")
-        or raw.get("qr_code")
-        or raw.get("code")
-        or ""
-    )
-    image = (
-        raw.get("qrcode_img_content")
-        or raw.get("qrcode_img")
-        or raw.get("qrcode_url")
-        or raw.get("qr_code_url")
-        or raw.get("url")
-        or ""
-    )
-    qr_url = image or qrcode
-    svg = make_qr_svg(qr_url)
-    return {
-        "qrcode": qrcode,
-        "qrcode_content": qr_url,
-        "qrcode_img": image,
-        "qrcode_url": qr_url,
-        "qrcode_svg": svg,
-        "can_render_qr": bool(svg),
-        "status": raw.get("status", "wait"),
-        "raw_keys": sorted(raw.keys()),
-    }
-
-
-def make_qr_svg(content: str) -> str:
-    """Render a QR code SVG for the deployment URL.
-
-    iLink returns a WeChat liteapp URL, not an image. The browser needs an
-    actual QR image to scan, matching emoRebot's Next implementation.
-    """
-    if not content:
-        return ""
-    try:
-        import qrcode
-        from qrcode.image.svg import SvgPathImage
-    except Exception:
-        return ""
-
-    qr = qrcode.QRCode(
-        version=None,
-        error_correction=qrcode.constants.ERROR_CORRECT_M,
-        box_size=10,
-        border=2,
-    )
-    qr.add_data(content)
-    qr.make(fit=True)
-    img = qr.make_image(image_factory=SvgPathImage)
-    return img.to_string(encoding="unicode")
-
-
-def make_qr_png(content: str) -> bytes:
-    """Render QR content to PNG bytes for browsers that cannot use raw SVG."""
-    if not content:
-        return b""
-    import qrcode
-
-    qr = qrcode.QRCode(
-        version=None,
-        error_correction=qrcode.constants.ERROR_CORRECT_M,
-        box_size=10,
-        border=2,
-    )
-    qr.add_data(content)
-    qr.make(fit=True)
-    img = qr.make_image()
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
 
 
 # ================================================================
@@ -1009,7 +751,7 @@ async def admin_config(request: Request):
         "contact": contact,
         "send_ready": bool(
             outbound_available
-            and _contact_can_send_for_bot(contact, current_bot_id)
+            and contact_can_send_for_bot(contact, current_bot_id, PROCESS_STARTED_AT)
         ),
     }
 
@@ -1108,7 +850,7 @@ async def admin_send_message(request: Request):
             status_code=400,
             detail="还没有真实 iLink 会话。请部署后从手机给这个内置 bot 发一条消息。",
         )
-    block_reason = _contact_send_block_reason(contact, BOT_ID)
+    block_reason = contact_send_block_reason(contact, BOT_ID, PROCESS_STARTED_AT)
     if block_reason:
         raise HTTPException(
             status_code=400,
@@ -1155,7 +897,7 @@ async def _handle_proactive_trigger(
         logger.warning("proactive trigger skipped: no current contact for user=%s", user_id)
         return None
 
-    lock = _get_user_lock(user_id)
+    lock = user_turns.get_lock(user_id)
     async with lock:
         if conversation_ctx.user_id != user_id:
             conversation_ctx.user_id = user_id
@@ -1184,7 +926,12 @@ async def _handle_proactive_trigger(
             source="proactive_speak",
             wechat_sender=_bound_sender,
             input_latest_seq=trigger_seq,
-            protocol_event_writer=_build_protocol_event_writer(user_id, BOT_ID),
+            protocol_event_writer=ProtocolEventWriter(
+                store=memory_store,
+                context=conversation_ctx,
+                user_id=user_id,
+                bot_id=BOT_ID,
+            ).write,
             post_turn_hooks=_build_chatagent_post_turn_hooks(
                 user_id=user_id,
                 bot_id=BOT_ID,
@@ -1207,19 +954,6 @@ async def _handle_proactive_trigger(
 
 
 task_scheduler.set_proactive_callback(_handle_proactive_trigger)
-
-
-def _visible_messages_as_dicts(turn: TurnScratchpad) -> list[dict[str, Any]]:
-    """Convert VisibleMessage list to backward-compat dict list."""
-    return [
-        {
-            "text": vm.guarded_text or vm.original_text,
-            "delay": vm.delay,
-            "send_status": vm.delivery_status,
-            "delivery_status": vm.delivery_status,
-        }
-        for vm in turn.visible_messages
-    ]
 
 
 # Compression logic lives in agent/compressor.py (maybe_compress_daily, compress_conversation).
@@ -1306,56 +1040,19 @@ async def _run_compression(
     }
 
 
-def _build_protocol_event_writer(user_id: str, bot_id: str):
-    """Persist raw events incrementally and update ConversationContext."""
-    async def _writer(
-        turn: TurnScratchpad,
-        event_type: str,
-        payload: dict[str, Any],
-    ) -> None:
-        cid = f"{user_id}:{bot_id}"
-        if event_type == "turn_started":
-            user_message = payload.get("user_message")
-            await memory_store.begin_turn(
-                turn_id=turn.turn_id,
-                conversation_id=cid,
-                user_message=None if user_message is None else str(user_message),
-                source=turn.source,
-                turn_type=turn.source if turn.source != "user_message" else "user_chat",
-            )
-            if user_message:
-                conversation_ctx.add_event("user", str(user_message))
-            return
+# Daily compression runner — orchestrates background compression for the
+# current bot contact (batch F).  The compression algorithm stays in
+# agent/compressor.py; this runner only handles contact lookup, per-user
+# locking, and context rebuild.
+daily_compression_runner = DailyCompressionRunner(
+    store=memory_store,
+    context=conversation_ctx,
+    user_turns=user_turns,
+    run_compression=lambda user_id, bot_id: _run_compression(user_id, bot_id, force=False),
+    default_bot_id=BOT_ID,
+)
 
-        if event_type == "message":
-            message = payload.get("message") or {}
-            role = str(message.get("role", ""))
-            content = message.get("content")
-            await memory_store.append_event(
-                turn_id=turn.turn_id,
-                role=role,
-                content=content,
-                call_id=str(payload.get("call_id", "")),
-            )
-            # Also append to in-memory context
-            conversation_ctx.add_event(role, content)
-            return
-
-        if event_type == "turn_finished":
-            terminal = str(payload.get("terminal_state", ""))
-            status = "completed" if terminal in {TurnState.END_REPLIED.value} else terminal
-            await memory_store.finish_turn(
-                turn_id=turn.turn_id,
-                status=status,
-                token_count=turn.token_usage.get("total_tokens", 0),
-                elapsed_ms=turn.elapsed_ms,
-                prompt_tokens_peak=turn.token_usage.get("peak_prompt_tokens", 0),
-                context_window_tokens=turn.context_window_tokens,
-                model_name=turn.model_name,
-                usage_estimated=bool(turn.token_usage.get("estimated", False)),
-            )
-
-    return _writer
+task_scheduler.set_daily_compression_callback(daily_compression_runner.run_current_contact)
 
 
 def _build_chatagent_post_turn_hooks(
@@ -1370,42 +1067,10 @@ def _build_chatagent_post_turn_hooks(
 ) -> list:
     """Return a list of PostTerminalCallback hooks for ChatAgent.
 
-    Each hook receives (turn: TurnScratchpad, terminal_state: TurnState).
-    Individual failures are caught inside each hook and logged.
-    send_status is computed from terminal_state inside _hook_dev_logs.
+    Composed of:
+      - generic observability hooks (dev-logs + model-attempt-log) from runtime.turn_hooks
+      - a local proactive-scheduling hook (captures task_scheduler)
     """
-
-    async def _hook_dev_logs(turn: TurnScratchpad, terminal_state: TurnState) -> None:
-        visible = _visible_messages_as_dicts(turn)
-        delivered_count = sum(
-            1 for m in visible
-            if (m.get("send_status") in _IS_DELIVERED
-                or m.get("delivery_status") in _IS_DELIVERED)
-        )
-        token_count = turn.token_usage.get("total_tokens", 0)
-        logger.info(
-            "[%s] turn=%s terminal=%s delivered=%d "
-            "tool_results=%d iterations=%d elapsed_ms=%d tokens=%d",
-            user_id, turn.turn_id, terminal_state.value,
-            delivered_count, len(turn.tool_results),
-            turn.llm_call_count, turn.elapsed_ms, token_count,
-        )
-
-    async def _hook_model_attempt_log(turn: TurnScratchpad, terminal_state: TurnState) -> None:
-        for attempt in turn.model_attempts:
-            logger.info(
-                "model_attempt: index=%d model=%s/%s mode=%s reason=%s "
-                "latency=%dms result=%s error=%s upgraded_from=%s",
-                attempt.attempt_index,
-                attempt.selected_model,
-                attempt.model_name,
-                attempt.routing_mode,
-                attempt.routing_reason,
-                attempt.latency_ms,
-                attempt.result_type,
-                attempt.error_type,
-                attempt.upgraded_from,
-            )
 
     async def _hook_proactive_schedule(turn: TurnScratchpad, terminal_state: TurnState) -> None:
         delivered = sum(
@@ -1433,11 +1098,14 @@ def _build_chatagent_post_turn_hooks(
             )
             logger.info("proactive schedule commit user=%s result=%s", user_id, result)
 
-    return [
-        _hook_dev_logs,
-        _hook_model_attempt_log,
-        _hook_proactive_schedule,
-    ]
+    return build_observability_hooks(
+        user_id=user_id,
+        bot_id=bot_id,
+        route=route,
+        context_policy=context_policy,
+        raw_messages=raw_messages,
+        memory_store=memory_store,
+    ) + [_hook_proactive_schedule]
 
 
 @app.post("/chat")
@@ -1505,8 +1173,8 @@ async def chat(request: Request):
         f"seq={input_first_seq}-{input_latest_seq} count={len(input_message_ids)}"
     )
 
-    _record_user_message_arrival(user_id, seq=input_latest_seq)
-    lock = _get_user_lock(user_id)
+    user_turns.record_arrival(user_id, seq=input_latest_seq)
+    lock = user_turns.get_lock(user_id)
     turn_id = ""
     send_status = ""
     try:
@@ -1540,7 +1208,7 @@ async def chat(request: Request):
             async def _bound_sender(messages: list[dict]) -> list[dict]:
                 return await wechat_sender(user_id, context_token, messages)
 
-            interrupt_checker = _make_interrupt_checker(user_id, input_latest_seq)
+            interrupt_checker = user_turns.make_interrupt_checker(user_id, input_latest_seq)
 
             _hook_cbs = _build_chatagent_post_turn_hooks(
                 user_id=user_id, bot_id=bot_id,
@@ -1564,7 +1232,12 @@ async def chat(request: Request):
                 input_cutoff_time=input_cutoff_time,
                 interrupt_checker=interrupt_checker,
                 post_turn_hooks=_hook_cbs,
-                protocol_event_writer=_build_protocol_event_writer(user_id, bot_id),
+                protocol_event_writer=ProtocolEventWriter(
+                    store=memory_store,
+                    context=conversation_ctx,
+                    user_id=user_id,
+                    bot_id=bot_id,
+                ).write,
                 idle_seconds=idle_seconds,
             )
 
@@ -1862,7 +1535,7 @@ async def developer_compress_now(request: Request):
         raise HTTPException(status_code=400, detail="还没有微信联系人记录")
 
     logger.info("Manual compression triggered for %s", user_id)
-    lock = _get_user_lock(user_id)
+    lock = user_turns.get_lock(user_id)
     async with lock:
         return await _run_compression(user_id, "default", force=True)
 
@@ -1888,7 +1561,7 @@ async def developer_reset_context(request: Request):
             "long_term_memory": {"files": 0},
             "kept": ["bot_contact_state"],
         }
-    lock = _get_user_lock(user_id)
+    lock = user_turns.get_lock(user_id)
     async with lock:
         clear_receipt = await long_term_memory.stage_clear(user_id)
         try:
@@ -1925,7 +1598,7 @@ async def admin_list_memories(request: Request):
     user_id = str(contact.get("user_id", "") or "").strip()
     if not user_id:
         raise HTTPException(status_code=400, detail="还没有微信联系人记录")
-    lock = _get_user_lock(user_id)
+    lock = user_turns.get_lock(user_id)
     async with lock:
         result = long_term_memory.diagnostics(user_id)
     return {
@@ -1942,7 +1615,7 @@ async def admin_get_memory(filename: str, request: Request):
     user_id = str(contact.get("user_id", "") or "").strip()
     if not user_id:
         raise HTTPException(status_code=400, detail="还没有微信联系人记录")
-    lock = _get_user_lock(user_id)
+    lock = user_turns.get_lock(user_id)
     async with lock:
         try:
             result = long_term_memory.view(user_id, filename)
@@ -1961,7 +1634,7 @@ async def admin_delete_memory(filename: str, request: Request):
     user_id = str(contact.get("user_id", "") or "").strip()
     if not user_id:
         raise HTTPException(status_code=400, detail="还没有微信联系人记录")
-    lock = _get_user_lock(user_id)
+    lock = user_turns.get_lock(user_id)
     async with lock:
         try:
             result = await long_term_memory.delete_for_admin(user_id, filename)
@@ -2110,7 +1783,7 @@ async def admin_logs(
     require_admin(request)
     logging_cfg = cfg.get("logging", {})
     log_path = logging_cfg.get("file", "./data/agent.log")
-    return _read_recent_log_lines(
+    return read_recent_log_lines(
         log_path=log_path,
         limit=limit,
         level=level,
@@ -2128,12 +1801,12 @@ async def _send_message_batch(
     context_token: str,
     messages: list[dict],
 ):
-    """Send a normalized message list through the active WeChat bridge."""
-    if _bridge is None:
-        raise RuntimeError("WeChat bridge is not configured")
-    if not context_token:
-        raise RuntimeError("missing iLink context_token")
+    """Send a normalized message list through the active WeChat bridge.
 
+    Thin wrapper around ``wechat_sender_service.send_admin_batch`` — guard
+    application stays here (main.py owns the agent-layer guard functions),
+    while the core sending loop lives in :class:`bridge.sender.WeChatSender`.
+    """
     non_empty = [
         m for m in messages
         if isinstance(m, dict) and str(m.get("text", "")).strip()
@@ -2148,44 +1821,22 @@ async def _send_message_batch(
         logger.warning("All messages filtered by guard, skipping WeChat send")
         return
 
-    min_gap = float(cfg.get("wechat", {}).get("message_delay", 1.2) or 1.2)
-    max_reply_delay = float(cfg.get("wechat", {}).get("max_reply_delay", 3.0) or 3.0)
-    for i, m in enumerate(guarded):
-        text = guard_single_message(m.get("text", ""))
-        if not text:
-            continue
-        delay = max(float(m.get("delay", 0) or 0), 0.0)
-        if max_reply_delay:
-            delay = min(delay, max_reply_delay)
-        if i == 0:
-            await asyncio.sleep(max(delay, 0))
-        else:
-            await asyncio.sleep(max(delay, min_gap))
-        await _bridge.send_text(user_id, text, context_token)
+    wcfg = cfg.get("wechat", {})
+    min_gap = float(wcfg.get("message_delay", 1.2) or 1.2)
+    max_reply_delay = float(wcfg.get("max_reply_delay", 3.0) or 3.0)
+    await wechat_sender_service.send_admin_batch(
+        user_id,
+        context_token,
+        guarded,
+        min_gap=min_gap,
+        max_reply_delay=max_reply_delay,
+        text_guard=guard_single_message,
+    )
 
 
 # ================================================================
 # Contact send helpers
 # ================================================================
-
-
-def _contact_send_block_reason(contact: dict[str, Any], bot_id: str) -> str:
-    """Return why a stored WeChat contact cannot receive current-bot sends."""
-    if not contact.get("user_id"):
-        return "no contact"
-    if not contact.get("context_token"):
-        return "missing context_token"
-    contact_bot = str(contact.get("bot_id", "") or "")
-    if contact_bot != bot_id:
-        return "bot not bound"
-    updated_at = float(contact.get("updated_at") or 0)
-    if updated_at < PROCESS_STARTED_AT:
-        return "stale contact binding"
-    return ""
-
-
-def _contact_can_send_for_bot(contact: dict[str, Any], bot_id: str) -> bool:
-    return _contact_send_block_reason(contact, bot_id) == ""
 
 
 # ================================================================

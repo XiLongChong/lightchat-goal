@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 from apscheduler.jobstores.memory import MemoryJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 from agent.output_guard import guard_single_message
 
@@ -19,6 +20,7 @@ logger = logging.getLogger("runtime")
 
 Sender = Callable[[str, str, list[dict[str, Any]]], Awaitable[list[dict[str, Any]]]]
 ProactiveCallback = Callable[[str, int, str | None, int | None], Awaitable[Any]]
+DailyCompressionCallback = Callable[[], Awaitable[dict[str, Any] | None]]
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
@@ -49,6 +51,7 @@ class TaskScheduler:
         max_attempts: int = 3,
         proactive_callback: ProactiveCallback | None = None,
         proactive_config_getter: Callable[[], dict[str, Any]] | None = None,
+        daily_compression_callback: DailyCompressionCallback | None = None,
     ) -> None:
         self._store = memory_store
         self._send_text = send_text
@@ -56,6 +59,7 @@ class TaskScheduler:
         self._max_attempts = max_attempts
         self._proactive_callback = proactive_callback
         self._proactive_config_getter = proactive_config_getter
+        self._daily_compression_callback = daily_compression_callback
         self._scheduler = AsyncIOScheduler(
             jobstores={"default": MemoryJobStore()},
             job_defaults={
@@ -68,6 +72,7 @@ class TaskScheduler:
         if not self._scheduler.running:
             self._scheduler.start()
         await self._recover_tasks()
+        self._schedule_daily_compression()
         logger.info("TaskScheduler started")
 
     async def stop(self) -> None:
@@ -147,6 +152,42 @@ class TaskScheduler:
 
     def set_proactive_callback(self, callback: ProactiveCallback | None) -> None:
         self._proactive_callback = callback
+
+    def set_daily_compression_callback(
+        self,
+        callback: DailyCompressionCallback | None,
+    ) -> None:
+        self._daily_compression_callback = callback
+
+    def _schedule_daily_compression(self) -> None:
+        if self._daily_compression_callback is None:
+            return
+        timezone_name = "Asia/Shanghai"
+        self._scheduler.add_job(
+            self._run_daily_compression,
+            CronTrigger(hour=3, minute=56, timezone=timezone_name),
+            id="daily_compression_0356",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+        )
+        self._scheduler.add_job(
+            self._run_daily_compression,
+            CronTrigger(hour=4, minute="1,6,11,16,21", timezone=timezone_name),
+            id="daily_compression_0401_0421",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+        )
+
+    async def _run_daily_compression(self) -> None:
+        if self._daily_compression_callback is None:
+            return
+        try:
+            result = await self._daily_compression_callback()
+            logger.info("daily compression trigger result=%s", result)
+        except Exception:
+            logger.exception("daily compression trigger failed")
 
     def _proactive_config(self) -> dict[str, Any]:
         if self._proactive_config_getter is None:
