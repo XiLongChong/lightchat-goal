@@ -1499,7 +1499,62 @@ async def api_send_message(request: Request):
             ],
         }
 
-    # ── persist user message ─────────────────────────────────────
+    # ── attached-session callback path ───────────────────────────────
+    if resolved["target"] == "attached_session":
+        callback_replies = await _call_attached_session_callback(
+            resolved, client_message_id, content,
+        )
+
+        # Persist user message + replies after successful callback
+        turn_id = f"app_turn_{uuid.uuid4().hex[:12]}"
+        user_remote_id = f"app_rm_user_{uuid.uuid4().hex[:12]}"
+        now_ts = time.time()
+        await memory_store.insert_app_message(
+            remote_id=user_remote_id,
+            client_message_id=client_message_id,
+            role="user",
+            content=content,
+            source_turn_id=turn_id,
+            sequence=0,
+            remote_agent_id=remote_agent_id,
+        )
+
+        agent_replies: list[dict[str, Any]] = []
+        for seq, reply in enumerate(callback_replies, start=1):
+            reply_id = reply.get("remoteId") or f"app_rm_agent_{uuid.uuid4().hex[:12]}"
+            reply_text = reply["content"]
+            reply_created_at = reply.get("createdAt") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            agent_replies.append({
+                "remoteId": reply_id,
+                "content": reply_text,
+                "createdAt": reply_created_at,
+            })
+            await memory_store.insert_app_message(
+                remote_id=reply_id,
+                client_message_id=None,
+                role="agent",
+                content=reply_text,
+                source_turn_id=turn_id,
+                sequence=seq,
+                remote_agent_id=remote_agent_id,
+            )
+
+        logger.info(
+            "[app] callback turn=%s user_remote=%s agent_replies=%d",
+            turn_id, user_remote_id, len(agent_replies),
+        )
+
+        return {
+            "userMessage": {
+                "remoteId": user_remote_id,
+                "clientMessageId": client_message_id,
+                "status": "sent",
+                "createdAt": _iso_from_ts(now_ts),
+            },
+            "agentReplies": agent_replies,
+        }
+
+    # ── persist user message (internal agent) ───────────────────────
     turn_id = f"app_turn_{uuid.uuid4().hex[:12]}"
     user_remote_id = f"app_rm_user_{uuid.uuid4().hex[:12]}"
     now_ts = time.time()
@@ -1562,7 +1617,7 @@ async def api_send_message(request: Request):
     # Only SENT_CONFIRMED / delivered send_text_message outputs become
     # agentReplies.  Assistant final text, thinking, tool_result, and
     # non-send tools are ignored.
-    agent_replies: list[dict[str, Any]] = []
+    agent_replies_internal: list[dict[str, Any]] = []
     seq = 1
     for vm in result.visible_messages:
         is_delivered = (
@@ -1572,7 +1627,7 @@ async def api_send_message(request: Request):
         if is_delivered:
             reply_id = f"app_rm_agent_{uuid.uuid4().hex[:12]}"
             reply_text = str(vm.get("text", ""))
-            agent_replies.append({
+            agent_replies_internal.append({
                 "remoteId": reply_id,
                 "content": reply_text,
                 "createdAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -1590,7 +1645,7 @@ async def api_send_message(request: Request):
 
     logger.info(
         "[app] turn=%s user_remote=%s agent_replies=%d elapsed_ms=%d",
-        turn_id, user_remote_id, len(agent_replies), result.elapsed_ms,
+        turn_id, user_remote_id, len(agent_replies_internal), result.elapsed_ms,
     )
 
     return {
@@ -1600,7 +1655,7 @@ async def api_send_message(request: Request):
             "status": "sent",
             "createdAt": _iso_from_ts(now_ts),
         },
-        "agentReplies": agent_replies,
+        "agentReplies": agent_replies_internal,
     }
 
 
@@ -1768,7 +1823,124 @@ def _iso_from_ts(ts: float) -> str:
         return datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-# ── attached session callback validation (v1 spec, not wired yet) ───
+# ── attached session callback forwarding (v1) ──────────────────────
+
+import httpx
+
+_CALLBACK_TIMEOUT_S = 55.0  # matches _APP_AGENT_TIMEOUT_S
+
+
+def _build_session_callback_url(callback_url: str) -> str:
+    """Append ``/api/app-session/messages`` to *callback_url*, stripping trailing slash."""
+    return f"{callback_url.rstrip('/')}/api/app-session/messages"
+
+
+async def _call_attached_session_callback(
+    resolved: dict,
+    client_message_id: str,
+    content: str,
+) -> list[dict[str, Any]]:
+    """POST to the attached session's callback endpoint and return validated replies.
+
+    Raises ``HTTPException`` with appropriate status/detail on any failure.
+    Returns a list of reply dicts (may be empty).
+    """
+    callback_url = _build_session_callback_url(resolved["callbackUrl"])
+    payload = {
+        "remoteAgentId": resolved["remoteAgentId"],
+        "sessionId": resolved["sessionId"],
+        "clientMessageId": client_message_id,
+        "content": content,
+        "createdAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=_CALLBACK_TIMEOUT_S) as client:
+            resp = await client.post(callback_url, json=payload)
+    except httpx.TimeoutException:
+        logger.warning(
+            "[app] callback timeout sessionId=%s url=%s",
+            resolved["sessionId"], callback_url,
+        )
+        raise HTTPException(
+            status_code=504,
+            detail=json.dumps({
+                "error": {
+                    "code": "agent_session_callback_timeout",
+                    "message": "Agent session callback timed out",
+                },
+            }),
+        )
+    except Exception as exc:
+        logger.warning(
+            "[app] callback network error sessionId=%s url=%s err=%s",
+            resolved["sessionId"], callback_url, exc,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=json.dumps({
+                "error": {
+                    "code": "agent_session_callback_error",
+                    "message": "Agent session callback network error",
+                },
+            }),
+        )
+
+    if resp.status_code < 200 or resp.status_code >= 300:
+        logger.warning(
+            "[app] callback non-2xx sessionId=%s status=%d body=%s",
+            resolved["sessionId"], resp.status_code,
+            resp.text[:500] if resp.text else "",
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=json.dumps({
+                "error": {
+                    "code": "agent_session_callback_failed",
+                    "message": f"Agent session returned HTTP {resp.status_code}",
+                },
+            }),
+        )
+
+    # Parse and validate response body
+    try:
+        body = resp.json()
+    except Exception:
+        logger.warning(
+            "[app] callback invalid JSON sessionId=%s body=%s",
+            resolved["sessionId"],
+            resp.text[:500] if resp.text else "",
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=json.dumps({
+                "error": {
+                    "code": "agent_session_callback_invalid_response",
+                    "message": "Agent session returned invalid JSON",
+                },
+            }),
+        )
+
+    validated = validate_callback_response(body)
+    if not validated["ok"]:
+        logger.warning(
+            "[app] callback invalid response shape sessionId=%s error=%s",
+            resolved["sessionId"], validated["error"],
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=json.dumps({
+                "error": {
+                    "code": "agent_session_callback_invalid_response",
+                    "message": "Agent session response does not match v1 contract",
+                },
+            }),
+        )
+
+    return validated["replies"]
+
+
+# ── attached session callback validation (v1 spec) ──────────────────
 
 
 def validate_callback_response(body: Any) -> dict[str, Any]:

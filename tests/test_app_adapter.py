@@ -2295,3 +2295,1162 @@ def test_validate_callback_multiple_replies():
     })
     assert result["ok"] is True
     assert len(result["replies"]) == 3
+
+
+# ================================================================
+# Callback URL builder tests
+# ================================================================
+
+
+def test_build_session_callback_url_with_trailing_slash():
+    from main import _build_session_callback_url
+
+    url = _build_session_callback_url("http://127.0.0.1:9010/")
+    assert url == "http://127.0.0.1:9010/api/app-session/messages"
+
+
+def test_build_session_callback_url_without_trailing_slash():
+    from main import _build_session_callback_url
+
+    url = _build_session_callback_url("http://127.0.0.1:9010")
+    assert url == "http://127.0.0.1:9010/api/app-session/messages"
+
+
+# ================================================================
+# Callback forwarding — success path tests
+# ================================================================
+
+
+@pytest.mark.asyncio
+async def test_callback_success_returns_user_message_and_replies(monkeypatch):
+    """Attached session callback success returns userMessage + agentReplies."""
+    import uuid as _uuid
+    import httpx
+    from unittest.mock import AsyncMock, MagicMock
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"cc-ok-{_uuid.uuid4().hex[:8]}"
+    app_agent_session_registry._sessions["s1"] = {
+        "sessionId": "s1",
+        "remoteAgentId": rid,
+        "displayName": "OK CC",
+        "description": "desc",
+        "status": "online",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "expiresAt": None,
+        "callbackUrl": "http://127.0.0.1:19010",
+        "sourceLabel": None,
+    }
+
+    cid = f"cm-ok-{_uuid.uuid4().hex[:8]}"
+
+    # Mock httpx.AsyncClient to return a valid callback response
+    fake_resp = MagicMock()
+    fake_resp.status_code = 200
+    fake_resp.json.return_value = {
+        "agentReplies": [
+            {"content": "你好，我在。", "remoteId": f"session-rm-{_uuid.uuid4().hex[:8]}"},
+            {"content": "有什么可以帮你的？"},
+        ],
+    }
+
+    class _FakeClientCtx:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            client = MagicMock()
+            client.post = AsyncMock(return_value=fake_resp)
+            return client
+
+        async def __aexit__(self, *args):
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClientCtx)
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {
+                "clientMessageId": cid,
+                "content": "你好",
+                "remoteAgentId": rid,
+            }
+
+    from main import api_send_message
+
+    result = await api_send_message(FakeRequest())
+    assert "userMessage" in result
+    assert result["userMessage"]["clientMessageId"] == cid
+    assert result["userMessage"]["status"] == "sent"
+    assert len(result["agentReplies"]) == 2
+    assert result["agentReplies"][0]["content"] == "你好，我在。"
+    assert result["agentReplies"][1]["content"] == "有什么可以帮你的？"
+
+
+@pytest.mark.asyncio
+async def test_callback_success_writes_messages_under_remote_agent_id(monkeypatch):
+    """Callback success persists user + agent messages under the correct remote_agent_id."""
+    import uuid as _uuid
+    import httpx
+    from unittest.mock import AsyncMock, MagicMock
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg, memory_store
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"cc-write-{_uuid.uuid4().hex[:8]}"
+    app_agent_session_registry._sessions["s1"] = {
+        "sessionId": "s1",
+        "remoteAgentId": rid,
+        "displayName": "Write CC",
+        "description": "desc",
+        "status": "online",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "expiresAt": None,
+        "callbackUrl": "http://127.0.0.1:19010",
+        "sourceLabel": None,
+    }
+
+    cid = f"cm-write-{_uuid.uuid4().hex[:8]}"
+
+    fake_resp = MagicMock()
+    fake_resp.status_code = 200
+    fake_resp.json.return_value = {
+        "agentReplies": [{"content": "stored reply"}],
+    }
+
+    class _FakeClientCtx:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            client = MagicMock()
+            client.post = AsyncMock(return_value=fake_resp)
+            return client
+
+        async def __aexit__(self, *args):
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClientCtx)
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {
+                "clientMessageId": cid,
+                "content": "hello",
+                "remoteAgentId": rid,
+            }
+
+    from main import api_send_message
+
+    result = await api_send_message(FakeRequest())
+    assert len(result["agentReplies"]) == 1
+
+    # Verify storage
+    found = await memory_store.find_app_message_by_client_message_id(
+        cid, remote_agent_id=rid,
+    )
+    assert found is not None
+    assert found["remote_agent_id"] == rid
+    assert found["content"] == "hello"
+
+    # Verify GET returns these messages
+    msgs, _, _ = await memory_store.get_app_messages_after_cursor(
+        remote_agent_id=rid,
+    )
+    assert len(msgs) >= 2  # user + agent
+
+
+@pytest.mark.asyncio
+async def test_callback_receives_correct_payload(monkeypatch):
+    """Callback POST body includes remoteAgentId, sessionId, clientMessageId, content, createdAt."""
+    import uuid as _uuid
+    import httpx
+    from unittest.mock import AsyncMock, MagicMock
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"cc-payload-{_uuid.uuid4().hex[:8]}"
+    app_agent_session_registry._sessions["s1"] = {
+        "sessionId": "s1",
+        "remoteAgentId": rid,
+        "displayName": "Payload CC",
+        "description": "desc",
+        "status": "online",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "expiresAt": None,
+        "callbackUrl": "http://127.0.0.1:19010",
+        "sourceLabel": None,
+    }
+
+    cid = f"cm-payload-{_uuid.uuid4().hex[:8]}"
+
+    captured_payload = {}
+
+    fake_resp = MagicMock()
+    fake_resp.status_code = 200
+    fake_resp.json.return_value = {
+        "agentReplies": [{"content": "got it"}],
+    }
+
+    class _FakeClientCtx:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            client = MagicMock()
+
+            async def _capture_post(url, json=None, **kw):
+                nonlocal captured_payload
+                captured_payload["url"] = url
+                captured_payload["json"] = json
+                return fake_resp
+
+            client.post = _capture_post
+            return client
+
+        async def __aexit__(self, *args):
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClientCtx)
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {
+                "clientMessageId": cid,
+                "content": "hello session",
+                "remoteAgentId": rid,
+            }
+
+    from main import api_send_message
+
+    await api_send_message(FakeRequest())
+
+    assert captured_payload["url"] == "http://127.0.0.1:19010/api/app-session/messages"
+    assert captured_payload["json"]["remoteAgentId"] == rid
+    assert captured_payload["json"]["sessionId"] == "s1"
+    assert captured_payload["json"]["clientMessageId"] == cid
+    assert captured_payload["json"]["content"] == "hello session"
+    assert captured_payload["json"]["createdAt"].endswith("Z")
+
+
+@pytest.mark.asyncio
+async def test_callback_empty_reply_content_skipped(monkeypatch):
+    """Empty/whitespace reply content is skipped."""
+    import uuid as _uuid
+    import httpx
+    from unittest.mock import AsyncMock, MagicMock
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"cc-empty-{_uuid.uuid4().hex[:8]}"
+    app_agent_session_registry._sessions["s1"] = {
+        "sessionId": "s1",
+        "remoteAgentId": rid,
+        "displayName": "Empty CC",
+        "description": "desc",
+        "status": "online",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "expiresAt": None,
+        "callbackUrl": "http://127.0.0.1:19010",
+        "sourceLabel": None,
+    }
+
+    cid = f"cm-empty-{_uuid.uuid4().hex[:8]}"
+
+    fake_resp = MagicMock()
+    fake_resp.status_code = 200
+    fake_resp.json.return_value = {
+        "agentReplies": [
+            {"content": ""},
+            {"content": "  "},
+            {"content": "valid reply"},
+        ],
+    }
+
+    class _FakeClientCtx:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            client = MagicMock()
+            client.post = AsyncMock(return_value=fake_resp)
+            return client
+
+        async def __aexit__(self, *args):
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClientCtx)
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {
+                "clientMessageId": cid,
+                "content": "hi",
+                "remoteAgentId": rid,
+            }
+
+    from main import api_send_message
+
+    result = await api_send_message(FakeRequest())
+    assert len(result["agentReplies"]) == 1
+    assert result["agentReplies"][0]["content"] == "valid reply"
+
+
+@pytest.mark.asyncio
+async def test_callback_missing_remote_id_gets_generated(monkeypatch):
+    """Missing reply remoteId gets a server-generated app_rm_agent_xxx."""
+    import uuid as _uuid
+    import httpx
+    from unittest.mock import AsyncMock, MagicMock
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"cc-genid-{_uuid.uuid4().hex[:8]}"
+    app_agent_session_registry._sessions["s1"] = {
+        "sessionId": "s1",
+        "remoteAgentId": rid,
+        "displayName": "GenId CC",
+        "description": "desc",
+        "status": "online",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "expiresAt": None,
+        "callbackUrl": "http://127.0.0.1:19010",
+        "sourceLabel": None,
+    }
+
+    cid = f"cm-genid-{_uuid.uuid4().hex[:8]}"
+
+    fake_resp = MagicMock()
+    fake_resp.status_code = 200
+    fake_resp.json.return_value = {
+        "agentReplies": [{"content": "no remoteId"}],
+    }
+
+    class _FakeClientCtx:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            client = MagicMock()
+            client.post = AsyncMock(return_value=fake_resp)
+            return client
+
+        async def __aexit__(self, *args):
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClientCtx)
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {
+                "clientMessageId": cid,
+                "content": "hi",
+                "remoteAgentId": rid,
+            }
+
+    from main import api_send_message
+
+    result = await api_send_message(FakeRequest())
+    assert len(result["agentReplies"]) == 1
+    assert result["agentReplies"][0]["remoteId"].startswith("app_rm_agent_")
+    assert result["agentReplies"][0]["content"] == "no remoteId"
+
+
+@pytest.mark.asyncio
+async def test_callback_missing_created_at_gets_server_timestamp(monkeypatch):
+    """Missing reply createdAt gets server current UTC Z time."""
+    import uuid as _uuid
+    import httpx
+    from unittest.mock import AsyncMock, MagicMock
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"cc-nots-{_uuid.uuid4().hex[:8]}"
+    app_agent_session_registry._sessions["s1"] = {
+        "sessionId": "s1",
+        "remoteAgentId": rid,
+        "displayName": "NoTs CC",
+        "description": "desc",
+        "status": "online",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "expiresAt": None,
+        "callbackUrl": "http://127.0.0.1:19010",
+        "sourceLabel": None,
+    }
+
+    cid = f"cm-nots-{_uuid.uuid4().hex[:8]}"
+
+    fake_resp = MagicMock()
+    fake_resp.status_code = 200
+    fake_resp.json.return_value = {
+        "agentReplies": [{"content": "no timestamp"}],
+    }
+
+    class _FakeClientCtx:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            client = MagicMock()
+            client.post = AsyncMock(return_value=fake_resp)
+            return client
+
+        async def __aexit__(self, *args):
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClientCtx)
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {
+                "clientMessageId": cid,
+                "content": "hi",
+                "remoteAgentId": rid,
+            }
+
+    from main import api_send_message
+
+    result = await api_send_message(FakeRequest())
+    assert len(result["agentReplies"]) == 1
+    assert result["agentReplies"][0]["createdAt"].endswith("Z")
+
+
+# ================================================================
+# Callback forwarding — failure path tests
+# ================================================================
+
+
+@pytest.mark.asyncio
+async def test_callback_non_2xx_returns_502_no_insert(monkeypatch):
+    """Callback returning non-2xx → 502, no app_messages inserted."""
+    import uuid as _uuid
+    import httpx
+    from unittest.mock import AsyncMock, MagicMock
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg, memory_store
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"cc-502-{_uuid.uuid4().hex[:8]}"
+    app_agent_session_registry._sessions["s1"] = {
+        "sessionId": "s1",
+        "remoteAgentId": rid,
+        "displayName": "Fail CC",
+        "description": "desc",
+        "status": "online",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "expiresAt": None,
+        "callbackUrl": "http://127.0.0.1:19010",
+        "sourceLabel": None,
+    }
+
+    cid = f"cm-502-{_uuid.uuid4().hex[:8]}"
+
+    fake_resp = MagicMock()
+    fake_resp.status_code = 500
+    fake_resp.text = "Internal Server Error"
+
+    class _FakeClientCtx:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            client = MagicMock()
+            client.post = AsyncMock(return_value=fake_resp)
+            return client
+
+        async def __aexit__(self, *args):
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClientCtx)
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {
+                "clientMessageId": cid,
+                "content": "hello",
+                "remoteAgentId": rid,
+            }
+
+    from main import api_send_message
+
+    with pytest.raises(HTTPException) as exc:
+        await api_send_message(FakeRequest())
+    assert exc.value.status_code == 502
+
+    # Verify no message was inserted
+    found = await memory_store.find_app_message_by_client_message_id(
+        cid, remote_agent_id=rid,
+    )
+    assert found is None
+
+
+@pytest.mark.asyncio
+async def test_callback_timeout_returns_504_no_insert(monkeypatch):
+    """Callback timeout → 504, no app_messages inserted."""
+    import uuid as _uuid
+    import httpx
+    from unittest.mock import AsyncMock, MagicMock
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg, memory_store
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"cc-timeout-{_uuid.uuid4().hex[:8]}"
+    app_agent_session_registry._sessions["s1"] = {
+        "sessionId": "s1",
+        "remoteAgentId": rid,
+        "displayName": "Timeout CC",
+        "description": "desc",
+        "status": "online",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "expiresAt": None,
+        "callbackUrl": "http://127.0.0.1:19010",
+        "sourceLabel": None,
+    }
+
+    cid = f"cm-timeout-{_uuid.uuid4().hex[:8]}"
+
+    class _FakeClientCtx:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            client = MagicMock()
+
+            async def _raise_timeout(*args, **kwargs):
+                raise httpx.TimeoutException("timed out")
+
+            client.post = _raise_timeout
+            return client
+
+        async def __aexit__(self, *args):
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClientCtx)
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {
+                "clientMessageId": cid,
+                "content": "hello",
+                "remoteAgentId": rid,
+            }
+
+    from main import api_send_message
+
+    with pytest.raises(HTTPException) as exc:
+        await api_send_message(FakeRequest())
+    assert exc.value.status_code == 504
+
+    found = await memory_store.find_app_message_by_client_message_id(
+        cid, remote_agent_id=rid,
+    )
+    assert found is None
+
+
+@pytest.mark.asyncio
+async def test_callback_network_error_returns_502_no_insert(monkeypatch):
+    """Callback network error → 502, no app_messages inserted."""
+    import uuid as _uuid
+    import httpx
+    from unittest.mock import AsyncMock, MagicMock
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg, memory_store
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"cc-net-{_uuid.uuid4().hex[:8]}"
+    app_agent_session_registry._sessions["s1"] = {
+        "sessionId": "s1",
+        "remoteAgentId": rid,
+        "displayName": "NetErr CC",
+        "description": "desc",
+        "status": "online",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "expiresAt": None,
+        "callbackUrl": "http://127.0.0.1:19010",
+        "sourceLabel": None,
+    }
+
+    cid = f"cm-net-{_uuid.uuid4().hex[:8]}"
+
+    class _FakeClientCtx:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            client = MagicMock()
+
+            async def _raise_connect_error(*args, **kwargs):
+                raise OSError("Connection refused")
+
+            client.post = _raise_connect_error
+            return client
+
+        async def __aexit__(self, *args):
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClientCtx)
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {
+                "clientMessageId": cid,
+                "content": "hello",
+                "remoteAgentId": rid,
+            }
+
+    from main import api_send_message
+
+    with pytest.raises(HTTPException) as exc:
+        await api_send_message(FakeRequest())
+    assert exc.value.status_code == 502
+
+    found = await memory_store.find_app_message_by_client_message_id(
+        cid, remote_agent_id=rid,
+    )
+    assert found is None
+
+
+@pytest.mark.asyncio
+async def test_callback_invalid_json_returns_502_no_insert(monkeypatch):
+    """Callback returns non-JSON body → 502, no app_messages inserted."""
+    import uuid as _uuid
+    import httpx
+    from unittest.mock import AsyncMock, MagicMock
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg, memory_store
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"cc-badj-{_uuid.uuid4().hex[:8]}"
+    app_agent_session_registry._sessions["s1"] = {
+        "sessionId": "s1",
+        "remoteAgentId": rid,
+        "displayName": "BadJson CC",
+        "description": "desc",
+        "status": "online",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "expiresAt": None,
+        "callbackUrl": "http://127.0.0.1:19010",
+        "sourceLabel": None,
+    }
+
+    cid = f"cm-badj-{_uuid.uuid4().hex[:8]}"
+
+    fake_resp = MagicMock()
+    fake_resp.status_code = 200
+    fake_resp.text = "not json at all"
+    fake_resp.json.side_effect = ValueError("not JSON")
+
+    class _FakeClientCtx:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            client = MagicMock()
+            client.post = AsyncMock(return_value=fake_resp)
+            return client
+
+        async def __aexit__(self, *args):
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClientCtx)
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {
+                "clientMessageId": cid,
+                "content": "hello",
+                "remoteAgentId": rid,
+            }
+
+    from main import api_send_message
+
+    with pytest.raises(HTTPException) as exc:
+        await api_send_message(FakeRequest())
+    assert exc.value.status_code == 502
+
+    found = await memory_store.find_app_message_by_client_message_id(
+        cid, remote_agent_id=rid,
+    )
+    assert found is None
+
+
+@pytest.mark.asyncio
+async def test_callback_missing_agent_replies_returns_502_no_insert(monkeypatch):
+    """Callback response without agentReplies list → 502, no insert."""
+    import uuid as _uuid
+    import httpx
+    from unittest.mock import AsyncMock, MagicMock
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg, memory_store
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"cc-norep-{_uuid.uuid4().hex[:8]}"
+    app_agent_session_registry._sessions["s1"] = {
+        "sessionId": "s1",
+        "remoteAgentId": rid,
+        "displayName": "NoRep CC",
+        "description": "desc",
+        "status": "online",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "expiresAt": None,
+        "callbackUrl": "http://127.0.0.1:19010",
+        "sourceLabel": None,
+    }
+
+    cid = f"cm-norep-{_uuid.uuid4().hex[:8]}"
+
+    fake_resp = MagicMock()
+    fake_resp.status_code = 200
+    fake_resp.json.return_value = {}  # no agentReplies
+
+    class _FakeClientCtx:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            client = MagicMock()
+            client.post = AsyncMock(return_value=fake_resp)
+            return client
+
+        async def __aexit__(self, *args):
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClientCtx)
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {
+                "clientMessageId": cid,
+                "content": "hello",
+                "remoteAgentId": rid,
+            }
+
+    from main import api_send_message
+
+    with pytest.raises(HTTPException) as exc:
+        await api_send_message(FakeRequest())
+    assert exc.value.status_code == 502
+
+    found = await memory_store.find_app_message_by_client_message_id(
+        cid, remote_agent_id=rid,
+    )
+    assert found is None
+
+
+# ================================================================
+# Callback forwarding — idempotency tests
+# ================================================================
+
+
+@pytest.mark.asyncio
+async def test_callback_idempotency_second_post_returns_stored(monkeypatch):
+    """Second POST with same remoteAgentId + clientMessageId returns stored, no re-call."""
+    import uuid as _uuid
+    import httpx
+    from unittest.mock import AsyncMock, MagicMock
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"cc-idem-{_uuid.uuid4().hex[:8]}"
+    app_agent_session_registry._sessions["s1"] = {
+        "sessionId": "s1",
+        "remoteAgentId": rid,
+        "displayName": "Idem CC",
+        "description": "desc",
+        "status": "online",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "expiresAt": None,
+        "callbackUrl": "http://127.0.0.1:19010",
+        "sourceLabel": None,
+    }
+
+    cid = f"cm-idem-{_uuid.uuid4().hex[:8]}"
+    call_count = 0
+
+    fake_resp = MagicMock()
+    fake_resp.status_code = 200
+    fake_resp.json.return_value = {
+        "agentReplies": [{"content": "first reply"}],
+    }
+
+    class _FakeClientCtx:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            client = MagicMock()
+
+            async def _counted_post(*args, **kwargs):
+                nonlocal call_count
+                call_count += 1
+                return fake_resp
+
+            client.post = _counted_post
+            return client
+
+        async def __aexit__(self, *args):
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClientCtx)
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        def __init__(self, cid, content, rid):
+            self._cid = cid
+            self._content = content
+            self._rid = rid
+
+        async def json(self):
+            return {
+                "clientMessageId": self._cid,
+                "content": self._content,
+                "remoteAgentId": self._rid,
+            }
+
+    from main import api_send_message
+
+    # First call
+    result1 = await api_send_message(FakeRequest(cid, "hello", rid))
+    assert result1["agentReplies"][0]["content"] == "first reply"
+    assert call_count == 1
+
+    # Second call — same cid, same rid
+    result2 = await api_send_message(FakeRequest(cid, "hello", rid))
+    assert result2["agentReplies"][0]["content"] == "first reply"
+    assert call_count == 1  # callback NOT called again
+
+
+@pytest.mark.asyncio
+async def test_callback_idempotency_different_rid_calls_different_callback(monkeypatch):
+    """Same clientMessageId under different remoteAgentId calls different callback."""
+    import uuid as _uuid
+    import httpx
+    from unittest.mock import AsyncMock, MagicMock
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid1 = f"cc-rid1-{_uuid.uuid4().hex[:8]}"
+    rid2 = f"cc-rid2-{_uuid.uuid4().hex[:8]}"
+
+    app_agent_session_registry._sessions["s1"] = {
+        "sessionId": "s1",
+        "remoteAgentId": rid1,
+        "displayName": "R1",
+        "description": "desc",
+        "status": "online",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "expiresAt": None,
+        "callbackUrl": "http://127.0.0.1:19010",
+        "sourceLabel": None,
+    }
+    app_agent_session_registry._sessions["s2"] = {
+        "sessionId": "s2",
+        "remoteAgentId": rid2,
+        "displayName": "R2",
+        "description": "desc",
+        "status": "online",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "expiresAt": None,
+        "callbackUrl": "http://127.0.0.1:19011",
+        "sourceLabel": None,
+    }
+
+    cid = f"cm-cross-{_uuid.uuid4().hex[:8]}"
+    call_urls = []
+
+    class _FakeClientCtx:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            client = MagicMock()
+
+            async def _tracked_post(url, *args, **kwargs):
+                call_urls.append(url)
+                resp = MagicMock()
+                resp.status_code = 200
+                resp.json.return_value = {
+                    "agentReplies": [{"content": f"reply from {url}"}],
+                }
+                return resp
+
+            client.post = _tracked_post
+            return client
+
+        async def __aexit__(self, *args):
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClientCtx)
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        def __init__(self, cid, content, rid):
+            self._cid = cid
+            self._content = content
+            self._rid = rid
+
+        async def json(self):
+            return {
+                "clientMessageId": self._cid,
+                "content": self._content,
+                "remoteAgentId": self._rid,
+            }
+
+    from main import api_send_message
+
+    result1 = await api_send_message(FakeRequest(cid, "hello r1", rid1))
+    result2 = await api_send_message(FakeRequest(cid, "hello r2", rid2))
+
+    assert "userMessage" in result1
+    assert "userMessage" in result2
+    assert len(call_urls) == 2  # both callbacks fired
+
+
+# ================================================================
+# Regression — existing behavior preserved
+# ================================================================
+
+
+@pytest.mark.asyncio
+async def test_default_post_still_works_with_callback_code_present(monkeypatch):
+    """POST /api/messages with default remoteAgentId still works."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {
+                "clientMessageId": "cm-regress-default",
+                "content": "hello default",
+            }
+
+    from main import api_send_message
+
+    result = await api_send_message(FakeRequest())
+    assert "userMessage" in result
+
+
+@pytest.mark.asyncio
+async def test_offline_still_503(monkeypatch):
+    """Offline attached session still returns 503 (unchanged)."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"cc-offreg-{_uuid.uuid4().hex[:8]}"
+    app_agent_session_registry._sessions["s1"] = {
+        "sessionId": "s1",
+        "remoteAgentId": rid,
+        "displayName": "Off CC",
+        "description": "desc",
+        "status": "offline",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "expiresAt": None,
+        "callbackUrl": "http://127.0.0.1:19010",
+        "sourceLabel": None,
+    }
+
+    cid = f"cm-offreg-{_uuid.uuid4().hex[:8]}"
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {
+                "clientMessageId": cid,
+                "content": "hello",
+                "remoteAgentId": rid,
+            }
+
+    from main import api_send_message
+
+    with pytest.raises(HTTPException) as exc:
+        await api_send_message(FakeRequest())
+    assert exc.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_no_callback_still_501(monkeypatch):
+    """Attached session without callbackUrl still returns 501 (unchanged)."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"cc-nocbreg-{_uuid.uuid4().hex[:8]}"
+    app_agent_session_registry._sessions["s1"] = {
+        "sessionId": "s1",
+        "remoteAgentId": rid,
+        "displayName": "NoCB CC",
+        "description": "desc",
+        "status": "online",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "expiresAt": None,
+        "callbackUrl": None,
+        "sourceLabel": None,
+    }
+
+    cid = f"cm-nocbreg-{_uuid.uuid4().hex[:8]}"
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {
+                "clientMessageId": cid,
+                "content": "hello",
+                "remoteAgentId": rid,
+            }
+
+    from main import api_send_message
+
+    with pytest.raises(HTTPException) as exc:
+        await api_send_message(FakeRequest())
+    assert exc.value.status_code == 501
+
+
+@pytest.mark.asyncio
+async def test_auth_before_remote_agent_id_validation_still_holds(monkeypatch):
+    """401 returned before remoteAgentId validation — no info leak."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    class FakeRequest:
+        headers = {}
+
+    from main import _require_chat_auth, _api_config
+
+    api_cfg = _api_config()
+    with pytest.raises(HTTPException) as exc:
+        _require_chat_auth(FakeRequest(), api_cfg)
+    assert exc.value.status_code == 401
