@@ -95,6 +95,7 @@ async def test_insert_and_find_app_message():
         assert found["id"] == remote_id
         assert found["content"] == "Hello"
         assert found["role"] == "user"
+        assert found["remote_agent_id"] == "default"
     finally:
         await store.close()
 
@@ -219,6 +220,350 @@ async def test_app_message_idempotency_conflict():
 
 
 # ──────────────────────────────────────────────────────────────────
+# App messages remote_agent_id isolation tests
+# ──────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_insert_default_remote_agent_id():
+    """Insert without remote_agent_id defaults to 'default'."""
+    from memory.store import MemoryStore
+
+    store = MemoryStore(db_path=":memory:")
+    try:
+        await store.insert_app_message(
+            remote_id="rm-1",
+            client_message_id="cm-1",
+            role="user",
+            content="hello",
+            source_turn_id="turn-1",
+        )
+        found = await store.find_app_message_by_client_message_id(
+            "cm-1", remote_agent_id="default",
+        )
+        assert found is not None
+        assert found["remote_agent_id"] == "default"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_same_client_msg_id_different_agents():
+    """Same clientMessageId can be inserted in different remote_agent_ids."""
+    from memory.store import MemoryStore
+
+    store = MemoryStore(db_path=":memory:")
+    try:
+        await store.insert_app_message(
+            remote_id="rm-default",
+            client_message_id="cm-same",
+            role="user",
+            content="hello from default",
+            source_turn_id="turn-1",
+            remote_agent_id="default",
+        )
+        await store.insert_app_message(
+            remote_id="rm-coder",
+            client_message_id="cm-same",
+            role="user",
+            content="hello from coder",
+            source_turn_id="turn-2",
+            remote_agent_id="coder",
+        )
+
+        found_default = await store.find_app_message_by_client_message_id(
+            "cm-same", remote_agent_id="default",
+        )
+        found_coder = await store.find_app_message_by_client_message_id(
+            "cm-same", remote_agent_id="coder",
+        )
+        assert found_default is not None
+        assert found_coder is not None
+        assert found_default["content"] == "hello from default"
+        assert found_coder["content"] == "hello from coder"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_same_client_msg_id_same_agent_conflict():
+    """Same clientMessageId in same remote_agent_id still conflicts."""
+    from memory.store import MemoryStore
+
+    store = MemoryStore(db_path=":memory:")
+    try:
+        await store.insert_app_message(
+            remote_id="rm-1",
+            client_message_id="cm-dup",
+            role="user",
+            content="first",
+            source_turn_id="turn-1",
+            remote_agent_id="default",
+        )
+        with pytest.raises(Exception):
+            await store.insert_app_message(
+                remote_id="rm-2",
+                client_message_id="cm-dup",
+                role="user",
+                content="second",
+                source_turn_id="turn-2",
+                remote_agent_id="default",
+            )
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_find_app_message_does_not_cross_agent():
+    """find_app_message_by_client_message_id scoped to remote_agent_id."""
+    from memory.store import MemoryStore
+
+    store = MemoryStore(db_path=":memory:")
+    try:
+        await store.insert_app_message(
+            remote_id="rm-coder",
+            client_message_id="cm-cross",
+            role="user",
+            content="coder msg",
+            source_turn_id="turn-1",
+            remote_agent_id="coder",
+        )
+        # Looking in "default" should NOT find coder's message
+        found = await store.find_app_message_by_client_message_id(
+            "cm-cross", remote_agent_id="default",
+        )
+        assert found is None
+        # Looking in "coder" should find it
+        found2 = await store.find_app_message_by_client_message_id(
+            "cm-cross", remote_agent_id="coder",
+        )
+        assert found2 is not None
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_find_agent_replies_does_not_cross_agent():
+    """find_app_agent_replies_by_turn_id scoped to remote_agent_id."""
+    from memory.store import MemoryStore
+
+    store = MemoryStore(db_path=":memory:")
+    try:
+        # Insert replies under "default"
+        await store.insert_app_message(
+            remote_id="agent-def",
+            client_message_id=None,
+            role="agent",
+            content="default reply",
+            source_turn_id="turn-same",
+            sequence=1,
+            remote_agent_id="default",
+        )
+        # Insert replies under "coder" with same turn_id
+        await store.insert_app_message(
+            remote_id="agent-cod",
+            client_message_id=None,
+            role="agent",
+            content="coder reply",
+            source_turn_id="turn-same",
+            sequence=1,
+            remote_agent_id="coder",
+        )
+
+        replies_default = await store.find_app_agent_replies_by_turn_id(
+            "turn-same", remote_agent_id="default",
+        )
+        replies_coder = await store.find_app_agent_replies_by_turn_id(
+            "turn-same", remote_agent_id="coder",
+        )
+        assert len(replies_default) == 1
+        assert replies_default[0]["content"] == "default reply"
+        assert len(replies_coder) == 1
+        assert replies_coder[0]["content"] == "coder reply"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_get_messages_scoped_to_remote_agent():
+    """get_app_messages_after_cursor only returns messages for given agent."""
+    from memory.store import MemoryStore
+
+    store = MemoryStore(db_path=":memory:")
+    try:
+        await store.insert_app_message(
+            remote_id="rm-def",
+            client_message_id="cm-def",
+            role="user",
+            content="default msg",
+            source_turn_id="turn-1",
+            remote_agent_id="default",
+        )
+        await store.insert_app_message(
+            remote_id="rm-coder",
+            client_message_id="cm-coder",
+            role="user",
+            content="coder msg",
+            source_turn_id="turn-2",
+            remote_agent_id="coder",
+        )
+
+        msgs_default, _, _ = await store.get_app_messages_after_cursor(
+            remote_agent_id="default",
+        )
+        msgs_coder, _, _ = await store.get_app_messages_after_cursor(
+            remote_agent_id="coder",
+        )
+
+        assert len(msgs_default) == 1
+        assert msgs_default[0]["content"] == "default msg"
+        assert len(msgs_coder) == 1
+        assert msgs_coder[0]["content"] == "coder msg"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_get_messages_cursor_from_different_agent_treated_as_none():
+    """Cursor from a different remote_agent_id is treated as None."""
+    from memory.store import MemoryStore
+
+    store = MemoryStore(db_path=":memory:")
+    try:
+        await store.insert_app_message(
+            remote_id="rm-def-1",
+            client_message_id="cm-1",
+            role="user",
+            content="default first",
+            source_turn_id="turn-1",
+            remote_agent_id="default",
+        )
+        await store.insert_app_message(
+            remote_id="rm-def-2",
+            client_message_id="cm-2",
+            role="user",
+            content="default second",
+            source_turn_id="turn-2",
+            remote_agent_id="default",
+        )
+        await store.insert_app_message(
+            remote_id="rm-coder",
+            client_message_id="cm-3",
+            role="user",
+            content="coder only",
+            source_turn_id="turn-3",
+            remote_agent_id="coder",
+        )
+
+        # Use coder's cursor to query default — should return from start of default
+        msgs, _, _ = await store.get_app_messages_after_cursor(
+            cursor="rm-coder", remote_agent_id="default",
+        )
+        assert len(msgs) == 2  # both default messages
+        contents = {m["content"] for m in msgs}
+        assert contents == {"default first", "default second"}
+    finally:
+        await store.close()
+
+
+# ──────────────────────────────────────────────────────────────────
+# Endpoint isolation tests (remote_agent_id scoping via real endpoints)
+# ──────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_messages_coder_does_not_return_default_history(monkeypatch):
+    """GET /api/messages?remoteAgentId=coder returns empty when coder has no history."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import cfg
+
+    cfg["app"] = {
+        "contact_invitations": [
+            {"id": "pc-agent-default", "remoteAgentId": "default"},
+            {"id": "pc-agent-coder", "remoteAgentId": "coder"},
+        ]
+    }
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+    from main import api_get_messages, memory_store
+
+    # Use unique id to avoid collision with previous test runs
+    cid = f"cm-def-pre-{_uuid.uuid4().hex[:8]}"
+    await memory_store.insert_app_message(
+        remote_id=f"rm-def-pre-{_uuid.uuid4().hex[:8]}",
+        client_message_id=cid,
+        role="user",
+        content="default history",
+        source_turn_id="turn-def",
+        remote_agent_id="default",
+    )
+
+    result = await api_get_messages(FakeRequest(), remoteAgentId="coder")
+    assert "messages" in result
+    assert isinstance(result["messages"], list)
+    # coder should see its own (empty) history, not default's
+    for m in result["messages"]:
+        assert m.get("content") != "default history"
+
+
+@pytest.mark.asyncio
+async def test_post_messages_coder_idempotency_isolated(monkeypatch):
+    """POST with same clientMessageId in default and coder doesn't collide."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import cfg
+
+    cfg["app"] = {
+        "contact_invitations": [
+            {"id": "pc-agent-default", "remoteAgentId": "default"},
+            {"id": "pc-agent-coder", "remoteAgentId": "coder"},
+        ]
+    }
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        def __init__(self, client_msg_id, content, remote_agent_id=None):
+            self._client_msg_id = client_msg_id
+            self._content = content
+            self._remote = remote_agent_id
+
+        async def json(self):
+            body = {
+                "clientMessageId": self._client_msg_id,
+                "content": self._content,
+            }
+            if self._remote is not None:
+                body["remoteAgentId"] = self._remote
+            return body
+
+    from main import api_send_message
+
+    cid = f"cm-isolated-{_uuid.uuid4().hex[:8]}"
+
+    # First: insert under "default"
+    result1 = await api_send_message(
+        FakeRequest(cid, "hello default", "default")
+    )
+    assert "userMessage" in result1
+
+    # Second: same clientMessageId under "coder" — should NOT collide
+    result2 = await api_send_message(
+        FakeRequest(cid, "hello coder", "coder")
+    )
+    assert "userMessage" in result2
+
+
+# ──────────────────────────────────────────────────────────────────
 # /api/contact-invitations tests
 # ──────────────────────────────────────────────────────────────────
 
@@ -253,7 +598,10 @@ async def test_contact_invitations_returns_envelope(monkeypatch):
     monkeypatch.setenv("CHAT_API_KEY", "secret")
     monkeypatch.setenv("COMPUTERNAME", "MY-PC")
 
-    from main import api_contact_invitations
+    from main import api_contact_invitations, cfg
+
+    # Ensure no leftover multi-invitation config from other tests
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
 
     result = await api_contact_invitations(
         _FakeAppRequest(

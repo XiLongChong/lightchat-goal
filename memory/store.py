@@ -60,6 +60,7 @@ class MemoryStore:
             await self._reset(db)
         await self._create_tables(db)
         await self._ensure_turn_metric_columns(db)
+        await self._ensure_app_message_remote_agent_id(db)
         await db.execute(
             "INSERT OR REPLACE INTO runtime_meta(key, value) VALUES('runtime_schema', ?)",
             (_SCHEMA_ID,),
@@ -192,6 +193,7 @@ class MemoryStore:
             CREATE TABLE IF NOT EXISTS app_messages (
                 id TEXT PRIMARY KEY,
                 client_message_id TEXT,
+                remote_agent_id TEXT NOT NULL DEFAULT 'default',
                 role TEXT NOT NULL CHECK(role IN ('user', 'agent', 'system')),
                 content TEXT NOT NULL,
                 created_at REAL NOT NULL,
@@ -201,14 +203,14 @@ class MemoryStore:
             );
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_app_messages_client_msg_id
-                ON app_messages(client_message_id)
+                ON app_messages(remote_agent_id, client_message_id)
                 WHERE client_message_id IS NOT NULL;
 
             CREATE INDEX IF NOT EXISTS idx_app_messages_created_at
-                ON app_messages(created_at);
+                ON app_messages(remote_agent_id, created_at);
 
             CREATE INDEX IF NOT EXISTS idx_app_messages_source_turn_id
-                ON app_messages(source_turn_id);
+                ON app_messages(remote_agent_id, source_turn_id);
             """
         )
 
@@ -228,6 +230,50 @@ class MemoryStore:
                 await db.execute(
                     f'ALTER TABLE turns ADD COLUMN "{name}" {definition}'
                 )
+
+    async def _ensure_app_message_remote_agent_id(self, db: aiosqlite.Connection) -> None:
+        """Incrementally add remote_agent_id to app_messages if missing.
+
+        - Adds ``remote_agent_id TEXT NOT NULL DEFAULT 'default'`` column.
+        - Rebuilds the client_message_id unique index as composite
+          ``(remote_agent_id, client_message_id)``.
+        - Rebuilds created_at and source_turn_id indexes to include
+          ``remote_agent_id`` as the leading column.
+        """
+        rows = await db.execute_fetchall("PRAGMA table_info(app_messages)")
+        existing = {str(row["name"]) for row in rows}
+
+        if "remote_agent_id" not in existing:
+            await db.execute(
+                "ALTER TABLE app_messages ADD COLUMN remote_agent_id TEXT NOT NULL DEFAULT 'default'"
+            )
+
+            # Rebuild the old single-column client_message_id unique index
+            # as a composite (remote_agent_id, client_message_id).
+            await db.execute(
+                "DROP INDEX IF EXISTS idx_app_messages_client_msg_id"
+            )
+            await db.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS idx_app_messages_client_msg_id
+                   ON app_messages(remote_agent_id, client_message_id)
+                   WHERE client_message_id IS NOT NULL"""
+            )
+
+            # Rebuild created_at index to include remote_agent_id.
+            await db.execute("DROP INDEX IF EXISTS idx_app_messages_created_at")
+            await db.execute(
+                """CREATE INDEX IF NOT EXISTS idx_app_messages_created_at
+                   ON app_messages(remote_agent_id, created_at)"""
+            )
+
+            # Rebuild source_turn_id index to include remote_agent_id.
+            await db.execute("DROP INDEX IF EXISTS idx_app_messages_source_turn_id")
+            await db.execute(
+                """CREATE INDEX IF NOT EXISTS idx_app_messages_source_turn_id
+                   ON app_messages(remote_agent_id, source_turn_id)"""
+            )
+
+            await db.commit()
 
     async def close(self) -> None:
         if self._db is not None:
@@ -969,6 +1015,7 @@ class MemoryStore:
         source_turn_id: str = "",
         source_tool_call_id: str = "",
         sequence: int = 0,
+        remote_agent_id: str = "default",
     ) -> None:
         """Insert a single app message (user or agent reply)."""
         now = time.time()
@@ -976,13 +1023,14 @@ class MemoryStore:
             db = await self._get_db()
             await db.execute(
                 """INSERT INTO app_messages(
-                       id, client_message_id, role, content, created_at,
-                       source_turn_id, source_tool_call_id, sequence
+                       id, client_message_id, remote_agent_id, role, content,
+                       created_at, source_turn_id, source_tool_call_id, sequence
                    )
-                   VALUES(?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     remote_id,
                     client_message_id,
+                    remote_agent_id,
                     role,
                     content,
                     now,
@@ -995,25 +1043,31 @@ class MemoryStore:
 
     async def find_app_message_by_client_message_id(
         self, client_message_id: str,
+        remote_agent_id: str = "default",
     ) -> dict[str, Any] | None:
-        """Look up an app message by its client-generated idempotency key."""
+        """Look up an app message by its client-generated idempotency key.
+
+        Only matches within *remote_agent_id* so different agents can share
+        the same ``clientMessageId`` without colliding.
+        """
         db = await self._get_db()
         rows = await db.execute_fetchall(
-            "SELECT * FROM app_messages WHERE client_message_id = ?",
-            (client_message_id,),
+            "SELECT * FROM app_messages WHERE remote_agent_id = ? AND client_message_id = ?",
+            (remote_agent_id, client_message_id),
         )
         return dict(rows[0]) if rows else None
 
     async def find_app_agent_replies_by_turn_id(
         self, source_turn_id: str,
+        remote_agent_id: str = "default",
     ) -> list[dict[str, Any]]:
-        """Return agent replies for a given turn, ordered by sequence."""
+        """Return agent replies for a given turn, scoped to *remote_agent_id*."""
         db = await self._get_db()
         rows = await db.execute_fetchall(
             """SELECT * FROM app_messages
-               WHERE source_turn_id = ? AND role = 'agent'
+               WHERE remote_agent_id = ? AND source_turn_id = ? AND role = 'agent'
                ORDER BY sequence ASC""",
-            (source_turn_id,),
+            (remote_agent_id, source_turn_id),
         )
         return [dict(row) for row in rows]
 
@@ -1021,31 +1075,50 @@ class MemoryStore:
         self,
         cursor: str | None = None,
         limit: int = 50,
+        remote_agent_id: str = "default",
     ) -> tuple[list[dict[str, Any]], str | None, bool]:
-        """Return app messages ordered by created_at ASC, id ASC.
+        """Return app messages scoped to *remote_agent_id*, ordered by created_at.
 
         cursor  – the id of the last-seen message (exclusive), or None for
-                  the first page.
+                  the first page.  A cursor from a different
+                  ``remote_agent_id`` is treated as None.
         limit   – maximum messages to return (1-200, clamped).
         Returns (messages, next_cursor, has_more).
         """
         limit = max(1, min(int(limit), 200))
         db = await self._get_db()
 
-        if cursor is None:
+        # Validate that cursor belongs to this remote_agent_id;
+        # if not, treat it as None so we don't cross-scope.
+        cursor_ts: float | None = None
+        if cursor is not None:
+            cr = await db.execute_fetchall(
+                "SELECT remote_agent_id, created_at FROM app_messages WHERE id = ?",
+                (cursor,),
+            )
+            if cr and str(cr[0]["remote_agent_id"]) == remote_agent_id:
+                cursor_ts = float(cr[0]["created_at"])
+            # else: cursor is from a different scope → fall through to
+            #        the cursor-is-None branch.
+
+        if cursor_ts is not None:
+            # Paginate within the same remote_agent_id using (created_at, id)
+            # as the composite cursor so rows are stable.
             rows = await db.execute_fetchall(
                 """SELECT * FROM app_messages
+                   WHERE remote_agent_id = ?
+                     AND (created_at > ? OR (created_at = ? AND id > ?))
                    ORDER BY created_at ASC, id ASC
                    LIMIT ?""",
-                (limit + 1,),
+                (remote_agent_id, cursor_ts, cursor_ts, cursor, limit + 1),
             )
         else:
             rows = await db.execute_fetchall(
                 """SELECT * FROM app_messages
-                   WHERE id > ?
+                   WHERE remote_agent_id = ?
                    ORDER BY created_at ASC, id ASC
                    LIMIT ?""",
-                (cursor, limit + 1,),
+                (remote_agent_id, limit + 1),
             )
 
         has_more = len(rows) > limit

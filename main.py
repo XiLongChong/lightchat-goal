@@ -1415,6 +1415,7 @@ async def api_send_message(request: Request):
     # ── idempotency ──────────────────────────────────────────────
     existing_user = await memory_store.find_app_message_by_client_message_id(
         client_message_id,
+        remote_agent_id=remote_agent_id,
     )
     if existing_user is not None:
         if str(existing_user.get("content", "")) != content:
@@ -1426,6 +1427,7 @@ async def api_send_message(request: Request):
         source_turn_id = str(existing_user.get("source_turn_id", ""))
         agent_replies = await memory_store.find_app_agent_replies_by_turn_id(
             source_turn_id,
+            remote_agent_id=remote_agent_id,
         )
         return {
             "userMessage": {
@@ -1457,6 +1459,7 @@ async def api_send_message(request: Request):
         content=content,
         source_turn_id=turn_id,
         sequence=0,
+        remote_agent_id=remote_agent_id,
     )
 
     # ── collector sender (replaces wechat_sender) ─────────────────
@@ -1529,6 +1532,7 @@ async def api_send_message(request: Request):
                 content=reply_text,
                 source_turn_id=turn_id,
                 sequence=seq,
+                remote_agent_id=remote_agent_id,
             )
             seq += 1
 
@@ -1576,6 +1580,7 @@ async def api_get_messages(
         await memory_store.get_app_messages_after_cursor(
             cursor=cursor,
             limit=limit,
+            remote_agent_id=resolved_id,
         )
     )
     return {
