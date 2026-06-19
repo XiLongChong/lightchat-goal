@@ -243,3 +243,145 @@ All options from `claude --help` (abridged to integration-relevant):
 | Budget | `--max-budget-usd`, `--fallback-model` |
 | Model | `--model`, `--agent` |
 | Minimal | `--bare` (skip hooks/LSP/plugins) |
+
+---
+
+## MCP Serve Capability Probe（2026-06-19 新增）
+
+### Probe script
+
+`tools/claude_mcp_probe.py` — 同步 stdio JSON-RPC MCP 客户端，Windows 兼容。
+
+启动 `claude mcp serve` 子进程，发送 MCP handshake + `tools/list` / `resources/list` / `prompts/list`，收集结果后退出。关键设计：过滤非 JSON 行（启动 banner、ANSI escape），避免被 CLI 噪音干扰。
+
+### Transport
+
+- **Protocol**: MCP JSON-RPC 2.0 over stdio
+- **Transport**: stdin/stdout pipes（Windows .exe → subprocess.PIPE）
+- **Handshake**: `initialize` (protocolVersion=`2024-11-05`) → `notifications/initialized`
+
+### Server info
+
+| Field | Value |
+|-------|-------|
+| serverInfo.name | `claude/tengu` |
+| serverInfo.version | `2.1.170` |
+| protocolVersion | `2024-11-05` |
+
+### Tools found（32 个）
+
+**全部是标准的 Claude Code 内置工具**：
+
+| Tool | 功能 | 能否注入手机消息 |
+|------|------|-----------------|
+| `Agent` | 启动子 agent | ❌ 启动新会话，不能注入 |
+| `TaskOutput` | 读取后台任务输出 | ❌ |
+| `Bash` | 执行 shell 命令 | ❌ |
+| `Glob` / `Grep` / `Read` / `Edit` / `Write` | 文件操作 | ❌ |
+| `WebFetch` / `WebSearch` | 网络访问 | ❌ |
+| `AskUserQuestion` | 向用户提问 | ❌ |
+| `Skill` | 执行 skill | ❌ |
+| `EnterPlanMode` | 进入计划模式 | ❌ |
+| `DesignSync` | Design 系统同步 | ❌ |
+| `TaskCreate` / `TaskGet` / `TaskUpdate` / `TaskList` | 任务管理 | ❌ |
+| `EnterWorktree` / `ExitWorktree` | Git worktree | ❌ |
+| `Workflow` | 多 agent 工作流 | ❌ |
+| `CronCreate` / `CronDelete` / `CronList` | 定时任务 | ❌ |
+| `ScheduleWakeup` | 定时唤醒 | ❌ |
+| `Monitor` | 后台监控 | ❌ |
+| `PushNotification` | 推送通知 | ❌ |
+| `PowerShell` | 执行 PowerShell | ❌ |
+| `ToolSearch` | 搜索工具 | ❌ |
+
+**结论：没有 `SendMessage`、`CreateTurn`、`AppendUserMessage` 或任何可以将外部消息注入会话的工具。**
+
+### Resources / Prompts
+
+- `resources`: 0 个
+- `prompts`: 0 个
+
+没有可用的 resources 或 prompts。
+
+### Can it drive a chat turn?
+
+**❌ 不能直接驱动聊天。**
+
+`claude mcp serve` 将 Claude Code 暴露为 MCP server，但它暴露的是 **Claude Code 自身的工具集**，不是会话管理接口。它没有：
+
+- 发送消息到当前会话的 API
+- 注入用户消息的工具
+- 读取当前会话 transcript 的 resource
+- 创建或恢复会话的 prompt
+
+### Verdict: Option B — MCP serve 不能直接驱动聊天
+
+**Option B confirmed: MCP serve 是工具执行器，不是消息注入器。**
+
+- 它适合让外部系统（Router adapter）调用 Claude Code 工具（执行命令、读写文件等）
+- 但它不适合作为"手机 → Claude Code 会话"的消息桥
+- 如果 Router adapter 需要在 Claude Code 执行时调用工具（而不是注入消息），MCP serve 可以辅助
+
+---
+
+## Updated Recommendation
+
+### Option B: `claude -p` per-message（推荐）
+
+探针确认 MCP serve 无法直接驱动聊天。回归 Option A（`claude -p`）：
+
+```bash
+claude -p "手机用户发来: <content>" \
+  --output-format json \
+  --session-id <uuid> \
+  --append-system-prompt "你是手机用户的代码助手..."
+```
+
+**优点**：
+- 每次消息 = 一次 LLM 调用，上下文通过 `--session-id` 保留
+- JSON 输出可直接解析 `result` 字段
+- 不需要长期子进程
+- 不依赖 MCP serve
+
+**缺点**：
+- 每次 App 消息 = 一次 API 调用，配额消耗快
+- 429 超额需要 `--fallback-model` 或重试退避
+- 上下文在会话级别保留，不是 turn 级别
+
+**架构**：
+```
+App → Router → claude-p Adapter → claude -p (per message) → JSON result → Router → App
+```
+
+### Option C: MCP serve 作为工具辅助
+
+MCP serve 可用于 **辅助场景**：
+- Router adapter 收到 App 消息，需要 Claude Code 执行特定任务（读写文件、运行测试）
+- adapter 调用 `claude -p` 并在 prompt 中指示 Claude Code 执行任务
+- 但这不是 MCP serve 的设计意图
+
+### Option D: Hybrid
+
+`claude -p` 驱动会话 + MCP serve 提供工具能力（如果有外部工具需要）。
+
+---
+
+## Conclusion
+
+**Answer: B — MCP serve 不能直接驱动聊天，但 `claude -p` 可以。**
+
+| 结论 | 原因 |
+|------|------|
+| MCP serve 是**工具执行器**，不是**消息注入器** | 32 个 tools 全部是 Claude Code 内置工具；无会话管理 API |
+| Option C 不适用于 attached session 桥接 | 无法注入手机消息；只能作为工具辅助 |
+| Option A（`claude -p`）是当前**唯一可行路径** | 有 `session-id` 保留上下文，有 JSON 输出，有 `--append-system-prompt` 塑形 |
+| MCP serve 可作为工具层辅助 | 当手机用户需要 Claude Code 执行特定工具时可用，但不是主要消息路径 |
+
+### Next step
+
+基于 `claude -p` 构建 claude-code-attached-adapter：
+1. Adapter 接收 Router callback
+2. 调用 `claude -p <手机消息> --session-id <session> --output-format json`
+3. 解析 JSON `result` 字段，转为 `agentReplies`
+4. 保留 `--session-id` 跨请求维持上下文
+5. 加入 `--permission-mode bypassPermissions`（需要评估安全风险）
+6. 处理 429/500 等错误，返回合适的 HTTP 状态
