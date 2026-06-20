@@ -201,3 +201,73 @@ export function phoneContextUrl(base, types = ["device_status", "app_status"], m
     `/api/phone-context/latest?types=${typesParam}&maxAgeSeconds=${age}`,
   );
 }
+
+/**
+ * Summarise a phone-context API response for an agent.
+ *
+ * Returns a plain-text summary describing availability, staleness, and
+ * what data is present.  The caller should pass the parsed JSON body from
+ * `GET /api/phone-context/latest`.
+ *
+ * @param {object} json — parsed response body
+ * @returns {string} human-readable summary
+ */
+export function summarizePhoneContext(json) {
+  const status = json?.status || "unknown";
+  const age = typeof json?.ageSeconds === "number" ? json.ageSeconds : null;
+  const missing = Array.isArray(json?.missing) ? json.missing : [];
+  const contexts = json?.contexts || {};
+
+  const lines = [];
+
+  if (status === "unavailable") {
+    lines.push("Phone context is unavailable.");
+    if (json?.reason) lines.push(`Reason: ${json.reason}`);
+    if (missing.length) lines.push(`Missing types: ${missing.join(", ")}`);
+    lines.push("Do not guess — tell the user the phone snapshot is not available right now.");
+    return lines.join("\n");
+  }
+
+  if (status !== "ok") {
+    lines.push(`Phone context status: ${status}. Treat as unavailable.`);
+    return lines.join("\n");
+  }
+
+  lines.push("Phone context is available.");
+  if (age !== null) {
+    lines.push(`Snapshot age: ${age}s${age > 120 ? " (stale — mention this to the user)" : ""}`);
+  }
+  if (missing.length) {
+    lines.push(`Missing types: ${missing.join(", ")}. Do not fabricate this data.`);
+  }
+
+  // device_status
+  const device = contexts.device_status;
+  if (device && device.status === "ok" && device.data) {
+    const d = device.data;
+    const parts = [];
+    if (typeof d.batteryPercent === "number") parts.push(`battery ${d.batteryPercent}%`);
+    if (d.isCharging) parts.push("charging");
+    if (typeof d.networkType === "string") parts.push(d.networkType);
+    if (typeof d.isOnline === "boolean") parts.push(d.isOnline ? "online" : "offline");
+    if (typeof d.timezoneId === "string") parts.push(d.timezoneId);
+    lines.push("Device: " + (parts.length ? parts.join(", ") : "no data"));
+  }
+
+  // app_status
+  const app = contexts.app_status;
+  if (app && app.status === "ok" && app.data) {
+    const a = app.data;
+    const parts = [];
+    if (typeof a.appState === "string") parts.push(a.appState);
+    if (typeof a.screen === "string") parts.push(`screen=${a.screen}`);
+    if (a.activeContactId) parts.push(`contact=${a.activeContactId}`);
+    if (typeof a.activeRemoteAgentId === "string") parts.push(`agent=${a.activeRemoteAgentId}`);
+    if (typeof a.notificationsEnabled === "boolean") {
+      parts.push(a.notificationsEnabled ? "notifications on" : "notifications off");
+    }
+    lines.push("App: " + (parts.length ? parts.join(", ") : "no data"));
+  }
+
+  return lines.join("\n");
+}

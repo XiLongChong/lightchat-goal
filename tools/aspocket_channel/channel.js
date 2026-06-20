@@ -320,10 +320,19 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "aspocket_get_phone_context",
       description:
-        "Get the most recent phone context snapshot cached by the Router. " +
-        "Returns device status (battery, network, timezone) and app status " +
-        "(foreground/background, active contact). " +
-        "This is a cached snapshot from the App — NOT real-time data.",
+        "Get the latest cached Android phone context uploaded by the AsPocket app. " +
+        "Use this when the user asks about their current phone/app state — e.g. " +
+        "which screen they are on, whether a chat is open, battery level, network " +
+        "type, or whether notifications are enabled. " +
+        "This is a CACHED snapshot — NOT real-time data. Always check the response " +
+        "fields before relying on the data: if `status` is \"unavailable\" or " +
+        "`missing` is non-empty, tell the user the context is unavailable or " +
+        "incomplete rather than guessing. Check `ageSeconds` to communicate staleness. " +
+        "The response can include `device_status` (battery, network, timezone) and " +
+        "`app_status` (foreground/background, current screen, active contact identity, " +
+        "notification toggle state). " +
+        "PRIVACY: this tool NEVER returns messages, typed text, location, SSID, IP " +
+        "address, clipboard data, media library contents, contact lists, or health data.",
       inputSchema: {
         type: "object",
         properties: {
@@ -331,12 +340,16 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "array",
             items: { type: "string", enum: ["device_status", "app_status"] },
             description:
-              "Context types to fetch. Defaults to both if omitted.",
+              "Context types to fetch. Defaults to both if omitted. " +
+              "Use [\"device_status\"] for battery/network only; " +
+              "use [\"app_status\"] for screen/active-chat/notification state only.",
           },
           maxAgeSeconds: {
             type: "number",
             description:
-              "Maximum age of the snapshot in seconds (0–86400). Default 300.",
+              "Maximum age of the snapshot in seconds (0–86400). Default 300 (5 min). " +
+              "Lower values reduce staleness risk but increase chance of \"unavailable\". " +
+              "Use 60 or less when the user asks \"right now\" questions.",
           },
         },
       },
@@ -390,7 +403,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       const body = await resp.text();
       if (!resp.ok) {
         return {
-          content: [{ type: "text", text: `HTTP ${resp.status}: ${body}` }],
+          content: [{
+            type: "text",
+            text: `Phone context fetch failed (HTTP ${resp.status}). ` +
+              `The Router may be unreachable or the auth token may be invalid. ` +
+              `Tell the user you cannot check their phone state right now.`,
+          }],
           isError: true,
         };
       }
@@ -399,7 +417,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       };
     } catch (err) {
       return {
-        content: [{ type: "text", text: `fetch failed: ${err.message}` }],
+        content: [{
+          type: "text",
+          text: `Phone context fetch failed: ${err.message}. ` +
+            `Tell the user the phone snapshot is currently unreachable.`,
+        }],
         isError: true,
       };
     }

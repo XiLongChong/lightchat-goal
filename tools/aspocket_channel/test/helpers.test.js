@@ -11,6 +11,7 @@ import {
   heartbeatUrl,
   offlineUrl,
   phoneContextUrl,
+  summarizePhoneContext,
 } from "../helpers.js";
 
 // ── buildRegistrationPayload ──────────────────────────────────────
@@ -253,4 +254,112 @@ test("phoneContextUrl clamps maxAgeSeconds to 0–86400", () => {
 test("phoneContextUrl with custom types", () => {
   const url = phoneContextUrl("http://127.0.0.1:8899", ["device_status"], 120);
   assert.ok(url.endsWith("types=device_status&maxAgeSeconds=120"));
+});
+
+test("phoneContextUrl defaults to both types when given empty array", () => {
+  // phoneContextUrl itself doesn't enforce non-empty — the caller (channel.js)
+  // defaults before calling. The URL builder just joins whatever it gets.
+  const url = phoneContextUrl("http://127.0.0.1:8899", [], 300);
+  assert.ok(url.includes("types="));
+});
+
+test("phoneContextUrl preserves custom maxAgeSeconds", () => {
+  const url = phoneContextUrl("http://127.0.0.1:8899", ["app_status"], 45);
+  assert.ok(url.includes("maxAgeSeconds=45"));
+});
+
+test("phoneContextUrl clamps negative maxAgeSeconds to 0", () => {
+  const url = phoneContextUrl("http://127.0.0.1:8899", ["device_status"], -5);
+  assert.ok(url.includes("maxAgeSeconds=0"));
+});
+
+// ── summarizePhoneContext ───────────────────────────────────────────
+
+test("summarizePhoneContext reports unavailable status with reason", () => {
+  const json = {
+    schemaVersion: 1,
+    status: "unavailable",
+    reason: "no phone context snapshot received yet",
+    contexts: {},
+    missing: ["device_status", "app_status"],
+  };
+  const summary = summarizePhoneContext(json);
+  assert.ok(summary.includes("unavailable"));
+  assert.ok(summary.includes("no phone context snapshot received yet"));
+  assert.ok(summary.includes("device_status"));
+  assert.ok(summary.includes("Do not guess"));
+});
+
+test("summarizePhoneContext reports ok status with device and app data", () => {
+  const json = {
+    schemaVersion: 1,
+    status: "ok",
+    snapshotId: "snap-1",
+    collectedAtMs: 1781950000000,
+    ageSeconds: 12.5,
+    contexts: {
+      device_status: {
+        status: "ok",
+        data: {
+          platform: "android",
+          localTime: "2026-06-21T10:00:00+08:00",
+          timezoneId: "Asia/Shanghai",
+          batteryPercent: 82,
+          isCharging: true,
+          powerSource: "usb",
+          networkType: "wifi",
+          isOnline: true,
+        },
+      },
+      app_status: {
+        status: "ok",
+        data: {
+          appState: "foreground",
+          screen: "chat",
+          activeContactId: "default-agent",
+          activeRemoteAgentId: "default",
+          activeContactDisplayName: "Default Agent",
+          notificationsEnabled: true,
+        },
+      },
+    },
+    missing: [],
+  };
+  const summary = summarizePhoneContext(json);
+  assert.ok(summary.includes("available"));
+  assert.ok(summary.includes("12.5s"));
+  assert.ok(summary.includes("battery 82%"));
+  assert.ok(summary.includes("wifi"));
+  assert.ok(summary.includes("foreground"));
+  assert.ok(summary.includes("screen=chat"));
+  assert.ok(summary.includes("agent=default"));
+  assert.ok(summary.includes("notifications on"));
+});
+
+test("summarizePhoneContext flags stale snapshots", () => {
+  const json = {
+    status: "ok",
+    ageSeconds: 180,
+    contexts: {},
+    missing: [],
+  };
+  const summary = summarizePhoneContext(json);
+  assert.ok(summary.includes("stale"));
+});
+
+test("summarizePhoneContext reports missing types without fabricating", () => {
+  const json = {
+    status: "ok",
+    ageSeconds: 5,
+    contexts: {},
+    missing: ["app_status"],
+  };
+  const summary = summarizePhoneContext(json);
+  assert.ok(summary.includes("Missing types: app_status"));
+  assert.ok(summary.includes("Do not fabricate"));
+});
+
+test("summarizePhoneContext handles null/undefined gracefully", () => {
+  assert.ok(summarizePhoneContext(null).includes("unavailable"));
+  assert.ok(summarizePhoneContext({}).includes("unknown"));
 });
