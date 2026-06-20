@@ -5,6 +5,7 @@
 
 - `scripts/start-aspocket-router.ps1` — 前台启动 PC Router。
 - `scripts/start-aspocket-claude-channel.ps1` — 准备 channel 环境并前台启动 Claude Code。
+- `scripts/check-aspocket-channel.ps1` — 只读检查 Router / MCP / session / invitation / history 是否就绪。
 
 两个脚本都从 `.env` 读取 `CHAT_API_KEY` 注入当前进程环境，**从不打印 token**，只输出 `token loaded: yes/no`。
 
@@ -98,6 +99,32 @@ cd D:\projects\goal
 - 进入聊天页发送消息。Claude Code 收到 channel 消息后会调用 `aspocket_reply` 写回，App 轮询/同步后显示回复气泡。
 
 ## 4. 验证命令
+
+优先使用只读检查脚本：
+
+```powershell
+cd D:\projects\goal
+.\scripts\check-aspocket-channel.ps1
+```
+
+它会检查：
+
+- `.env` 中是否能读取 `CHAT_API_KEY`（只显示 loaded yes/no，不打印 token）。
+- `tools/aspocket_channel/channel.js` 是否存在。
+- `claude` CLI 是否可用。
+- `aspocket` MCP server 是否已注册。
+- Router `/api/profile` 是否可访问。
+- `aspocket-claude-1` session 是否存在及当前状态。
+- `Claude Code - AsPocket` invitation 是否存在。
+- `remoteAgentId=aspocket-claude-1` 的 history 是否可读。
+
+检查脚本不会启动 Router，不会启动 Claude，不会注册 MCP，也不会修改用户配置。失败时按提示使用两个启动脚本。
+
+可选参数：
+
+```powershell
+.\scripts\check-aspocket-channel.ps1 -RouterUrl http://127.0.0.1:9000 -SessionId aspocket-claude-2
+```
 
 Router 启动后，用 `CHAT_API_KEY` 做 Bearer / `x-api-key` 认证访问：
 
