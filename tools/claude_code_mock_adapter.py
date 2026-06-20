@@ -54,15 +54,19 @@ def _reply_template(
     content: str,
     *,
     now: datetime | None = None,
+    attachments: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build a single agent reply entry with the v1 contract fields."""
     if now is None:
         now = datetime.now(timezone.utc)
-    return {
+    reply: dict[str, Any] = {
         "content": content,
         "remoteId": f"claude-mock-{client_message_id}",
         "createdAt": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+    if attachments:
+        reply["attachments"] = attachments
+    return reply
 
 
 def build_claude_mock_reply(
@@ -84,6 +88,20 @@ def build_claude_mock_reply(
     *now* may be supplied for deterministic tests; defaults to current UTC.
     """
     lower = content.lower()
+
+    # Sticker triggers — reply with a sticker attachment
+    if any(kw in lower for kw in ("sticker", "表情", "happy")):
+        reply_text = "Here is a happy sticker for you!"
+        return {
+            "agentReplies": [
+                _reply_template(
+                    client_message_id,
+                    reply_text,
+                    now=now,
+                    attachments=[{"type": "sticker", "stickerId": "happy_01"}],
+                ),
+            ]
+        }
 
     if any(kw in lower for kw in ("status", "状态", "进度")):
         reply_text = (

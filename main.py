@@ -1325,6 +1325,11 @@ app_agent_session_registry = AppAgentSessionRegistry()
 channel_pending_inbox = ChannelPendingInbox()
 
 
+from runtime.sticker_catalog import (
+    is_known_sticker,
+    canonicalize_sticker_attachment,
+)
+
 # ── attachment helpers ─────────────────────────────────────────────
 
 import os as _os
@@ -1715,34 +1720,58 @@ async def api_send_message(request: Request):
                 status_code=400,
                 detail="Phase 1 supports at most 1 attachment per message",
             )
-        # Validate each attachmentId exists in the store
-        incoming_ids: list[str] = []
+        # Validate each attachment by type
+        image_ids: list[str] = []
+        sticker_attachments: list[dict] = []
         for att in raw_attachments:
-            aid = str(att.get("attachmentId", "")).strip()
-            if not aid:
-                raise HTTPException(status_code=400, detail="attachmentId is required")
-            incoming_ids.append(aid)
+            atype = str(att.get("type", "image")).strip().lower()
+            if atype == "image":
+                aid = str(att.get("attachmentId", "")).strip()
+                if not aid:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="image attachment requires attachmentId",
+                    )
+                image_ids.append(aid)
+            elif atype == "sticker":
+                try:
+                    canon = canonicalize_sticker_attachment(att)
+                except ValueError as exc:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=str(exc),
+                    )
+                sticker_attachments.append(canon)
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"unsupported attachment type: {atype!r}",
+                )
 
-        stored_atts = await memory_store.get_app_attachments(incoming_ids)
+        # Validate image attachments against app_attachments table
+        stored_atts = await memory_store.get_app_attachments(image_ids) if image_ids else []
         stored_by_id = {s["attachment_id"]: s for s in stored_atts}
-        for aid in incoming_ids:
+        for aid in image_ids:
             if aid not in stored_by_id:
                 raise HTTPException(
                     status_code=400,
                     detail=f"unknown attachmentId: {aid}",
                 )
         base = str(request.base_url).rstrip("/")
-        # Build canonical attachment dicts from stored metadata (not from client)
-        for aid in incoming_ids:
+        # Build canonical image attachment dicts from stored metadata
+        for aid in image_ids:
             s = stored_by_id[aid]
             incoming_attachments.append({
                 "attachmentId": s["attachment_id"],
-                "type": s["type"],
+                "type": "image",
                 "mimeType": s["mime_type"],
                 "fileName": s["file_name"],
                 "sizeBytes": int(s["size_bytes"]),
                 "url": f"{base}/api/attachments/{s['attachment_id']}",
             })
+
+        # Append canonical sticker attachments
+        incoming_attachments.extend(sticker_attachments)
 
     # ── idempotency key for attachments (stable JSON) ──────────────
     _attachments_sort_key = json.dumps(
@@ -1936,11 +1965,13 @@ async def api_send_message(request: Request):
             if reply_ts is None:
                 reply_ts = now_ts
                 cb_created_at = _iso_from_ts(now_ts)
+            reply_attachments = reply.get("attachments") or []
             agent_replies.append({
                 "remoteId": router_reply_id,
                 "content": reply_text,
                 "createdAt": cb_created_at,
                 "sourceToolCallId": session_remote_id or None,
+                "attachments": reply_attachments,
             })
             reply_rows.append({
                 "remote_id": router_reply_id,
@@ -1950,6 +1981,7 @@ async def api_send_message(request: Request):
                 "source_tool_call_id": session_remote_id,
                 "created_at": reply_ts,
                 "remote_agent_id": remote_agent_id,
+                "attachments": reply_attachments,
             })
 
         await memory_store.insert_app_turn_messages(
@@ -2427,6 +2459,21 @@ def validate_callback_response(body: Any) -> dict[str, Any]:
             reply["remoteId"] = entry["remoteId"]
         if isinstance(entry.get("createdAt"), str):
             reply["createdAt"] = entry["createdAt"]
+        # Carry agent reply attachments (e.g. sticker)
+        raw_att = entry.get("attachments")
+        if isinstance(raw_att, list) and raw_att:
+            canonical_att: list[dict] = []
+            for a in raw_att:
+                if not isinstance(a, dict):
+                    continue
+                atype = str(a.get("type", "")).strip()
+                if atype == "sticker":
+                    try:
+                        canonical_att.append(canonicalize_sticker_attachment(a))
+                    except ValueError:
+                        continue  # skip invalid, non-fatal
+            if canonical_att:
+                reply["attachments"] = canonical_att
         replies.append(reply)
 
     return {"ok": True, "replies": replies}
@@ -2667,6 +2714,30 @@ async def api_channel_post_reply(session_id: str, request: Request):
         raise HTTPException(status_code=400, detail="content is required")
     source_tool_call_id = str(body.get("sourceToolCallId", "")).strip() or ""
 
+    # ── optional sticker attachment ──────────────────────────────
+    reply_attachments: list[dict] = []
+    raw_reply_att = body.get("attachments")
+    if raw_reply_att:
+        if not isinstance(raw_reply_att, list):
+            raise HTTPException(status_code=400, detail="attachments must be an array")
+        for a in raw_reply_att:
+            if not isinstance(a, dict):
+                continue
+            atype = str(a.get("type", "")).strip()
+            if atype == "sticker":
+                try:
+                    reply_attachments.append(canonicalize_sticker_attachment(a))
+                except ValueError as exc:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=str(exc),
+                    )
+            elif atype:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"unsupported agent reply attachment type: {atype!r}",
+                )
+
     remote_agent_id = session["remoteAgentId"]
     user_msg = await memory_store.find_app_message_by_client_message_id(
         client_message_id, remote_agent_id=remote_agent_id,
@@ -2696,6 +2767,7 @@ async def api_channel_post_reply(session_id: str, request: Request):
         sequence=next_seq,
         remote_agent_id=remote_agent_id,
         created_at=now_ts,
+        attachments=reply_attachments,
     )
 
     logger.info(
@@ -2710,6 +2782,7 @@ async def api_channel_post_reply(session_id: str, request: Request):
             "content": content,
             "createdAt": _iso_from_ts(now_ts),
             "sourceToolCallId": source_tool_call_id or None,
+            "attachments": reply_attachments,
         },
     }
 

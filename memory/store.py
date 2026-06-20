@@ -1130,12 +1130,16 @@ class MemoryStore:
                     reply_ts = reply.get("created_at")
                     if reply_ts is None:
                         reply_ts = time.time()
+                    reply_attachments_json = json.dumps(
+                        reply.get("attachments") or [], ensure_ascii=False,
+                    )
                     await db.execute(
                         """INSERT INTO app_messages(
                                id, client_message_id, remote_agent_id, role, content,
-                               created_at, source_turn_id, source_tool_call_id, sequence
+                               created_at, source_turn_id, source_tool_call_id, sequence,
+                               attachments_json
                            )
-                           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             reply["remote_id"],
                             None,
@@ -1146,6 +1150,7 @@ class MemoryStore:
                             reply.get("source_turn_id", ""),
                             reply.get("source_tool_call_id", ""),
                             reply.get("sequence", 0),
+                            reply_attachments_json,
                         ),
                     )
                 await db.commit()

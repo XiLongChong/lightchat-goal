@@ -76,15 +76,20 @@ export function buildChannelNotificationParams({
  * @param {string} opts.clientMessageId
  * @param {string} opts.content
  * @param {string} [opts.sourceToolCallId]
+ * @param {Array<object>} [opts.attachments] — optional array of attachment dicts
+ *   (e.g. `[{ type: "sticker", stickerId: "happy_01" }]`)
  * @returns {object}
  */
-export function buildReplyPayload({ clientMessageId, content, sourceToolCallId }) {
+export function buildReplyPayload({ clientMessageId, content, sourceToolCallId, attachments }) {
   const payload = {
     clientMessageId: String(clientMessageId),
     content: String(content),
   };
   if (sourceToolCallId) {
     payload.sourceToolCallId = String(sourceToolCallId);
+  }
+  if (Array.isArray(attachments) && attachments.length > 0) {
+    payload.attachments = attachments;
   }
   return payload;
 }

@@ -159,11 +159,12 @@ async function ackDelivery(deliveryId) {
   await resp.json();
 }
 
-async function postReply(clientMessageId, text, sourceToolCallId) {
+async function postReply(clientMessageId, text, sourceToolCallId, attachments) {
   const payload = buildReplyPayload({
     clientMessageId,
     content: text,
     sourceToolCallId,
+    attachments,
   });
   const url = replyUrl(ROUTER_URL, SESSION_ID);
   const resp = await fetch(url, {
@@ -290,7 +291,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: "aspocket_reply",
-      description: "Reply to an AsPocket mobile app message",
+      description:
+        "Reply to an AsPocket mobile app message. " +
+        "Optional stickerId sends a sticker instead of/as well as text. " +
+        "Available sticker IDs: happy_01, laugh_01, sad_01, angry_01, shy_01, think_01, ok_01, heart_01.",
       inputSchema: {
         type: "object",
         properties: {
@@ -300,7 +304,13 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           text: {
             type: "string",
-            description: "The reply text to send back",
+            description: "The reply text to send back (may be empty if sending a sticker)",
+          },
+          stickerId: {
+            type: "string",
+            description:
+              "Optional sticker to send alongside the reply. " +
+              "Values: happy_01, laugh_01, sad_01, angry_01, shy_01, think_01, ok_01, heart_01.",
           },
         },
         required: ["clientMessageId", "text"],
@@ -319,6 +329,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
   const clientMessageId = String(args?.clientMessageId || "").trim();
   const text = String(args?.text || "").trim();
+  const stickerId = String(args?.stickerId || "").trim();
   if (!clientMessageId || !text) {
     return {
       content: [
@@ -330,8 +341,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       isError: true,
     };
   }
+  const attachments = stickerId
+    ? [{ type: "sticker", stickerId }]
+    : undefined;
   try {
-    await postReply(clientMessageId, text, undefined);
+    await postReply(clientMessageId, text, undefined, attachments);
     return {
       content: [{ type: "text", text: "sent" }],
     };

@@ -113,6 +113,36 @@ test("buildReplyPayload omits sourceToolCallId when empty", () => {
   assert.equal(payload.sourceToolCallId, undefined);
 });
 
+test("buildReplyPayload includes attachments when provided", () => {
+  const payload = buildReplyPayload({
+    clientMessageId: "cm1",
+    content: "sticker reply",
+    attachments: [{ type: "sticker", stickerId: "happy_01" }],
+  });
+  assert.equal(payload.clientMessageId, "cm1");
+  assert.equal(payload.content, "sticker reply");
+  assert.equal(payload.attachments.length, 1);
+  assert.equal(payload.attachments[0].type, "sticker");
+  assert.equal(payload.attachments[0].stickerId, "happy_01");
+});
+
+test("buildReplyPayload omits attachments when empty array", () => {
+  const payload = buildReplyPayload({
+    clientMessageId: "cm1",
+    content: "reply",
+    attachments: [],
+  });
+  assert.equal(payload.attachments, undefined);
+});
+
+test("buildReplyPayload omits attachments when not provided", () => {
+  const payload = buildReplyPayload({
+    clientMessageId: "cm1",
+    content: "reply",
+  });
+  assert.equal(payload.attachments, undefined);
+});
+
 // ── URL helpers ───────────────────────────────────────────────────
 
 test("joinRouterUrl strips trailing slashes from base", () => {

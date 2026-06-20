@@ -169,3 +169,36 @@ def test_single_reply_not_multiple():
     for content in ("status", "test", "fix bug", "hello"):
         reply = build_claude_mock_reply(content, "cm-x")
         assert len(reply["agentReplies"]) == 1
+
+
+def test_sticker_keyword_triggers_sticker_attachment():
+    """Content containing sticker/表情/happy returns a sticker attachment."""
+    from tools.claude_code_mock_adapter import build_claude_mock_reply
+
+    for keyword in ("sticker", "表情", "happy"):
+        reply = build_claude_mock_reply(keyword, "cm-s")
+        assert len(reply["agentReplies"]) == 1
+        att = reply["agentReplies"][0].get("attachments", [])
+        assert len(att) == 1
+        assert att[0]["type"] == "sticker"
+        assert att[0]["stickerId"] == "happy_01"
+
+
+def test_sticker_reply_has_text_content():
+    """Sticker reply still has text content alongside the attachment."""
+    from tools.claude_code_mock_adapter import build_claude_mock_reply
+
+    reply = build_claude_mock_reply("send me a sticker!", "cm-t")
+    assert len(reply["agentReplies"]) == 1
+    entry = reply["agentReplies"][0]
+    assert isinstance(entry["content"], str) and entry["content"]
+    assert len(entry.get("attachments", [])) == 1
+
+
+def test_status_prompt_does_not_return_sticker():
+    """'status' prompt does NOT trigger the sticker path."""
+    from tools.claude_code_mock_adapter import build_claude_mock_reply
+
+    reply = build_claude_mock_reply("status", "cm-n")
+    assert len(reply["agentReplies"]) == 1
+    assert reply["agentReplies"][0].get("attachments", []) == []
