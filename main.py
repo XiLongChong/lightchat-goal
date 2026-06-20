@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 # Add project root to path
@@ -1325,6 +1325,109 @@ app_agent_session_registry = AppAgentSessionRegistry()
 channel_pending_inbox = ChannelPendingInbox()
 
 
+# ── attachment helpers ─────────────────────────────────────────────
+
+import os as _os
+import re as _re
+
+_ATTACHMENTS_DIR = Path("./data/app_attachments")
+_MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024  # 10 MB
+_MAX_BODY_CONTENT_LENGTH = _MAX_ATTACHMENT_BYTES + 1 * 1024 * 1024  # 11 MB fudge for multipart overhead
+_ATTACHMENT_ID_RE = _re.compile(r"^app_att_[a-f0-9]+$")
+
+
+def _sanitize_attachment_filename(filename: str) -> str:
+    """Return a safe basename; never empty.  Strips path separators."""
+    name = _os.path.basename(filename).strip() or "image"
+    name = name.replace("\\", "").replace("/", "").replace("\x00", "")
+    return name if name else "image"
+
+
+def _attachment_ext(mime_type: str, filename: str = "") -> str:
+    """Derive a safe file extension (no leading dot)."""
+    if filename:
+        _, dot_ext = _os.path.splitext(filename)
+        if dot_ext and 1 < len(dot_ext) <= 6:
+            return dot_ext.lower().lstrip(".")
+    mime_map = {
+        "image/jpeg": "jpg", "image/png": "png",
+        "image/gif": "gif", "image/webp": "webp",
+        "image/svg+xml": "svg", "image/bmp": "bmp",
+    }
+    return mime_map.get(mime_type, "bin")
+
+
+def parse_multipart_form(content_type: str, body: bytes) -> list[dict]:
+    """Parse a ``multipart/form-data`` body into [{name, filename?, content_type, data}].
+
+    Returns an empty list when *content_type* isn't multipart or has no boundary.
+    """
+    if not content_type or "multipart/form-data" not in content_type.lower():
+        return []
+    boundary: str | None = None
+    for param in content_type.split(";"):
+        param = param.strip()
+        if param.lower().startswith("boundary="):
+            boundary = param[len("boundary="):].strip().strip('"')
+            break
+    if not boundary:
+        return []
+    delim = b"--" + boundary.encode("ascii")
+    parts: list[dict] = []
+    for seg in body.split(delim):
+        if seg in (b"--", b"--\r\n", b"\r\n", b""):
+            continue
+        if seg.startswith(b"--"):
+            continue  # closing boundary
+        if seg.startswith(b"\r\n"):
+            seg = seg[2:]
+        if seg.endswith(b"\r\n"):
+            seg = seg[:-2]
+        if b"\r\n\r\n" in seg:
+            header_blob, data = seg.split(b"\r\n\r\n", 1)
+        else:
+            header_blob, data = seg, b""
+        name = None
+        filename = None
+        ctype = ""
+        for line in header_blob.split(b"\r\n"):
+            try:
+                line_s = line.decode("utf-8", "replace")
+            except Exception:
+                continue
+            low = line_s.lower()
+            if low.startswith("content-disposition:"):
+                for p in line_s.split(";"):
+                    p = p.strip()
+                    if p.startswith("name="):
+                        name = p[5:].strip().strip('"')
+                    elif p.startswith("filename="):
+                        filename = p[9:].strip().strip('"')
+            elif low.startswith("content-type:"):
+                ctype = line_s.split(":", 1)[1].strip()
+        if name:
+            parts.append({
+                "name": name,
+                "filename": filename,
+                "content_type": ctype,
+                "data": data,
+            })
+    return parts
+
+
+def _parse_attachments_json(value: Any) -> list[dict]:
+    """Parse an attachments_json column value into a Python list."""
+    if isinstance(value, list):
+        return value
+    if not value:
+        return []
+    try:
+        parsed = json.loads(str(value))
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
 # ── app contact-invitation / remote-agent helpers ──────────────────
 
 
@@ -1453,6 +1556,113 @@ def resolve_app_remote_agent(remote_agent_id: str) -> dict:
     }
 
 
+# ── app attachments ──────────────────────────────────────────────
+
+
+@app.post("/api/attachments")
+async def api_upload_attachment(request: Request):
+    """Upload an image attachment (multipart/form-data).
+
+    Auth-first: returns 401 before parsing the file body.
+    Phase 1: only ``image/*``, max 10 MB.
+    """
+    api_cfg = _api_config()
+    _require_chat_auth(request, api_cfg)  # 401 before body
+
+    content_type = request.headers.get("content-type", "")
+    if "multipart/form-data" not in content_type.lower():
+        raise HTTPException(status_code=400, detail="content-type must be multipart/form-data")
+
+    # Early size guard via Content-Length (optional — body-size check catches the rest)
+    cl = request.headers.get("content-length")
+    if cl:
+        try:
+            if int(cl) > _MAX_BODY_CONTENT_LENGTH:
+                raise HTTPException(status_code=413, detail="attachment exceeds 10 MB limit")
+        except (ValueError, TypeError):
+            pass
+
+    body = await request.body()
+    if len(body) > _MAX_BODY_CONTENT_LENGTH:
+        raise HTTPException(status_code=413, detail="attachment exceeds 10 MB limit")
+
+    parts = parse_multipart_form(content_type, body)
+    file_part = next((p for p in parts if p["name"] == "file"), None)
+    if file_part is None or not file_part.get("filename"):
+        raise HTTPException(status_code=400, detail="file part is required")
+    if not file_part.get("content_type", "").startswith("image/"):
+        raise HTTPException(status_code=400, detail="only image attachments are supported")
+    if not file_part["data"]:
+        raise HTTPException(status_code=400, detail="empty file")
+    if len(file_part["data"]) > _MAX_ATTACHMENT_BYTES:
+        raise HTTPException(status_code=413, detail="attachment exceeds 10 MB limit")
+
+    mime_type = file_part["content_type"].strip()
+    original_filename = file_part["filename"]
+    sanitized = _sanitize_attachment_filename(original_filename)
+    ext = _attachment_ext(mime_type, original_filename)
+    attachment_id = f"app_att_{uuid.uuid4().hex}"
+    storage_filename = f"{attachment_id}.{ext}"
+    _ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
+    storage_path = _ATTACHMENTS_DIR / storage_filename
+
+    storage_path.write_bytes(file_part["data"])
+
+    size_bytes = len(file_part["data"])
+    now_ts = time.time()
+    await memory_store.insert_app_attachment(
+        attachment_id=attachment_id,
+        type="image",
+        mime_type=mime_type,
+        file_name=sanitized,
+        size_bytes=size_bytes,
+        storage_path=str(storage_path),
+        created_at=now_ts,
+    )
+
+    base = str(request.base_url).rstrip("/")
+    url = f"{base}/api/attachments/{attachment_id}"
+
+    logger.info("[app] attachment uploaded id=%s mime=%s size=%d", attachment_id, mime_type, size_bytes)
+
+    return {
+        "attachmentId": attachment_id,
+        "type": "image",
+        "mimeType": mime_type,
+        "fileName": sanitized,
+        "sizeBytes": size_bytes,
+        "url": url,
+        "createdAt": _iso_from_ts(now_ts),
+    }
+
+
+@app.get("/api/attachments/{attachment_id}")
+async def api_get_attachment(attachment_id: str, request: Request):
+    """Download a previously uploaded attachment."""
+    api_cfg = _api_config()
+    _require_chat_auth(request, api_cfg)
+
+    if not _ATTACHMENT_ID_RE.fullmatch(attachment_id):
+        raise HTTPException(status_code=404, detail="attachment not found")
+
+    meta = await memory_store.get_app_attachment(attachment_id)
+    if meta is None:
+        raise HTTPException(status_code=404, detail="attachment not found")
+
+    storage_path = str(meta["storage_path"])
+    # Defensive: refuse paths that don't resolve under the attachments root
+    resolved = _os.path.realpath(_os.path.normpath(storage_path))
+    expected_root = _os.path.realpath(_os.path.normpath(str(_ATTACHMENTS_DIR)))
+    if not resolved.startswith(expected_root + _os.path.sep) and resolved != expected_root:
+        logger.warning("[app] attachment path traversal attempt id=%s resolved=%s", attachment_id, resolved)
+        raise HTTPException(status_code=404, detail="attachment not found")
+
+    if not _os.path.isfile(resolved):
+        raise HTTPException(status_code=404, detail="attachment file missing on disk")
+
+    return FileResponse(resolved, media_type=str(meta["mime_type"]))
+
+
 @app.get("/api/profile")
 async def api_profile(request: Request):
     """Validate auth and return agent name — same auth as /chat."""
@@ -1488,10 +1698,57 @@ async def api_send_message(request: Request):
 
     client_message_id = str(body.get("clientMessageId", "")).strip()
     content = str(body.get("content", "")).strip()
+    raw_attachments = body.get("attachments")
+
     if not client_message_id:
         raise HTTPException(status_code=400, detail="clientMessageId is required")
-    if not content:
-        raise HTTPException(status_code=400, detail="content is required")
+    if not content and not raw_attachments:
+        raise HTTPException(status_code=400, detail="content or attachments are required")
+
+    # ── validate and canonicalise attachments ──────────────────────
+    incoming_attachments: list[dict] = []
+    if raw_attachments:
+        if not isinstance(raw_attachments, list):
+            raise HTTPException(status_code=400, detail="attachments must be an array")
+        if len(raw_attachments) > 1:
+            raise HTTPException(
+                status_code=400,
+                detail="Phase 1 supports at most 1 attachment per message",
+            )
+        # Validate each attachmentId exists in the store
+        incoming_ids: list[str] = []
+        for att in raw_attachments:
+            aid = str(att.get("attachmentId", "")).strip()
+            if not aid:
+                raise HTTPException(status_code=400, detail="attachmentId is required")
+            incoming_ids.append(aid)
+
+        stored_atts = await memory_store.get_app_attachments(incoming_ids)
+        stored_by_id = {s["attachment_id"]: s for s in stored_atts}
+        for aid in incoming_ids:
+            if aid not in stored_by_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"unknown attachmentId: {aid}",
+                )
+        base = str(request.base_url).rstrip("/")
+        # Build canonical attachment dicts from stored metadata (not from client)
+        for aid in incoming_ids:
+            s = stored_by_id[aid]
+            incoming_attachments.append({
+                "attachmentId": s["attachment_id"],
+                "type": s["type"],
+                "mimeType": s["mime_type"],
+                "fileName": s["file_name"],
+                "sizeBytes": int(s["size_bytes"]),
+                "url": f"{base}/api/attachments/{s['attachment_id']}",
+            })
+
+    # ── idempotency key for attachments (stable JSON) ──────────────
+    _attachments_sort_key = json.dumps(
+        [tuple(sorted(a.items())) for a in incoming_attachments],
+        ensure_ascii=False,
+    )
 
     # ── resolve remote agent id ────────────────────────────────────
     raw_remote = body.get("remoteAgentId")
@@ -1536,10 +1793,22 @@ async def api_send_message(request: Request):
         remote_agent_id=remote_agent_id,
     )
     if existing_user is not None:
+        # Compare content
         if str(existing_user.get("content", "")) != content:
             raise HTTPException(
                 status_code=409,
                 detail="clientMessageId already used with different content",
+            )
+        # Compare attachments (canonical JSON)
+        existing_attach = _parse_attachments_json(existing_user.get("attachments_json"))
+        existing_attach_key = json.dumps(
+            [tuple(sorted(a.items())) for a in existing_attach],
+            ensure_ascii=False,
+        )
+        if existing_attach_key != _attachments_sort_key:
+            raise HTTPException(
+                status_code=409,
+                detail="clientMessageId already used with different attachments",
             )
         # Return the existing result
         source_turn_id = str(existing_user.get("source_turn_id", ""))
@@ -1553,6 +1822,9 @@ async def api_send_message(request: Request):
                 "clientMessageId": client_message_id,
                 "status": "sent",
                 "createdAt": _iso_from_ts(existing_user.get("created_at", 0)),
+                "attachments": _parse_attachments_json(
+                    existing_user.get("attachments_json")
+                ),
             },
             "agentReplies": [
                 {
@@ -1600,6 +1872,7 @@ async def api_send_message(request: Request):
             sequence=0,
             remote_agent_id=remote_agent_id,
             created_at=now_ts,
+            attachments=incoming_attachments,
         )
 
         # Enqueue in the pending inbox for channel polling.  The inbox
@@ -1611,6 +1884,7 @@ async def api_send_message(request: Request):
             client_message_id=client_message_id,
             content=content,
             created_at=_iso_from_ts(now_ts),
+            attachments=incoming_attachments,
         )
 
         logger.info(
@@ -1624,6 +1898,7 @@ async def api_send_message(request: Request):
                 "clientMessageId": client_message_id,
                 "status": "sent",
                 "createdAt": _iso_from_ts(now_ts),
+                "attachments": incoming_attachments,
             },
             "agentReplies": [],
         }
@@ -1631,7 +1906,7 @@ async def api_send_message(request: Request):
     # ── attached-session callback path ───────────────────────────────
     if resolved["target"] == "attached_session":
         callback_replies = await _call_attached_session_callback(
-            resolved, client_message_id, content,
+            resolved, client_message_id, content, attachments=incoming_attachments,
         )
 
         # Persist user message + replies after successful callback.
@@ -1685,6 +1960,7 @@ async def api_send_message(request: Request):
                 "source_turn_id": turn_id,
                 "remote_agent_id": remote_agent_id,
                 "created_at": now_ts,
+                "attachments": incoming_attachments,
             },
             agent_replies=reply_rows,
         )
@@ -1700,6 +1976,7 @@ async def api_send_message(request: Request):
                 "clientMessageId": client_message_id,
                 "status": "sent",
                 "createdAt": _iso_from_ts(now_ts),
+                "attachments": incoming_attachments,
             },
             "agentReplies": agent_replies,
         }
@@ -1717,6 +1994,7 @@ async def api_send_message(request: Request):
         source_turn_id=turn_id,
         sequence=0,
         remote_agent_id=remote_agent_id,
+        attachments=incoming_attachments,
     )
 
     # ── collector sender (replaces wechat_sender) ─────────────────
@@ -1731,10 +2009,11 @@ async def api_send_message(request: Request):
         return messages
 
     # ── call Agent with 55 s timeout ──────────────────────────────
+    agent_user_message = content if content else "用户发送了一张图片。"
     try:
         result: TurnResult = await asyncio.wait_for(
             chat_runtime.handle_chat(
-                user_message=content,
+                user_message=agent_user_message,
                 user_id=_APP_USER_ID,
                 bot_id=BOT_ID,
                 history=[],
@@ -1804,6 +2083,7 @@ async def api_send_message(request: Request):
             "clientMessageId": client_message_id,
             "status": "sent",
             "createdAt": _iso_from_ts(now_ts),
+            "attachments": incoming_attachments,
         },
         "agentReplies": agent_replies_internal,
     }
@@ -1848,6 +2128,7 @@ async def api_get_messages(
                 "role": m["role"],
                 "content": m["content"],
                 "createdAt": _iso_from_ts(m.get("created_at", 0)),
+                "attachments": _parse_attachments_json(m.get("attachments_json")),
             }
             for m in messages
         ],
@@ -2007,6 +2288,8 @@ async def _call_attached_session_callback(
     resolved: dict,
     client_message_id: str,
     content: str,
+    *,
+    attachments: list[dict] | None = None,
 ) -> list[dict[str, Any]]:
     """POST to the attached session's callback endpoint and return validated replies.
 
@@ -2020,6 +2303,7 @@ async def _call_attached_session_callback(
         "clientMessageId": client_message_id,
         "content": content,
         "createdAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "attachments": list(attachments) if attachments else [],
     }
 
     try:
@@ -2299,6 +2583,7 @@ async def api_channel_poll_pending(
                 "clientMessageId": m["clientMessageId"],
                 "content": m["content"],
                 "createdAt": m["createdAt"],
+                "attachments": m.get("attachments", []),
             }
             for m in messages
         ],

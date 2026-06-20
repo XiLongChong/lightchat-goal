@@ -5503,3 +5503,885 @@ async def test_attached_session_callback_still_works_with_channel_code_present(m
     # Channel inbox should be empty (message went through callback path)
     pending = await channel_pending_inbox.list_pending(f"s-{rid}")
     assert len(pending) == 0
+
+
+# ================================================================
+# Image attachments (Phase 1) — upload / download / message extension
+# ================================================================
+
+import asyncio as _asyncio
+from pathlib import Path as _Path
+
+
+def _build_multipart(parts, boundary=None):
+    """Build a multipart/form-data body + content-type header for tests.
+
+    *parts*: list of dicts with keys: ``name``, ``filename`` (optional),
+    ``content_type`` (optional), ``data`` (bytes or str).
+    Returns ``(content_type, body_bytes)``.
+    """
+    import uuid as _uuid2
+    boundary = boundary or f"----GoalTest{_uuid2.uuid4().hex[:8]}"
+    b = boundary.encode()
+    crlf = b"\r\n"
+    chunks = []
+    for p in parts:
+        chunks.append(b"--" + b + crlf)
+        header_lines = [
+            f'Content-Disposition: form-data; name="{p["name"]}"'
+            + (f'; filename="{p["filename"]}"' if p.get("filename") else ""),
+        ]
+        if p.get("content_type"):
+            header_lines.append(f"Content-Type: {p['content_type']}")
+        for h in header_lines:
+            chunks.append(h.encode() + crlf)
+        chunks.append(crlf)
+        data = p["data"]
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        chunks.append(data + crlf)
+    chunks.append(b"--" + b + b"--" + crlf)
+    return f"multipart/form-data; boundary={boundary}", b"".join(chunks)
+
+
+class _MultipartRequest:
+    """Fake FastAPI Request for attachment endpoints."""
+
+    def __init__(self, content_type, body, auth=True):
+        self.headers = {"content-type": content_type}
+        if auth:
+            self.headers["authorization"] = "Bearer secret"
+        self.base_url = "http://127.0.0.1:8899/"
+        self._body = body
+
+    async def body(self):
+        return self._body
+
+
+@pytest.fixture
+def _clean_attachments():
+    """Remove test attachments from data/app_attachments/."""
+    d = _Path("./data/app_attachments")
+    if d.exists():
+        for f in d.iterdir():
+            if f.is_file() and f.name.startswith("app_att_"):
+                f.unlink()
+    yield
+    if d.exists():
+        for f in d.iterdir():
+            if f.is_file() and f.name.startswith("app_att_"):
+                f.unlink()
+
+
+# ── test 1: upload image success ────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_upload_image_success_returns_metadata(monkeypatch):
+    """POST /api/attachments with a valid image returns metadata + url."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 50  # valid PNG header
+    ct, body = _build_multipart(
+        [{"name": "file", "filename": "cat.png",
+          "content_type": "image/png", "data": png}])
+
+    from main import api_upload_attachment
+    result = await api_upload_attachment(
+        _MultipartRequest(ct, body))
+    assert result["type"] == "image"
+    assert result["mimeType"] == "image/png"
+    assert result["fileName"] == "cat.png"
+    assert result["sizeBytes"] == len(png)
+    aid = result["attachmentId"]
+    assert aid.startswith("app_att_")
+    assert result["url"].endswith(f"/api/attachments/{aid}")
+    assert result["createdAt"].endswith("Z")
+
+    # File persisted on disk
+    from main import memory_store
+    meta = await memory_store.get_app_attachment(aid)
+    assert meta is not None
+    assert meta["mime_type"] == "image/png"
+    storage = _Path(meta["storage_path"])
+    assert storage.exists()
+    assert storage.read_bytes() == png
+
+    # Cleanup
+    storage.unlink(missing_ok=True)
+
+
+# ── test 2: upload non-image returns 400 ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_upload_non_image_returns_400(monkeypatch):
+    """POST /api/attachments with text/plain returns 400."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    ct, body = _build_multipart(
+        [{"name": "file", "filename": "a.txt",
+          "content_type": "text/plain", "data": b"hello"}])
+
+    from main import api_upload_attachment
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as exc:
+        await api_upload_attachment(_MultipartRequest(ct, body))
+    assert exc.value.status_code == 400
+
+
+# ── test 3: upload over 10 MB returns 413 ───────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_upload_over_10mb_returns_413(monkeypatch):
+    """POST /api/attachments with >10 MB file returns 413."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    # 10 MB + 1 byte: triggers file-size guard
+    big = b"\x00" * (10 * 1024 * 1024 + 1)  # 10_485_761 bytes
+    ct, body = _build_multipart(
+        [{"name": "file", "filename": "big.png",
+          "content_type": "image/png", "data": big}])
+
+    from main import api_upload_attachment
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as exc:
+        await api_upload_attachment(_MultipartRequest(ct, body))
+    assert exc.value.status_code == 413
+
+
+# ── test 4: unauth upload returns 401 and writes no file ────────────
+
+
+@pytest.mark.asyncio
+async def test_upload_unauth_returns_401_no_file(monkeypatch):
+    """POST /api/attachments without auth returns 401 before writing."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    ct, body = _build_multipart(
+        [{"name": "file", "filename": "nope.png",
+          "content_type": "image/png", "data": b"\x89PNG\r\n\x1a\n"}])
+    from fastapi import HTTPException
+
+    # Check that no files are written
+    d = _Path("./data/app_attachments")
+    before = set(d.iterdir()) if d.exists() else set()
+
+    from main import api_upload_attachment
+
+    with pytest.raises(HTTPException) as exc:
+        await api_upload_attachment(_MultipartRequest(ct, body, auth=False))
+    assert exc.value.status_code == 401
+
+    after = set(d.iterdir()) if d.exists() else set()
+    assert after == before  # no new files
+
+
+# ── test 5: GET attachment success, correct media type ──────────────
+
+
+@pytest.mark.asyncio
+async def test_get_attachment_success(monkeypatch):
+    """GET /api/attachments/{id} returns the file with correct media type."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    # Upload first
+    png = b"\x89PNG\r\n\x1a\n" + b"hello"
+    ct, body = _build_multipart(
+        [{"name": "file", "filename": "hi.png",
+          "content_type": "image/png", "data": png}])
+    from main import api_upload_attachment, api_get_attachment
+
+    up = await api_upload_attachment(_MultipartRequest(ct, body))
+    aid = up["attachmentId"]
+
+    resp = await api_get_attachment(
+        aid, _MultipartRequest(ct, body, auth=True))
+    assert resp.media_type == "image/png"
+    assert resp.status_code == 200
+    # Read back content
+    import tempfile
+    # FileResponse is a callable (send) — we check the path instead
+    fp = _Path(resp.path)
+    assert fp.exists()
+    assert fp.read_bytes() == png
+
+    # Cleanup
+    fp.unlink(missing_ok=True)
+
+
+# ── test 6: GET missing attachment returns 404 ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_attachment_missing_returns_404(monkeypatch):
+    """GET /api/attachments/{id} for unknown id returns 404."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+    from fastapi import HTTPException
+    from main import api_get_attachment
+
+    with pytest.raises(HTTPException) as exc:
+        await api_get_attachment(
+            "app_att_deadbeef00000000",
+            _MultipartRequest("", b"", auth=True))
+    assert exc.value.status_code == 404
+
+
+# ── test 6b: path traversal rejected as 404 ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_attachment_path_traversal_returns_404(monkeypatch):
+    """IDs that don't match the expected pattern are 404, not a traversal."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+    from fastapi import HTTPException
+    from main import api_get_attachment
+
+    for bad_id in ("../../etc/passwd", "\\..\\..\\secret", "not-an-id"):
+        with pytest.raises(HTTPException) as exc:
+            await api_get_attachment(
+                bad_id, _MultipartRequest("", b"", auth=True))
+        assert exc.value.status_code == 404
+
+
+# ── test 7: POST content empty + image attachment succeeds ──────────
+
+
+@pytest.mark.asyncio
+async def test_post_content_empty_image_attachment_succeeds(monkeypatch):
+    """POST /api/messages with empty content + valid attachment succeeds."""
+    import uuid as _t7
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    # Upload an image first
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 20
+    ct, body = _build_multipart(
+        [{"name": "file", "filename": "img.jpg",
+          "content_type": "image/jpeg", "data": png}])
+    from main import api_upload_attachment, api_send_message
+
+    up = await api_upload_attachment(_MultipartRequest(ct, body))
+    aid = up["attachmentId"]
+
+    cid = f"cm-t7-{_t7.uuid4().hex[:8]}"
+
+    class _Req:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://127.0.0.1:8899/"
+
+        async def json(self):
+            return {
+                "clientMessageId": cid,
+                "content": "",
+                "attachments": [{
+                    "attachmentId": aid,
+                    "type": "image",
+                    "mimeType": "image/jpeg",
+                    "fileName": "img.jpg",
+                    "sizeBytes": len(png),
+                    "url": f"http://127.0.0.1:8899/api/attachments/{aid}",
+                }],
+            }
+
+    result = await api_send_message(_Req())
+    assert "userMessage" in result
+    um = result["userMessage"]
+    assert um["clientMessageId"] == cid
+    assert um["status"] == "sent"
+    assert len(um.get("attachments", [])) == 1
+    assert um["attachments"][0]["attachmentId"] == aid
+
+    # Cleanup
+    storage = _Path("./data/app_attachments") / f"{aid}.jpg"
+    storage.unlink(missing_ok=True)
+
+
+# ── test 8: POST no content + no attachments returns 400 ────────────
+
+
+@pytest.mark.asyncio
+async def test_post_no_content_no_attachments_returns_400(monkeypatch):
+    """POST /api/messages with empty content and no attachments returns 400."""
+    import uuid as _t8
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+    from fastapi import HTTPException
+    from main import api_send_message
+
+    cid = f"cm-t8-{_t8.uuid4().hex[:8]}"
+
+    class _Req:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {"clientMessageId": cid, "content": ""}
+
+    with pytest.raises(HTTPException) as exc:
+        await api_send_message(_Req())
+    assert exc.value.status_code == 400
+
+
+# ── test 9: POST unknown attachmentId returns 400 ───────────────────
+
+
+@pytest.mark.asyncio
+async def test_post_unknown_attachment_returns_400(monkeypatch):
+    """POST /api/messages with non-existent attachmentId returns 400."""
+    import uuid as _t9
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+    from fastapi import HTTPException
+    from main import api_send_message
+
+    cid = f"cm-t9-{_t9.uuid4().hex[:8]}"
+
+    class _Req:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {
+                "clientMessageId": cid,
+                "content": "hi",
+                "attachments": [{
+                    "attachmentId": "app_att_deadbeef00000000",
+                    "type": "image",
+                    "mimeType": "image/png",
+                    "fileName": "nope.png",
+                    "sizeBytes": 100,
+                    "url": "http://x/y",
+                }],
+            }
+
+    with pytest.raises(HTTPException) as exc:
+        await api_send_message(_Req())
+    assert exc.value.status_code == 400
+
+
+# ── test 10: >1 attachment returns 400 ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_post_more_than_one_attachment_returns_400(monkeypatch):
+    """POST /api/messages with 2 attachments returns 400 (Phase 1 limit)."""
+    import uuid as _t10
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    # Upload 2 images
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 20
+    ct, body = _build_multipart(
+        [{"name": "file", "filename": "a.png",
+          "content_type": "image/png", "data": png}])
+    ct2, body2 = _build_multipart(
+        [{"name": "file", "filename": "bb.png",
+          "content_type": "image/png", "data": png}])
+    from main import api_upload_attachment
+    up_a = await api_upload_attachment(_MultipartRequest(ct, body))
+    up_b = await api_upload_attachment(_MultipartRequest(ct2, body2))
+
+    from fastapi import HTTPException
+    from main import api_send_message
+    cid = f"cm-t10-{_t10.uuid4().hex[:8]}"
+
+    class _Req:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://127.0.0.1:8899/"
+
+        async def json(self):
+            return {
+                "clientMessageId": cid,
+                "content": "hi",
+                "attachments": [
+                    {"attachmentId": up_a["attachmentId"], "type": "image",
+                     "mimeType": "image/png", "fileName": "a.png",
+                     "sizeBytes": len(png),
+                     "url": up_a["url"]},
+                    {"attachmentId": up_b["attachmentId"], "type": "image",
+                     "mimeType": "image/png", "fileName": "bb.png",
+                     "sizeBytes": len(png),
+                     "url": up_b["url"]},
+                ],
+            }
+
+    with pytest.raises(HTTPException) as exc:
+        await api_send_message(_Req())
+    assert exc.value.status_code == 400
+
+    # Cleanup
+    for uid in (up_a["attachmentId"], up_b["attachmentId"]):
+        (_Path("./data/app_attachments") / f"{uid}.png").unlink(missing_ok=True)
+
+
+# ── test 11: GET /api/messages returns attachments metadata ─────────
+
+
+@pytest.mark.asyncio
+async def test_get_messages_returns_attachments(monkeypatch):
+    """GET /api/messages returns attachments metadata per message."""
+    import uuid as _t11
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    # Upload image
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 20
+    ct, body = _build_multipart(
+        [{"name": "file", "filename": "test.jpg",
+          "content_type": "image/jpeg", "data": png}])
+    from main import api_upload_attachment, api_send_message, api_get_messages
+    up = await api_upload_attachment(_MultipartRequest(ct, body))
+    aid = up["attachmentId"]
+
+    # POST with attachment
+    cid = f"cm-t11-{_t11.uuid4().hex[:8]}"
+
+    class _PostReq:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://127.0.0.1:8899/"
+
+        async def json(self):
+            return {
+                "clientMessageId": cid,
+                "content": "看这张图",
+                "attachments": [{
+                    "attachmentId": aid,
+                    "type": "image",
+                    "mimeType": "image/jpeg",
+                    "fileName": "test.jpg",
+                    "sizeBytes": len(png),
+                    "url": up["url"],
+                }],
+            }
+
+    # Insert a test message directly via store (deterministic, no agent call)
+    from main import memory_store
+    import time as _time
+
+    user_rid = f"app_rm_user_{_t11.uuid4().hex[:12]}"
+    now_ts = _time.time()
+    await memory_store.insert_app_message(
+        remote_id=user_rid,
+        client_message_id=cid,
+        role="user",
+        content="看这张图",
+        source_turn_id=f"app_turn_{_t11.uuid4().hex[:12]}",
+        sequence=0,
+        remote_agent_id="default",
+        created_at=now_ts,
+        attachments=[{
+            "attachmentId": aid,
+            "type": "image",
+            "mimeType": "image/jpeg",
+            "fileName": "test.jpg",
+            "sizeBytes": len(png),
+            "url": up["url"],
+        }],
+    )
+
+    # Verify via direct store lookup
+    found = await memory_store.find_app_message_by_client_message_id(cid)
+    assert found is not None
+    parsed = json.loads(found["attachments_json"])
+    assert len(parsed) == 1
+    assert parsed[0]["attachmentId"] == aid
+    assert parsed[0]["type"] == "image"
+
+    # GET history: any message should have the attachments field ([] or populated)
+    class _GetReq:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+    result = await api_get_messages(_GetReq(), limit=5)
+    msgs = result["messages"]
+    for m in msgs:
+        assert "attachments" in m  # all messages carry the field
+        assert isinstance(m["attachments"], list)
+
+    # Cleanup
+    (_Path("./data/app_attachments") / f"{aid}.jpeg").unlink(missing_ok=True)
+
+
+# ── test 12: idempotency — same attachments returns existing ────────
+
+
+@pytest.mark.asyncio
+async def test_idempotency_same_attachments_returns_existing(monkeypatch):
+    """Same clientMessageId + content + attachments returns cached result."""
+    import uuid as _t12
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 20
+    ct, body = _build_multipart(
+        [{"name": "file", "filename": "idem.jpg",
+          "content_type": "image/jpeg", "data": png}])
+    from main import api_upload_attachment, api_send_message
+    up = await api_upload_attachment(_MultipartRequest(ct, body))
+    aid = up["attachmentId"]
+
+    cid = f"cm-t12-{_t12.uuid4().hex[:8]}"
+    attach_payload = [{
+        "attachmentId": aid,
+        "type": "image",
+        "mimeType": "image/jpeg",
+        "fileName": "idem.jpg",
+        "sizeBytes": len(png),
+        "url": up["url"],
+    }]
+
+    class _Req:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://127.0.0.1:8899/"
+
+        async def json(self):
+            return {
+                "clientMessageId": cid,
+                "content": "test",
+                "attachments": attach_payload,
+            }
+
+    r1 = await api_send_message(_Req())
+    r2 = await api_send_message(_Req())
+
+    assert r1["userMessage"]["remoteId"] == r2["userMessage"]["remoteId"]
+    assert r1["userMessage"]["clientMessageId"] == cid
+
+    # Cleanup
+    (_Path("./data/app_attachments") / f"{aid}.jpeg").unlink(missing_ok=True)
+
+
+# ── test 13: idempotency — different attachments returns 409 ────────
+
+
+@pytest.mark.asyncio
+async def test_idempotency_different_attachments_returns_409(monkeypatch):
+    """Same clientMessageId + different attachments returns 409."""
+    import uuid as _t13
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    png_a = b"\x89PNG\r\n\x1a\n" + b"A" * 20
+    png_b = b"\x89PNG\r\n\x1a\n" + b"B" * 20
+    ct, body = _build_multipart(
+        [{"name": "file", "filename": "imgA.jpg",
+          "content_type": "image/jpeg", "data": png_a}])
+    from main import api_upload_attachment, api_send_message
+    up_a = await api_upload_attachment(_MultipartRequest(ct, body))
+    # Upload second image with a different name
+    ct2, body2 = _build_multipart(
+        [{"name": "file", "filename": "imgB.jpg",
+          "content_type": "image/jpeg", "data": png_b}])
+    up_b = await api_upload_attachment(
+        _MultipartRequest(ct2, body2))
+
+    cid = f"cm-t13-{_t13.uuid4().hex[:8]}"
+
+    # First post with imgA
+    class _ReqA:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://127.0.0.1:8899/"
+
+        async def json(self):
+            return {
+                "clientMessageId": cid,
+                "content": "diff",
+                "attachments": [{
+                    "attachmentId": up_a["attachmentId"],
+                    "type": "image",
+                    "mimeType": "image/jpeg",
+                    "fileName": "imgA.jpg",
+                    "sizeBytes": len(png_a),
+                    "url": up_a["url"],
+                }],
+            }
+
+    r1 = await api_send_message(_ReqA())
+    assert "userMessage" in r1
+
+    # Second post with same cid but imgB → 409
+    class _ReqB:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://127.0.0.1:8899/"
+
+        async def json(self):
+            return {
+                "clientMessageId": cid,
+                "content": "diff",
+                "attachments": [{
+                    "attachmentId": up_b["attachmentId"],
+                    "type": "image",
+                    "mimeType": "image/jpeg",
+                    "fileName": "imgB.jpg",
+                    "sizeBytes": len(png_b),
+                    "url": up_b["url"],
+                }],
+            }
+
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc:
+        await api_send_message(_ReqB())
+    assert exc.value.status_code == 409
+
+    # Cleanup
+    for uid in (up_a["attachmentId"], up_b["attachmentId"]):
+        (_Path("./data/app_attachments") / f"{uid}.jpeg").unlink(missing_ok=True)
+
+
+# ── test 14: claude_channel pending inbox saves attachments ─────────
+
+
+@pytest.mark.asyncio
+async def test_claude_channel_pending_attachments(monkeypatch):
+    """Claude channel pending inbox stores and returns attachments."""
+    import uuid as _t14
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg, channel_pending_inbox
+
+    app_agent_session_registry._sessions.clear()
+    channel_pending_inbox._messages.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    # Upload an image
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 20
+    ct, body = _build_multipart(
+        [{"name": "file", "filename": "chan.jpg",
+          "content_type": "image/jpeg", "data": png}])
+    from main import api_upload_attachment
+    up = await api_upload_attachment(_MultipartRequest(ct, body))
+    aid = up["attachmentId"]
+
+    # Register claude_channel session
+    rid = f"chan-att-{_t14.uuid4().hex[:8]}"
+    sid = f"s-{rid}"
+    app_agent_session_registry._sessions[sid] = _make_claude_channel_session(rid, sid)
+
+    cid = f"cm-t14-{_t14.uuid4().hex[:8]}"
+
+    class _PostReq:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://127.0.0.1:8899/"
+
+        async def json(self):
+            return {
+                "clientMessageId": cid,
+                "content": "channel message",
+                "remoteAgentId": rid,
+                "attachments": [{
+                    "attachmentId": aid,
+                    "type": "image",
+                    "mimeType": "image/jpeg",
+                    "fileName": "chan.jpg",
+                    "sizeBytes": len(png),
+                    "url": up["url"],
+                }],
+            }
+
+    from main import api_send_message, api_channel_poll_pending
+
+    await api_send_message(_PostReq())
+
+    class _PollReq:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+    poll = await api_channel_poll_pending(sid, _PollReq())
+    assert len(poll["messages"]) == 1
+    pending = poll["messages"][0]
+    assert pending["clientMessageId"] == cid
+    attachments = pending.get("attachments", [])
+    assert len(attachments) == 1
+    assert attachments[0]["attachmentId"] == aid
+
+    # Cleanup
+    (_Path("./data/app_attachments") / f"{aid}.jpeg").unlink(missing_ok=True)
+
+
+# ── test 15: callback payload includes attachments ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_callback_payload_includes_attachments(monkeypatch):
+    """Attached-session callback POST body includes attachments field."""
+    import uuid as _t15
+    import httpx
+    from unittest.mock import MagicMock
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg, channel_pending_inbox
+
+    app_agent_session_registry._sessions.clear()
+    channel_pending_inbox._messages.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    # Upload an image
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 20
+    ct, body = _build_multipart(
+        [{"name": "file", "filename": "cb.jpg",
+          "content_type": "image/jpeg", "data": png}])
+    from main import api_upload_attachment
+    up = await api_upload_attachment(_MultipartRequest(ct, body))
+    aid = up["attachmentId"]
+
+    # Register attached session
+    rid = f"att-cb-att-{_t15.uuid4().hex[:8]}"
+    app_agent_session_registry._sessions[f"s-{rid}"] = _make_attached_session(rid)
+
+    # Capture callback payload
+    captured = {}
+
+    fake_resp = MagicMock()
+    fake_resp.status_code = 200
+    fake_resp.json.return_value = {"agentReplies": [{"content": "got attachments"}]}
+
+    class _FakeClientCtx:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            client = MagicMock()
+
+            async def _capture(url, json=None, **kw):
+                captured["url"] = url
+                captured["json"] = json
+                return fake_resp
+
+            client.post = _capture
+            return client
+
+        async def __aexit__(self, *args):
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClientCtx)
+
+    cid = f"cm-t15-{_t15.uuid4().hex[:8]}"
+
+    class _PostReq:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://127.0.0.1:8899/"
+
+        async def json(self):
+            return {
+                "clientMessageId": cid,
+                "content": "hello with image",
+                "remoteAgentId": rid,
+                "attachments": [{
+                    "attachmentId": aid,
+                    "type": "image",
+                    "mimeType": "image/jpeg",
+                    "fileName": "cb.jpg",
+                    "sizeBytes": len(png),
+                    "url": up["url"],
+                }],
+            }
+
+    from main import api_send_message
+    result = await api_send_message(_PostReq())
+    assert len(result["agentReplies"]) == 1
+
+    # Assert callback payload includes attachments
+    assert "json" in captured, "callback was called"
+    payload = captured["json"]
+    assert "attachments" in payload
+    attachments = payload["attachments"]
+    assert len(attachments) == 1
+    assert attachments[0]["attachmentId"] == aid
+    assert attachments[0]["type"] == "image"
+
+    # Cleanup
+    (_Path("./data/app_attachments") / f"{aid}.jpeg").unlink(missing_ok=True)
+
+
+# ── Store-layer tests for attachments ───────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_app_message_stores_and_returns_attachments():
+    """insert_app_message with attachments stores JSON; SELECT returns it."""
+    from memory.store import MemoryStore
+
+    store = MemoryStore(db_path=":memory:")
+    try:
+        await store.insert_app_message(
+            remote_id="rm-att-1",
+            client_message_id="cm-att-1",
+            role="user",
+            content="hello",
+            source_turn_id="turn-1",
+            attachments=[{"attachmentId": "app_att_test", "type": "image"}],
+        )
+        found = await store.find_app_message_by_client_message_id("cm-att-1")
+        assert found is not None
+        import json as _json
+        parsed = _json.loads(found["attachments_json"])
+        assert len(parsed) == 1
+        assert parsed[0]["attachmentId"] == "app_att_test"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_app_attachment_insert_and_get():
+    """insert_app_attachment persists; get_app_attachment reads back."""
+    from memory.store import MemoryStore
+
+    store = MemoryStore(db_path=":memory:")
+    try:
+        await store.insert_app_attachment(
+            attachment_id="app_att_store1",
+            mime_type="image/png",
+            file_name="test.png",
+            size_bytes=123,
+            storage_path="/tmp/test.png",
+        )
+        meta = await store.get_app_attachment("app_att_store1")
+        assert meta is not None
+        assert meta["mime_type"] == "image/png"
+        assert meta["file_name"] == "test.png"
+        assert meta["size_bytes"] == 123
+
+        # Missing returns None
+        meta2 = await store.get_app_attachment("app_att_nonexist")
+        assert meta2 is None
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_app_attachments_get_multiple():
+    """get_app_attachments returns all matching IDs, ignores missing."""
+    from memory.store import MemoryStore
+
+    store = MemoryStore(db_path=":memory:")
+    try:
+        await store.insert_app_attachment(
+            attachment_id="app_att_a",
+            mime_type="image/png",
+            file_name="a.png",
+            size_bytes=10,
+            storage_path="/tmp/a.png",
+        )
+        await store.insert_app_attachment(
+            attachment_id="app_att_b",
+            mime_type="image/jpeg",
+            file_name="b.jpg",
+            size_bytes=20,
+            storage_path="/tmp/b.jpg",
+        )
+        results = await store.get_app_attachments(
+            ["app_att_a", "app_att_b", "app_att_missing"])
+        assert len(results) == 2
+        ids = {r["attachment_id"] for r in results}
+        assert ids == {"app_att_a", "app_att_b"}
+
+        # Empty input
+        empty = await store.get_app_attachments([])
+        assert empty == []
+    finally:
+        await store.close()

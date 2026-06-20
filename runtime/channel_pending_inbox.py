@@ -45,6 +45,7 @@ class ChannelPendingInbox:
         content: str,
         created_at: str,
         delivery_id: str | None = None,
+        attachments: list | None = None,
     ) -> dict[str, Any]:
         """Add a pending message.
 
@@ -72,6 +73,7 @@ class ChannelPendingInbox:
                 "clientMessageId": client_message_id,
                 "content": content,
                 "createdAt": created_at,
+                "attachments": list(attachments) if attachments else [],
                 "status": "pending",
             }
             self._messages[delivery] = msg

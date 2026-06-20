@@ -61,6 +61,7 @@ class MemoryStore:
         await self._create_tables(db)
         await self._ensure_turn_metric_columns(db)
         await self._ensure_app_message_remote_agent_id(db)
+        await self._ensure_app_message_attachments_json(db)
         await db.execute(
             "INSERT OR REPLACE INTO runtime_meta(key, value) VALUES('runtime_schema', ?)",
             (_SCHEMA_ID,),
@@ -199,7 +200,8 @@ class MemoryStore:
                 created_at REAL NOT NULL,
                 source_turn_id TEXT NOT NULL DEFAULT '',
                 source_tool_call_id TEXT NOT NULL DEFAULT '',
-                sequence INTEGER NOT NULL DEFAULT 0
+                sequence INTEGER NOT NULL DEFAULT 0,
+                attachments_json TEXT NOT NULL DEFAULT '[]'
             );
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_app_messages_client_msg_id
@@ -211,6 +213,16 @@ class MemoryStore:
 
             CREATE INDEX IF NOT EXISTS idx_app_messages_source_turn_id
                 ON app_messages(remote_agent_id, source_turn_id);
+
+            CREATE TABLE IF NOT EXISTS app_attachments (
+                attachment_id TEXT PRIMARY KEY,
+                type TEXT NOT NULL DEFAULT 'image',
+                mime_type TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL DEFAULT 0,
+                storage_path TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL
+            );
             """
         )
 
@@ -273,6 +285,17 @@ class MemoryStore:
                    ON app_messages(remote_agent_id, source_turn_id)"""
             )
 
+            await db.commit()
+
+    async def _ensure_app_message_attachments_json(self, db: aiosqlite.Connection) -> None:
+        """Incrementally add attachments_json to app_messages if missing."""
+        rows = await db.execute_fetchall("PRAGMA table_info(app_messages)")
+        existing = {str(row["name"]) for row in rows}
+
+        if "attachments_json" not in existing:
+            await db.execute(
+                "ALTER TABLE app_messages ADD COLUMN attachments_json TEXT NOT NULL DEFAULT '[]'"
+            )
             await db.commit()
 
     async def close(self) -> None:
@@ -1017,6 +1040,7 @@ class MemoryStore:
         sequence: int = 0,
         remote_agent_id: str = "default",
         created_at: float | None = None,
+        attachments: list[dict] | None = None,
     ) -> None:
         """Insert a single app message (user or agent reply).
 
@@ -1025,14 +1049,18 @@ class MemoryStore:
         the current time is used.
         """
         now = created_at if created_at is not None else time.time()
+        attachments_json = json.dumps(
+            attachments if attachments else [], ensure_ascii=False,
+        )
         async with self._write_lock:
             db = await self._get_db()
             await db.execute(
                 """INSERT INTO app_messages(
                        id, client_message_id, remote_agent_id, role, content,
-                       created_at, source_turn_id, source_tool_call_id, sequence
+                       created_at, source_turn_id, source_tool_call_id, sequence,
+                       attachments_json
                    )
-                   VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     remote_id,
                     client_message_id,
@@ -1043,6 +1071,7 @@ class MemoryStore:
                     source_turn_id,
                     source_tool_call_id,
                     sequence,
+                    attachments_json,
                 ),
             )
             await db.commit()
@@ -1062,7 +1091,7 @@ class MemoryStore:
 
         *user_message* keys: ``remote_id``, ``client_message_id``,
         ``content``, ``source_turn_id``, ``remote_agent_id``,
-        ``created_at`` (optional).
+        ``created_at`` (optional), ``attachments`` (optional list of dicts).
 
         Each *agent_replies* entry keys: ``remote_id``, ``content``,
         ``source_turn_id``, ``sequence``, ``remote_agent_id``,
@@ -1074,12 +1103,16 @@ class MemoryStore:
                 user_ts = user_message.get("created_at")
                 if user_ts is None:
                     user_ts = time.time()
+                user_attachments_json = json.dumps(
+                    user_message.get("attachments") or [], ensure_ascii=False,
+                )
                 await db.execute(
                     """INSERT INTO app_messages(
                            id, client_message_id, remote_agent_id, role, content,
-                           created_at, source_turn_id, source_tool_call_id, sequence
+                           created_at, source_turn_id, source_tool_call_id, sequence,
+                           attachments_json
                        )
-                       VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         user_message["remote_id"],
                         user_message.get("client_message_id"),
@@ -1090,6 +1123,7 @@ class MemoryStore:
                         user_message.get("source_turn_id", ""),
                         "",
                         0,
+                        user_attachments_json,
                     ),
                 )
                 for reply in agent_replies:
@@ -1236,11 +1270,59 @@ class MemoryStore:
         next_cursor = messages[-1]["id"] if messages else cursor
         return messages, next_cursor, has_more
 
+    # ── app_attachments ─────────────────────────────────────────────
+
+    async def insert_app_attachment(
+        self,
+        *,
+        attachment_id: str,
+        type: str = "image",
+        mime_type: str,
+        file_name: str,
+        size_bytes: int,
+        storage_path: str,
+        created_at: float | None = None,
+    ) -> None:
+        """Persist attachment metadata."""
+        now = created_at if created_at is not None else time.time()
+        async with self._write_lock:
+            db = await self._get_db()
+            await db.execute(
+                """INSERT INTO app_attachments(
+                       attachment_id, type, mime_type, file_name, size_bytes,
+                       storage_path, created_at
+                   )
+                   VALUES(?, ?, ?, ?, ?, ?, ?)""",
+                (attachment_id, type, mime_type, file_name, size_bytes, storage_path, now),
+            )
+            await db.commit()
+
+    async def get_app_attachment(self, attachment_id: str) -> dict[str, Any] | None:
+        """Look up a single attachment by id."""
+        db = await self._get_db()
+        rows = await db.execute_fetchall(
+            "SELECT * FROM app_attachments WHERE attachment_id = ?",
+            (attachment_id,),
+        )
+        return dict(rows[0]) if rows else None
+
+    async def get_app_attachments(self, attachment_ids: list[str]) -> list[dict[str, Any]]:
+        """Look up multiple attachments by their ids.  Missing ids are silently dropped."""
+        if not attachment_ids:
+            return []
+        db = await self._get_db()
+        placeholders = ", ".join("?" for _ in attachment_ids)
+        rows = await db.execute_fetchall(
+            f"SELECT * FROM app_attachments WHERE attachment_id IN ({placeholders})",
+            tuple(attachment_ids),
+        )
+        return [dict(row) for row in rows]
+
     # ── clear ───────────────────────────────────────────────────────
 
     async def clear_all(self) -> dict[str, int]:
         """Clear all data except bot_contact_state and runtime_meta."""
-        tables = ("conversations", "turns", "raw_events", "context_snapshots", "tool_versions", "daily_summaries", "scheduled_tasks", "app_messages")
+        tables = ("conversations", "turns", "raw_events", "context_snapshots", "tool_versions", "daily_summaries", "scheduled_tasks", "app_messages", "app_attachments")
         counts: dict[str, int] = {}
         async with self._write_lock:
             db = await self._get_db()
