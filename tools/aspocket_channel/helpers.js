@@ -144,3 +144,38 @@ export function replyUrl(base, sessionId) {
     `/api/app-agent-sessions/${encodeURIComponent(sessionId)}/replies`,
   );
 }
+
+/**
+ * Build the heartbeat URL: `POST /api/app-agent-sessions/{sessionId}/heartbeat`.
+ *
+ * The channel server calls this every ~30s while running so the Router's
+ * stale-TTL detection keeps the session online.  The endpoint takes no
+ * body — the URL alone is the signal.
+ *
+ * @param {string} base
+ * @param {string} sessionId
+ * @returns {string}
+ */
+export function heartbeatUrl(base, sessionId) {
+  return joinRouterUrl(
+    base,
+    `/api/app-agent-sessions/${encodeURIComponent(sessionId)}/heartbeat`,
+  );
+}
+
+/**
+ * Build the offline URL: `POST /api/app-agent-sessions/{sessionId}/offline`.
+ *
+ * Called best-effort on shutdown.  Not relied upon — the Router's
+ * heartbeat TTL is the source of truth for liveness.
+ *
+ * @param {string} base
+ * @param {string} sessionId
+ * @returns {string}
+ */
+export function offlineUrl(base, sessionId) {
+  return joinRouterUrl(
+    base,
+    `/api/app-agent-sessions/${encodeURIComponent(sessionId)}/offline`,
+  );
+}

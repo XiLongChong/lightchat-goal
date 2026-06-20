@@ -5,9 +5,21 @@ from __future__ import annotations
 import json
 import os
 import time
+from datetime import datetime, timezone
 
 import pytest
 from fastapi import HTTPException
+
+
+def _fresh_last_seen() -> str:
+    """A current UTC ``...Z`` timestamp for fixture ``lastSeenAt``.
+
+    The registry's stale-TTL treats sessions whose ``lastSeenAt`` is older
+    than 90s as offline.  Fixtures that want an *online* session must use a
+    fresh timestamp — the historical ``2026-01-01T00:00:00Z`` would now be
+    stale.  Tests that want a stale session set ``lastSeenAt`` explicitly.
+    """
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -1571,13 +1583,147 @@ def test_session_registry_known_remote_agent_ids():
         "description": "desc",
         "status": "online",
         "createdAt": "2026-01-01T00:00:00Z",
-        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": _fresh_last_seen(),
         "expiresAt": None,
         "callbackUrl": None,
         "sourceLabel": None,
     }
     ids = reg.known_remote_agent_ids()
     assert "cc-1" in ids
+
+
+# ================================================================
+# Stale-TTL detection tests
+# ================================================================
+
+
+def _stale_session_dict(remote_agent_id="stale-1", status="online"):
+    """Build a session dict whose lastSeenAt is far past the stale TTL."""
+    from runtime.app_agent_session_registry import AppAgentSessionRegistry
+
+    reg = AppAgentSessionRegistry()
+    reg._sessions["stale-s1"] = {
+        "sessionId": "stale-s1",
+        "remoteAgentId": remote_agent_id,
+        "displayName": "Stale",
+        "description": "desc",
+        "kind": "claude_channel",
+        "status": status,
+        "createdAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": "2026-01-01T00:00:00Z",  # far past the 90s TTL
+        "expiresAt": None,
+        "callbackUrl": None,
+        "sourceLabel": None,
+    }
+    return reg
+
+
+@pytest.mark.asyncio
+async def test_stale_session_list_shows_offline():
+    """list_all reports a stale (lastSeenAt > TTL) session as offline."""
+    reg = _stale_session_dict()
+    sessions = await reg.list_all()
+    assert len(sessions) == 1
+    assert sessions[0]["status"] == "offline"
+
+
+@pytest.mark.asyncio
+async def test_stale_session_get_shows_offline():
+    """get reports a stale session as offline."""
+    reg = _stale_session_dict()
+    sess = await reg.get("stale-s1")
+    assert sess is not None
+    assert sess["status"] == "offline"
+
+
+@pytest.mark.asyncio
+async def test_stale_session_excluded_from_list_online():
+    """A stale session is not returned by list_online."""
+    reg = _stale_session_dict()
+    online = await reg.list_online()
+    assert online == []
+
+
+def test_stale_session_find_by_remote_agent_id_shows_offline():
+    """find_by_remote_agent_id reports a stale session as offline."""
+    reg = _stale_session_dict(remote_agent_id="stale-rid")
+    sess = reg.find_by_remote_agent_id("stale-rid")
+    assert sess is not None
+    assert sess["status"] == "offline"
+
+
+def test_stale_session_still_known_not_unknown():
+    """A stale session remains a known remoteAgentId (no 400 unknown)."""
+    from main import resolve_app_remote_agent, app_agent_session_registry
+
+    app_agent_session_registry._sessions.clear()
+    app_agent_session_registry._sessions["stale-s1"] = {
+        "sessionId": "stale-s1",
+        "remoteAgentId": "stale-known",
+        "displayName": "Stale",
+        "description": "desc",
+        "kind": "claude_channel",
+        "status": "online",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "expiresAt": None,
+        "callbackUrl": None,
+        "sourceLabel": None,
+    }
+    # Known → resolver does not raise 400; status resolves as offline.
+    resolved = resolve_app_remote_agent("stale-known")
+    assert resolved["target"] == "claude_channel"
+    assert resolved["status"] == "offline"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_keeps_session_online_within_ttl():
+    """A fresh heartbeat keeps a session online across reads."""
+    from runtime.app_agent_session_registry import AppAgentSessionRegistry
+
+    reg = AppAgentSessionRegistry()
+    await reg.register(
+        session_id="s1",
+        remote_agent_id="s1",
+        display_name="S1",
+        kind="claude_channel",
+    )
+    await reg.heartbeat("s1")
+    sess = await reg.get("s1")
+    assert sess["status"] == "online"
+    listed = await reg.list_online()
+    assert len(listed) == 1
+
+
+@pytest.mark.asyncio
+async def test_register_initial_status_online():
+    """A freshly registered session is online (not stale)."""
+    from runtime.app_agent_session_registry import AppAgentSessionRegistry
+
+    reg = AppAgentSessionRegistry()
+    await reg.register(
+        session_id="s1",
+        remote_agent_id="s1",
+        display_name="S1",
+        kind="claude_channel",
+    )
+    sess = await reg.get("s1")
+    assert sess["status"] == "online"
+
+
+@pytest.mark.asyncio
+async def test_stale_session_does_not_mutate_stored_status():
+    """Effective-status is computed on read; stored status is left intact.
+
+    This keeps the registry's lazy semantics non-destructive: a heartbeat
+    arriving later can flip a stale session back online without an
+    explicit status write.
+    """
+    reg = _stale_session_dict()
+    await reg.get("stale-s1")  # triggers effective-status computation
+    stored = reg._sessions["stale-s1"]
+    assert stored["status"] == "online"  # storage unchanged
+    assert stored["lastSeenAt"] == "2026-01-01T00:00:00Z"
 
 
 # ================================================================
@@ -1722,7 +1868,7 @@ def test_resolver_known_includes_session_remote_agent_id():
         "description": "desc",
         "status": "online",
         "createdAt": "2026-01-01T00:00:00Z",
-        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": _fresh_last_seen(),
         "expiresAt": None,
         "callbackUrl": None,
         "sourceLabel": None,
@@ -1744,7 +1890,7 @@ def test_resolve_session_online_returns_attached_session():
         "description": "desc",
         "status": "online",
         "createdAt": "2026-01-01T00:00:00Z",
-        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": _fresh_last_seen(),
         "expiresAt": None,
         "callbackUrl": "http://127.0.0.1:9010",
         "sourceLabel": None,
@@ -1768,7 +1914,7 @@ def test_resolve_session_offline_still_succeeds():
         "description": "desc",
         "status": "offline",
         "createdAt": "2026-01-01T00:00:00Z",
-        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": _fresh_last_seen(),
         "expiresAt": None,
         "callbackUrl": "http://127.0.0.1:9010",
         "sourceLabel": None,
@@ -1848,7 +1994,7 @@ async def test_register_session_endpoint_409_conflict(monkeypatch):
         "description": "desc",
         "status": "online",
         "createdAt": "2026-01-01T00:00:00Z",
-        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": _fresh_last_seen(),
         "expiresAt": None,
         "callbackUrl": None,
         "sourceLabel": None,
@@ -1906,7 +2052,7 @@ async def test_heartbeat_endpoint_updates_session(monkeypatch):
         "description": "desc",
         "status": "offline",
         "createdAt": "2026-01-01T00:00:00Z",
-        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": _fresh_last_seen(),
         "expiresAt": None,
         "callbackUrl": None,
         "sourceLabel": None,
@@ -1956,7 +2102,7 @@ async def test_offline_endpoint_marks_offline(monkeypatch):
         "description": "desc",
         "status": "online",
         "createdAt": "2026-01-01T00:00:00Z",
-        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": _fresh_last_seen(),
         "expiresAt": None,
         "callbackUrl": None,
         "sourceLabel": None,
@@ -1989,7 +2135,7 @@ async def test_list_sessions_endpoint(monkeypatch):
         "description": "desc",
         "status": "online",
         "createdAt": "2026-01-01T00:00:00Z",
-        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": _fresh_last_seen(),
         "expiresAt": None,
         "callbackUrl": None,
         "sourceLabel": None,
@@ -2030,7 +2176,7 @@ async def test_post_messages_attached_session_no_callback_returns_501(monkeypatc
         "description": "desc",
         "status": "online",
         "createdAt": "2026-01-01T00:00:00Z",
-        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": _fresh_last_seen(),
         "expiresAt": None,
         "callbackUrl": None,
         "sourceLabel": None,
@@ -2082,7 +2228,7 @@ async def test_post_messages_attached_session_offline_returns_503(monkeypatch):
         "description": "desc",
         "status": "offline",
         "createdAt": "2026-01-01T00:00:00Z",
-        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": _fresh_last_seen(),
         "expiresAt": None,
         "callbackUrl": "http://127.0.0.1:9010",
         "sourceLabel": None,
@@ -2165,7 +2311,7 @@ async def test_get_messages_attached_session_offline_still_reads_history(monkeyp
         "description": "desc",
         "status": "offline",
         "createdAt": "2026-01-01T00:00:00Z",
-        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": _fresh_last_seen(),
         "expiresAt": None,
         "callbackUrl": "http://127.0.0.1:9010",
         "sourceLabel": None,
@@ -2436,7 +2582,7 @@ async def test_callback_success_returns_user_message_and_replies(monkeypatch):
         "description": "desc",
         "status": "online",
         "createdAt": "2026-01-01T00:00:00Z",
-        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": _fresh_last_seen(),
         "expiresAt": None,
         "callbackUrl": "http://127.0.0.1:19010",
         "sourceLabel": None,
@@ -2512,7 +2658,7 @@ async def test_callback_success_writes_messages_under_remote_agent_id(monkeypatc
         "description": "desc",
         "status": "online",
         "createdAt": "2026-01-01T00:00:00Z",
-        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": _fresh_last_seen(),
         "expiresAt": None,
         "callbackUrl": "http://127.0.0.1:19010",
         "sourceLabel": None,
@@ -2593,7 +2739,7 @@ async def test_callback_receives_correct_payload(monkeypatch):
         "description": "desc",
         "status": "online",
         "createdAt": "2026-01-01T00:00:00Z",
-        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": _fresh_last_seen(),
         "expiresAt": None,
         "callbackUrl": "http://127.0.0.1:19010",
         "sourceLabel": None,
@@ -2675,7 +2821,7 @@ async def test_callback_empty_reply_content_skipped(monkeypatch):
         "description": "desc",
         "status": "online",
         "createdAt": "2026-01-01T00:00:00Z",
-        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": _fresh_last_seen(),
         "expiresAt": None,
         "callbackUrl": "http://127.0.0.1:19010",
         "sourceLabel": None,
@@ -2747,7 +2893,7 @@ async def test_callback_missing_remote_id_gets_generated(monkeypatch):
         "description": "desc",
         "status": "online",
         "createdAt": "2026-01-01T00:00:00Z",
-        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": _fresh_last_seen(),
         "expiresAt": None,
         "callbackUrl": "http://127.0.0.1:19010",
         "sourceLabel": None,
@@ -2816,7 +2962,7 @@ async def test_callback_missing_created_at_gets_server_timestamp(monkeypatch):
         "description": "desc",
         "status": "online",
         "createdAt": "2026-01-01T00:00:00Z",
-        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": _fresh_last_seen(),
         "expiresAt": None,
         "callbackUrl": "http://127.0.0.1:19010",
         "sourceLabel": None,
@@ -2889,7 +3035,7 @@ async def test_callback_non_2xx_returns_502_no_insert(monkeypatch):
         "description": "desc",
         "status": "online",
         "createdAt": "2026-01-01T00:00:00Z",
-        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": _fresh_last_seen(),
         "expiresAt": None,
         "callbackUrl": "http://127.0.0.1:19010",
         "sourceLabel": None,
@@ -2961,7 +3107,7 @@ async def test_callback_timeout_returns_504_no_insert(monkeypatch):
         "description": "desc",
         "status": "online",
         "createdAt": "2026-01-01T00:00:00Z",
-        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": _fresh_last_seen(),
         "expiresAt": None,
         "callbackUrl": "http://127.0.0.1:19010",
         "sourceLabel": None,
@@ -3032,7 +3178,7 @@ async def test_callback_network_error_returns_502_no_insert(monkeypatch):
         "description": "desc",
         "status": "online",
         "createdAt": "2026-01-01T00:00:00Z",
-        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": _fresh_last_seen(),
         "expiresAt": None,
         "callbackUrl": "http://127.0.0.1:19010",
         "sourceLabel": None,
@@ -3103,7 +3249,7 @@ async def test_callback_invalid_json_returns_502_no_insert(monkeypatch):
         "description": "desc",
         "status": "online",
         "createdAt": "2026-01-01T00:00:00Z",
-        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": _fresh_last_seen(),
         "expiresAt": None,
         "callbackUrl": "http://127.0.0.1:19010",
         "sourceLabel": None,
@@ -3175,7 +3321,7 @@ async def test_callback_missing_agent_replies_returns_502_no_insert(monkeypatch)
         "description": "desc",
         "status": "online",
         "createdAt": "2026-01-01T00:00:00Z",
-        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": _fresh_last_seen(),
         "expiresAt": None,
         "callbackUrl": "http://127.0.0.1:19010",
         "sourceLabel": None,
@@ -3251,7 +3397,7 @@ async def test_callback_idempotency_second_post_returns_stored(monkeypatch):
         "description": "desc",
         "status": "online",
         "createdAt": "2026-01-01T00:00:00Z",
-        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": _fresh_last_seen(),
         "expiresAt": None,
         "callbackUrl": "http://127.0.0.1:19010",
         "sourceLabel": None,
@@ -3339,7 +3485,7 @@ async def test_callback_idempotency_different_rid_calls_different_callback(monke
         "description": "desc",
         "status": "online",
         "createdAt": "2026-01-01T00:00:00Z",
-        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": _fresh_last_seen(),
         "expiresAt": None,
         "callbackUrl": "http://127.0.0.1:19010",
         "sourceLabel": None,
@@ -3351,7 +3497,7 @@ async def test_callback_idempotency_different_rid_calls_different_callback(monke
         "description": "desc",
         "status": "online",
         "createdAt": "2026-01-01T00:00:00Z",
-        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": _fresh_last_seen(),
         "expiresAt": None,
         "callbackUrl": "http://127.0.0.1:19011",
         "sourceLabel": None,
@@ -3461,7 +3607,7 @@ async def test_offline_still_503(monkeypatch):
         "description": "desc",
         "status": "offline",
         "createdAt": "2026-01-01T00:00:00Z",
-        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": _fresh_last_seen(),
         "expiresAt": None,
         "callbackUrl": "http://127.0.0.1:19010",
         "sourceLabel": None,
@@ -3507,7 +3653,7 @@ async def test_no_callback_still_501(monkeypatch):
         "description": "desc",
         "status": "online",
         "createdAt": "2026-01-01T00:00:00Z",
-        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": _fresh_last_seen(),
         "expiresAt": None,
         "callbackUrl": None,
         "sourceLabel": None,
@@ -3563,7 +3709,7 @@ def _make_attached_session(rid, callback_url="http://127.0.0.1:19010"):
         "description": "desc",
         "status": "online",
         "createdAt": "2026-01-01T00:00:00Z",
-        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": _fresh_last_seen(),
         "expiresAt": None,
         "callbackUrl": callback_url,
         "sourceLabel": None,
@@ -4411,7 +4557,7 @@ def test_resolve_claude_channel_returns_correct_target():
         "kind": "claude_channel",
         "status": "online",
         "createdAt": "2026-01-01T00:00:00Z",
-        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": _fresh_last_seen(),
         "expiresAt": None,
         "callbackUrl": None,
         "sourceLabel": None,
@@ -4438,11 +4584,22 @@ def _make_claude_channel_session(rid, sid=None, status="online"):
         "kind": "claude_channel",
         "status": status,
         "createdAt": "2026-01-01T00:00:00Z",
-        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": _fresh_last_seen(),
         "expiresAt": None,
         "callbackUrl": None,
         "sourceLabel": None,
     }
+
+
+def _make_stale_claude_channel_session(rid, sid=None):
+    """Helper: a claude_channel session whose lastSeenAt is past the TTL.
+
+    Stored status is still ``"online"`` — the stale-TTL detection is what
+    flips the effective status to offline on read.
+    """
+    sess = _make_claude_channel_session(rid, sid=sid, status="online")
+    sess["lastSeenAt"] = "2026-01-01T00:00:00Z"
+    return sess
 
 
 @pytest.mark.asyncio
@@ -4476,6 +4633,125 @@ async def test_post_messages_claude_channel_returns_sent_and_empty_replies(monke
     assert result["userMessage"]["status"] == "sent"
     assert result["userMessage"]["clientMessageId"] == cid
     assert result["agentReplies"] == []
+
+
+@pytest.mark.asyncio
+async def test_post_messages_stale_claude_channel_returns_503_no_pending(monkeypatch):
+    """POST to a stale claude_channel returns 503 and writes no pending delivery."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg, channel_pending_inbox, memory_store
+
+    app_agent_session_registry._sessions.clear()
+    channel_pending_inbox._messages.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"chan-stale-{_uuid.uuid4().hex[:8]}"
+    sid = f"s-{rid}"
+    # Stored status online but lastSeenAt far past the TTL → effective offline.
+    app_agent_session_registry._sessions[sid] = _make_stale_claude_channel_session(rid, sid)
+
+    cid = f"cm-chan-stale-{_uuid.uuid4().hex[:8]}"
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {"clientMessageId": cid, "content": "hi", "remoteAgentId": rid}
+
+    from main import api_send_message
+
+    with pytest.raises(HTTPException) as exc:
+        await api_send_message(FakeRequest())
+    assert exc.value.status_code == 503
+
+    # No user message persisted, no pending delivery enqueued.
+    found = await memory_store.find_app_message_by_client_message_id(cid, remote_agent_id=rid)
+    assert found is None
+    pending = await channel_pending_inbox.list_pending(sid, limit=10)
+    assert pending == []
+
+
+@pytest.mark.asyncio
+async def test_post_messages_claude_channel_retry_after_stale_returns_existing(monkeypatch):
+    """A retried clientMessageId accepted while online still returns its
+    existing result after the channel goes stale — idempotency beats 503."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg, channel_pending_inbox
+
+    app_agent_session_registry._sessions.clear()
+    channel_pending_inbox._messages.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"chan-retry-{_uuid.uuid4().hex[:8]}"
+    sid = f"s-{rid}"
+    # First accepted while online (fresh lastSeenAt).
+    app_agent_session_registry._sessions[sid] = _make_claude_channel_session(rid, sid)
+
+    cid = f"cm-chan-retry-{_uuid.uuid4().hex[:8]}"
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+        async def json(self):
+            return {"clientMessageId": cid, "content": "hi", "remoteAgentId": rid}
+
+    from main import api_send_message
+
+    first = await api_send_message(FakeRequest())
+    assert first["userMessage"]["status"] == "sent"
+
+    # Channel goes stale (lastSeenAt ages past TTL).
+    app_agent_session_registry._sessions[sid]["lastSeenAt"] = "2026-01-01T00:00:00Z"
+
+    second = await api_send_message(FakeRequest())
+    assert second["userMessage"]["status"] == "sent"
+    assert second["userMessage"]["clientMessageId"] == cid
+
+
+@pytest.mark.asyncio
+async def test_get_messages_stale_claude_channel_still_reads_history(monkeypatch):
+    """GET /api/messages still reads history for a stale/offline channel."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg, memory_store
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    rid = f"chan-hist-stale-{_uuid.uuid4().hex[:8]}"
+    sid = f"s-{rid}"
+    app_agent_session_registry._sessions[sid] = _make_stale_claude_channel_session(rid, sid)
+
+    # Seed some history under this remote_agent_id.
+    await memory_store.insert_app_message(
+        remote_id=f"rm-{_uuid.uuid4().hex[:8]}",
+        client_message_id=f"cm-seed-{_uuid.uuid4().hex[:8]}",
+        role="user",
+        content="past msg",
+        source_turn_id="turn-seed",
+        remote_agent_id=rid,
+    )
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+    from main import api_get_messages
+
+    result = await api_get_messages(FakeRequest(), remoteAgentId=rid)
+    assert "messages" in result
+    contents = [m.get("content") for m in result["messages"]]
+    assert "past msg" in contents
 
 
 @pytest.mark.asyncio
@@ -4681,7 +4957,7 @@ async def test_poll_pending_non_channel_session_returns_400(monkeypatch):
         "kind": "attached_session",
         "status": "online",
         "createdAt": "2026-01-01T00:00:00Z",
-        "lastSeenAt": "2026-01-01T00:00:00Z",
+        "lastSeenAt": _fresh_last_seen(),
         "expiresAt": None,
         "callbackUrl": "http://127.0.0.1:9010",
         "sourceLabel": None,

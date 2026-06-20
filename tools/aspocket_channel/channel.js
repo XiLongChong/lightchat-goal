@@ -33,6 +33,8 @@ import {
   pollPendingUrl,
   ackUrl,
   replyUrl,
+  heartbeatUrl,
+  offlineUrl,
 } from "./helpers.js";
 
 // ── Config (env) ──────────────────────────────────────────────────
@@ -47,6 +49,20 @@ const WORKSPACE = process.env.ASPOCKET_WORKSPACE || "";
 const API_KEY = process.env.CHAT_API_KEY || "";
 const POLL_INTERVAL_MS = parseInt(
   process.env.ASPOCKET_POLL_INTERVAL_MS || "1500",
+  10,
+);
+// Heartbeat cadence: must be well under the Router's stale TTL (90s) so a
+// single missed beat doesn't flip the session offline.  30s gives ~2 missed
+// beats of tolerance.
+const HEARTBEAT_INTERVAL_MS = parseInt(
+  process.env.ASPOCKET_HEARTBEAT_INTERVAL_MS || "30000",
+  10,
+);
+// Best-effort /offline on shutdown is given a short deadline so a dead
+// Router doesn't delay process exit.  The Router's TTL is the real
+// liveness signal — this call is a courtesy, not a requirement.
+const OFFLINE_SHUTDOWN_TIMEOUT_MS = parseInt(
+  process.env.ASPOCKET_OFFLINE_TIMEOUT_MS || "2000",
   10,
 );
 
@@ -164,9 +180,40 @@ async function postReply(clientMessageId, text, sourceToolCallId) {
   return await resp.json();
 }
 
+async function sendHeartbeat() {
+  // No body — the URL alone refreshes lastSeenAt on the Router.  A failed
+  // heartbeat is logged but never exits the process; the Router's stale
+  // TTL handles a truly dead channel, and the next beat retries.
+  const url = heartbeatUrl(ROUTER_URL, SESSION_ID);
+  const resp = await fetch(url, { method: "POST", headers: authHeaders() });
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => "");
+    throw new Error(
+      `HTTP ${resp.status} ${resp.statusText} body=${body.slice(0, 200)}`,
+    );
+  }
+}
+
+async function sendOffline() {
+  // Best-effort shutdown signal.  Bounded by OFFLINE_SHUTDOWN_TIMEOUT_MS
+  // so a unreachable Router cannot stall exit.  Errors are swallowed.
+  const url = offlineUrl(ROUTER_URL, SESSION_ID);
+  const ctrl = new AbortController();
+  const timer = setTimeout(
+    () => ctrl.abort(),
+    OFFLINE_SHUTDOWN_TIMEOUT_MS,
+  );
+  try {
+    await fetch(url, { method: "POST", headers: authHeaders(), signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ── Polling loop ──────────────────────────────────────────────────
 
 let pollTimer = null;
+let heartbeatTimer = null;
 
 async function pollOnce() {
   let messages;
@@ -213,6 +260,27 @@ function stopPolling() {
   if (pollTimer) {
     clearInterval(pollTimer);
     pollTimer = null;
+  }
+}
+
+function startHeartbeat() {
+  if (heartbeatTimer) clearInterval(heartbeatTimer);
+  // Fire one immediately so the session's lastSeenAt is fresh right after
+  // registration, then on the interval.
+  sendHeartbeat().catch((err) => {
+    console.error(`[aspocket] heartbeat failed: ${err.message}`);
+  });
+  heartbeatTimer = setInterval(() => {
+    sendHeartbeat().catch((err) => {
+      console.error(`[aspocket] heartbeat failed: ${err.message}`);
+    });
+  }, HEARTBEAT_INTERVAL_MS);
+}
+
+function stopHeartbeat() {
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
   }
 }
 
@@ -290,16 +358,30 @@ try {
 }
 
 startPolling();
+startHeartbeat();
 console.error(
-  `[aspocket] polling every ${POLL_INTERVAL_MS}ms session=${SESSION_ID}`,
+  `[aspocket] polling every ${POLL_INTERVAL_MS}ms heartbeat every ${HEARTBEAT_INTERVAL_MS}ms session=${SESSION_ID}`,
 );
 
 // ── Graceful shutdown ─────────────────────────────────────────────
 
-function shutdown() {
+async function shutdown() {
   stopPolling();
+  stopHeartbeat();
+  // Best-effort /offline — do not rely on this.  Bounded by a short
+  // timeout so a dead Router doesn't stall exit; the Router's heartbeat
+  // TTL is what actually clears a stale session.
+  try {
+    await sendOffline();
+  } catch {
+    // ignored — TTL will mark the session offline
+  }
   process.exit(0);
 }
 
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+process.on("SIGINT", () => {
+  shutdown();
+});
+process.on("SIGTERM", () => {
+  shutdown();
+});

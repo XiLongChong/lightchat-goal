@@ -1525,9 +1525,10 @@ async def api_send_message(request: Request):
                 }),
             )
 
-    # Note: claude_channel sessions accept user messages regardless of
-    # online/offline status — the pending inbox decouples App delivery
-    # from channel polling.  No routing guard needed here.
+    # Note: claude_channel sessions queue user messages into a pending
+    # inbox that the channel server polls.  A message is only queued when
+    # the session is online (effective status, incl. stale-TTL check) —
+    # an offline/stale channel returns 503 below instead of enqueuing.
 
     # ── idempotency ──────────────────────────────────────────────
     existing_user = await memory_store.find_app_message_by_client_message_id(
@@ -1571,6 +1572,21 @@ async def api_send_message(request: Request):
     # pushes messages to Claude Code via ``notifications/claude/channel``.
     # Replies come back via ``POST /api/app-agent-sessions/{id}/replies``.
     if resolved["target"] == "claude_channel":
+        # Stale/offline channel: the channel process is not polling, so a
+        # queued message would sit in the inbox indefinitely.  Reject with
+        # 503 instead of writing a pending delivery.  A retried
+        # clientMessageId that was already accepted while online is handled
+        # by the idempotency block above and returns its existing result.
+        if resolved.get("status") != "online":
+            raise HTTPException(
+                status_code=503,
+                detail=json.dumps({
+                    "error": {
+                        "code": "agent_session_offline",
+                        "message": "Agent session is offline",
+                    },
+                }),
+            )
         turn_id = f"app_turn_{uuid.uuid4().hex[:12]}"
         user_remote_id = f"app_rm_user_{uuid.uuid4().hex[:12]}"
         now_ts = time.time()
@@ -1921,10 +1937,12 @@ def build_app_contact_invitations(request: Request) -> list[dict]:
     # 2. Online attached sessions
     # list_online() is async — but this function is sync.  We access the
     # internal _sessions dict directly, which is safe for a read-only
-    # snapshot in the synchronous context.
+    # snapshot in the synchronous context.  effective_status() applies the
+    # stale-TTL so a dead channel (no heartbeat within the TTL) is excluded
+    # from new invitations even though it never called /offline.
     online_sessions = [
         s for s in app_agent_session_registry._sessions.values()
-        if s["status"] == "online"
+        if app_agent_session_registry.effective_status(s) == "online"
     ]
     for sess in online_sessions:
         kind = sess.get("kind") or "attached_session"

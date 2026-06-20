@@ -11,8 +11,26 @@ import asyncio
 from datetime import datetime, timezone
 
 
+# Sessions that have not sent a heartbeat (or any other signal) within this
+# window are treated as offline on read — the channel process may have exited
+# without a chance to call /offline.  90s tolerates one missed 30s heartbeat.
+APP_AGENT_SESSION_STALE_SECONDS = 90
+
+
 def _utc_now_z() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_iso_z(value: str | None) -> datetime | None:
+    """Parse an ISO-8601 UTC ``...Z`` timestamp.  Returns None on failure."""
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except (ValueError, TypeError):
+        return None
 
 
 class AppAgentSessionRegistry:
@@ -26,6 +44,36 @@ class AppAgentSessionRegistry:
         self._lock = asyncio.Lock()
         # sessionId -> session dict
         self._sessions: dict[str, dict] = {}
+
+    # ── internal: stale detection ────────────────────────────────────
+
+    def _effective_status(self, sess: dict, now: datetime) -> str:
+        """Return the effective status, treating stale sessions as offline.
+
+        A session is stale when ``now - lastSeenAt`` exceeds
+        :data:`APP_AGENT_SESSION_STALE_SECONDS`.  Stale sessions are reported
+        as ``"offline"`` regardless of stored status; a non-stale session
+        keeps its stored status.  This is the lazy offline detection — no
+        background task is required, every read re-evaluates freshness.
+        """
+        status = sess.get("status") or "offline"
+        if status != "online":
+            return status
+        last = _parse_iso_z(sess.get("lastSeenAt"))
+        if last is None:
+            return "offline"
+        if (now - last).total_seconds() > APP_AGENT_SESSION_STALE_SECONDS:
+            return "offline"
+        return "online"
+
+    def effective_status(self, sess: dict) -> str:
+        """Synchronous effective-status helper for snapshot readers.
+
+        Used by callers that read ``_sessions`` directly (e.g. the
+        invitation builder) so stale sessions are excluded without an
+        async registry call.
+        """
+        return self._effective_status(sess, datetime.now(timezone.utc))
 
     # ── public API ───────────────────────────────────────────────────
 
@@ -119,27 +167,44 @@ class AppAgentSessionRegistry:
             return dict(sess)
 
     async def get(self, session_id: str) -> dict | None:
-        """Return a copy of the session or None."""
+        """Return a copy of the session or None.
+
+        The returned ``status`` is the *effective* status: stale sessions
+        (no heartbeat within the TTL) are reported as ``"offline"``.
+        """
+        now = datetime.now(timezone.utc)
         async with self._lock:
             sess = self._sessions.get(session_id)
-            return dict(sess) if sess is not None else None
+            if sess is None:
+                return None
+            return dict(sess, status=self._effective_status(sess, now))
 
     async def list_all(self) -> list[dict]:
-        """Return copies of all registered sessions."""
+        """Return copies of all registered sessions with effective status."""
+        now = datetime.now(timezone.utc)
         async with self._lock:
-            return [dict(s) for s in self._sessions.values()]
+            return [
+                dict(s, status=self._effective_status(s, now))
+                for s in self._sessions.values()
+            ]
 
     async def list_online(self) -> list[dict]:
-        """Return copies of sessions with status 'online'."""
+        """Return copies of sessions whose effective status is 'online'."""
+        now = datetime.now(timezone.utc)
         async with self._lock:
-            return [dict(s) for s in self._sessions.values() if s["status"] == "online"]
+            return [
+                dict(s, status=self._effective_status(s, now))
+                for s in self._sessions.values()
+                if self._effective_status(s, now) == "online"
+            ]
 
     def known_remote_agent_ids(self) -> set[str]:
         """Return all remoteAgentId values known to the registry.
 
         This is NOT async because the resolver needs a synchronous call.
-        The snapshot may be slightly stale which is acceptable for the
-        resolver's "is this id known?" check.
+        Stale/offline sessions remain known — only their *status* flips,
+        not their identity, so ``resolve_app_remote_agent`` never raises
+        ``400 unknown`` for a session that was once registered.
         """
         return {s["remoteAgentId"] for s in self._sessions.values()}
 
@@ -147,9 +212,11 @@ class AppAgentSessionRegistry:
         """Synchronous lookup by remoteAgentId.  Returns a copy or None.
 
         NOT async — used by the synchronous ``resolve_app_remote_agent``
-        helper.  The snapshot may be slightly stale.
+        helper.  The returned ``status`` is the effective status, so stale
+        sessions resolve as ``"offline"`` while remaining known.
         """
+        now = datetime.now(timezone.utc)
         for sess in self._sessions.values():
             if sess["remoteAgentId"] == remote_agent_id:
-                return dict(sess)
+                return dict(sess, status=self._effective_status(sess, now))
         return None

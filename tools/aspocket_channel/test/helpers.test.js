@@ -8,6 +8,8 @@ import {
   pollPendingUrl,
   ackUrl,
   replyUrl,
+  heartbeatUrl,
+  offlineUrl,
 } from "../helpers.js";
 
 // ── buildRegistrationPayload ──────────────────────────────────────
@@ -165,5 +167,39 @@ test("URLs encode special characters in path segments", () => {
   assert.equal(
     url,
     "http://127.0.0.1:8899/api/app-agent-sessions/sess%2F1/pending-messages?limit=10",
+  );
+});
+
+// ── heartbeat / offline URL helpers ───────────────────────────────
+
+test("heartbeatUrl builds correct URL with no query or body path", () => {
+  const url = heartbeatUrl("http://127.0.0.1:8899", "sess-1");
+  assert.equal(
+    url,
+    "http://127.0.0.1:8899/api/app-agent-sessions/sess-1/heartbeat",
+  );
+});
+
+test("heartbeatUrl strips trailing slash from base", () => {
+  const url = heartbeatUrl("http://127.0.0.1:8899/", "sess-1");
+  assert.equal(
+    url,
+    "http://127.0.0.1:8899/api/app-agent-sessions/sess-1/heartbeat",
+  );
+});
+
+test("heartbeatUrl encodes special characters in sessionId", () => {
+  const url = heartbeatUrl("http://127.0.0.1:8899", "sess/1");
+  assert.equal(
+    url,
+    "http://127.0.0.1:8899/api/app-agent-sessions/sess%2F1/heartbeat",
+  );
+});
+
+test("offlineUrl builds correct URL", () => {
+  const url = offlineUrl("http://127.0.0.1:8899", "sess-1");
+  assert.equal(
+    url,
+    "http://127.0.0.1:8899/api/app-agent-sessions/sess-1/offline",
   );
 });
