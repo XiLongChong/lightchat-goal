@@ -10,7 +10,9 @@ from datetime import datetime, timezone
 
 from tools.claude_code_mock_adapter import (
     build_claude_mock_reply,
+    build_empty_content_reply,
     build_registration_payload,
+    build_heartbeat_url,
     _reply_template,
 )
 
@@ -202,3 +204,87 @@ def test_status_prompt_does_not_return_sticker():
     reply = build_claude_mock_reply("status", "cm-n")
     assert len(reply["agentReplies"]) == 1
     assert reply["agentReplies"][0].get("attachments", []) == []
+
+
+# ── build_empty_content_reply ───────────────────────────────────────
+
+
+def test_empty_content_reply_with_image_attachment():
+    """Empty content + image attachment returns a text acknowledgement."""
+    reply = build_empty_content_reply(
+        [{"type": "image", "attachmentId": "app_att_test", "mimeType": "image/png"}],
+        "cm-img",
+    )
+    assert len(reply["agentReplies"]) == 1
+    entry = reply["agentReplies"][0]
+    assert "image attachment" in entry["content"]
+    assert "cannot inspect" in entry["content"]
+    assert entry.get("attachments") is None
+
+
+def test_empty_content_reply_with_sticker_attachment():
+    """Empty content + sticker attachment returns a text reply — no crash."""
+    reply = build_empty_content_reply(
+        [{"type": "sticker", "stickerId": "happy_01"}],
+        "cm-stk",
+    )
+    assert len(reply["agentReplies"]) == 1
+    entry = reply["agentReplies"][0]
+    assert isinstance(entry["content"], str) and entry["content"]
+    assert entry.get("attachments", []) == []
+
+
+def test_empty_content_reply_without_images_returns_generic():
+    """Non-image attachments (e.g. sticker only) get a generic ack."""
+    reply = build_empty_content_reply(
+        [{"type": "sticker", "stickerId": "laugh_01"}],
+        "cm-gen",
+    )
+    entry = reply["agentReplies"][0]
+    assert "received" in entry["content"].lower()
+    assert "image" not in entry["content"].lower()
+
+
+def test_empty_content_reply_has_required_fields():
+    """Empty-content replies still have remoteId and createdAt."""
+    reply = build_empty_content_reply(
+        [{"type": "image", "attachmentId": "a"}], "cm-fields",
+    )
+    entry = reply["agentReplies"][0]
+    assert entry["remoteId"].startswith("claude-mock-")
+    assert entry["createdAt"].endswith("Z")
+
+
+# ── sticker_happy_e2e regression ────────────────────────────────────
+
+
+def test_sticker_happy_keyword_still_triggers_sticker_attachment():
+    """Content containing 'happy' still returns a sticker (not overridden)."""
+    reply = build_claude_mock_reply("happy birthday!", "cm-e2e")
+    assert len(reply["agentReplies"]) == 1
+    entry = reply["agentReplies"][0]
+    assert len(entry.get("attachments", [])) == 1
+    assert entry["attachments"][0]["type"] == "sticker"
+    assert entry["attachments"][0]["stickerId"] == "happy_01"
+
+
+# ── heartbeat URL helper ────────────────────────────────────────────
+
+
+def test_build_heartbeat_url_defaults():
+    """build_heartbeat_url constructs the correct Router endpoint."""
+    url = build_heartbeat_url(
+        router_base_url="http://127.0.0.1:8899/",
+        session_id="mock-1",
+    )
+    assert url == "http://127.0.0.1:8899/api/app-agent-sessions/mock-1/heartbeat"
+
+
+def test_build_heartbeat_url_no_trailing_slash():
+    """Trailing slash is stripped from base URL."""
+    url = build_heartbeat_url(
+        router_base_url="http://10.0.2.2:8899",
+        session_id="my-session",
+    )
+    assert url.endswith("/api/app-agent-sessions/my-session/heartbeat")
+    assert not "//api" in url

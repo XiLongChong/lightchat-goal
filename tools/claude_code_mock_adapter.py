@@ -32,6 +32,7 @@ printed.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
 import sys
 from contextlib import asynccontextmanager
@@ -67,6 +68,32 @@ def _reply_template(
     if attachments:
         reply["attachments"] = attachments
     return reply
+
+
+def build_empty_content_reply(
+    attachments: list[dict[str, Any]],
+    client_message_id: str,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Build a v1 callback response when content is empty but attachments exist.
+
+    Returns a text-only ``agentReplies`` envelope — the mock adapter cannot
+    inspect images, so it acknowledges receipt without processing.
+    """
+    has_image = any(
+        isinstance(a, dict) and a.get("type") == "image" for a in attachments
+    )
+    if has_image:
+        reply_text = (
+            "I received an image attachment, but this mock adapter "
+            "cannot inspect images."
+        )
+    else:
+        reply_text = "I received an attachment."
+    return {
+        "agentReplies": [_reply_template(client_message_id, reply_text, now=now)],
+    }
 
 
 def build_claude_mock_reply(
@@ -223,6 +250,67 @@ async def offline_from_router(
         )
 
 
+def build_heartbeat_url(*, router_base_url: str, session_id: str) -> str:
+    """Build the heartbeat URL: ``POST /api/app-agent-sessions/{s}/heartbeat``."""
+    return (
+        f"{router_base_url.rstrip('/')}"
+        f"/api/app-agent-sessions/{session_id}/heartbeat"
+    )
+
+
+async def heartbeat_to_router(
+    *,
+    router_base_url: str,
+    api_key: str,
+    session_id: str,
+) -> None:
+    """Best-effort POST to the Router's heartbeat endpoint.  Never raises.
+
+    On failure, logs to stderr but does not exit — the Router's stale-TTL
+    handles liveness.
+    """
+    url = build_heartbeat_url(
+        router_base_url=router_base_url, session_id=session_id,
+    )
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(url, headers=_auth_headers(api_key))
+        if resp.status_code < 200 or resp.status_code >= 300:
+            print(
+                f"[claude-mock] heartbeat returned HTTP {resp.status_code} "
+                f"(non-fatal)",
+                file=sys.stderr,
+            )
+    except Exception as exc:
+        print(
+            f"[claude-mock] heartbeat failed (non-fatal): {exc}",
+            file=sys.stderr,
+        )
+
+
+# ── Heartbeat loop (background) ─────────────────────────────────────
+
+
+async def _run_heartbeat_loop(
+    *,
+    router_base_url: str,
+    api_key: str,
+    session_id: str,
+    interval_seconds: float = 30.0,
+) -> None:
+    """Run heartbeat every *interval_seconds*.  Exits on ``CancelledError``."""
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+            await heartbeat_to_router(
+                router_base_url=router_base_url,
+                api_key=api_key,
+                session_id=session_id,
+            )
+        except asyncio.CancelledError:
+            break
+
+
 # ── FastAPI app ────────────────────────────────────────────────────
 
 
@@ -236,8 +324,13 @@ def create_app(
     description: str,
     callback_url: str,
     workspace_name: str = "goal",
+    heartbeat_interval_seconds: float = 30.0,
 ) -> FastAPI:
-    """Build the Claude Code mock FastAPI app."""
+    """Build the Claude Code mock FastAPI app.
+
+    *heartbeat_interval_seconds* — how often to call the Router's heartbeat
+    endpoint to prevent stale-TTL offline.  Default 30s (Router TTL is 90s).
+    """
 
     @asynccontextmanager
     async def _lifespan(_app: FastAPI):
@@ -265,7 +358,32 @@ def create_app(
             f"remoteAgentId={remote_agent_id} -> Router {router_base_url}"
         )
 
+        # First heartbeat immediately after registration so lastSeenAt is fresh
+        await heartbeat_to_router(
+            router_base_url=router_base_url,
+            api_key=api_key,
+            session_id=session_id,
+        )
+
+        # Background heartbeat loop
+        heartbeat_task: asyncio.Task | None = asyncio.create_task(
+            _run_heartbeat_loop(
+                router_base_url=router_base_url,
+                api_key=api_key,
+                session_id=session_id,
+                interval_seconds=heartbeat_interval_seconds,
+            ),
+        )
+
         yield
+
+        # Cancel heartbeat loop
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
 
         await offline_from_router(
             router_base_url=router_base_url,
@@ -281,7 +399,13 @@ def create_app(
 
     @app.post("/api/app-session/messages")
     async def handle_messages(request: Request) -> JSONResponse:
-        """Callback endpoint matching the v1 contract."""
+        """Callback endpoint matching the v1 contract.
+
+        Accepts:
+        - content non-empty + optional attachments
+        - content empty + attachments non-empty
+        Rejects only: content empty AND attachments empty.
+        """
         try:
             body = await request.json()
         except Exception:
@@ -296,19 +420,28 @@ def create_app(
 
         content = str(body.get("content", "")).strip()
         client_message_id = str(body.get("clientMessageId", "")).strip()
-        if not content:
+        attachments = body.get("attachments") or []
+        if not isinstance(attachments, list):
+            attachments = []
+        if not content and not attachments:
             return JSONResponse(
-                status_code=400, content={"error": "content is required"},
+                status_code=400,
+                content={"error": "content or attachments are required"},
             )
 
-        reply = build_claude_mock_reply(
-            content,
-            client_message_id or "unknown",
-            workspace_name=workspace_name,
-        )
+        if not content and attachments:
+            reply = build_empty_content_reply(
+                attachments, client_message_id or "unknown",
+            )
+        else:
+            reply = build_claude_mock_reply(
+                content,
+                client_message_id or "unknown",
+                workspace_name=workspace_name,
+            )
         print(
             f"[claude-mock] received clientMessageId={client_message_id} "
-            f"content={content!r} -> replying"
+            f"content={content!r} attachments={len(attachments)} -> replying"
         )
         return JSONResponse(reply)
 
