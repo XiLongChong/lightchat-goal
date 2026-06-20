@@ -6986,3 +6986,137 @@ async def test_phone_context_get_unknown_type_returns_400(monkeypatch):
         await api_phone_context_latest(
             _GetReq(), types="calendar", maxAgeSeconds=300)
     assert exc.value.status_code == 400
+
+
+# ── Phase 2A: new optional app_status fields pass through ────────────
+
+
+@pytest.mark.asyncio
+async def test_phone_context_post_accepts_new_app_status_fields(monkeypatch):
+    """POST accepts screen / activeRemoteAgentId / activeContactDisplayName."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+    from main import api_phone_context_snapshot
+
+    body = _make_phone_snapshot_body()
+    body["contexts"]["app_status"] = {
+        "appState": "foreground",
+        "activeContactId": "contact-1",
+        "notificationsEnabled": True,
+        "screen": "chat",
+        "activeRemoteAgentId": "agent-42",
+        "activeContactDisplayName": "Bob",
+    }
+    result = await api_phone_context_snapshot(_JsonFakeRequest(body))
+    assert result["ok"] is True
+    assert "app_status" in result["acceptedTypes"]
+
+
+@pytest.mark.asyncio
+async def test_phone_context_get_returns_new_app_status_fields(monkeypatch):
+    """GET returns stored screen / activeRemoteAgentId / activeContactDisplayName."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+    from main import api_phone_context_snapshot, api_phone_context_latest
+
+    body = _make_phone_snapshot_body()
+    body["contexts"]["app_status"] = {
+        "appState": "foreground",
+        "activeContactId": "contact-1",
+        "notificationsEnabled": True,
+        "screen": "chat",
+        "activeRemoteAgentId": "agent-42",
+        "activeContactDisplayName": "Bob",
+    }
+    await api_phone_context_snapshot(_JsonFakeRequest(body))
+
+    class _GetReq:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+    result = await api_phone_context_latest(
+        _GetReq(), types="app_status", maxAgeSeconds=86400)
+    assert result["status"] == "ok"
+    data = result["contexts"]["app_status"]["data"]
+    assert data["screen"] == "chat"
+    assert data["activeRemoteAgentId"] == "agent-42"
+    assert data["activeContactDisplayName"] == "Bob"
+
+
+@pytest.mark.asyncio
+async def test_phone_context_background_snapshot(monkeypatch):
+    """Background snapshot: screen=background, active fields null."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+    from main import api_phone_context_snapshot, api_phone_context_latest
+
+    body = _make_phone_snapshot_body(reason="background_sync")
+    body["contexts"]["app_status"] = {
+        "appState": "background",
+        "activeContactId": None,
+        "notificationsEnabled": True,
+        "screen": "background",
+        "activeRemoteAgentId": None,
+        "activeContactDisplayName": None,
+    }
+    await api_phone_context_snapshot(_JsonFakeRequest(body))
+
+    class _GetReq:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+    result = await api_phone_context_latest(
+        _GetReq(), types="app_status", maxAgeSeconds=86400)
+    assert result["status"] == "ok"
+    data = result["contexts"]["app_status"]["data"]
+    assert data["appState"] == "background"
+    assert data["screen"] == "background"
+    assert data["activeContactId"] is None
+    assert data["activeRemoteAgentId"] is None
+    assert data["activeContactDisplayName"] is None
+
+
+@pytest.mark.asyncio
+async def test_phone_context_old_payload_without_new_fields_compatible(monkeypatch):
+    """Old payload without screen/activeRemoteAgentId/activeContactDisplayName still works."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+    from main import api_phone_context_snapshot, api_phone_context_latest
+
+    # Phase 1 payload: no screen, no activeRemoteAgentId, no activeContactDisplayName.
+    body = _make_phone_snapshot_body()
+    body["contexts"]["app_status"] = {
+        "appState": "foreground",
+        "activeContactId": "contact-1",
+        "notificationsEnabled": True,
+    }
+    await api_phone_context_snapshot(_JsonFakeRequest(body))
+
+    class _GetReq:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+    result = await api_phone_context_latest(
+        _GetReq(), types="app_status", maxAgeSeconds=86400)
+    assert result["status"] == "ok"
+    data = result["contexts"]["app_status"]["data"]
+    # Old core fields still present.
+    assert data["appState"] == "foreground"
+    assert data["activeContactId"] == "contact-1"
+    assert data["notificationsEnabled"] is True
+
+
+@pytest.mark.asyncio
+async def test_phone_context_unknown_screen_accepted_no_strict_validation(monkeypatch):
+    """Router does NOT enforce screen enum — permissive passthrough storage."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+    from main import api_phone_context_snapshot
+
+    body = _make_phone_snapshot_body()
+    body["contexts"]["app_status"] = {
+        "appState": "foreground",
+        "activeContactId": None,
+        "notificationsEnabled": True,
+        "screen": "some_future_screen",
+        "activeRemoteAgentId": None,
+        "activeContactDisplayName": None,
+    }
+    result = await api_phone_context_snapshot(_JsonFakeRequest(body))
+    # Should be accepted — Router is a passthrough, not a strict validator.
+    assert result["ok"] is True
