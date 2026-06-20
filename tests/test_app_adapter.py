@@ -193,6 +193,99 @@ async def test_get_app_messages_pagination():
 
 
 @pytest.mark.asyncio
+async def test_app_messages_ordering_stable_when_created_at_ties():
+    """user/reply written with the same created_at must keep user before reply.
+
+    Regression guard for a flaky history-sort failure: when the user message
+    and its agent reply share an identical ``created_at`` (e.g. written within
+    one ``time.time()`` tick on the claude_channel path), ordering by
+    ``created_at`` alone leaves the tie to SQLite's non-deterministic internal
+    order.  Tying the break on the lexicographic ``id`` (``app_rm_agent_*`` <
+    ``app_rm_user_*``) sorts the reply *before* the user, flipping the history.
+
+    The composite key ``created_at, source_turn_id, sequence, id`` keeps the
+    user (sequence 0) ahead of its reply (sequence >= 1) regardless of id.
+    """
+    from memory.store import MemoryStore
+
+    store = MemoryStore(db_path=":memory:")
+    try:
+        tied_ts = 1_750_000_000.0  # identical timestamp for both rows
+        await store.insert_app_message(
+            remote_id="app_rm_user_aaaaaaaaaaaa",
+            client_message_id="cm-tie",
+            role="user",
+            content="hi hist",
+            source_turn_id="turn-tie",
+            sequence=0,
+            remote_agent_id="default",
+            created_at=tied_ts,
+        )
+        await store.insert_app_message(
+            remote_id="app_rm_agent_bbbbbbbbbbbb",
+            client_message_id=None,
+            role="agent",
+            content="reply hist",
+            source_turn_id="turn-tie",
+            sequence=1,
+            remote_agent_id="default",
+            created_at=tied_ts,
+        )
+
+        messages, _, _ = await store.get_app_messages_after_cursor(
+            remote_agent_id="default",
+        )
+        assert [m["role"] for m in messages] == ["user", "agent"]
+        assert messages[0]["content"] == "hi hist"
+        assert messages[1]["content"] == "reply hist"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_app_messages_cursor_no_drop_or_dup_on_created_at_tie():
+    """Cursor pagination across tied ``created_at`` must not drop/duplicate rows.
+
+    With several rows sharing the same ``created_at`` and the page boundary
+    falling in the middle of that tie group, a cursor that only keys on
+    ``created_at`` (or on ``id`` alone) can either skip rows or repeat them.
+    The composite cursor ``(created_at, source_turn_id, sequence, id)`` keeps
+    the page walk stable.
+    """
+    from memory.store import MemoryStore
+
+    store = MemoryStore(db_path=":memory:")
+    try:
+        tied_ts = 1_750_000_000.0
+        # Five rows sharing one timestamp, distinct sequence/turn within.
+        for seq in range(5):
+            await store.insert_app_message(
+                remote_id=f"app_rm_row_{seq}",
+                client_message_id=None,
+                role="user",
+                content=f"row {seq}",
+                source_turn_id="turn-tie",
+                sequence=seq,
+                remote_agent_id="default",
+                created_at=tied_ts,
+            )
+
+        seen: list[str] = []
+        cursor = None
+        while True:
+            page, cursor, has_more = await store.get_app_messages_after_cursor(
+                cursor=cursor, limit=2, remote_agent_id="default",
+            )
+            seen.extend(m["id"] for m in page)
+            if not has_more:
+                break
+
+        assert seen == [f"app_rm_row_{seq}" for seq in range(5)]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_app_message_idempotency_conflict():
     """clientMessageId unique constraint prevents duplicate user messages."""
     from memory.store import MemoryStore

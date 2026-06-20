@@ -1162,6 +1162,19 @@ class MemoryStore:
                   ``remote_agent_id`` is treated as None.
         limit   – maximum messages to return (1-200, clamped).
         Returns (messages, next_cursor, has_more).
+
+        Rows are ordered by the deterministic composite key
+        ``(created_at, source_turn_id, sequence, id)``.  ``created_at`` alone
+        is not a stable sort key: a user message and its agent reply can be
+        written within a single ``time.time()`` tick and end up with an
+        identical timestamp, at which point SQLite's tie-break is
+        non-deterministic and (worse) the lexicographic ``id`` tie-break
+        (``app_rm_agent_*`` < ``app_rm_user_*``) flips the reply ahead of the
+        user.  ``sequence`` (0 for the user message, >= 1 for each reply,
+        shared ``source_turn_id``) keeps a turn's user message ahead of its
+        replies; ``id`` is the final unique tie-break so the order is total.
+        The same composite key is used for cursor pagination so pages neither
+        drop nor duplicate rows that share a timestamp.
         """
         limit = max(1, min(int(limit), 200))
         db = await self._get_db()
@@ -1169,32 +1182,48 @@ class MemoryStore:
         # Validate that cursor belongs to this remote_agent_id;
         # if not, treat it as None so we don't cross-scope.
         cursor_ts: float | None = None
+        cursor_turn: str = ""
+        cursor_seq: int = 0
         if cursor is not None:
             cr = await db.execute_fetchall(
-                "SELECT remote_agent_id, created_at FROM app_messages WHERE id = ?",
+                "SELECT remote_agent_id, created_at, source_turn_id, sequence "
+                "FROM app_messages WHERE id = ?",
                 (cursor,),
             )
             if cr and str(cr[0]["remote_agent_id"]) == remote_agent_id:
                 cursor_ts = float(cr[0]["created_at"])
+                cursor_turn = str(cr[0]["source_turn_id"] or "")
+                cursor_seq = int(cr[0]["sequence"] or 0)
             # else: cursor is from a different scope → fall through to
             #        the cursor-is-None branch.
 
         if cursor_ts is not None:
-            # Paginate within the same remote_agent_id using (created_at, id)
-            # as the composite cursor so rows are stable.
+            # Paginate within the same remote_agent_id using the same
+            # composite key the ORDER BY uses, so the page walk is a strict
+            # continuation of the ordering (no row dropped or duplicated).
             rows = await db.execute_fetchall(
                 """SELECT * FROM app_messages
                    WHERE remote_agent_id = ?
-                     AND (created_at > ? OR (created_at = ? AND id > ?))
-                   ORDER BY created_at ASC, id ASC
+                     AND (created_at > ?
+                          OR (created_at = ? AND source_turn_id > ?)
+                          OR (created_at = ? AND source_turn_id = ? AND sequence > ?)
+                          OR (created_at = ? AND source_turn_id = ? AND sequence = ? AND id > ?))
+                   ORDER BY created_at ASC, source_turn_id ASC, sequence ASC, id ASC
                    LIMIT ?""",
-                (remote_agent_id, cursor_ts, cursor_ts, cursor, limit + 1),
+                (
+                    remote_agent_id,
+                    cursor_ts,
+                    cursor_ts, cursor_turn,
+                    cursor_ts, cursor_turn, cursor_seq,
+                    cursor_ts, cursor_turn, cursor_seq, cursor,
+                    limit + 1,
+                ),
             )
         else:
             rows = await db.execute_fetchall(
                 """SELECT * FROM app_messages
                    WHERE remote_agent_id = ?
-                   ORDER BY created_at ASC, id ASC
+                   ORDER BY created_at ASC, source_turn_id ASC, sequence ASC, id ASC
                    LIMIT ?""",
                 (remote_agent_id, limit + 1),
             )
