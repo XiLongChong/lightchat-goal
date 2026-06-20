@@ -1,5 +1,29 @@
 # CLAUDE.md
 
+## Current AsPocket Router scope (2026-06-21)
+
+The App adapter is no longer limited to `/api/profile` and `/api/messages`.
+Current AsPocket Router capabilities include:
+
+- App contact invitations
+- App message send/history with `remoteAgentId`
+- image attachment upload/download
+- sticker attachment validation
+- attached-session callback routing
+- Claude Code channel routing
+- cached Phone Context snapshots and `aspocket_get_phone_context`
+
+For current review/planning, use:
+
+- `docs/done/2026-06-21/current-capabilities-and-upgrade-map.md`
+
+Keep protocol types generic. Do not create a bespoke Router protocol per external agent; normalize
+toward generic `internal`, `callback`, and `channel` concepts while preserving compatibility.
+
+Phone Context privacy boundary: do not request or store message content, typed text, contact lists,
+location, SSID, IP address, clipboard contents, media library contents, or health data as phone
+context without a new explicit design review.
+
 Goal Chat Agent — 基于 DeepSeek LLM 的微信聊天机器人，单进程 FastAPI + SQLite。
 
 ## 项目规则
