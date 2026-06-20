@@ -184,3 +184,20 @@ export function offlineUrl(base, sessionId) {
     `/api/app-agent-sessions/${encodeURIComponent(sessionId)}/offline`,
   );
 }
+
+/**
+ * Build the phone context URL: `GET /api/phone-context/latest`.
+ *
+ * @param {string} base
+ * @param {string[]} [types=["device_status","app_status"]]
+ * @param {number} [maxAgeSeconds=300]
+ * @returns {string}
+ */
+export function phoneContextUrl(base, types = ["device_status", "app_status"], maxAgeSeconds = 300) {
+  const typesParam = encodeURIComponent(types.join(","));
+  const age = Math.max(0, Math.min(Math.floor(maxAgeSeconds), 86400));
+  return joinRouterUrl(
+    base,
+    `/api/phone-context/latest?types=${typesParam}&maxAgeSeconds=${age}`,
+  );
+}

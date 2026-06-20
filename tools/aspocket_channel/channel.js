@@ -35,6 +35,7 @@ import {
   replyUrl,
   heartbeatUrl,
   offlineUrl,
+  phoneContextUrl,
 } from "./helpers.js";
 
 // ── Config (env) ──────────────────────────────────────────────────
@@ -316,45 +317,98 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["clientMessageId", "text"],
       },
     },
+    {
+      name: "aspocket_get_phone_context",
+      description:
+        "Get the most recent phone context snapshot cached by the Router. " +
+        "Returns device status (battery, network, timezone) and app status " +
+        "(foreground/background, active contact). " +
+        "This is a cached snapshot from the App — NOT real-time data.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          types: {
+            type: "array",
+            items: { type: "string", enum: ["device_status", "app_status"] },
+            description:
+              "Context types to fetch. Defaults to both if omitted.",
+          },
+          maxAgeSeconds: {
+            type: "number",
+            description:
+              "Maximum age of the snapshot in seconds (0–86400). Default 300.",
+          },
+        },
+      },
+    },
   ],
 }));
 
 mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
-  if (name !== "aspocket_reply") {
-    return {
-      content: [{ type: "text", text: `unknown tool: ${name}` }],
-      isError: true,
-    };
+  if (name === "aspocket_reply") {
+    const clientMessageId = String(args?.clientMessageId || "").trim();
+    const text = String(args?.text || "").trim();
+    const stickerId = String(args?.stickerId || "").trim();
+    if (!clientMessageId || !text) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "send failed: clientMessageId and text are required",
+          },
+        ],
+        isError: true,
+      };
+    }
+    const attachments = stickerId
+      ? [{ type: "sticker", stickerId }]
+      : undefined;
+    try {
+      await postReply(clientMessageId, text, undefined, attachments);
+      return {
+        content: [{ type: "text", text: "sent" }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: `send failed: ${err.message}` }],
+        isError: true,
+      };
+    }
   }
-  const clientMessageId = String(args?.clientMessageId || "").trim();
-  const text = String(args?.text || "").trim();
-  const stickerId = String(args?.stickerId || "").trim();
-  if (!clientMessageId || !text) {
-    return {
-      content: [
-        {
-          type: "text",
-          text: "send failed: clientMessageId and text are required",
-        },
-      ],
-      isError: true,
-    };
+
+  if (name === "aspocket_get_phone_context") {
+    const types = Array.isArray(args?.types) && args.types.length > 0
+      ? args.types
+      : ["device_status", "app_status"];
+    const maxAge = typeof args?.maxAgeSeconds === "number"
+      ? args.maxAgeSeconds
+      : 300;
+    const url = phoneContextUrl(ROUTER_URL, types, maxAge);
+    try {
+      const resp = await fetch(url, { headers: authHeaders() });
+      const body = await resp.text();
+      if (!resp.ok) {
+        return {
+          content: [{ type: "text", text: `HTTP ${resp.status}: ${body}` }],
+          isError: true,
+        };
+      }
+      return {
+        content: [{ type: "text", text: body }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: `fetch failed: ${err.message}` }],
+        isError: true,
+      };
+    }
   }
-  const attachments = stickerId
-    ? [{ type: "sticker", stickerId }]
-    : undefined;
-  try {
-    await postReply(clientMessageId, text, undefined, attachments);
-    return {
-      content: [{ type: "text", text: "sent" }],
-    };
-  } catch (err) {
-    return {
-      content: [{ type: "text", text: `send failed: ${err.message}` }],
-      isError: true,
-    };
-  }
+
+  return {
+    content: [{ type: "text", text: `unknown tool: ${name}` }],
+    isError: true,
+  };
 });
 
 // ── Startup ───────────────────────────────────────────────────────

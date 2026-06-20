@@ -223,6 +223,14 @@ class MemoryStore:
                 storage_path TEXT NOT NULL DEFAULT '',
                 created_at REAL NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS phone_context_snapshots (
+                snapshot_id TEXT PRIMARY KEY,
+                collected_at_ms INTEGER NOT NULL,
+                received_at_ms INTEGER NOT NULL,
+                payload_json TEXT NOT NULL,
+                stored_at REAL NOT NULL
+            );
             """
         )
 
@@ -1325,9 +1333,53 @@ class MemoryStore:
 
     # ── clear ───────────────────────────────────────────────────────
 
+    # ── phone context snapshots ──────────────────────────────────────
+
+    async def insert_phone_context_snapshot(
+        self,
+        *,
+        snapshot_id: str,
+        collected_at_ms: int,
+        received_at_ms: int,
+        payload_json: str,
+    ) -> None:
+        """Store a phone context snapshot and prune old entries."""
+        async with self._write_lock:
+            db = await self._get_db()
+            now_ts = time.time()
+            await db.execute(
+                """INSERT INTO phone_context_snapshots(
+                       snapshot_id, collected_at_ms, received_at_ms, payload_json, stored_at
+                   )
+                   VALUES(?, ?, ?, ?, ?)""",
+                (snapshot_id, collected_at_ms, received_at_ms, payload_json, now_ts),
+            )
+            # Prune: keep at most 50 recent snapshots
+            rows = await db.execute_fetchall(
+                "SELECT snapshot_id FROM phone_context_snapshots "
+                "ORDER BY received_at_ms DESC LIMIT -1 OFFSET 50"
+            )
+            for row in rows:
+                await db.execute(
+                    "DELETE FROM phone_context_snapshots WHERE snapshot_id = ?",
+                    (row["snapshot_id"],),
+                )
+            await db.commit()
+
+    async def get_latest_phone_context_snapshot(self) -> dict[str, Any] | None:
+        """Return the most recent phone context snapshot, or None."""
+        db = await self._get_db()
+        rows = await db.execute_fetchall(
+            "SELECT * FROM phone_context_snapshots "
+            "ORDER BY received_at_ms DESC LIMIT 1"
+        )
+        return dict(rows[0]) if rows else None
+
+    # ── clear ───────────────────────────────────────────────────────
+
     async def clear_all(self) -> dict[str, int]:
         """Clear all data except bot_contact_state and runtime_meta."""
-        tables = ("conversations", "turns", "raw_events", "context_snapshots", "tool_versions", "daily_summaries", "scheduled_tasks", "app_messages", "app_attachments")
+        tables = ("conversations", "turns", "raw_events", "context_snapshots", "tool_versions", "daily_summaries", "scheduled_tasks", "app_messages", "app_attachments", "phone_context_snapshots")
         counts: dict[str, int] = {}
         async with self._write_lock:
             db = await self._get_db()

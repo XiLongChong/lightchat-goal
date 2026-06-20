@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import uuid
 from datetime import datetime, timezone
 
 import pytest
@@ -6748,4 +6749,240 @@ async def test_channel_reply_unknown_sticker_rejected(monkeypatch):
 
     with pytest.raises(HTTPException) as exc:
         await api_channel_post_reply(sid, _Req())
+    assert exc.value.status_code == 400
+
+
+# ================================================================
+# Phone context (Phase 1) — snapshot upload + latest query
+# ================================================================
+
+
+def _make_phone_snapshot_body(**overrides):
+    """Build a valid POST /api/phone-context/snapshots request body."""
+    body = {
+        "schemaVersion": 1,
+        "snapshotId": f"snap-{uuid.uuid4().hex[:12]}",
+        "collectedAtMs": 1781950000000,
+        "source": "android-app",
+        "reason": "foreground_start",
+        "contexts": {
+            "device_status": {
+                "platform": "android",
+                "localTime": "2026-06-20T21:30:00+08:00",
+                "timezoneId": "Asia/Shanghai",
+                "batteryPercent": 82,
+                "isCharging": True,
+                "powerSource": "usb",
+                "networkType": "wifi",
+                "isOnline": True,
+            },
+        },
+    }
+    body.update(overrides)
+    return body
+
+
+class _JsonFakeRequest:
+    """FakeRequest that returns a JSON body via async json()."""
+    def __init__(self, body, auth=True):
+        self.headers = {}
+        if auth:
+            self.headers["authorization"] = "Bearer secret"
+        self.base_url = "http://127.0.0.1:8899/"
+        self._body = body
+
+    async def json(self):
+        return self._body
+
+
+# ── POST snapshot success ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_phone_context_post_snapshot_success(monkeypatch):
+    """POST /api/phone-context/snapshots with valid body returns ok."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import api_phone_context_snapshot
+
+    body = _make_phone_snapshot_body()
+    result = await api_phone_context_snapshot(
+        _JsonFakeRequest(body))
+    assert result["ok"] is True
+    assert result["snapshotId"] == body["snapshotId"]
+    assert "device_status" in result["acceptedTypes"]
+    assert result["storedAtMs"] > 0
+
+
+# ── POST snapshot auth missing → 401 ───────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_phone_context_post_unauth_returns_401(monkeypatch):
+    """POST without auth returns 401 before body is parsed."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+    from fastapi import HTTPException
+    from main import api_phone_context_snapshot
+
+    with pytest.raises(HTTPException) as exc:
+        await api_phone_context_snapshot(
+            _JsonFakeRequest(_make_phone_snapshot_body(), auth=False))
+    assert exc.value.status_code == 401
+
+
+# ── POST unknown context type → 400 ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_phone_context_post_unknown_type_returns_400(monkeypatch):
+    """POST with unsupported context type returns 400."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+    from fastapi import HTTPException
+    from main import api_phone_context_snapshot
+
+    body = _make_phone_snapshot_body()
+    body["contexts"]["unknown_type"] = {"x": 1}
+    with pytest.raises(HTTPException) as exc:
+        await api_phone_context_snapshot(_JsonFakeRequest(body))
+    assert exc.value.status_code == 400
+
+
+# ── POST invalid schemaVersion → 400 ───────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_phone_context_post_bad_schema_version_returns_400(monkeypatch):
+    """POST with schemaVersion != 1 returns 400."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+    from fastapi import HTTPException
+    from main import api_phone_context_snapshot
+
+    body = _make_phone_snapshot_body()
+    body["schemaVersion"] = 99
+    with pytest.raises(HTTPException) as exc:
+        await api_phone_context_snapshot(_JsonFakeRequest(body))
+    assert exc.value.status_code == 400
+
+
+# ── POST invalid reason → 400 ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_phone_context_post_bad_reason_returns_400(monkeypatch):
+    """POST with unsupported reason returns 400."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+    from fastapi import HTTPException
+    from main import api_phone_context_snapshot
+
+    body = _make_phone_snapshot_body()
+    body["reason"] = "evil_hack"
+    with pytest.raises(HTTPException) as exc:
+        await api_phone_context_snapshot(_JsonFakeRequest(body))
+    assert exc.value.status_code == 400
+
+
+# ── POST invalid source → 400 ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_phone_context_post_bad_source_returns_400(monkeypatch):
+    """POST with source != android-app returns 400."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+    from fastapi import HTTPException
+    from main import api_phone_context_snapshot
+
+    body = _make_phone_snapshot_body()
+    body["source"] = "ios-app"
+    with pytest.raises(HTTPException) as exc:
+        await api_phone_context_snapshot(_JsonFakeRequest(body))
+    assert exc.value.status_code == 400
+
+
+# ── GET latest success ─────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_phone_context_get_latest_success(monkeypatch):
+    """GET /api/phone-context/latest returns stored snapshot."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import api_phone_context_snapshot, api_phone_context_latest
+
+    # Post a snapshot first
+    body = _make_phone_snapshot_body()
+    await api_phone_context_snapshot(_JsonFakeRequest(body))
+
+    class _GetReq:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+    result = await api_phone_context_latest(
+        _GetReq(), types="device_status", maxAgeSeconds=86400)
+    assert result["status"] == "ok"
+    assert result["snapshotId"] == body["snapshotId"]
+    assert "device_status" in result["contexts"]
+    assert result["contexts"]["device_status"]["status"] == "ok"
+
+
+# ── GET latest expired → unavailable ───────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_phone_context_get_latest_expired_returns_unavailable(monkeypatch):
+    """GET with maxAgeSeconds=0 returns unavailable when snapshot is old."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import api_phone_context_snapshot, api_phone_context_latest
+
+    # Post a snapshot (collectedAtMs is in the past)
+    body = _make_phone_snapshot_body()
+    await api_phone_context_snapshot(_JsonFakeRequest(body))
+
+    class _GetReq:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+    result = await api_phone_context_latest(
+        _GetReq(), types="device_status", maxAgeSeconds=0)
+    assert result["status"] == "unavailable"
+    assert result["missing"] == ["device_status"]
+
+
+# ── GET no snapshot → unavailable ──────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_phone_context_get_no_snapshot_returns_unavailable(monkeypatch):
+    """GET returns unavailable when no snapshot has been posted."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+    from main import api_phone_context_latest
+
+    class _GetReq:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+    result = await api_phone_context_latest(
+        _GetReq(), types="device_status,app_status", maxAgeSeconds=300)
+    assert result["status"] == "unavailable"
+    assert "device_status" in result["missing"]
+    assert "app_status" in result["missing"]
+
+
+# ── GET unknown type → 400 ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_phone_context_get_unknown_type_returns_400(monkeypatch):
+    """GET with unsupported type returns 400."""
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+    from fastapi import HTTPException
+    from main import api_phone_context_latest
+
+    class _GetReq:
+        headers = {"authorization": "Bearer secret"}
+        base_url = "http://testserver/"
+
+    with pytest.raises(HTTPException) as exc:
+        await api_phone_context_latest(
+            _GetReq(), types="calendar", maxAgeSeconds=300)
     assert exc.value.status_code == 400

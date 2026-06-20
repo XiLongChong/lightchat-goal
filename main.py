@@ -1330,6 +1330,22 @@ from runtime.sticker_catalog import (
     canonicalize_sticker_attachment,
 )
 
+# ── phone context constants ────────────────────────────────────────
+
+_PHONE_CONTEXT_VALID_REASONS = frozenset({
+    "foreground_start",
+    "foreground_tick",
+    "active_chat_changed",
+    "background_sync",
+    "manual_debug",
+})
+
+_PHONE_CONTEXT_VALID_TYPES = frozenset({
+    "device_status",
+    "app_status",
+})
+
+
 # ── attachment helpers ─────────────────────────────────────────────
 
 import os as _os
@@ -2477,6 +2493,191 @@ def validate_callback_response(body: Any) -> dict[str, Any]:
         replies.append(reply)
 
     return {"ok": True, "replies": replies}
+
+
+# ================================================================
+# Phone context endpoints
+# ================================================================
+
+
+@app.post("/api/phone-context/snapshots")
+async def api_phone_context_snapshot(request: Request):
+    """Accept a phone context snapshot from the App.
+
+    Phase 1: cached snapshot, not a real-time request.  Only
+    ``device_status`` and ``app_status`` context types are accepted.
+    """
+    api_cfg = _api_config()
+    _require_chat_auth(request, api_cfg)
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="JSON body must be an object")
+
+    # ── schemaVersion ─────────────────────────────────────
+    schema_version = body.get("schemaVersion")
+    if schema_version != 1:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unsupported schemaVersion: {schema_version!r}. Only version 1 is supported",
+        )
+
+    # ── snapshotId ─────────────────────────────────────────
+    snapshot_id = str(body.get("snapshotId", "")).strip()
+    if not snapshot_id:
+        raise HTTPException(status_code=400, detail="snapshotId is required")
+
+    # ── collectedAtMs ─────────────────────────────────────
+    collected_at_ms = body.get("collectedAtMs")
+    if not isinstance(collected_at_ms, (int, float)) or collected_at_ms <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="collectedAtMs must be a positive integer",
+        )
+    collected_at_ms = int(collected_at_ms)
+
+    # ── source ────────────────────────────────────────────
+    source = str(body.get("source", "")).strip()
+    if source != "android-app":
+        raise HTTPException(
+            status_code=400,
+            detail=f"unsupported source: {source!r}. Only android-app is supported",
+        )
+
+    # ── reason ────────────────────────────────────────────
+    reason = str(body.get("reason", "")).strip()
+    if reason not in _PHONE_CONTEXT_VALID_REASONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unsupported reason: {reason!r}. "
+            f"Valid reasons: {', '.join(sorted(_PHONE_CONTEXT_VALID_REASONS))}",
+        )
+
+    # ── contexts ──────────────────────────────────────────
+    contexts = body.get("contexts")
+    if not isinstance(contexts, dict) or not contexts:
+        raise HTTPException(status_code=400, detail="contexts must be a non-empty object")
+
+    for ctype in contexts:
+        if ctype not in _PHONE_CONTEXT_VALID_TYPES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unsupported context type: {ctype!r}. "
+                f"Valid types: {', '.join(sorted(_PHONE_CONTEXT_VALID_TYPES))}",
+            )
+        if not isinstance(contexts[ctype], dict):
+            raise HTTPException(
+                status_code=400,
+                detail=f"context '{ctype}' must be an object",
+            )
+
+    # ── store ─────────────────────────────────────────────
+    received_at_ms = int(time.time() * 1000)
+    await memory_store.insert_phone_context_snapshot(
+        snapshot_id=snapshot_id,
+        collected_at_ms=collected_at_ms,
+        received_at_ms=received_at_ms,
+        payload_json=json.dumps(body, ensure_ascii=False),
+    )
+
+    logger.info(
+        "[app] phone context snapshot stored id=%s collectedAt=%d types=%s",
+        snapshot_id,
+        collected_at_ms,
+        list(contexts.keys()),
+    )
+
+    return {
+        "ok": True,
+        "snapshotId": snapshot_id,
+        "acceptedTypes": sorted(contexts.keys()),
+        "storedAtMs": received_at_ms,
+    }
+
+
+@app.get("/api/phone-context/latest")
+async def api_phone_context_latest(
+    request: Request,
+    types: str = "device_status,app_status",
+    maxAgeSeconds: int = 300,
+):
+    """Return the most recent phone context snapshot, if available.
+
+    Query params:
+    - *types*: comma-separated context types to request. Default both.
+    - *maxAgeSeconds*: maximum age (0–86400). Default 300.
+    """
+    api_cfg = _api_config()
+    _require_chat_auth(request, api_cfg)
+
+    # ── parse & validate types ────────────────────────────
+    requested_types = [t.strip() for t in types.split(",") if t.strip()]
+    if not requested_types:
+        raise HTTPException(status_code=400, detail="types is required")
+    for ct in requested_types:
+        if ct not in _PHONE_CONTEXT_VALID_TYPES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unsupported context type: {ct!r}. "
+                f"Valid types: {', '.join(sorted(_PHONE_CONTEXT_VALID_TYPES))}",
+            )
+
+    # ── validate maxAgeSeconds ────────────────────────────
+    if not isinstance(maxAgeSeconds, (int, float)):
+        raise HTTPException(status_code=400, detail="maxAgeSeconds must be a number")
+    maxAgeSeconds = max(0, min(int(maxAgeSeconds), 86400))
+
+    # ── look up latest snapshot ───────────────────────────
+    row = await memory_store.get_latest_phone_context_snapshot()
+    if row is None:
+        return {
+            "schemaVersion": 1,
+            "status": "unavailable",
+            "reason": "no phone context snapshot received yet",
+            "contexts": {},
+            "missing": requested_types,
+        }
+
+    payload = json.loads(row["payload_json"])
+    collected_at_ms = int(row["collected_at_ms"])
+    now_ms = int(time.time() * 1000)
+    age_seconds = (now_ms - collected_at_ms) / 1000.0
+
+    if age_seconds > maxAgeSeconds:
+        return {
+            "schemaVersion": 1,
+            "status": "unavailable",
+            "reason": "no recent phone context snapshot",
+            "contexts": {},
+            "missing": requested_types,
+        }
+
+    # ── build response contexts ───────────────────────────
+    available_contexts: dict[str, Any] = {}
+    missing: list[str] = []
+    raw_contexts = payload.get("contexts") or {}
+
+    for ct in requested_types:
+        if ct in raw_contexts and isinstance(raw_contexts[ct], dict):
+            available_contexts[ct] = {
+                "status": "ok",
+                "data": raw_contexts[ct],
+            }
+        else:
+            missing.append(ct)
+
+    return {
+        "schemaVersion": 1,
+        "status": "ok" if missing else "ok" if available_contexts else "unavailable",
+        "snapshotId": row["snapshot_id"],
+        "collectedAtMs": collected_at_ms,
+        "ageSeconds": round(age_seconds, 1),
+        "contexts": available_contexts,
+        "missing": missing,
+    }
 
 
 # ================================================================

@@ -10,6 +10,7 @@ import {
   replyUrl,
   heartbeatUrl,
   offlineUrl,
+  phoneContextUrl,
 } from "../helpers.js";
 
 // ── buildRegistrationPayload ──────────────────────────────────────
@@ -232,4 +233,24 @@ test("offlineUrl builds correct URL", () => {
     url,
     "http://127.0.0.1:8899/api/app-agent-sessions/sess-1/offline",
   );
+});
+
+// ── phoneContextUrl ───────────────────────────────────────────────
+
+test("phoneContextUrl builds URL with default types and maxAge", () => {
+  const url = phoneContextUrl("http://127.0.0.1:8899");
+  assert.equal(
+    url,
+    "http://127.0.0.1:8899/api/phone-context/latest?types=device_status%2Capp_status&maxAgeSeconds=300",
+  );
+});
+
+test("phoneContextUrl clamps maxAgeSeconds to 0–86400", () => {
+  const url = phoneContextUrl("http://127.0.0.1:8899", ["device_status"], 99999);
+  assert.ok(url.includes("maxAgeSeconds=86400"));
+});
+
+test("phoneContextUrl with custom types", () => {
+  const url = phoneContextUrl("http://127.0.0.1:8899", ["device_status"], 120);
+  assert.ok(url.endsWith("types=device_status&maxAgeSeconds=120"));
 });
