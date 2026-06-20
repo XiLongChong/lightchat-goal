@@ -1336,6 +1336,8 @@ _PHONE_CONTEXT_VALID_REASONS = frozenset({
     "foreground_start",
     "foreground_tick",
     "active_chat_changed",
+    "active_contact_resolved",
+    "screen_changed",
     "background_sync",
     "manual_debug",
 })
