@@ -15,7 +15,7 @@ Current AsPocket Router capabilities include:
 
 For current review/planning, use:
 
-- `docs/done/2026-06-21/current-capabilities-and-upgrade-map.md`
+- `docs/done/20260621/20260621-current-capabilities-and-upgrade-map.md`
 
 Keep protocol types generic. Do not create a bespoke Router protocol per external agent; normalize
 toward generic `internal`, `callback`, and `channel` concepts while preserving compatibility.
