@@ -2031,21 +2031,10 @@ async def api_send_message(request: Request):
             "agentReplies": agent_replies,
         }
 
-    # ── persist user message (internal agent) ───────────────────────
+    # ── prepare turn ids ──────────────────────────────────────────
     turn_id = f"app_turn_{uuid.uuid4().hex[:12]}"
     user_remote_id = f"app_rm_user_{uuid.uuid4().hex[:12]}"
     now_ts = time.time()
-
-    await memory_store.insert_app_message(
-        remote_id=user_remote_id,
-        client_message_id=client_message_id,
-        role="user",
-        content=content,
-        source_turn_id=turn_id,
-        sequence=0,
-        remote_agent_id=remote_agent_id,
-        attachments=incoming_attachments,
-    )
 
     # ── collector sender (replaces wechat_sender) ─────────────────
     collected_texts: list[str] = []
@@ -2097,6 +2086,7 @@ async def api_send_message(request: Request):
     # agentReplies.  Assistant final text, thinking, tool_result, and
     # non-send tools are ignored.
     agent_replies_internal: list[dict[str, Any]] = []
+    agent_reply_rows: list[dict[str, Any]] = []
     seq = 1
     for vm in result.visible_messages:
         is_delivered = (
@@ -2106,21 +2096,38 @@ async def api_send_message(request: Request):
         if is_delivered:
             reply_id = f"app_rm_agent_{uuid.uuid4().hex[:12]}"
             reply_text = str(vm.get("text", ""))
+            reply_created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             agent_replies_internal.append({
                 "remoteId": reply_id,
                 "content": reply_text,
-                "createdAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "createdAt": reply_created_at,
             })
-            await memory_store.insert_app_message(
-                remote_id=reply_id,
-                client_message_id=None,
-                role="agent",
-                content=reply_text,
-                source_turn_id=turn_id,
-                sequence=seq,
-                remote_agent_id=remote_agent_id,
-            )
+            agent_reply_rows.append({
+                "remote_id": reply_id,
+                "content": reply_text,
+                "source_turn_id": turn_id,
+                "sequence": seq,
+                "remote_agent_id": remote_agent_id,
+                "created_at": now_ts,
+            })
             seq += 1
+
+    # ── atomically persist user + replies ─────────────────────────
+    # Uses the same insert_app_turn_messages transaction as the
+    # attached_session path.  If any reply insert fails the user
+    # message is rolled back too — no half-success history.
+    await memory_store.insert_app_turn_messages(
+        user_message={
+            "remote_id": user_remote_id,
+            "client_message_id": client_message_id,
+            "content": content,
+            "source_turn_id": turn_id,
+            "remote_agent_id": remote_agent_id,
+            "created_at": now_ts,
+            "attachments": incoming_attachments,
+        },
+        agent_replies=agent_reply_rows,
+    )
 
     logger.info(
         "[app] turn=%s user_remote=%s agent_replies=%d elapsed_ms=%d",

@@ -11,8 +11,8 @@ message with the same ``clientMessageId`` (idempotent at the DB layer)
 and the channel will pick it up again.
 
 Delivery semantics: at-least-once.  A message stays in the inbox until
-``ack`` is called.  If ``ack`` is missing, ``poll`` keeps returning the
-same message.
+``ack`` is called, at which point it is deleted.  If ``ack`` is missing,
+``poll`` keeps returning the same message.
 """
 
 from __future__ import annotations
@@ -102,14 +102,16 @@ class ChannelPendingInbox:
             return result
 
     async def ack(self, delivery_id: str) -> dict[str, Any] | None:
-        """Mark a pending message as delivered to the channel.
+        """Remove a pending message from the inbox and mark it as delivered.
 
-        Returns the acked message dict, or ``None`` if *delivery_id* is
-        unknown.  Acking an already-acked message is a no-op (still
-        returns the dict).
+        Returns the acked message dict (with ``status`` set to ``"acked"``),
+        or ``None`` if *delivery_id* is unknown.  The message is deleted
+        from the inbox so memory does not grow unboundedly.
+
+        Acking an already-acked (deleted) message returns ``None``.
         """
         async with self._lock:
-            msg = self._messages.get(delivery_id)
+            msg = self._messages.pop(delivery_id, None)
             if msg is None:
                 return None
             msg["status"] = "acked"

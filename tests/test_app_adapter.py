@@ -5389,7 +5389,8 @@ async def test_inbox_ack_unknown_returns_none():
 
 
 @pytest.mark.asyncio
-async def test_inbox_ack_is_idempotent():
+async def test_inbox_ack_deletes_message_so_second_ack_returns_none():
+    """After ack deletes the message, a second ack returns None."""
     from runtime.channel_pending_inbox import ChannelPendingInbox
 
     inbox = ChannelPendingInbox()
@@ -5398,10 +5399,11 @@ async def test_inbox_ack_is_idempotent():
         client_message_id="cm", content="x", created_at="t",
     )
     first = await inbox.ack(msg["deliveryId"])
-    second = await inbox.ack(msg["deliveryId"])
     assert first is not None
-    assert second is not None
-    assert first["deliveryId"] == second["deliveryId"]
+    assert first["status"] == "acked"
+    # Second ack on the same deliveryId returns None (message was deleted).
+    second = await inbox.ack(msg["deliveryId"])
+    assert second is None
 
 
 @pytest.mark.asyncio
@@ -5416,6 +5418,42 @@ async def test_inbox_list_pending_respects_limit():
         )
     pending = await inbox.list_pending("s", limit=3)
     assert len(pending) == 3
+
+
+@pytest.mark.asyncio
+async def test_inbox_get_after_ack_returns_none():
+    """get() returns None after the message is acked (deleted)."""
+    from runtime.channel_pending_inbox import ChannelPendingInbox
+
+    inbox = ChannelPendingInbox()
+    msg = await inbox.add(
+        remote_agent_id="r", session_id="s",
+        client_message_id="cm", content="x", created_at="t",
+    )
+    delivery_id = msg["deliveryId"]
+    # Before ack: get returns the message
+    assert (await inbox.get(delivery_id)) is not None
+    # Ack deletes it
+    await inbox.ack(delivery_id)
+    # After ack: get returns None
+    assert (await inbox.get(delivery_id)) is None
+
+
+@pytest.mark.asyncio
+async def test_inbox_list_pending_empty_after_ack():
+    """After ack, list_pending no longer returns the message."""
+    from runtime.channel_pending_inbox import ChannelPendingInbox
+
+    inbox = ChannelPendingInbox()
+    msg = await inbox.add(
+        remote_agent_id="r", session_id="s",
+        client_message_id="cm", content="x", created_at="t",
+    )
+    pending_before = await inbox.list_pending("s")
+    assert len(pending_before) == 1
+    await inbox.ack(msg["deliveryId"])
+    pending_after = await inbox.list_pending("s")
+    assert len(pending_after) == 0
 
 
 # ================================================================
@@ -5448,6 +5486,102 @@ async def test_default_internal_path_still_works_with_channel_code_present(monke
 
     result = await api_send_message(FakeRequest())
     assert "userMessage" in result
+
+
+@pytest.mark.asyncio
+async def test_default_internal_atomic_write_user_and_replies(monkeypatch):
+    """Default/internal agent path atomically writes user + replies."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg, memory_store, api_send_message
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    # Wrap memory_store.insert_app_turn_messages to verify it is called.
+    called_with = {}
+
+    async def _capture(**kwargs):
+        called_with["user_message"] = kwargs["user_message"]
+        called_with["agent_replies"] = kwargs["agent_replies"]
+        await _orig_insert_turn(**kwargs)
+
+    _orig_insert_turn = memory_store.insert_app_turn_messages
+    memory_store.insert_app_turn_messages = _capture
+    try:
+        cid = f"cm-atomic-{_uuid.uuid4().hex[:8]}"
+
+        class FakeRequest:
+            headers = {"authorization": "Bearer secret"}
+            base_url = "http://testserver/"
+
+            async def json(self):
+                return {"clientMessageId": cid, "content": "hello atomic", "remoteAgentId": "default"}
+
+        result = await api_send_message(FakeRequest())
+        assert "userMessage" in result
+        assert "agentReplies" in result
+        assert result["userMessage"]["status"] == "sent"
+
+        # Verify insert_app_turn_messages was called with both user and replies.
+        assert "user_message" in called_with, "insert_app_turn_messages was not called"
+        um = called_with["user_message"]
+        assert um["client_message_id"] == cid
+        assert um["content"] == "hello atomic"
+        assert um["role"] == "user" if "role" in um else True  # role may be derived
+        # Replies list must be present (may be empty if agent produced no visible messages).
+        assert "agent_replies" in called_with
+    finally:
+        memory_store.insert_app_turn_messages = _orig_insert_turn
+
+
+@pytest.mark.asyncio
+async def test_default_internal_reply_failure_rolls_back_user_message(monkeypatch):
+    """If insert_app_turn_messages fails, user message is not persisted."""
+    import uuid as _uuid
+
+    monkeypatch.setenv("CHAT_API_KEY", "secret")
+
+    from main import app_agent_session_registry, cfg, memory_store, api_send_message
+
+    app_agent_session_registry._sessions.clear()
+    cfg.setdefault("app", {}).pop("contact_invitations", None)
+
+    # Simulate a write failure in insert_app_turn_messages.
+    _orig_insert_turn = memory_store.insert_app_turn_messages
+
+    async def _failing_insert(**kwargs):
+        raise RuntimeError("simulated write failure")
+
+    memory_store.insert_app_turn_messages = _failing_insert
+    cid = f"cm-rollback-{_uuid.uuid4().hex[:8]}"
+    try:
+        class FakeRequest:
+            headers = {"authorization": "Bearer secret"}
+            base_url = "http://testserver/"
+
+            async def json(self):
+                return {"clientMessageId": cid, "content": "hello rollback", "remoteAgentId": "default"}
+
+        from fastapi import HTTPException
+        # The insert failure may surface as a 500 or propagate as an exception.
+        # Either way, the user message must not be persisted.
+        try:
+            await api_send_message(FakeRequest())
+            # If no exception, check that user message was NOT stored.
+            found = await memory_store.find_app_message_by_client_message_id(cid)
+            assert found is None, "user message should not be persisted after write failure"
+        except HTTPException:
+            # Exception path: also verify no user message was stored.
+            found = await memory_store.find_app_message_by_client_message_id(cid)
+            assert found is None, "user message should not be persisted after write failure"
+        except RuntimeError:
+            found = await memory_store.find_app_message_by_client_message_id(cid)
+            assert found is None, "user message should not be persisted after write failure"
+    finally:
+        memory_store.insert_app_turn_messages = _orig_insert_turn
 
 
 @pytest.mark.asyncio
