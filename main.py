@@ -2601,6 +2601,7 @@ async def api_phone_context_snapshot(request: Request):
 
     return {
         "ok": True,
+        "accepted": True,
         "snapshotId": snapshot_id,
         "acceptedTypes": sorted(contexts.keys()),
         "storedAtMs": received_at_ms,

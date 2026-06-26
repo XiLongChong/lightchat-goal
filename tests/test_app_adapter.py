@@ -6896,7 +6896,7 @@ def _make_phone_snapshot_body(**overrides):
     body = {
         "schemaVersion": 1,
         "snapshotId": f"snap-{uuid.uuid4().hex[:12]}",
-        "collectedAtMs": 1781950000000,
+        "collectedAtMs": int(time.time() * 1000),
         "source": "android-app",
         "reason": "foreground_start",
         "contexts": {
@@ -6927,6 +6927,16 @@ class _JsonFakeRequest:
 
     async def json(self):
         return self._body
+
+
+async def _clear_phone_context_snapshots():
+    """Keep phone-context tests independent when run in one process."""
+    from main import memory_store
+
+    async with memory_store._write_lock:
+        db = await memory_store._get_db()
+        await db.execute("DELETE FROM phone_context_snapshots")
+        await db.commit()
 
 
 # ── POST snapshot success ──────────────────────────────────────────
@@ -7089,6 +7099,7 @@ async def test_phone_context_get_latest_expired_returns_unavailable(monkeypatch)
 async def test_phone_context_get_no_snapshot_returns_unavailable(monkeypatch):
     """GET returns unavailable when no snapshot has been posted."""
     monkeypatch.setenv("CHAT_API_KEY", "secret")
+    await _clear_phone_context_snapshots()
     from main import api_phone_context_latest
 
     class _GetReq:
