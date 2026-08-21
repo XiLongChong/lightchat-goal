@@ -11,10 +11,28 @@ __init__.py  — 导出所有公共类型
 
 ## 核心类型
 
-- **TurnType / UserIntent / TurnPhase** — 当前只有单一路径（USER_CHAT / CHAT / NORMAL_CHAT），为未来扩展预留
-- **ToolExposure** — 描述某 turn 可用的工具集合（名称 + schema + 契约文本）
-- **BuildContextRequest / BuiltContext** — context builder 的输入/输出接口
-- **DeliveryStatus** — 不同于 agent/state_machine.py 中的 DeliveryStatus（那是发送状态枚举），这个是消息投递状态
+### 枚举
+
+| 类型 | 枚举值 | 说明 |
+|------|--------|------|
+| **TurnType** | `USER_CHAT` | 当前唯一值，为未来扩展预留 |
+| **UserIntent** | `UNKNOWN`, `CHAT` | 用户意图分类 |
+| **TurnPhase** | `NORMAL_CHAT` | 对话阶段标记 |
+| **ToolCategory** | `OUTPUT`, `INFORMATION`, `MEMORY` | 工具分类（UI 展示用） |
+| **ToolSideEffect** | `NONE`, `SENDS_MESSAGE`, `READS_EXTERNAL`, `WRITES_STATE` | 工具副作用类型 |
+| **DeliveryStatus** | `DELIVERED`, `FAILED`, `UNKNOWN`, `NOT_APPLICABLE` | 消息投递状态 |
+
+### Dataclass
+
+| 类 | 用途 |
+|----|------|
+| **SystemTime** | 时区感知的系统时间（dt, timezone, weekday_cn） |
+| **ProviderMessage** | LLM Provider 消息结构（role, content） |
+| **ConversationHistoryMessage** | 历史消息记录（含 delivery_status, source, created_at） |
+| **NativeToolSchema** | 原生工具定义 Schema（name, description, parameters_schema, terminal, side_effect, category） |
+| **ToolExposure** | 某一回合可用的工具集合（exposed_tool_names, native_tool_schemas, tool_contract_block, denied_tools） |
+| **BuildContextRequest** / **BuiltContext** | context builder 的输入/输出接口 |
+| **ContextBuildWarning** | 上下文构建警告（source, detail, severity） |
 
 ## 注意事项
 

@@ -77,6 +77,16 @@ Ctrl+C 导致服务关闭属于预期行为；关闭过程中取消 lifespan 任
 
 不建议简单吞掉所有 `BaseException` 或关闭全部错误日志，这会同时隐藏真实的强制退出和资源清理问题。
 
+## 修复进展
+
+### 已修复（2026-06-27 确认）
+
+- **方案 1**：`@asynccontextmanager` 装饰器已天然提供 `yield` 前后的 try/finally 语义。`lifespan()` 中 `task_scheduler.stop()`、`_bridge.stop()`、`memory_store.close()` 在取消场景下均能执行。
+
+### 仍待修复
+
+- **方案 2**：`bridge/ilink_client.py::poll_qr_status()` 仍为 `except Exception`，未显式捕获 `asyncio.CancelledError`。退出时 35s 长轮询被取消仍可能记录为 ASGI 错误。不影响功能，仅影响退出日志美观。
+
 ## 状态
 
-已确认，待修复。严重程度建议为低：主要影响退出体验、日志可信度和关闭流程的可观察性，当前证据未表明会影响正常运行期间的业务请求或持久化数据。
+部分修复。剩余问题严重程度为低：仅影响退出体验，不影响正常运行期间的业务请求或持久化数据。
