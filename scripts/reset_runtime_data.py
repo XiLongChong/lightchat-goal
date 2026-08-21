@@ -10,13 +10,17 @@ from pathlib import Path
 DB_PATH = Path("data/memory.db")
 TABLES_TO_CLEAR = (
     "turns",
-    "protocol_messages",
-    "outbound_messages",
-    "turn_drafts",
-    "turn_diagnostics",
-    "usage_events",
-    "visible_activity",
-    "llm_traces",
+    "raw_events",
+    "conversations",
+    "context_snapshots",
+    "tool_versions",
+    "daily_summaries",
+    "app_messages",
+    "app_attachments",
+    "phone_context_snapshots",
+    "scheduled_tasks",
+    "proactive_quota",
+    "reminders",
 )
 
 
