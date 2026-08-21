@@ -268,6 +268,9 @@ async def wechat_sender(user_id: str, context_token: str, messages: list[dict]) 
     """
     return await wechat_sender_service.send_batch(user_id, context_token, messages)
 
+# Inbound source mode: "wechat" | "app" | "both" (default)
+_INBOUND_MODE: str = "both"
+
 # WeChat iLink bridge (lazy start if config.enabled)
 _bridge: WeChatBridge | None = None
 if cfg.get("wechat", {}).get("enabled"):
@@ -1712,6 +1715,12 @@ async def api_send_message(request: Request):
     api_cfg = _api_config()
     _require_chat_auth(request, api_cfg)
 
+    if _INBOUND_MODE == "wechat":
+        raise HTTPException(
+            status_code=503,
+            detail="当前为微信独占模式，App 消息入口已关闭。请在管理后台切换接入源。",
+        )
+
     try:
         body = await request.json()
     except Exception:
@@ -2161,6 +2170,12 @@ async def api_get_messages(
     """
     api_cfg = _api_config()
     _require_chat_auth(request, api_cfg)
+
+    if _INBOUND_MODE == "wechat":
+        raise HTTPException(
+            status_code=503,
+            detail="当前为微信独占模式，App 消息入口已关闭。请在管理后台切换接入源。",
+        )
 
     # ── resolve remote agent id ────────────────────────────────────
     resolved_id = normalize_remote_agent_id(remoteAgentId)
@@ -3262,6 +3277,229 @@ async def admin_logs(
         level=level,
         contains=contains,
     )
+
+
+# ================================================================
+# Admin management endpoints
+# ================================================================
+
+
+@app.get("/admin/inbound-source")
+async def admin_get_inbound_source(request: Request):
+    """Return current inbound source mode."""
+    require_admin(request)
+    return {
+        "mode": _INBOUND_MODE,
+        "wechat_running": _bridge is not None and _bridge.running,
+        "app_sessions_online": len(app_agent_session_registry.list_online()),
+    }
+
+
+@app.post("/admin/inbound-source")
+async def admin_set_inbound_source(request: Request):
+    """Switch inbound source mode: wechat | app | both."""
+    global _INBOUND_MODE
+    require_admin(request)
+    body = await request.json()
+    mode = str(body.get("mode", "")).strip().lower()
+    if mode not in ("wechat", "app", "both"):
+        raise HTTPException(status_code=400, detail="mode must be wechat | app | both")
+
+    # If switching to wechat-exclusive, stop app bridge connections gracefully
+    if mode == "wechat":
+        # Mark all app sessions offline
+        for sid in list(app_agent_session_registry.list_all().keys()):
+            app_agent_session_registry.offline(sid)
+
+    # If switching to app-exclusive, stop WeChat bridge
+    if mode == "app":
+        if _bridge is not None and _bridge.running:
+            await _bridge.stop()
+
+    _INBOUND_MODE = mode
+    return {"mode": _INBOUND_MODE}
+
+
+@app.get("/admin/app-sessions")
+async def admin_list_app_sessions(request: Request):
+    """List all registered app agent sessions."""
+    require_admin(request)
+    sessions = app_agent_session_registry.list_all()
+    result = []
+    for sid, sess in sessions.items():
+        result.append({
+            "sessionId": sid,
+            "remoteAgentId": sess.get("remoteAgentId"),
+            "kind": sess.get("kind"),
+            "status": "online" if sess.get("online") else "offline",
+            "lastSeenAt": _iso_from_ts(sess.get("lastSeenAt", 0)),
+            "callbackUrl": sess.get("callbackUrl"),
+        })
+    return {"sessions": result, "count": len(result)}
+
+
+@app.post("/admin/app-sessions/{session_id}/offline")
+async def admin_offline_app_session(session_id: str, request: Request):
+    """Force an app session offline."""
+    require_admin(request)
+    app_agent_session_registry.offline(session_id)
+    return {"sessionId": session_id, "status": "offline"}
+
+
+@app.get("/admin/phone-context")
+async def admin_phone_context(request: Request):
+    """Return latest phone context snapshot."""
+    require_admin(request)
+    snapshot = await memory_store.get_latest_phone_context_snapshot()
+    if not snapshot:
+        return {"available": False}
+    payload = json.loads(snapshot.get("payload_json", "{}"))
+    age_seconds = int((time.time() * 1000 - snapshot.get("received_at_ms", 0)) / 1000)
+    return {
+        "available": True,
+        "snapshotId": snapshot.get("snapshot_id"),
+        "ageSeconds": age_seconds,
+        "payload": payload,
+    }
+
+
+@app.get("/admin/attachments")
+async def admin_attachments(request: Request):
+    """List app attachments metadata."""
+    require_admin(request)
+    db = await memory_store._get_db()
+    rows = await db.execute_fetchall(
+        "SELECT attachment_id, type, mime_type, file_name, size_bytes, created_at "
+        "FROM app_attachments ORDER BY created_at DESC LIMIT 100"
+    )
+    return {
+        "attachments": [
+            {
+                "id": r["attachment_id"],
+                "type": r["type"],
+                "mimeType": r["mime_type"],
+                "fileName": r["file_name"],
+                "sizeBytes": r["size_bytes"],
+                "createdAt": _iso_from_ts(r["created_at"]),
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.get("/admin/reminders")
+async def admin_reminders(request: Request):
+    """List pending reminders for current contact."""
+    require_admin(request)
+    contact = await memory_store.get_contact_state()
+    user_id = str(contact.get("user_id", "") or "").strip()
+    if not user_id:
+        return {"reminders": []}
+    reminders = await task_scheduler.list_reminders(user_id)
+    return {
+        "reminders": [
+            {
+                "taskId": r.get("task_id"),
+                "status": r.get("status"),
+                "triggerAt": r.get("trigger_at_utc"),
+                "note": (r.get("payload") or {}).get("reminder_note", ""),
+                "deliveryText": (r.get("payload") or {}).get("delivery_text", ""),
+            }
+            for r in reminders
+        ],
+    }
+
+
+@app.get("/admin/compression/status")
+async def admin_compression_status(request: Request):
+    """Return compression schedule and next run info."""
+    require_admin(request)
+    contact = await memory_store.get_contact_state()
+    user_id = str(contact.get("user_id", "") or "").strip()
+    next_run = None
+    if task_scheduler._scheduler.running:
+        jobs = task_scheduler._scheduler.get_jobs()
+        for job in jobs:
+            if "daily_compression" in str(job.id):
+                nxt = job.next_run_time
+                if nxt:
+                    next_run = nxt.isoformat()
+    return {
+        "enabled": True,
+        "schedule": "03:56 and 04:01-04:21 (every 5 min)",
+        "nextRun": next_run,
+        "userId": user_id or None,
+    }
+
+
+@app.get("/admin/compression/history")
+async def admin_compression_history(request: Request):
+    """Return daily compression summary history."""
+    require_admin(request)
+    contact = await memory_store.get_contact_state()
+    user_id = str(contact.get("user_id", "") or "").strip()
+    if not user_id:
+        return {"summaries": []}
+    conv = await memory_store.get_conversation(user_id, BOT_ID)
+    conv_id = conv.get("id") if conv else None
+    if not conv_id:
+        return {"summaries": []}
+    summaries = await memory_store.get_daily_summaries(conv_id, limit=30)
+    return {
+        "summaries": [
+            {
+                "date": s.get("summary_date"),
+                "text": s.get("summary_text", "")[:200],
+            }
+            for s in summaries
+        ],
+    }
+
+
+@app.get("/admin/proactive/config")
+async def admin_proactive_config(request: Request):
+    """Return proactive messaging configuration."""
+    require_admin(request)
+    pcfg = cfg.get("proactive", {})
+    contact = await memory_store.get_contact_state()
+    user_id = str(contact.get("user_id", "") or "").strip()
+    used = 0
+    if user_id:
+        used = await memory_store.get_proactive_quota_used(
+            user_id=user_id, date=datetime.now().strftime("%Y-%m-%d")
+        )
+    tier = str(pcfg.get("default_frequency") or "moderate")
+    limits = {"low": 1, "moderate": 3, "high": 6}
+    return {
+        "enabled": bool(pcfg.get("enabled", True)),
+        "frequencyTier": tier,
+        "dailyLimit": limits.get(tier, 3),
+        "todayUsed": used,
+        "quietHours": {
+            "start": pcfg.get("quiet_hours_start", "23:00"),
+            "end": pcfg.get("quiet_hours_end", "08:00"),
+            "timezone": pcfg.get("quiet_hours_timezone", "Asia/Shanghai"),
+        },
+    }
+
+
+@app.get("/admin/tools/status")
+async def admin_tools_status(request: Request):
+    """Return tool registry status and dependency health."""
+    require_admin(request)
+    tools = []
+    for td in TOOL_REGISTRY.iter_defs():
+        tools.append({
+            "name": td.name,
+            "category": td.tool_category,
+            "sideEffect": td.side_effect_level,
+            "nativeEligible": td.native_tool_call_eligible,
+        })
+    deps = {
+        "QWEATHER_API_KEY": bool(os.getenv("QWEATHER_API_KEY", "")),
+        "TAVILY_API_KEY": bool(os.getenv("TAVILY_API_KEY", "")),
+    }
+    return {"tools": tools, "dependencies": deps}
 
 
 # ================================================================
